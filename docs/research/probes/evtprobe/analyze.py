@@ -53,6 +53,17 @@ for e in events:
 status_events = [s for s in subs if s["event"] == "pane.agent_status_changed"]
 other_events = [s for s in subs if s["event"] != "pane.agent_status_changed"]
 
+def pane_name(kind):
+    """Resolve a pane_id to the agent name that polls observed in it."""
+    found = []
+    for row in polls:
+        if row.get("src") != "list":
+            continue
+        for a in row.get("agents") or []:
+            if a.get("pane_id") == kind and a.get("name"):
+                found.append(a["name"])
+    return found[-1] if found else None
+
 # ---- poll timeline per agent (from src=list, full snapshot) ----
 timeline = {}   # name -> list of {t, status, seq}
 for row in polls:
@@ -70,7 +81,7 @@ def transitions_from_polls(name):
         if prev is None:
             prev = obs
             continue
-        if obs["status"] != prev["status"] or (obs["seq"] != prev["seq"]):
+        if obs["status"] != prev["status"]:
             out.append({"t_from": prev["t"], "t_at": obs["t"], "from": prev["status"], "to": obs["status"],
                         "seq_from": prev["seq"], "seq_at": obs["seq"]})
         prev = obs
@@ -101,9 +112,8 @@ for name in names:
     for row in polls:
         if row.get("src") == "list":
             for a in row.get("agents") or []:
-                if a.get("name") == name:
+                if a.get("name") == name and a.get("pane_id"):
                     pane_id = a.get("pane_id")
-            break
     pts = transitions_from_polls(name)
     ets = transitions_from_events(pane_id) if pane_id else []
     seq_delta = None
@@ -113,10 +123,8 @@ for name in names:
     for row in polls:
         if row.get("src") == "list":
             for a in row.get("agents") or []:
-                if a.get("name") == name:
+                if a.get("name") == name and a.get("kind"):
                     kind = a.get("kind")
-            if kind:
-                break
     print(f"| {name} | {pane_id} | {kind} | {len(pts)} | {len(ets)} | {len(pts)-len(ets)} | {seq_delta} |")
     summary["agents"][name] = {"pane_id": pane_id, "kind": kind,
         "poll_transitions": len(pts), "event_transitions": len(ets),
@@ -125,17 +133,25 @@ for name in names:
         "evt_list": [{"t": x["t"], "from": None, "to": x["status"]} for x in ets]}
 
 # ---- latency: pair each event transition with poll bracket ----
-print("\n== latency bounds (event ts vs 2s poll bracket; lower = event_ts - poll_new_ts, upper = event_ts - poll_prev_ts) ==")
+print("\n== latency bounds (event ts vs poll bracket; lower = event_ts - poll_new_ts, upper = event_ts - poll_prev_ts) ==")
 print("| agent | to | poll_prev | poll_new | event_ts | lb_ms | ub_ms |")
 lat = []
+unconfirmed = 0
+dupes = 0
+# count duplicate consecutive same-status events per pane (raw over-delivery check)
+last_by_pane = {}
+for s in status_events:
+    lp = last_by_pane.get(s["pane_id"])
+    if lp and lp["status"] == s["status"]:
+        dupes += 1
+    last_by_pane[s["pane_id"]] = s
 for name in names:
     pane_id = None
     for row in polls:
         if row.get("src") == "list":
             for a in row.get("agents") or []:
-                if a.get("name") == name:
+                if a.get("name") == name and a.get("pane_id"):
                     pane_id = a.get("pane_id")
-            break
     ets = transitions_from_events(pane_id) if pane_id else []
     tls = timeline.get(name, [])
     for e in ets:
@@ -151,6 +167,11 @@ for name in names:
             ub = e["t"] - prev["t"]
             print(f"| {name} | {e['status']} | {prev['t']} | {new['t']} | {e['t']} | {lb} | {ub} |")
             lat.append({"agent": name, "to": e["status"], "lb": lb, "ub": ub})
+        else:
+            unconfirmed += 1
+print(f"\nduplicate (consecutive same-status) events: {dupes}; unconfirmed (no poll bracket showing the new status): {unconfirmed}")
+summary["dupes"] = dupes
+summary["unconfirmed"] = unconfirmed
 summary["latency"] = lat
 
 print("\n== non-status events ==")
