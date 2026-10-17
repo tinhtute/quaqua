@@ -302,7 +302,7 @@ pub fn spawn_worker<G: GitOps, H: HerdrOps>(
 
     if opts.review && !kind_info.can_review {
         eprintln!(
-            "error: --review is only supported for claude kinds (ni, suhuynh, truonglao), not {}",
+            "error: --review requires a kind with can_review = true in team.toml (ni, suhuynh, truonglao), not {}",
             opts.kind
         );
         return Err((1, format!("{}\n", USAGE)));

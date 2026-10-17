@@ -61,9 +61,9 @@ model = "opus-5.5"
 effort = "low"
 can_review = true
 [kinds.suhuynh]
-harness = "claude"
-model = "opus-5.5"
-effort = "medium"
+harness = "opencode"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"                    # Claude out (anh iu, 2026-10-17): reviewer on opencode
 can_review = true
 [kinds.truonglao]
 harness = "claude"

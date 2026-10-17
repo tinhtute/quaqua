@@ -580,8 +580,10 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
         let reviewer = match reviewer_opt {
             Some(r) => {
                 let rh = harness_of_kind(&r, &cfg).ok_or_else(|| (1, format!("unknown reviewer kind: {r}\n")))?;
-                if !["ni", "suhuynh", "truonglao"].contains(&r.as_str()) {
-                    return Err((1, format!("reviewer must be a claude kind (ni|suhuynh|truonglao) — spawn-worker.sh --review refuses {r}\n")));
+                // Any kind with can_review = true may review — harness-independent
+                // (Claude out: suhuynh runs on opencode).
+                if !cfg.kinds.get(&r).map(|k| k.can_review).unwrap_or(false) {
+                    return Err((1, format!("reviewer kind '{r}' has can_review = false in team.toml\n")));
                 }
                 if bh == rh {
                     return Err((1, format!("builder and reviewer must be different harnesses (models.md): {builder}/{r} are both {bh}\n")));
