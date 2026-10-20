@@ -142,7 +142,8 @@ enum ConfigCmd {
 
 #[derive(Args)]
 struct ConfigArgs {
-    /// Path to team.toml (default: $QUAQUA_TEAM_TOML, else ./team.toml).
+    /// Path to team.toml (default: $QUAQUA_TEAM_TOML, else ./team.toml, else
+    /// <workspace>/team.toml, else the embedded default).
     #[arg(long)]
     file: Option<PathBuf>,
     /// Validate the config as seen by this project (applies its override).
@@ -160,9 +161,24 @@ fn team_file(explicit: &Option<PathBuf>) -> Result<PathBuf, String> {
     Ok(PathBuf::from("team.toml"))
 }
 
+/// `config get|validate` config source: the explicit `--file`, else the same
+/// resolution every other command uses (`config::load_team_config`).
+fn load_config(explicit: &Option<PathBuf>) -> Result<config::Config, String> {
+    if let Some(p) = explicit {
+        return config::load(p);
+    }
+    // load_team_config pre-formats its message for callers that `eprint!` it
+    // verbatim; the config command prints its own `error: ` prefix.
+    config::load_team_config().map_err(|(_, msg)| {
+        msg.trim()
+            .strip_prefix("error: ")
+            .unwrap_or(msg.trim())
+            .to_string()
+    })
+}
+
 fn do_validate(args: &ConfigArgs) -> Result<(), String> {
-    let file = team_file(&args.file)?;
-    let cfg = config::load(&file)?;
+    let cfg = load_config(&args.file)?;
     // Validate the raw file once. `validate` already bounds every [projects.*]
     // override (and the weights) against the top-level cap, so a bad override is
     // caught even without --project.
@@ -179,24 +195,8 @@ fn do_validate(args: &ConfigArgs) -> Result<(), String> {
 }
 
 fn do_get(key: &str, args: &ConfigArgs) -> Result<String, String> {
-    let file = team_file(&args.file)?;
-    let cfg = config::load(&file)?;
+    let cfg = load_config(&args.file)?;
     config::get(&cfg, key, args.project.as_deref())
-}
-
-fn load_spawn_config() -> Result<quaqua::config::Config, (i32, String)> {
-    if let Ok(path_str) = std::env::var("QUAQUA_TEAM_TOML") {
-        return config::load(Path::new(&path_str)).map_err(|e| (1, format!("error: {e}\n")));
-    }
-    if Path::new("team.toml").is_file() {
-        return config::load(Path::new("team.toml")).map_err(|e| (1, format!("error: {e}\n")));
-    }
-    let home_team = quaqua::workspace::workspace_root().join("team.toml");
-    if home_team.is_file() {
-        return config::load(&home_team).map_err(|e| (1, format!("error: {e}\n")));
-    }
-    const DEFAULT_TOML: &str = include_str!("../../../team.toml");
-    toml::from_str(DEFAULT_TOML).map_err(|e| (1, format!("error: failed to parse default team.toml: {e}\n")))
 }
 
 fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
@@ -206,7 +206,7 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
     match args[0].as_str() {
         "spawn" => {
             let opts = parse_spawn_args(&args[1..])?;
-            let cfg = load_spawn_config()?;
+            let cfg = config::load_team_config()?;
             spawn_worker(opts, &cfg, git, herdr)?;
             Ok(())
         }
