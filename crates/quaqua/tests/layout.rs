@@ -933,3 +933,27 @@ fn layout_shadow_evidence_taskforce_member_skips_edge() {
         assert_eq!(would_denies.len(), 0, "TaskforceMember origin skips edge, so 0 would_deny events");
     }
 }
+
+#[test]
+fn layout_repro_finding1_missing_owner_and_cycle_have_distinct_rule_ids() {
+    let slp = builtin::get("slp").expect("slp built-in");
+    let lead_missing = Caller {
+        name: "gate-lead".to_string(),
+        role: Role::Lead,
+        depth: CallerDepth::MissingOwner("gate-lead".to_string()),
+        source: IdentitySource::PaneTokens,
+    };
+    let dec_missing = check(&slp, &lead_missing, Verb::Spawn, "peer");
+    assert!(!dec_missing.allow);
+    assert_eq!(dec_missing.rule_id, "depth.owner_missing", "missing owner must deny depth.owner_missing, not depth.exceeded");
+
+    let lead_cycle = Caller {
+        name: "cycle-lead".to_string(),
+        role: Role::Lead,
+        depth: CallerDepth::Cycle(vec!["cycle-lead".to_string()]),
+        source: IdentitySource::PaneTokens,
+    };
+    let dec_cycle = check(&slp, &lead_cycle, Verb::Spawn, "peer");
+    assert!(!dec_cycle.allow);
+    assert_eq!(dec_cycle.rule_id, "depth.cycle", "cycle in owner chain must deny depth.cycle, not depth.exceeded");
+}
