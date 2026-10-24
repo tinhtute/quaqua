@@ -366,6 +366,8 @@ mod tests {
 
     #[test]
     fn landed_prompt_clears_then_submits_with_wait() {
+        let _env_lock = crate::test_env::lock_env();
+        let _pane_guard = crate::test_env::TestEnvVarGuard::remove("HERDR_PANE_ID");
         let fake = FakeHerdr::new(
             "working",
             true,
