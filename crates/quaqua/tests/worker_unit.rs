@@ -2353,8 +2353,9 @@ fn test_spawn_worker_purpose_with_matching_positional_kind() {
     assert!(res.is_ok(), "spawn with matching kind should succeed: {:?}", res.err());
     let bus = quaqua::bus::FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
     let events = bus.load_events(0).expect("load events");
-    let spawned = events.iter().find(|e| e.event_type == "spawned").expect("spawned event must exist");
-    assert_eq!(spawned.subject.as_deref(), Some("suhuynh-purpmatch"));
+    let spawned: Vec<_> = events.iter().filter(|e| e.event_type == "spawned").collect();
+    assert_eq!(spawned.len(), 1, "must record exactly one spawned event");
+    assert_eq!(spawned[0].subject.as_deref(), Some("suhuynh-purpmatch"));
 
 
     let _ = std::fs::remove_dir_all(&temp);

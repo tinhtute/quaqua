@@ -287,7 +287,7 @@ pub fn check_with_origin(
                     passed: false,
                     detail: format!("cycle in owner chain: {:?}", cycle),
                 });
-                return Decision::deny("depth.exceeded", trace);
+                return Decision::deny("depth.cycle", trace);
             }
             CallerDepth::MissingOwner(owner) => {
                 trace.push(TraceStep {
@@ -295,7 +295,7 @@ pub fn check_with_origin(
                     passed: false,
                     detail: format!("missing owner in chain: {}", owner),
                 });
-                return Decision::deny("depth.exceeded", trace);
+                return Decision::deny("depth.owner_missing", trace);
             }
             CallerDepth::Unknown => {
                 trace.push(TraceStep {
@@ -443,12 +443,9 @@ pub fn shadow<H: HerdrOps>(
     );
 
     if !decision.allow {
-        let layer = decision
-            .trace
-            .iter()
-            .find(|t| !t.passed)
-            .map(|t| t.layer.as_str())
-            .unwrap_or("unknown");
+        let failing_step = decision.trace.iter().find(|t| !t.passed);
+        let layer = failing_step.map(|t| t.layer.as_str()).unwrap_or("unknown");
+        let detail = failing_step.map(|t| t.detail.as_str()).unwrap_or("");
 
         eprintln!(
             "would_deny: rule_id={} layer={} layout={}",
@@ -459,6 +456,7 @@ pub fn shadow<H: HerdrOps>(
         let mut payload = serde_json::json!({
             "rule_id": decision.rule_id,
             "layer": layer,
+            "detail": detail,
             "layout": layout.name,
             "verb": verb.as_str(),
             "caller_role": effective_caller.role.as_str(),

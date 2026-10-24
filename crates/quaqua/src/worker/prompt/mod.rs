@@ -524,18 +524,20 @@ pub fn prompt_worker<G: GitOps>(
         .ok()
         .map(|s| s.trim().to_string());
     let target_role = if name.ends_with("-lead") { "lead" } else { "peer" };
-    crate::layout::shadow(
-        None,
-        Some(herdr),
-        crate::layout::Verb::Prompt,
-        target_role,
-        Some(name),
-        crate::layout::SpawnOrigin::Cli,
-        target_owner.as_deref(),
-        None,
-        &runs_dir,
-        None,
-    );
+    if !resume {
+        crate::layout::shadow(
+            None,
+            Some(herdr),
+            crate::layout::Verb::Prompt,
+            target_role,
+            Some(name),
+            crate::layout::SpawnOrigin::Cli,
+            target_owner.as_deref(),
+            None,
+            &runs_dir,
+            None,
+        );
+    }
 
     let out = runs_dir.join(format!("{name}.md"));
     let submit_log = WorkerMetadata::submit_log_path(&runs_dir, name);
