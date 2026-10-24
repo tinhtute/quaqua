@@ -3,7 +3,10 @@ pub mod gate;
 pub mod legacy;
 pub mod model;
 
-pub use gate::{check, check_with_count, resolve_target_role, validate_layout};
+pub use gate::{
+    check, check_with_count, check_with_origin, resolve_target_role, shadow, validate_layout,
+    SpawnOrigin,
+};
 pub use model::{
     Decision, Layout, LayoutRole, Member, Naming, RoleClass, TraceStep, Verb,
 };

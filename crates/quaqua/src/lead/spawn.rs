@@ -311,6 +311,19 @@ pub fn spawn_lead<G: GitOps, H: HerdrOps>(
         false,
     )?;
 
+    crate::layout::shadow(
+        Some(&caller),
+        Some(herdr),
+        crate::layout::Verb::Spawn,
+        "lead",
+        Some(&name),
+        crate::layout::SpawnOrigin::Cli,
+        Some(&caller_owner),
+        Some(&slug),
+        &runs_dir,
+        Some(&cfg),
+    );
+
     // Herdr workspace create
     let owner_env = format!("QUAQUA_OWNER={name}");
     let mut ws_args = vec![

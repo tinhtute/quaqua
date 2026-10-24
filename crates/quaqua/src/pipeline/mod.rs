@@ -1144,7 +1144,7 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                         let spawn_res = (|| -> Result<(), (i32, String)> {
                             let mut opts = crate::worker::spawn::parse_spawn_args(&sargs)?;
                             opts.approve_kinds = state.approve_kinds.clone();
-                            crate::worker::spawn::spawn_worker(opts, &ctx.cfg, ctx.git, ctx.herdr)
+                            crate::worker::spawn::spawn_worker(opts, &ctx.cfg, ctx.git, ctx.herdr, crate::layout::SpawnOrigin::Pipeline)
                         })();
 
                         if let Some(pt) = prev_pt {
@@ -1211,7 +1211,7 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                         let spawn_res = (|| -> Result<(), (i32, String)> {
                             let mut opts = crate::worker::spawn::parse_spawn_args(&sargs)?;
                             opts.approve_kinds = state.approve_kinds.clone();
-                            crate::worker::spawn::spawn_worker(opts, &ctx.cfg, ctx.git, ctx.herdr)
+                            crate::worker::spawn::spawn_worker(opts, &ctx.cfg, ctx.git, ctx.herdr, crate::layout::SpawnOrigin::Pipeline)
                         })();
 
                         if let Some(pt) = prev_pt {

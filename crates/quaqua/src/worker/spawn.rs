@@ -13,6 +13,7 @@ pub use crate::worker::worktree::{
     apply_push_block, canonicalize_repo_path, prepare_worktree, remove_worktree, resolve_paths,
     resolve_worktree_path, setup_worktree, validate_base_ref,
 };
+pub use crate::layout::SpawnOrigin;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Output;
@@ -294,6 +295,7 @@ pub fn spawn_worker<G: GitOps, H: HerdrOps>(
     cfg: &Config,
     git: &G,
     herdr: &H,
+    origin: SpawnOrigin,
 ) -> Result<(), (i32, String)> {
     let runs_dir = crate::worker::cleanup::default_runs_dir();
     let name = opts.name.clone();
@@ -303,7 +305,7 @@ pub fn spawn_worker<G: GitOps, H: HerdrOps>(
         .and_then(|n| n.to_str())
         .map(String::from);
 
-    let res = spawn_worker_inner(opts, cfg, git, herdr, &runs_dir);
+    let res = spawn_worker_inner(opts, cfg, git, herdr, &runs_dir, origin);
 
     match &res {
         Ok((caller, owner)) => {
@@ -348,6 +350,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     git: &G,
     herdr: &H,
     runs_dir: &std::path::Path,
+    origin: SpawnOrigin,
 ) -> Result<(String, String), (i32, String)> {
     let resolved_kind = match (&opts.purpose, &opts.kind) {
         (Some(p), Some(pos)) => {
@@ -422,6 +425,19 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     let caller = crate::identity::resolve_caller_from_tokens(caller_tokens.as_ref(), runs_dir);
     let _ = std::fs::create_dir_all(runs_dir);
     eprintln!("[identity] worker spawn: name={} caller={caller}", opts.name);
+
+    crate::layout::shadow(
+        Some(&caller),
+        Some(herdr),
+        crate::layout::Verb::Spawn,
+        "peer",
+        Some(&opts.name),
+        origin,
+        Some(&owner),
+        opts.repo_path.file_name().and_then(|n| n.to_str()),
+        runs_dir,
+        Some(cfg),
+    );
 
     // Lead gate (AGENTS.md '## Roles (SLP)'): a `cos`-owned project with two or
     // more topology signals needs a Lead before another worker joins it.

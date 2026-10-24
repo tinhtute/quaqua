@@ -663,7 +663,7 @@ fn test_unknown_harness_rejected_before_split_n4() {
     ])
     .unwrap();
 
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &dummy_git, &spy);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &dummy_git, &spy, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_err());
     // N4: pane_split must NEVER have been called!
     assert!(!spy.has_call("herdr.pane_split"));
@@ -707,7 +707,7 @@ fn test_missing_effort_rejected_before_split() {
     ])
     .unwrap();
 
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &dummy_git, &spy);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &dummy_git, &spy, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_err());
     assert!(!spy.has_call("herdr.pane_split"));
     assert_eq!(spy.call_count(), 0);
@@ -750,7 +750,7 @@ fn test_unsupported_effort_rejected_before_split() {
     ])
     .unwrap();
 
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &dummy_git, &spy);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &dummy_git, &spy, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_err());
     assert!(!spy.has_call("herdr.pane_split"));
     assert_eq!(spy.call_count(), 0);
@@ -815,6 +815,7 @@ fn test_spawn_worker_records_spawn_failed_on_early_rejection_in_production() {
         &cfg,
         &DummyGit,
         &MockActivitiesHerdr::new(MockActivities::new()),
+        quaqua::layout::SpawnOrigin::Cli,
     );
     assert!(res.is_err());
 
@@ -2289,7 +2290,7 @@ fn test_spawn_worker_resolving_purpose() {
     .unwrap();
     assert_eq!(opts.purpose.as_deref(), Some("review"));
     assert_eq!(opts.kind, None);
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_ok(), "spawn should resolve purpose and succeed: {:?}", res.err());
 
     let starts = herdr.agent_starts();
@@ -2348,13 +2349,12 @@ fn test_spawn_worker_purpose_with_matching_positional_kind() {
         repo_dir.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_ok(), "spawn with matching kind should succeed: {:?}", res.err());
     let bus = quaqua::bus::FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
     let events = bus.load_events(0).expect("load events");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, "spawned");
-    assert_eq!(events[0].subject.as_deref(), Some("suhuynh-purpmatch"));
+    let spawned = events.iter().find(|e| e.event_type == "spawned").expect("spawned event must exist");
+    assert_eq!(spawned.subject.as_deref(), Some("suhuynh-purpmatch"));
 
 
     let _ = std::fs::remove_dir_all(&temp);
@@ -2398,7 +2398,7 @@ fn test_spawn_worker_purpose_with_mismatched_positional_kind_fails() {
         repo_dir.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_err(), "spawn with mismatched kind should fail");
     let (code, msg) = res.unwrap_err();
     assert_eq!(code, 1);
@@ -2463,7 +2463,7 @@ fn test_spawn_worker_purpose_with_colon_resolves_correctly() {
         repo_dir.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_ok(), "spawn with colon in purpose should resolve correctly: {:?}", res.err());
 
     let starts = herdr.agent_starts();
@@ -2700,7 +2700,7 @@ fn test_spawn_worker_fallback_scenarios() {
         ])
         .unwrap();
 
-        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
         assert!(
             res.is_ok(),
             "spawn should succeed with fallback: {:?}",
@@ -2759,7 +2759,7 @@ fn test_spawn_worker_fallback_scenarios() {
         ])
         .unwrap();
 
-        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
         assert!(res.is_err(), "must error when fallback fails");
 
         let starts = herdr.agent_starts();
@@ -2798,7 +2798,7 @@ fn test_spawn_worker_fallback_scenarios() {
         ])
         .unwrap();
 
-        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
         assert!(res.is_err(), "must error when fallback kind is missing");
 
         let starts = herdr.agent_starts();
@@ -2842,7 +2842,7 @@ fn test_spawn_worker_fallback_scenarios() {
         ])
         .unwrap();
 
-        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
         assert!(
             res.is_err(),
             "must refuse fallback to non-review kind when in review mode"
@@ -2901,7 +2901,7 @@ fn test_spawn_worker_approve_policy_gate() {
         repo.clone(),
     ])
     .unwrap();
-    let err = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr).unwrap_err();
+    let err = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli).unwrap_err();
     assert!(err.1.contains("--approve-kind truonglao"), "{}", err.1);
     assert!(
         !herdr.has_call("herdr.agent_start:claude"),
@@ -2919,7 +2919,7 @@ fn test_spawn_worker_approve_policy_gate() {
     ])
     .unwrap();
     assert_eq!(opts.approve_kinds, vec!["truonglao".to_string()]);
-    quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr)
+    quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli)
         .expect("approved spawn should start");
     assert!(herdr.has_call("herdr.agent_start:claude"));
 
@@ -2954,7 +2954,7 @@ fn test_spawn_worker_default_grid_tab_from_owner() {
             repo_dir.to_str().unwrap().to_string(),
         ])
         .unwrap();
-        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+        let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
         assert!(res.is_ok(), "spawn {name} failed: {:?}", res.err());
         std::fs::read_to_string(runs_dir.join(format!("{name}.grid")))
             .expect("runs/<name>.grid must be recorded")
@@ -3018,7 +3018,7 @@ fn spawn_with_caller_pane(
         repo_dir.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let res = quaqua::worker::spawn::spawn_worker(opts, cfg, &SpawnTestGit, &herdr);
+    let res = quaqua::worker::spawn::spawn_worker(opts, cfg, &SpawnTestGit, &herdr, quaqua::layout::SpawnOrigin::Cli);
     assert!(res.is_ok(), "spawn {name} failed: {:?}", res.err());
     let owner = std::fs::read_to_string(runs_dir.join(format!("{name}.owner"))).unwrap();
     let grid = std::fs::read_to_string(runs_dir.join(format!("{name}.grid"))).unwrap();
@@ -3122,7 +3122,7 @@ fn test_spawn_worker_grid_timeout_fails() {
     ])
     .unwrap();
 
-    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr);
+    let res = quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli);
 
     std::env::remove_var("QUAQUA_RUNS_DIR");
     std::env::remove_var("QUAQUA_OWNER");
@@ -4103,7 +4103,7 @@ fn test_cap_gate_counts_live_workers_and_exempts_leads() {
     ])
     .unwrap();
     let (code, msg) =
-        quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr).unwrap_err();
+        quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr, quaqua::layout::SpawnOrigin::Cli).unwrap_err();
     assert_eq!(code, 1, "cap refusal must exit 1: {msg}");
     assert!(msg.contains("worker cap exceeded"), "{msg}");
     assert!(
@@ -4124,7 +4124,7 @@ fn test_cap_gate_counts_live_workers_and_exempts_leads() {
     ])
     .unwrap();
     let herdr = herdr_listing(&agent_list_json(&names));
-    quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr)
+    quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr, quaqua::layout::SpawnOrigin::Cli)
         .expect("a Lead spawns despite the CoS sitting at its cap");
     assert_eq!(
         std::fs::read_to_string(runs_dir.join("sude-leadw1.owner")).unwrap(),
@@ -4149,7 +4149,7 @@ fn test_cap_gate_counts_live_workers_and_exempts_leads() {
     ])
     .unwrap();
     let (code, msg) =
-        quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr).unwrap_err();
+        quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr, quaqua::layout::SpawnOrigin::Cli).unwrap_err();
     assert_eq!(code, 1, "{msg}");
     assert!(msg.contains("owner 'baro-lead'"), "{msg}");
     assert!(
@@ -4165,7 +4165,7 @@ fn test_cap_gate_counts_live_workers_and_exempts_leads() {
     ])
     .unwrap();
     let herdr = herdr_listing(&agent_list_json(&names));
-    quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr)
+    quaqua::worker::spawn::spawn_worker(opts, &cfg, &SpawnTestGit, &herdr, quaqua::layout::SpawnOrigin::Cli)
         .expect("the Lead cap must not leak into the CoS");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -4371,7 +4371,7 @@ impl GateFixture {
         args.push("sude".to_string());
         args.push(self.repo().to_string_lossy().to_string());
         let opts = parse_spawn_args(&args).unwrap();
-        quaqua::worker::spawn::spawn_worker(opts, &gate_cfg(), &SpawnTestGit, herdr)
+        quaqua::worker::spawn::spawn_worker(opts, &gate_cfg(), &SpawnTestGit, herdr, quaqua::layout::SpawnOrigin::Cli)
     }
 
     fn today(&self) -> String {

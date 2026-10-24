@@ -319,7 +319,7 @@ impl SystemActivities {
                     solo: None,
                 };
 
-                crate::worker::spawn::spawn_worker(opts, &cfg, &self.git, &self.herdr).map_err(
+                crate::worker::spawn::spawn_worker(opts, &cfg, &self.git, &self.herdr, crate::layout::SpawnOrigin::Activity).map_err(
                     |(code, msg)| {
                         ActivityError::ExecutionFailed(format!("spawn failed (exit {code}): {msg}"))
                     },

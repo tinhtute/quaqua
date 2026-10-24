@@ -38,6 +38,21 @@ pub fn prompt_lead<H: HerdrOps>(args: &[String], herdr: &H) -> Result<(), (i32, 
     }
     let name = format!("{slug}-lead");
 
+    let runs_dir = crate::worker::cleanup::default_runs_dir();
+    let _ = std::fs::create_dir_all(&runs_dir);
+    crate::layout::shadow(
+        None,
+        Some(herdr),
+        crate::layout::Verb::Prompt,
+        "lead",
+        Some(&name),
+        crate::layout::SpawnOrigin::Cli,
+        None,
+        Some(slug),
+        &runs_dir,
+        None,
+    );
+
     // The Lead must exist and expose a pane to read back.
     let info = match liveness(herdr, &name) {
         Liveness::Alive(body) => body,

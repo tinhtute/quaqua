@@ -109,6 +109,7 @@ pub fn handle_taskforce(args: &[String], git: &Git, herdr: &Herdr) -> Result<(),
     } else {
         base_cfg
     };
+    crate::layout::shadow(None, Some(herdr), crate::layout::Verb::Spawn, "taskforce", Some(&targs.task), crate::layout::SpawnOrigin::Cli, Some(&owner), proj_slug.as_deref(), &runs_dir, Some(&cfg));
     let weight = cfg
         .limits
         .weights
@@ -170,7 +171,7 @@ fn run_advisor(
     // Set PIPELINE_TASK during inner spawn to prevent double-charging the reservation
     std::env::set_var("PIPELINE_TASK", &args.task);
     std::env::set_var("QUAQUA_OWNER", owner);
-    let spawn_res = crate::worker::spawn::spawn_worker(opts, cfg, git, herdr);
+    let spawn_res = crate::worker::spawn::spawn_worker(opts, cfg, git, herdr, crate::layout::SpawnOrigin::TaskforceMember);
     std::env::remove_var("PIPELINE_TASK");
     spawn_res?;
 
@@ -267,9 +268,9 @@ fn run_dual_lens(
 
     std::env::set_var("PIPELINE_TASK", &args.task);
     std::env::set_var("QUAQUA_OWNER", owner);
-    let s1 = crate::worker::spawn::spawn_worker(opts1, cfg, git, herdr);
+    let s1 = crate::worker::spawn::spawn_worker(opts1, cfg, git, herdr, crate::layout::SpawnOrigin::TaskforceMember);
     let s2 = if s1.is_ok() {
-        crate::worker::spawn::spawn_worker(opts2, cfg, git, herdr)
+        crate::worker::spawn::spawn_worker(opts2, cfg, git, herdr, crate::layout::SpawnOrigin::TaskforceMember)
     } else {
         Ok(())
     };

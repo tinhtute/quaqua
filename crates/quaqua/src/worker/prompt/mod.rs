@@ -520,6 +520,23 @@ pub fn prompt_worker<G: GitOps>(
     let runs_dir = default_runs_dir();
     let _ = std::fs::create_dir_all(&runs_dir);
 
+    let target_owner = std::fs::read_to_string(runs_dir.join(format!("{name}.owner")))
+        .ok()
+        .map(|s| s.trim().to_string());
+    let target_role = if name.ends_with("-lead") { "lead" } else { "peer" };
+    crate::layout::shadow(
+        None,
+        Some(herdr),
+        crate::layout::Verb::Prompt,
+        target_role,
+        Some(name),
+        crate::layout::SpawnOrigin::Cli,
+        target_owner.as_deref(),
+        None,
+        &runs_dir,
+        None,
+    );
+
     let out = runs_dir.join(format!("{name}.md"));
     let submit_log = WorkerMetadata::submit_log_path(&runs_dir, name);
     let cost_budget: Option<f64> = resolve_cost_budget(task.unwrap_or(""));

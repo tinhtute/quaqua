@@ -1,5 +1,30 @@
+use std::fmt;
+use std::path::Path;
+use serde::{Deserialize, Serialize};
+use crate::config::Config;
+use crate::herdr::HerdrOps;
 use crate::identity::{Caller, CallerDepth, Role};
 use crate::layout::model::{Decision, Layout, TraceStep, Verb};
+
+/// Origin of a worker spawn invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SpawnOrigin {
+    Cli,
+    Pipeline,
+    Activity,
+    TaskforceMember,
+}
+
+impl fmt::Display for SpawnOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SpawnOrigin::Cli => write!(f, "cli"),
+            SpawnOrigin::Pipeline => write!(f, "pipeline"),
+            SpawnOrigin::Activity => write!(f, "activity"),
+            SpawnOrigin::TaskforceMember => write!(f, "taskforce-member"),
+        }
+    }
+}
 
 /// Resolve the role name for a target string within a layout.
 ///
@@ -95,6 +120,18 @@ pub fn check_with_count(
     target: &str,
     current_children: Option<i64>,
 ) -> Decision {
+    check_with_origin(layout, caller, verb, target, current_children, false)
+}
+
+/// Pure layout gate check with optional child count and edge-skip flag.
+pub fn check_with_origin(
+    layout: &Layout,
+    caller: &Caller,
+    verb: Verb,
+    target: &str,
+    current_children: Option<i64>,
+    skip_edge: bool,
+) -> Decision {
     let mut trace = Vec::new();
 
     // 1. Identity layer
@@ -159,20 +196,29 @@ pub fn check_with_count(
 
     // 3. Edge layer
     let mut reports_to_edge = false;
-    let edge_allowed = match verb {
-        Verb::Spawn => role.can_spawn.iter().any(|r| r == target_role),
-        Verb::Prompt => role.can_prompt.iter().any(|r| r == target_role),
-        Verb::Mail => {
-            if role.can_prompt.iter().any(|r| r == target_role) {
-                true
-            } else if role.reports_to.as_deref() == Some(target_role) {
-                reports_to_edge = true;
-                true
-            } else if role.reports_to.as_deref() == Some("owner") && target_role == "cos" {
-                reports_to_edge = true;
-                true
-            } else {
-                false
+    let edge_allowed = if skip_edge {
+        trace.push(TraceStep {
+            layer: "edge".to_string(),
+            passed: true,
+            detail: "edge check skipped".to_string(),
+        });
+        true
+    } else {
+        match verb {
+            Verb::Spawn => role.can_spawn.iter().any(|r| r == target_role),
+            Verb::Prompt => role.can_prompt.iter().any(|r| r == target_role),
+            Verb::Mail => {
+                if role.can_prompt.iter().any(|r| r == target_role) {
+                    true
+                } else if role.reports_to.as_deref() == Some(target_role) {
+                    reports_to_edge = true;
+                    true
+                } else if role.reports_to.as_deref() == Some("owner") && target_role == "cos" {
+                    reports_to_edge = true;
+                    true
+                } else {
+                    false
+                }
             }
         }
     };
@@ -199,14 +245,16 @@ pub fn check_with_count(
         });
         return Decision::deny("edge.none", trace);
     }
-    trace.push(TraceStep {
-        layer: "edge".to_string(),
-        passed: true,
-        detail: format!(
-            "{} edge permits '{}' -> '{}'",
-            verb, caller_role_name, target_role
-        ),
-    });
+    if !skip_edge {
+        trace.push(TraceStep {
+            layer: "edge".to_string(),
+            passed: true,
+            detail: format!(
+                "{} edge permits '{}' -> '{}'",
+                verb, caller_role_name, target_role
+            ),
+        });
+    }
 
     // 4. Depth layer
     if verb == Verb::Spawn {
@@ -323,4 +371,116 @@ pub fn check_with_count(
     };
 
     Decision::allow(rule_id, trace)
+}
+
+/// Shadow mode evaluation of layout rules at a choke point.
+///
+/// Evaluates the decision, prints one `would_deny` stderr line and writes a
+/// `farm_events` row if denied. Never blocks, never changes exit codes.
+pub fn shadow<H: HerdrOps>(
+    caller: Option<&Caller>,
+    herdr: Option<&H>,
+    verb: Verb,
+    target: &str,
+    target_name: Option<&str>,
+    origin: SpawnOrigin,
+    owner: Option<&str>,
+    project: Option<&str>,
+    runs_dir: &Path,
+    cfg: Option<&Config>,
+) -> Decision {
+    let layout = match cfg {
+        Some(c) => crate::layout::resolve_layout(c),
+        None => match crate::config::load_team_config() {
+            Ok(c) => crate::layout::resolve_layout(&c),
+            Err((_, e)) => Err(format!("failed to load team config: {e}")),
+        },
+    };
+    let layout = match layout {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("warning: [layout shadow] cannot resolve layout: {e}");
+            return Decision::allow("shadow.skipped.layout_err", Vec::new());
+        }
+    };
+
+    let caller_resolved;
+    let effective_caller = match caller {
+        Some(c) => c,
+        None => {
+            caller_resolved = match herdr {
+                Some(h) => crate::identity::resolve_caller(h, runs_dir),
+                None => crate::identity::Caller {
+                    name: "unknown".to_string(),
+                    role: crate::identity::Role::Unknown,
+                    depth: crate::identity::CallerDepth::Unknown,
+                    source: crate::identity::IdentitySource::Unknown,
+                },
+            };
+            &caller_resolved
+        }
+    };
+
+    let mut skip_edge = origin == SpawnOrigin::TaskforceMember;
+    if !skip_edge && verb == Verb::Prompt {
+        if let Some(tname) = target_name {
+            let owner_file = runs_dir.join(format!("{tname}.owner"));
+            if let Ok(target_owner) = std::fs::read_to_string(&owner_file) {
+                if target_owner.trim() == effective_caller.name {
+                    skip_edge = true;
+                }
+            }
+        }
+    }
+
+    let decision = check_with_origin(
+        &layout,
+        effective_caller,
+        verb,
+        target,
+        None,
+        skip_edge,
+    );
+
+    if !decision.allow {
+        let layer = decision
+            .trace
+            .iter()
+            .find(|t| !t.passed)
+            .map(|t| t.layer.as_str())
+            .unwrap_or("unknown");
+
+        eprintln!(
+            "would_deny: rule_id={} layer={} layout={}",
+            decision.rule_id, layer, layout.name
+        );
+
+        let subj = target_name.map(String::from).or_else(|| Some(target.to_string()));
+        let mut payload = serde_json::json!({
+            "rule_id": decision.rule_id,
+            "layer": layer,
+            "layout": layout.name,
+            "verb": verb.as_str(),
+            "caller_role": effective_caller.role.as_str(),
+            "target": target,
+            "origin": origin.to_string(),
+        });
+        if let Some(target_role) = resolve_target_role(&layout, target) {
+            payload["target_role"] = serde_json::Value::String(target_role.to_string());
+        }
+
+        let event = crate::bus::FarmEvent::new(
+            "would_deny",
+            Some(effective_caller.name.clone()),
+            subj,
+            owner.map(String::from),
+            project.map(String::from),
+        )
+        .with_payload_json(payload.to_string());
+
+        let _ = std::fs::create_dir_all(runs_dir);
+        crate::bus::record_event_safely_in_runs(runs_dir, &event);
+    }
+
+    decision
 }

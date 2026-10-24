@@ -303,7 +303,7 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
         "spawn" => {
             let opts = parse_spawn_args(&args[1..])?;
             let cfg = config::load_team_config()?;
-            spawn_worker(opts, &cfg, git, herdr)?;
+            spawn_worker(opts, &cfg, git, herdr, quaqua::layout::SpawnOrigin::Cli)?;
             Ok(())
         }
         "prompt" => {
