@@ -383,15 +383,20 @@ fn prompt_body_without_playbook_is_byte_identical() {
 // ─── CLI: --check-brief warns (exit 0) and rejects an unknown name ─────────
 
 fn run_check_brief(sandbox: &TempDir, dirs: &(PathBuf, PathBuf), brief: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_quaqua"))
-        .args(["worker", "prompt", "--check-brief", brief])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_quaqua"));
+    cmd.args(["worker", "prompt", "--check-brief", brief])
         .env("HOME", &sandbox.0)
         .env("QUAQUA_HOME", sandbox.0.join("ws"))
         .env("QUAQUA_PLAYBOOKS_DIR", &dirs.0)
         .env("QUAQUA_PRINCIPLES_DIR", &dirs.1)
         .env_remove("PROMPT_WORKER_BUDGET_SEC")
-        .output()
-        .expect("run quaqua")
+        .env_remove("HERDR_PANE_ID");
+    for (k, _) in std::env::vars() {
+        if k.starts_with("HERDR_") && k != "HERDR_BIN_PATH" {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.output().expect("run quaqua")
 }
 
 #[test]

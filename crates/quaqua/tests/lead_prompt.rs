@@ -39,15 +39,24 @@ impl Fixture {
         }
     }
 
-    fn run(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_quaqua"))
-            .args(["lead", "prompt", "baro", "please fix the gate"])
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_quaqua"));
+        cmd.args(["lead", "prompt", "baro", "please fix the gate"])
             .env("HERDR_BIN_PATH", &self.herdr)
             .env("QUAQUA_TEST_STATE", &self.state)
             .env("QUAQUA_TEST_CALLS", &self.calls)
             .env("QUAQUA_LEAD_PROMPT_WAIT_MS", "300")
-            .output()
-            .expect("run quaqua lead prompt")
+            .env_remove("HERDR_PANE_ID");
+        for (k, _) in std::env::vars() {
+            if k.starts_with("HERDR_") && k != "HERDR_BIN_PATH" {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd
+    }
+
+    fn run(&self) -> Output {
+        self.cmd().output().expect("run quaqua lead prompt")
     }
 
     fn calls(&self) -> String {

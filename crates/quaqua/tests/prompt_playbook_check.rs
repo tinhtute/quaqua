@@ -370,10 +370,15 @@ fn playbook_check_cli_exits_6_for_a_builder_gap() {
     let h = Harness::new("cli");
     h.set_report("# Report\n\n## Changes\n\ndid things\n\n## Lessons\nnone\n");
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"))
-        .args(["worker", "prompt", "sude-s5f", &brief_with_playbook()])
-        .output()
-        .unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"));
+    cmd.args(["worker", "prompt", "sude-s5f", &brief_with_playbook()])
+        .env_remove("HERDR_PANE_ID");
+    for (k, _) in std::env::vars() {
+        if k.starts_with("HERDR_") && k != "HERDR_BIN_PATH" {
+            cmd.env_remove(&k);
+        }
+    }
+    let out = cmd.output().unwrap();
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(6), "stderr: {stderr}");
