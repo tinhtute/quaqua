@@ -7,7 +7,9 @@ use quaqua::config;
 use quaqua::git::Git;
 use quaqua::herdr::Herdr;
 use quaqua::worker::cleanup::{cleanup_worker, default_runs_dir};
-use quaqua::worker::prompt::{do_check_brief, prompt_worker, USAGE as PROMPT_USAGE};
+use quaqua::worker::prompt::{
+    do_check_brief, prompt_worker, USAGE as PROMPT_USAGE, USAGE_HELP as PROMPT_USAGE_HELP,
+};
 use quaqua::worker::spawn::{parse_spawn_args, spawn_worker};
 use quaqua::worker::stop::{parse_stop_args, stop_worker};
 use std::path::{Path, PathBuf};
@@ -373,6 +375,11 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
             let p_args = &args[1..];
             if p_args.is_empty() {
                 return Err((1, format!("{PROMPT_USAGE}\n")));
+            }
+            if p_args[0] == "--help" || p_args[0] == "-h" {
+                println!("{PROMPT_USAGE}");
+                println!("{PROMPT_USAGE_HELP}");
+                return Ok(());
             }
             if p_args[0] == "--check-brief" {
                 if p_args.len() != 2 || p_args[1].is_empty() {

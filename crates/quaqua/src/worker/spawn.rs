@@ -140,12 +140,67 @@ pub fn parse_spawn_args(args: &[String]) -> Result<SpawnOptions, (i32, String)> 
         }
     }
 
-    let (name, kind, repo_path) = if pos.len() == 2 && purpose.is_some() {
-        (pos[0].clone(), None, PathBuf::from(&pos[1]))
-    } else if pos.len() >= 3 {
-        (pos[0].clone(), Some(pos[1].clone()), PathBuf::from(&pos[2]))
-    } else {
-        return Err((1, format!("{}\n", USAGE)));
+    // Positional grammar: `<name> [<kind>] <repo-path>`, where `<kind>` may be
+    // left out only in favour of `--purpose`. A usage error names the argument
+    // that is missing: the bare usage block left the caller to diff it against
+    // their command line (2026-11-01).
+    let (name, kind, repo_path) = match (pos.len(), purpose.is_some()) {
+        (2, true) => (pos[0].clone(), None, PathBuf::from(&pos[1])),
+        (3, _) => (pos[0].clone(), Some(pos[1].clone()), PathBuf::from(&pos[2])),
+        (0, _) => {
+            return Err((
+                1,
+                format!("error: missing <name> <kind> <repo-path>\n{USAGE}\n"),
+            ));
+        }
+        (1, true) => {
+            return Err((
+                1,
+                format!(
+                    "error: missing <repo-path> for spawn '{}'\n{USAGE}\n",
+                    pos[0]
+                ),
+            ));
+        }
+        (1, false) => {
+            return Err((
+                1,
+                format!(
+                    "error: missing <kind> and <repo-path> for spawn '{}' (--purpose <p> resolves the kind)\n{USAGE}\n",
+                    pos[0]
+                ),
+            ));
+        }
+        (2, false) => {
+            // `<name> <repo>` and `<name> <kind>` are both two positionals: the
+            // one that is not a repo path is the kind, so it is what is missing.
+            return if looks_like_repo_path(&pos[1]) {
+                Err((
+                    1,
+                    format!(
+                        "error: missing <kind> for spawn '{}' (--purpose <p> resolves it from team.toml)\n{USAGE}\n",
+                        pos[0]
+                    ),
+                ))
+            } else {
+                Err((
+                    1,
+                    format!(
+                        "error: missing <repo-path> for spawn '{}' (got kind '{}')\n{USAGE}\n",
+                        pos[0], pos[1]
+                    ),
+                ))
+            };
+        }
+        (n, _) => {
+            return Err((
+                1,
+                format!(
+                    "error: unexpected extra argument '{}'\n{USAGE}\n",
+                    pos[n - 1]
+                ),
+            ));
+        }
     };
 
     Ok(SpawnOptions {
@@ -158,6 +213,16 @@ pub fn parse_spawn_args(args: &[String]) -> Result<SpawnOptions, (i32, String)> 
         approve_kinds,
         solo,
     })
+}
+
+/// Does a positional read as a repo path rather than a kind name? A kind never
+/// contains a path separator, and `.`/`~`/an existing directory is a path.
+fn looks_like_repo_path(arg: &str) -> bool {
+    arg.contains('/')
+        || arg.contains('\\')
+        || arg.starts_with('~')
+        || arg.starts_with('.')
+        || std::path::Path::new(arg).is_dir()
 }
 
 pub(crate) fn is_valid_name(name: &str, kind: &str) -> bool {
