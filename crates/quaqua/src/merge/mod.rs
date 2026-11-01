@@ -321,28 +321,48 @@ impl<'a> Drop for MergeWorktreeGuard<'a> {
     }
 }
 
+/// Default build check for a Rust `*-integ` target when no check is configured (#170):
+/// a merge that is clean as text can still fail to compile.
+/// `QUAQUA_INTEG_CHECK_CMD` replaces the command (tests inject a fake).
+const INTEG_CHECK_CMD: &str = "cargo check --workspace --locked";
+
+fn resolve_check_cmd(explicit: Option<&str>, integ: &str, target: &Path) -> Option<String> {
+    let configured = explicit
+        .map(str::to_string)
+        .or_else(|| std::env::var("QUAQUA_CHECK_CMD").ok())
+        .or_else(|| std::env::var("MERGE_CHECK_CMD").ok());
+    if let Some(cmd) = configured {
+        return (!cmd.trim().is_empty()).then_some(cmd);
+    }
+    if integ.ends_with("-integ") && target.join("Cargo.toml").is_file() {
+        return Some(
+            std::env::var("QUAQUA_INTEG_CHECK_CMD").unwrap_or_else(|_| INTEG_CHECK_CMD.to_string()),
+        )
+        .filter(|cmd| !cmd.trim().is_empty());
+    }
+    None
+}
+
+/// A check passes only if it exits 0 and leaves tracked files untouched: a modified
+/// tracked file (e.g. a rewritten Cargo.lock) would otherwise make the next merge fail
+/// as a misattributed conflict.
 fn run_check(repo: &Path, check_cmd: Option<&str>) -> bool {
-    let cmd_str = if let Some(cmd) = check_cmd {
-        cmd.to_string()
-    } else if let Ok(env_cmd) = std::env::var("QUAQUA_CHECK_CMD") {
-        env_cmd
-    } else if let Ok(env_cmd2) = std::env::var("MERGE_CHECK_CMD") {
-        env_cmd2
-    } else {
+    let Some(cmd_str) = check_cmd else {
         return true;
     };
-
-    if cmd_str.trim().is_empty() {
-        return true;
-    }
-
-    let res = Command::new("sh")
+    let ok = Command::new("sh")
         .arg("-c")
-        .arg(&cmd_str)
+        .arg(cmd_str)
         .current_dir(repo)
-        .status();
-
-    res.map(|s| s.success()).unwrap_or(false)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok && Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(repo)
+        .output()
+        .map(|o| o.status.success() && o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 pub fn handle_merge(args: &[String], git: &Git) -> Result<(), (i32, String)> {
@@ -466,10 +486,8 @@ pub fn handle_merge_with_sink<W: std::io::Write>(
 
     let target = &guard.target_dir;
 
-    if opts.check_cmd.is_none()
-        && std::env::var("QUAQUA_CHECK_CMD").is_err()
-        && std::env::var("MERGE_CHECK_CMD").is_err()
-    {
+    let check_cmd = resolve_check_cmd(opts.check_cmd.as_deref(), &integ, target);
+    if check_cmd.is_none() {
         let _ = writeln!(
             warn_sink,
             "warning: no check command configured; merging without checks"
@@ -514,7 +532,7 @@ pub fn handle_merge_with_sink<W: std::io::Write>(
         }
 
         // 3. Run project check
-        let check_pass = run_check(target, opts.check_cmd.as_deref());
+        let check_pass = run_check(target, check_cmd.as_deref());
         if check_pass {
             let new_rev = git
                 .run_in(target, &["rev-parse", "HEAD"])
@@ -532,16 +550,16 @@ pub fn handle_merge_with_sink<W: std::io::Write>(
             }
 
             // Check if check fails without the branch too
-            let base_check_pass = run_check(target, opts.check_cmd.as_deref());
+            let base_check_pass = run_check(target, check_cmd.as_deref());
             if !base_check_pass {
                 return Err((
                     3,
-                    format!("error: check fails on integ base without '{branch}' — ask CoS and hold queue\n"),
+                    format!("error: check `{}` fails (or modifies tracked files) on integ base without '{branch}' — ask CoS and hold queue\n", check_cmd.as_deref().unwrap_or("")),
                 ));
             } else {
                 return Err((
                     2,
-                    format!("error: check failed with branch '{branch}' — undoing merge and returning rework to Peer\n"),
+                    format!("error: check `{}` failed (or modified tracked files) with branch '{branch}' merged into '{integ}' — undoing merge and returning rework to Peer\n", check_cmd.as_deref().unwrap_or("")),
                 ));
             }
         }
@@ -674,6 +692,90 @@ mod tests {
             warn_str.contains("warning: no verdict matches head SHA"),
             "warning must be emitted to sink on unverified head, got: {warn_str}"
         );
+    }
+
+    /// #170: a `*-integ` Rust target with no configured check runs the build check after
+    /// each merge; a failing build stops the queue before the next branch.
+    #[test]
+    fn test_integ_default_build_check_stops_queue() {
+        let _env_lock = crate::test_env::lock_env();
+        let _env_guard = EnvGuard::capture(&[
+            "QUAQUA_HOME",
+            "QUAQUA_RUNS_DIR",
+            "QUAQUA_CHECK_CMD",
+            "MERGE_CHECK_CMD",
+            "QUAQUA_INTEG_CHECK_CMD",
+        ]);
+        std::env::remove_var("QUAQUA_CHECK_CMD");
+        std::env::remove_var("MERGE_CHECK_CMD");
+        let git = Git::new();
+        // (case, fake check, expected exit code; 0 = all merged)
+        let cases = [
+            // Passes on the base, fails once b1 is merged: rework, b1 undone.
+            ("rework", "test ! -f b1.txt", 2),
+            // Passes, but rewrites a tracked file once b1 is merged (a stale merged
+            // Cargo.lock): rework for b1, never a misattributed merge conflict.
+            ("dirty", "if [ -f b1.txt ]; then echo '# x' >> Cargo.toml; fi", 2),
+            ("pass", "true", 0),
+        ];
+        for (case, fake, want) in cases {
+            let tmp = std::env::temp_dir()
+                .join(format!("test-merge-integ-{}-{case}", std::process::id()));
+            let _ = fs::remove_dir_all(&tmp);
+            let repo = tmp.join("repo");
+            let runs = tmp.join("runs");
+            fs::create_dir_all(&repo).unwrap();
+            fs::create_dir_all(&runs).unwrap();
+            fs::write(
+                tmp.join("team.toml"),
+                include_str!("../../../../templates/workspace/team.toml"),
+            )
+            .unwrap();
+            let g = |a: &[&str]| assert!(git.run_in(&repo, a).unwrap().status.success(), "{a:?}");
+            g(&["init", "-q", "-b", "main"]);
+            g(&["config", "user.email", "t@t"]);
+            g(&["config", "user.name", "t"]);
+            fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+            g(&["add", "."]);
+            g(&["commit", "-qm", "base"]);
+            g(&["branch", "quaqua/proj-integ"]);
+            for b in ["b1", "b2"] {
+                g(&["checkout", "-qb", b, "main"]);
+                fs::write(repo.join(format!("{b}.txt")), b).unwrap();
+                g(&["add", "."]);
+                g(&["commit", "-qm", b]);
+            }
+            g(&["checkout", "-q", "main"]);
+            std::env::set_var("QUAQUA_HOME", &tmp);
+            std::env::set_var("QUAQUA_RUNS_DIR", &runs);
+            std::env::set_var("QUAQUA_INTEG_CHECK_CMD", fake);
+            let args: Vec<String> = ["--repo", repo.to_str().unwrap(), "proj", "b1", "b2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let mut warn = Vec::new();
+            let res = handle_merge_with_sink(&args, &git, &mut warn);
+            let merged = |b: &str| {
+                git.run_in(
+                    &repo,
+                    &["merge-base", "--is-ancestor", b, "quaqua/proj-integ"],
+                )
+                .unwrap()
+                .status
+                .success()
+            };
+            if want == 0 {
+                assert!(res.is_ok(), "passing check must merge all: {res:?}");
+                assert!(merged("b1") && merged("b2"));
+            } else {
+                let Err((code, msg)) = res else { panic!("{case}: failing check must fail the merge") };
+                assert_eq!(code, want, "{case}: {msg}");
+                assert!(msg.contains(fake), "{case}: message must name the check: {msg}");
+                assert!(!merged("b1"), "{case}: failing branch must be undone");
+                assert!(!merged("b2"), "{case}: queue must stop before the next branch");
+            }
+            let _ = fs::remove_dir_all(&tmp);
+        }
     }
     struct EnvGuard {
         vars: Vec<(String, Option<String>)>,

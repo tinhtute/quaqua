@@ -13,8 +13,9 @@ use quaqua::worker::stop::{parse_stop_args, stop_worker};
 use std::path::{Path, PathBuf};
 
 const CLEANUP_USAGE: &str = "\
-# Usage: cleanup-worker.sh <name> <repo-path>
-# Stops the agent pane and removes its worktree. Branch quaqua/<name> is kept.";
+# Usage: cleanup-worker.sh <name> [<repo-path>]
+# Stops the agent pane and removes its worktree. Branch quaqua/<name> is kept.
+# <repo-path> defaults to the repo recorded at spawn (runs/<name>.repo).";
 
 const CAP_USAGE: &str = "\
 # Usage: worker-cap.sh <owner> [<exclude-worker>]";
@@ -443,12 +444,18 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
             Ok(())
         }
         "cleanup" => {
-            if args.len() != 3 || args[1].is_empty() || args[2].is_empty() {
+            if !(2..=3).contains(&args.len()) || args[1..].iter().any(String::is_empty) {
                 return Err((1, format!("{CLEANUP_USAGE}\n")));
             }
             let name = &args[1];
-            let repo = Path::new(&args[2]);
-            cleanup_worker(name, repo, git, herdr)?;
+            let explicit = args.get(2).map(Path::new);
+            let Some(repo) =
+                quaqua::worker::cleanup::resolve_cleanup_repo(name, explicit, &default_runs_dir())
+                    .map_err(|e| (1, e))?
+            else {
+                return Err((1, format!("{CLEANUP_USAGE}\n")));
+            };
+            cleanup_worker(name, &repo, git, herdr)?;
             Ok(())
         }
         "stop" => {

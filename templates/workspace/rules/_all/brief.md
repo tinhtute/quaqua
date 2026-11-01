@@ -30,6 +30,7 @@ Review rounds: <N>                        (optional, default the pipeline's --ro
 - No pre-solve: a brief never fixes the cause or the solution — the worker finds it.
 - `Current design` is a hypothesis, not an answer: deliver the goal within the constraints, not the design.
 - `Unknowns` names what to check before building; `Evidence` is the proof the worker returns.
+- Review before sending: a request for "parity" or "like X" scopes every command of X unless the Principal excludes some — 2026-11-01, issue #170
 - Keep briefs short and technical. No mention of AI, and no representing anyone.
 
 ## Challenge
@@ -67,3 +68,4 @@ none
 
 Publish atomically: write `runs/.<name>.tmp` then `mv` it to `runs/<name>.md` — the pipeline reads the file the moment it exists; a partial file is a corrupted report. Stale reports from earlier tasks are archived, never consumed.
 - Lead/CoS acceptance conditions go in the review or fix brief, never appended to the plan file after plan-ready (BUILD ignores them) — 2026-10-14, runs/mu-lead.md
+- Read a run report by section (`Outcome:`/`Verification:` first, e.g. `sed -n '/^Outcome:/,/^Unknown/p'`), not a whole-file cat — 2026-11-01, issue #170

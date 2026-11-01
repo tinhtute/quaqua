@@ -306,6 +306,32 @@ pub fn run_grid_hook(grid_tab: &str, owner: Option<&str>) -> Result<(), (i32, St
     Ok(())
 }
 
+/// The repo to clean `name` against: the explicit argument, else the repo
+/// recorded at spawn (`runs/<name>.repo`). `Ok(None)` = cannot infer; an
+/// explicit repo that disagrees with the record is an error, so a typo cannot
+/// clean (and consume the metadata of) a worker of another repo.
+pub fn resolve_cleanup_repo(
+    name: &str,
+    explicit: Option<&Path>,
+    runs_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let recorded = WorkerMetadata::load_repo(runs_dir, name);
+    match (explicit, recorded) {
+        (Some(e), Some(r)) => {
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon(e) != canon(&r) {
+                return Err(format!(
+                    "error: repo {} does not match the repo recorded for {name} at spawn ({}) — refusing to clean up\n",
+                    e.display(),
+                    r.display()
+                ));
+            }
+            Ok(Some(e.to_path_buf()))
+        }
+        (e, r) => Ok(e.map(Path::to_path_buf).or(r)),
+    }
+}
+
 pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
     name: &str,
     repo_path: &Path,
@@ -322,6 +348,17 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
         Some(parent) => parent.join(".wt").join(name),
         None => PathBuf::from(".wt").join(name),
     };
+
+    // A Lead has no worker worktree: it is cleaned by `quaqua lead cleanup
+    // <slug>`, which also closes the team workspace and returns the project to
+    // cos. `is_valid_name` never lets a worker take this name.
+    if name.ends_with("-lead") {
+        let slug = name.trim_end_matches("-lead");
+        return Err((
+            1,
+            format!("error: {name} is a Lead, not a worker — use `quaqua lead cleanup {slug}`\n"),
+        ));
+    }
 
     // agent_not_found alone is not "gone": liveness confirms it with
     // `agent list` before the worktree is removed (issue #69).
@@ -349,6 +386,31 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
                 format!("error: refusing to close CoS pane '{pane}' (grid_role=cos)\n"),
             ));
         }
+    }
+
+    // "Nothing to remove" may only be reported when this repo proves the worker
+    // belonged to it: git still registers a worktree at the derived path, or
+    // the spawn's branch survives (cleanup keeps it). A wrong or foreign repo
+    // has neither, and must not close the pane, print "cleaned" and delete the
+    // record that finds the real worktree (#170 F1).
+    let registered = git
+        .worktree_list_porcelain(&repo)
+        .map_err(|e| (1, format!("error: git worktree list failed in {}: {e}", repo.display())))?
+        .iter()
+        .any(|p| Path::new(p) == wt);
+    let branch = format!("quaqua/{name}");
+    if !wt.is_dir() && !registered && !git.branch_exists(&repo, &branch) {
+        return Err((
+            1,
+            format!(
+                "error: nothing to remove in {}: no worktree {} and no branch {branch} — refusing to clean up (wrong repo?)\n",
+                repo.display(),
+                wt.display()
+            ),
+        ));
+    }
+
+    if let Some(pane) = &pane_to_close {
         let _ = herdr.pane_close(pane);
     }
 
@@ -368,13 +430,18 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
         .or_else(|| WorkerMetadata::load_grid(&runs_dir, name))
         .unwrap_or_else(|| format!("{repo_name}-workers"));
 
-    let rm_out = git
-        .worktree_remove(&repo, &wt)
-        .map_err(|e| (1, format!("error: worktree remove failed: {e}")))?;
+    // A registration whose directory is already gone is still a worktree to
+    // git: `worktree remove` drops it, so a later same-name spawn does not die
+    // on "missing but already registered worktree" (#170 F3).
+    if wt.is_dir() || registered {
+        let rm_out = git
+            .worktree_remove(&repo, &wt)
+            .map_err(|e| (1, format!("error: worktree remove failed: {e}")))?;
 
-    if !rm_out.status.success() {
-        let err_text = String::from_utf8_lossy(&rm_out.stderr).to_string();
-        return Err((rm_out.status.code().unwrap_or(1), err_text));
+        if !rm_out.status.success() {
+            let err_text = String::from_utf8_lossy(&rm_out.stderr).to_string();
+            return Err((rm_out.status.code().unwrap_or(1), err_text));
+        }
     }
 
     run_grid_hook(&grid_tab, Some(&owner))?;
@@ -737,6 +804,175 @@ pub(crate) mod metrics {
     }
 
     #[test]
+    fn test_cleanup_repo_inferred_from_spawn_record() {
+        let tmp = std::env::temp_dir().join(format!("cleanup-infer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let runs_dir = tmp.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        assert_eq!(resolve_cleanup_repo("w-infer", None, &runs_dir), Ok(None));
+        WorkerMetadata::save_repo(&runs_dir, "w-infer", &tmp.join("repo")).unwrap();
+        assert_eq!(
+            resolve_cleanup_repo("w-infer", None, &runs_dir),
+            Ok(Some(tmp.join("repo")))
+        );
+        assert_eq!(
+            resolve_cleanup_repo("w-infer", Some(&tmp.join("repo")), &runs_dir),
+            Ok(Some(tmp.join("repo")))
+        );
+        // The record wins over an explicit repo for any other repo (#170 F1).
+        let err = resolve_cleanup_repo("w-infer", Some(Path::new("/x/explicit")), &runs_dir)
+            .expect_err("an explicit repo that disagrees with the record must be refused");
+        assert!(
+            err.contains("/x/explicit") && err.contains(&tmp.join("repo").display().to_string()),
+            "the refusal must name both repos: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Real-git sandbox with two repos under different parents, so the derived
+    /// worktree path `<repo>.parent()/.wt/<name>` differs between them: the
+    /// owner repo's is `<tmp>/.wt/<name>`, the foreign repo's would be
+    /// `<tmp>/other/.wt/<name>`. Returns (tmp, runs_dir, owner, foreign).
+    fn worktree_sandbox(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let tmp = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("cleanup-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let runs_dir = tmp.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let owner = tmp.join("a");
+        let foreign = tmp.join("other").join("b");
+        crate::test_env::init_repo(&owner);
+        crate::test_env::init_repo(&foreign);
+        (tmp, runs_dir, owner, foreign)
+    }
+
+    fn cleanup_env(runs_dir: &Path) -> Vec<crate::test_env::TestEnvVarGuard> {
+        use crate::test_env::TestEnvVarGuard as G;
+        vec![
+            G::remove("QUAQUA_OWNER"),
+            G::set("QUAQUA_RUNS_DIR", runs_dir),
+            G::set("GRID_SKIP", "1"),
+            G::set("QUAQUA_TEST", "1"),
+        ]
+    }
+
+    fn gone_herdr() -> MockHerdr {
+        MockHerdr {
+            agent_list_response: LIST_COS.to_string(),
+            agent_get_response: r#"{"error":{"code":"agent_not_found"}}"#.to_string(),
+        }
+    }
+
+    /// #170 F1: a repo with no trace of the worker must not be reported as
+    /// "cleaned", and must not consume the metadata that finds the real
+    /// worktree.
+    #[test]
+    fn test_cleanup_foreign_repo_refused_keeps_metadata() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let (tmp, runs_dir, owner, foreign) = worktree_sandbox("foreign");
+        let _env = cleanup_env(&runs_dir);
+        let git = crate::git::Git::new();
+        let wt = tmp.join(".wt").join("w1");
+        let add = git.worktree_add(&owner, "quaqua/w1", &wt, None).unwrap();
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        WorkerMetadata::save_owner(&runs_dir, "w1", "cos").unwrap();
+
+        let res = cleanup_worker_in("w1", &foreign, &git, &gone_herdr(), Some(&runs_dir));
+        res.expect_err("cleanup against a repo with no trace of w1 must be refused");
+
+        assert!(wt.is_dir(), "the real worktree must survive");
+        assert!(
+            runs_dir.join("w1.owner").exists(),
+            "metadata must survive a refused cleanup"
+        );
+        assert!(
+            !runs_dir.join("telemetry.jsonl").exists(),
+            "a refused cleanup must not record telemetry"
+        );
+        assert!(
+            git.worktree_list_porcelain(&owner)
+                .unwrap()
+                .iter()
+                .any(|p| Path::new(p) == wt),
+            "the owner repo must still register the worktree"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #170 F2: a Lead is cleaned by `quaqua lead cleanup <slug>`, which also
+    /// closes the team workspace and returns the project to cos.
+    #[test]
+    fn test_cleanup_refuses_lead_name() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let (tmp, runs_dir, owner, _foreign) = worktree_sandbox("lead");
+        let _env = cleanup_env(&runs_dir);
+        WorkerMetadata::save_owner(&runs_dir, "mu-lead", "cos").unwrap();
+
+        let res = cleanup_worker_in(
+            "mu-lead",
+            &owner,
+            &crate::git::Git::new(),
+            &gone_herdr(),
+            Some(&runs_dir),
+        );
+        let err = res
+            .expect_err("a Lead must not go through worker cleanup")
+            .1;
+        assert!(err.contains("quaqua lead cleanup mu"), "{err}");
+        assert!(
+            runs_dir.join("mu-lead.owner").exists(),
+            "the Lead's owner record must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #170 F3: a worktree deleted by hand leaves git's registration behind;
+    /// cleanup must drop it, or a same-name spawn dies on
+    /// "missing but already registered worktree".
+    #[test]
+    fn test_cleanup_gone_worktree_drops_registration() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let (tmp, runs_dir, owner, _foreign) = worktree_sandbox("gone");
+        let _env = cleanup_env(&runs_dir);
+        let git = crate::git::Git::new();
+        let wt = tmp.join(".wt").join("w-gone");
+        let add = git.worktree_add(&owner, "quaqua/w-gone", &wt, None).unwrap();
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        std::fs::remove_dir_all(&wt).unwrap();
+        WorkerMetadata::save_owner(&runs_dir, "w-gone", "cos").unwrap();
+
+        cleanup_worker_in("w-gone", &owner, &git, &gone_herdr(), Some(&runs_dir)).unwrap();
+
+        assert!(!runs_dir.join("w-gone.owner").exists());
+        assert!(
+            !git.worktree_list_porcelain(&owner)
+                .unwrap()
+                .iter()
+                .any(|p| Path::new(p) == wt),
+            "git must no longer register the deleted worktree"
+        );
+        // The same name can be spawned again.
+        let out = git.worktree_add_existing(&owner, "quaqua/w-gone", &wt).unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn test_cleanup_metrics_all_readers_failing() {
         let _lock = test_lock();
         let _env_lock = crate::test_env::lock_env();
@@ -1020,6 +1256,10 @@ pub(crate) mod metrics {
         let repo = tmp.join("repo");
         std::fs::create_dir_all(&runs_dir).unwrap();
         std::fs::create_dir_all(&repo).unwrap();
+        // A live worker owns a worktree; the metrics readers run behind that check.
+        for name in ["sude-fail", "tieude-fail", "truonglao-fail"] {
+            std::fs::create_dir_all(tmp.join(".wt").join(name)).unwrap();
+        }
 
         let _env_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", &runs_dir);
         let _env_skip = TestEnvVarGuard::set("GRID_SKIP", "1");
