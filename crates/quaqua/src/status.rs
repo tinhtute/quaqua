@@ -70,6 +70,54 @@ pub struct OrchestrationRow {
     pub phase: String,
     pub wait_time: String,
     pub flags: Vec<WarningFlag>,
+    /// Why a blocked worker needs the Principal; `None` unless blocked (#179).
+    pub blocked_reason: Option<BlockReason>,
+}
+
+/// The fixed set of reasons a blocked worker shows in `quaqua status` (#179).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    PlanToApprove,
+    AsksPermission,
+    SignedOut,
+    QuestionForYou,
+    /// No (or an unknown) cause recorded by the hook.
+    NeedsInput,
+}
+
+impl BlockReason {
+    /// Map the optional third token of `runs/.<name>.state` (`blocked <ts> <token>`).
+    pub fn from_token(token: Option<&str>) -> Self {
+        match token.map(str::trim) {
+            Some("plan") => Self::PlanToApprove,
+            Some("permission") => Self::AsksPermission,
+            Some("signed-out") => Self::SignedOut,
+            Some("question") => Self::QuestionForYou,
+            _ => Self::NeedsInput,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlanToApprove => "Plan to approve",
+            Self::AsksPermission => "Asks permission",
+            Self::SignedOut => "Signed out",
+            Self::QuestionForYou => "Question for you",
+            Self::NeedsInput => "Needs your input",
+        }
+    }
+}
+
+/// Reason for a blocked row: the hook's reason token when the state file says
+/// `blocked`, else the generic fallback (e.g. herdr's screen said blocked).
+fn blocked_reason(runs_dir: &Path, name: &str) -> BlockReason {
+    let content = std::fs::read_to_string(crate::state::WorkerMetadata::state_path(runs_dir, name))
+        .unwrap_or_default();
+    let mut parts = content.split_whitespace();
+    if parts.next() != Some("blocked") {
+        return BlockReason::NeedsInput;
+    }
+    BlockReason::from_token(parts.nth(1))
 }
 
 /// A branch verdict row showing the strongest verdict and freshness flags (§ S2).
@@ -644,7 +692,11 @@ pub fn scan_orchestration<H: HerdrOps>(
             }
         };
         let has_progress = WorkerMetadata::progress_path(runs_dir, &name).exists();
-        if is_task_worker_name(&name, cfg) && agent_status == "idle" && !has_session && !has_progress {
+        if is_task_worker_name(&name, cfg)
+            && agent_status == "idle"
+            && !has_session
+            && !has_progress
+        {
             flags.push(WarningFlag::IdleUnprompted);
         }
 
@@ -680,6 +732,7 @@ pub fn scan_orchestration<H: HerdrOps>(
         flags.sort();
         flags.dedup();
 
+        let reason = (agent_status == "blocked").then(|| blocked_reason(runs_dir, &name));
         rows.push(OrchestrationRow {
             name: name.clone(),
             owner,
@@ -689,6 +742,7 @@ pub fn scan_orchestration<H: HerdrOps>(
             phase,
             wait_time,
             flags,
+            blocked_reason: reason,
         });
     }
 
@@ -766,8 +820,19 @@ pub fn format_status_report(
                 };
                 out.push_str(&format!(
                     "{:<18} {:<16} {:<12} {:<10} {:<8} {:<10} {:<8} {}\n",
-                    r.name, r.owner, r.team, r.agent_status, rep_str, r.phase, r.wait_time, flags_str
+                    r.name,
+                    r.owner,
+                    r.team,
+                    r.agent_status,
+                    rep_str,
+                    r.phase,
+                    r.wait_time,
+                    flags_str
                 ));
+                if let Some(reason) = r.blocked_reason {
+                    out.pop();
+                    out.push_str(&format!(" · {}\n", reason.label()));
+                }
             }
         }
         Err(err) => {
@@ -1018,7 +1083,11 @@ pub struct JournalMetrics {
     #[serde(default)]
     pub merges_per_repo: Vec<MergeRepoStat>,
     /// G1: whether any contributing ref scan hit the 500-merge cap.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not", alias = "merges_truncated")]
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        alias = "merges_truncated"
+    )]
     pub truncated: bool,
     /// G2: watchdog exits inside the window.
     pub accepted_reports: usize,
@@ -1302,11 +1371,7 @@ fn merge_targets<G: GitOps>(repo: &Path, git: &G) -> Vec<String> {
 /// committer date and capped at [`MERGE_SCAN_LIMIT`] per target. Deduplicated by
 /// SHA across targets, so a merge reachable from `main` and from an integration
 /// branch is counted once.
-fn collect_merge_commits<G: GitOps>(
-    repos: &[PathBuf],
-    git: &G,
-    cutoff_ms: u64,
-) -> MergeScan {
+fn collect_merge_commits<G: GitOps>(repos: &[PathBuf], git: &G, cutoff_ms: u64) -> MergeScan {
     let fetch_limit = (MERGE_SCAN_LIMIT + 1).to_string();
     let since = format!("--since=@{}", cutoff_ms / 1000);
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -2837,6 +2902,33 @@ mod tests {
         assert_eq!(row("sude-h2").agent_status, "blocked");
         assert_eq!(row("sude-h3").agent_status, "done");
         assert_eq!(row("sude-h4").agent_status, "working");
+
+        // #179: a blocked row carries exactly one standard reason; others none.
+        // h2's hook gave no reason -> generic fallback.
+        assert_eq!(row("sude-h2").blocked_reason, Some(BlockReason::NeedsInput));
+        assert_eq!(row("sude-h1").blocked_reason, None);
+        assert_eq!(row("sude-h4").blocked_reason, None);
+        for (token, want) in [
+            ("plan", BlockReason::PlanToApprove),
+            ("permission", BlockReason::AsksPermission),
+            ("signed-out", BlockReason::SignedOut),
+            ("question", BlockReason::QuestionForYou),
+            ("garbage", BlockReason::NeedsInput),
+        ] {
+            fs::write(
+                tmp.join(".sude-h2.state"),
+                format!("blocked {now} {token}\n"),
+            )
+            .unwrap();
+            let rows = scan_orchestration(&tmp, &mock, &test_team_cfg()).unwrap();
+            let r = rows.iter().find(|r| r.name == "sude-h2").unwrap();
+            assert_eq!(r.agent_status, "blocked");
+            assert_eq!(r.blocked_reason, Some(want), "token {token}");
+            assert!(want.label().len() <= 40);
+            let out = format_status_report(Ok(&[]), Ok(&rows), Ok(&[]));
+            let line = out.lines().find(|l| l.starts_with("sude-h2")).unwrap();
+            assert!(line.contains(want.label()), "{line}");
+        }
 
         // Flags read the resolved status: h1 is working while its lead is idle.
         assert!(
