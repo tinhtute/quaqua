@@ -22,72 +22,128 @@ pub enum ProviderError {
     Fatal(&'static str),
 }
 
-const FATAL: &[(&str, &str)] = &[
-    ("signed out", "signed-out"),
+/// Lines that open a harness provider-error message (lowercased, after the
+/// `⎿`/`⏺`/`●` gutter). Claude Code prints `API Error: …`, a bare
+/// `Request timed out.`, and the login notices below; anything else on the
+/// pane is the worker's own output and never classifies.
+const FATAL_LINES: &[(&str, &str)] = &[
     ("not logged in", "signed-out"),
-    ("please log in", "signed-out"),
-    ("please run /login", "signed-out"),
-    ("auth_required", "signed-out"),
     ("invalid api key", "signed-out"),
-    ("authentication_error", "signed-out"),
-    ("insufficient_quota", "quota"),
-    ("quota exceeded", "quota"),
-    ("exceeded your current quota", "quota"),
-    ("usage limit reached", "quota"),
+    ("oauth token has expired", "signed-out"),
+    ("please run /login", "signed-out"),
     ("credit balance is too low", "billing"),
-    ("insufficient credits", "billing"),
-    ("billing", "billing"),
+    ("claude ai usage limit reached", "quota"),
+    ("usage limit reached", "quota"),
 ];
 
-const RETRYABLE: &[(&str, &str)] = &[
+/// Reason words inside an `API Error:` line. Fatal is checked first.
+const API_FATAL: &[(&str, &str)] = &[
+    ("authentication_error", "signed-out"),
+    ("oauth token has expired", "signed-out"),
+    ("invalid api key", "signed-out"),
+    ("401", "signed-out"),
+    ("insufficient_quota", "quota"),
+    ("exceeded your current quota", "quota"),
+    ("credit balance", "billing"),
+];
+
+const API_RETRYABLE: &[(&str, &str)] = &[
     ("overloaded", "overloaded"),
-    ("rate limit", "rate-limit"),
+    ("529", "overloaded"),
     ("rate_limit", "rate-limit"),
-    ("too many requests", "rate-limit"),
-    ("internal server error", "5xx"),
-    ("bad gateway", "5xx"),
-    ("service unavailable", "5xx"),
-    ("gateway timeout", "5xx"),
-    ("api error: 5", "5xx"),
-    ("econnreset", "network"),
-    ("connection reset", "network"),
+    ("rate limit", "rate-limit"),
+    ("429", "rate-limit"),
+    ("timed out", "timeout"),
     ("connection error", "network"),
-    ("network error", "network"),
+    ("econnreset", "network"),
     ("fetch failed", "network"),
     ("socket hang up", "network"),
     ("etimedout", "network"),
+    (": 5", "5xx"),
 ];
 
-/// Classify pane text. Fatal wins over retryable: a signed-out pane that
-/// also shows an earlier overload must not be retried.
-pub fn classify(pane: &str) -> Option<ProviderError> {
-    let text = pane.to_lowercase();
-    let hit = |table: &[(&str, &'static str)]| {
-        table
-            .iter()
-            .find(|(pat, _)| text.contains(pat))
-            .map(|(_, r)| *r)
-    };
-    hit(FATAL)
-        .map(ProviderError::Fatal)
-        .or_else(|| hit(RETRYABLE).map(ProviderError::Retryable))
+fn find(table: &[(&str, &'static str)], text: &str) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|(p, _)| text.contains(p))
+        .map(|(_, r)| *r)
 }
 
+/// One pane line → its provider error, if the line has the harness shape.
+fn classify_line(line: &str) -> Option<ProviderError> {
+    let l = line
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '⎿' | '⏺' | '●'))
+        .to_lowercase();
+    if l.starts_with("request timed out") {
+        return Some(ProviderError::Retryable("timeout"));
+    }
+    if let Some(rest) = l.strip_prefix("api error") {
+        return Some(
+            find(API_FATAL, rest)
+                .map(ProviderError::Fatal)
+                .or_else(|| find(API_RETRYABLE, rest).map(ProviderError::Retryable))
+                // An API error we cannot name is not known to be transient.
+                .unwrap_or(ProviderError::Fatal("api-error")),
+        );
+    }
+    FATAL_LINES
+        .iter()
+        .find(|(p, _)| l.starts_with(p) || (*p == "please run /login" && l.contains(p)))
+        .map(|(_, r)| ProviderError::Fatal(r))
+}
+
+/// Classify the last `TAIL_LINES` non-empty pane lines. Fatal wins over
+/// retryable: a signed-out pane that also shows an earlier overload must not
+/// be retried.
+pub fn classify(pane: &str) -> Option<ProviderError> {
+    let lines: Vec<&str> = pane.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
+    let hits: Vec<ProviderError> = tail.iter().filter_map(|l| classify_line(l)).collect();
+    hits.iter()
+        .find(|e| matches!(e, ProviderError::Fatal(_)))
+        .or_else(|| hits.last())
+        .copied()
+}
+
+/// Non-empty pane lines, from the bottom, read for a provider error.
 pub const TAIL_LINES: usize = 15;
 
 /// How a `prompt_worker_once` run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ended {
+    /// The brief landed and the watchdog ran to an exit.
     Watched,
+    /// The watchdog interrupted the worker at its cost cap (#48).
     CostCap,
+    /// The brief never reached the turn (submit blocked / not landed).
     NotLanded,
 }
 
-pub fn decide(code: i32, _ended: Ended, pane: &str, _nudged: bool) -> Option<ProviderError> {
-    if !matches!(code, 3 | 5) {
+/// The retry decision for one `prompt_worker_once` result: only a watched
+/// turn that ended stalled (3) or blocked (5) qualifies — never a cost-cap
+/// kill or a brief that never landed. After a `continue` nudge (`nudged`),
+/// only the pane text below the echoed nudge counts.
+pub fn decide(code: i32, ended: Ended, pane: &str, nudged: bool) -> Option<ProviderError> {
+    if !matches!(code, 3 | 5) || ended != Ended::Watched {
         return None;
     }
-    classify(pane)
+    let text = if nudged { after_nudge(pane) } else { pane };
+    classify(text)
+}
+
+/// Pane text after the last echoed `continue` prompt line; empty when the
+/// echo is not on the pane (nothing is known to be newer than the nudge).
+fn after_nudge(pane: &str) -> &str {
+    let mut cut = None;
+    let mut off = 0;
+    for line in pane.split_inclusive('\n') {
+        off += line.len();
+        let t = line.trim().trim_start_matches(['>', '❯', '›']).trim();
+        if t == "continue" {
+            cut = Some(off);
+        }
+    }
+    cut.map_or("", |i| &pane[i..])
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {

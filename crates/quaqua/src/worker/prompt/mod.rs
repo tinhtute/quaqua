@@ -551,15 +551,19 @@ pub fn prompt_worker<G: GitOps>(
     git: &G,
     herdr: &Herdr,
 ) -> Result<(), (i32, String)> {
-    let mut res = prompt_worker_once(name, task, resume, extend, git, herdr);
+    let mut ended = retry::Ended::NotLanded;
+    let mut res = prompt_worker_once(name, task, resume, extend, git, herdr, &mut ended);
     let runs_dir = default_runs_dir();
     let mut attempt: u32 = 0;
-    while let Err((c @ (3 | 5), _)) = &res {
-        let code = *c;
+    while let Err((code, _)) = &res {
+        let code = *code;
+        if !matches!(code, 3 | 5) || ended != retry::Ended::Watched {
+            break;
+        }
         let pane = herdr
             .agent_read(name, "recent-unwrapped", 80)
             .unwrap_or_default();
-        let Some(err) = retry::classify(&pane) else {
+        let Some(err) = retry::decide(code, ended, &pane, attempt > 0) else {
             break;
         };
         let (reason, retryable) = match err {
@@ -601,7 +605,7 @@ pub fn prompt_worker<G: GitOps>(
         );
         std::thread::sleep(Duration::from_millis(delay_ms));
         let _ = herdr.agent_prompt_nowait(name, "continue");
-        res = prompt_worker_once(name, None, true, None, git, herdr);
+        res = prompt_worker_once(name, None, true, None, git, herdr, &mut ended);
     }
     if attempt > 0 && res.is_ok() {
         let _ = std::fs::remove_file(WorkerMetadata::provider_retry_path(&runs_dir, name));
@@ -616,7 +620,15 @@ fn prompt_worker_once<G: GitOps>(
     extend: Option<u64>,
     git: &G,
     herdr: &Herdr,
+    ended: &mut retry::Ended,
 ) -> Result<(), (i32, String)> {
+    // A resume watches a turn whose brief already landed; a fresh task only
+    // after the land check below.
+    *ended = if task.is_none() {
+        retry::Ended::Watched
+    } else {
+        retry::Ended::NotLanded
+    };
     validate_env_budget()?;
 
     let runs_dir = default_runs_dir();
@@ -905,6 +917,7 @@ fn prompt_worker_once<G: GitOps>(
         // The worker only got the steps if the prompt landed, so the pin
         // (`runs/.<name>.playbook`) is written here, after the land check.
         brief::pin_playbook(&runs_dir, name, injection.as_ref());
+        *ended = retry::Ended::Watched;
         // § S8: this session checks the report against the pin it was given.
         config.playbook = playbook_check::PlaybookPin::read(&runs_dir, name);
 
@@ -1331,6 +1344,7 @@ fn prompt_worker_once<G: GitOps>(
             Err(watchdog_exit(4, &reason))
         }
         5 if *acts.cost_stopped.lock().unwrap() => {
+            *ended = retry::Ended::CostCap;
             record_bus_event(
                 "blocked",
                 Some(format!("blocked:{name}:{start_sec}")),
@@ -1527,14 +1541,15 @@ esac
     }
 
     /// Stub herdr for #177: the agent sits blocked; `agent read` prints
-    /// `FAKE_PANE`; each `agent prompt` appends its text to `FAKE_RUNS/prompts`.
+    /// the prompts sent so far (`> <text>`, like a real echo), then `FAKE_PANE`;
+    /// each `agent prompt` appends its text to `FAKE_RUNS/prompts`.
     fn provider_stub(tmp: &std::path::Path) -> std::path::PathBuf {
         let path = tmp.join("herdr-provider");
         fs::write(
             &path,
             r#"#!/bin/sh
 case "$1 $2" in
-  "agent read") printf '%s\n' "$FAKE_PANE" ;;
+  "agent read") [ -f "$FAKE_RUNS/prompts" ] && sed 's/^/> /' "$FAKE_RUNS/prompts"; printf '%s\n' "$FAKE_PANE" ;;
   "agent prompt") printf '%s\n' "$4" >> "$FAKE_RUNS/prompts"; echo '{"result": {}}' ;;
   "agent get") echo '{"result": {"agent": {"name": "'"$3"'", "agent_status": "blocked"}}}' ;;
   "agent wait") echo '{"result": {"agent": {"agent_status": "blocked", "state_change_seq": 1}}}' ;;
