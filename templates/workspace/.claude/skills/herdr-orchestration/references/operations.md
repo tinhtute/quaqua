@@ -1,6 +1,6 @@
 # Herdr operations
 
-`AGENTS.md`, `models.md`, and `rules/_all/` are authoritative. Prefer `scripts/*` over manual orchestration. Check `HERDR_ENV=1`; never run bare `herdr`. Use `herdr --help` / `herdr <group>` for current syntax.
+`AGENTS.md`, `models.md`, and `rules/_all/` are authoritative. Prefer the `quaqua` subcommand over manual orchestration (`quaqua --help` lists them). Check `HERDR_ENV=1`; never run bare `herdr`. Use `herdr --help` / `herdr <group>` for current syntax.
 
 ## Command recipes
 
@@ -25,8 +25,8 @@ herdr pane close <pane_id>
 
 ## Panes, tabs, and layout
 
-- Scripts arrange 1 worker beside its orchestrator (anchor 2/5, worker 3/5); 2–4 in the project's workers tab: 2 left|right, 3 A|B top + C below, 4 a 2x2 grid. The project's tab must not mix another orchestrator's workers. This replaces ad-hoc alternating splits.
-- Use `GRID_TAB=<project>-workers` for spawn/cleanup or `grid-workers.sh --tab <project>-workers --only <names>` for a scoped group. The pipeline scopes every grid call to its own builder/reviewer; never sweep foreign workers.
+- `quaqua grid reconcile` (run by `quaqua worker spawn` and `quaqua worker cleanup`) arranges 1 worker beside its orchestrator (anchor 2/5, worker 3/5); 2–4 in the project's workers tab: 2 left|right, 3 A|B top + C below, 4 a 2x2 grid. The project's tab must not mix another orchestrator's workers. This replaces ad-hoc alternating splits.
+- Use `GRID_TAB=<project>-workers` for spawn/cleanup or `quaqua grid reconcile --tab <project>-workers --only <names>` for a scoped group. The pipeline scopes every grid call to its own builder/reviewer; never sweep foreign workers.
 - Never move a working agent, during `--wait`, or without `--no-focus`. When moving a pane across workspaces, IDs can change: use the agent name or `.result.move_result.pane.pane_id`, not a remembered old ID.
 - Manual recovery can create a tab with `herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd <repo> --label <project>-workers` (no `--focus`); read `.result.root_pane`. A new project's workspace can use `herdr workspace create`; read IDs from JSON. Use `herdr tab close` only after that tab's owned workers are closed.
 - Plain `git worktree` + panes is the default. `herdr worktree create` creates linked workspaces (and may open a review sidebar); use it only when the task explicitly asks.
@@ -34,8 +34,8 @@ herdr pane close <pane_id>
 
 ## Monitoring and lifecycle
 
-- Prefer the scripted watchdog: cap, budget, stall, idle, blocked, and one soft nudge are specified in `rules/_all/worker-timebox.md`. Run long `--wait` clients in the background when the orchestrator must continue doing other work; don't replace the watchdog with repeated polling or resubmission.
-- A long-running worker's report is not accepted until the current artifact and its exact test have been verified. On a stalled/blocked UI, look first; make at most one safe recovery input, then wait via `prompt-worker.sh --resume`. Destructive/outward choices go to the Principal.
+- Prefer the `quaqua worker prompt` watchdog: cap, budget, stall, idle, blocked, and one soft nudge are specified in `rules/_all/worker-timebox.md`. Run long `--wait` clients in the background when the orchestrator must continue doing other work; don't replace the watchdog with repeated polling or resubmission.
+- A long-running worker's report is not accepted until the current artifact and its exact test have been verified. On a stalled/blocked UI, look first; make at most one safe recovery input, then wait via `quaqua worker prompt --resume <name>`. Destructive/outward choices go to the Principal.
 - Check provider quota before assigning a long task. Flag a nearly exhausted 5-hour/weekly allowance. Startup update prompts are skipped; inspect trust dialogs and answer only within the task's authority.
 - Tell the Principal briefly who was spawned/closed and why, and check in at phase ends. At session end, query `herdr agent list` and hand off or clean up every worker owned by the session. Useful context is not permission to keep a completed task worker indefinitely.
 - Report read + exact test rerun green → update the card/memory per `AGENTS.md`, then cleanup immediately. Preserve immutable evidence by SHA; the report can be archived under `raw/` when the task calls for it. Durable lessons belong in `rules/` via CoS, not an automatic memory overwrite.
