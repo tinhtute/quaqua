@@ -3630,6 +3630,14 @@ mod tests {
             }
             other => panic!("expected blocked, got {other:?}"),
         }
+        // An untagged finding next to a tagged minor still blocks (fail closed).
+        let mixed = "## Findings\n1. SQL injection in login\n- [minor] typo\nVerdict: 2 findings\n";
+        match review_step("brief", mixed).0 {
+            StepDecision::PauseForApproval { reason } => {
+                assert!(reason.contains("1 findings remain"), "{reason}")
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
         // Untagged findings keep counting in full.
         match review_step("brief", "- a\nVerdict: 1 findings\n").0 {
             StepDecision::PauseForApproval { .. } => {}
