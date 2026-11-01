@@ -158,14 +158,21 @@ pub fn review_read_root(wt: &str) -> String {
 pub fn claude_settings(name: &str, runs_dir: &str, read_root: Option<&str>) -> serde_json::Value {
     let state_file = format!("{runs_dir}/.{name}.state");
     let state_tmp = format!("{runs_dir}/.{name}.state.tmp");
+    // A blocked state carries a reason token after the timestamp
+    // (`blocked <ts> <reason>`); `status` maps it to a fixed label (#179) and
+    // `HookState::parse` still reads only the first two tokens.
+    let tool_re =
+        |tool: &str| format!("\"\\\"tool_name\\\"[[:space:]]*:[[:space:]]*\\\"{tool}\\\"\"");
     let pre_tool_cmd = format!(
-        "sh -c 'if grep -Eq \"\\\"tool_name\\\"[[:space:]]*:[[:space:]]*\\\"(AskUserQuestion|ExitPlanMode)\\\"\"; then s=\"blocked\"; else s=\"working\"; fi; echo \"$s $(date +%s)\" > \"{state_tmp}\" && mv \"{state_tmp}\" \"{state_file}\"'"
+        "sh -c 'p=$(cat); s=\"working\"; r=\"\"; if printf %s \"$p\" | grep -Eq {ask}; then s=\"blocked\"; r=\" question\"; elif printf %s \"$p\" | grep -Eq {plan}; then s=\"blocked\"; r=\" plan\"; fi; echo \"$s $(date +%s)$r\" > \"{state_tmp}\" && mv \"{state_tmp}\" \"{state_file}\"'",
+        ask = tool_re("AskUserQuestion"),
+        plan = tool_re("ExitPlanMode"),
     );
     let stop_cmd = format!(
         "sh -c 'echo \"idle $(date +%s)\" > \"{state_tmp}\" && mv \"{state_tmp}\" \"{state_file}\"'"
     );
     let notif_cmd = format!(
-        "sh -c 'echo \"blocked $(date +%s)\" > \"{state_tmp}\" && mv \"{state_tmp}\" \"{state_file}\"'"
+        "sh -c 'p=$(cat); r=\"\"; if printf %s \"$p\" | grep -q permission_prompt; then r=\" permission\"; elif printf %s \"$p\" | grep -Eiq \"not logged in|/login|log in|sign in|signed out|auth_required\"; then r=\" signed-out\"; fi; echo \"blocked $(date +%s)$r\" > \"{state_tmp}\" && mv \"{state_tmp}\" \"{state_file}\"'"
     );
 
     let hooks = serde_json::json!({
@@ -334,4 +341,86 @@ pub fn claude_trust_dialog_up<H: HerdrOps>(herdr: &H, pane: &str) -> bool {
         .pane_read(pane, "visible", 30)
         .map(|text| text.contains("trust"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claude_settings;
+    use crate::status::BlockReason;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// Run one generated hook with `payload` on stdin; return the state line it wrote.
+    fn run_hook(event: &str, payload: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "quaqua-hook-{}-{}",
+            std::process::id(),
+            &crate::hash::md5_hex(format!("{event}{payload}").as_bytes())[..12]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = claude_settings("w", dir.to_str().unwrap(), None);
+        let cmd = s["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "{cmd}");
+        let out = std::fs::read_to_string(dir.join(".w.state")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn reason(line: &str) -> Option<BlockReason> {
+        let mut p = line.split_whitespace();
+        (p.next() == Some("blocked")).then(|| BlockReason::from_token(p.nth(1)))
+    }
+
+    #[test]
+    fn liveness_hooks_write_block_reason_token() {
+        let cases = [
+            (
+                "PreToolUse",
+                r#"{"tool_name": "AskUserQuestion"}"#,
+                Some(BlockReason::QuestionForYou),
+            ),
+            (
+                "PreToolUse",
+                r#"{"tool_name":"ExitPlanMode"}"#,
+                Some(BlockReason::PlanToApprove),
+            ),
+            ("PreToolUse", r#"{"tool_name":"Bash"}"#, None),
+            (
+                "Notification",
+                r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}"#,
+                Some(BlockReason::AsksPermission),
+            ),
+            (
+                "Notification",
+                r#"{"hook_event_name":"Notification","message":"Not logged in. Please run /login"}"#,
+                Some(BlockReason::SignedOut),
+            ),
+            (
+                "Notification",
+                r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}"#,
+                Some(BlockReason::NeedsInput),
+            ),
+        ];
+        for (event, payload, want) in cases {
+            let line = run_hook(event, payload);
+            // Backward compatible: state + timestamp still parse.
+            let hs = crate::liveness::HookState::parse(&line).unwrap();
+            assert!(hs.timestamp_sec > 0, "{line}");
+            assert_eq!(reason(&line), want, "{event} {payload} -> {line}");
+        }
+    }
 }
