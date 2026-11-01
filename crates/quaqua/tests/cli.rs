@@ -187,3 +187,70 @@ fn doctor_fails_when_the_binary_is_older_than_the_checkout() {
     assert!(stderr.contains("older than the checkout"), "{stderr}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `quaqua worker spawn` with `<kind>` or `<repo-path>` missing must name the
+/// missing argument, not only print the usage block.
+#[test]
+fn worker_spawn_names_the_missing_argument() {
+    let dir = temp_dir("spawnargs");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    let bin = env!("CARGO_BIN_EXE_quaqua");
+
+    // kind omitted: `worker spawn <name> <repo>`
+    let kind_omitted = Command::new(bin)
+        .args(["worker", "spawn", "sude-task"])
+        .arg(&repo)
+        .current_dir(&dir)
+        .output()
+        .expect("spawn worker spawn");
+    assert_eq!(kind_omitted.status.code(), Some(1), "{kind_omitted:?}");
+    let stderr = String::from_utf8_lossy(&kind_omitted.stderr);
+    assert!(stderr.contains("missing <kind>"), "kind omitted: {stderr}");
+
+    // repo omitted: `worker spawn <name> <kind>`
+    let repo_omitted = Command::new(bin)
+        .args(["worker", "spawn", "sude-task", "sude"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn worker spawn");
+    assert_eq!(repo_omitted.status.code(), Some(1), "{repo_omitted:?}");
+    let stderr = String::from_utf8_lossy(&repo_omitted.stderr);
+    assert!(
+        stderr.contains("missing <repo-path>"),
+        "repo omitted: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `quaqua worker prompt --help` documents the exit-code vocabulary a caller
+/// branches on: one line per code, with its meaning.
+#[test]
+fn worker_prompt_help_lists_the_exit_codes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_quaqua"))
+        .args(["worker", "prompt", "--help"])
+        .output()
+        .expect("spawn worker prompt --help");
+    assert!(out.status.success(), "{out:?}");
+    let help = String::from_utf8_lossy(&out.stdout);
+    for (code, meaning) in [
+        ("0", "report printed"),
+        ("1", "usage error"),
+        ("2", "hard cap"),
+        ("3", "stall"),
+        ("4", "time budget"),
+        ("5", "blocked"),
+        ("6", "malformed report"),
+        ("7", "provider error"),
+    ] {
+        let listed = help.lines().any(|line| {
+            let body = line.trim_start_matches('#').trim_start();
+            body.starts_with(code) && body.contains(meaning)
+        });
+        assert!(
+            listed,
+            "exit {code} ({meaning}) is missing from --help: {help}"
+        );
+    }
+}
