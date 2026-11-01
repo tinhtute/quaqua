@@ -180,6 +180,8 @@ pub fn do_check_brief_with_owner(
     // does not say solo or lead cannot be checked against AGENTS.md '## Roles (SLP)'.
     crate::worker::leadgate::topology(task).map_err(|msg| (1, msg))?;
     brief::warn_brief_headers(task);
+    // #178: a stated review rule must be valid; an absent one takes the defaults.
+    brief::review_policy(task).map_err(|e| (1, e))?;
     brief::warn_lead_routing(task, owner, runs_dir);
     // A name the present index cannot resolve or render is the one rejection
     // here; a missing or incomplete index only warns.
@@ -1808,5 +1810,32 @@ exit 0
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod check_brief_review_tests {
+    use super::*;
+
+    const BASE: &str = "Topology: solo — test\nPlaybook: none, test\nContext: none, test\nGoal: g\nHard constraints: h\nCurrent design (open to challenge): d\n";
+
+    #[test]
+    fn check_brief_review_fields_validate() {
+        let dir = std::env::temp_dir().join(format!("qq-cbr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = &dir;
+        assert!(do_check_brief_with_owner(BASE, None, runs).is_ok());
+        let ok = format!("{BASE}Must fix: minor\nReview rounds: 2\n");
+        assert!(do_check_brief_with_owner(&ok, None, runs).is_ok());
+        let bad = format!("{BASE}Must fix: blocker\n");
+        assert_eq!(
+            do_check_brief_with_owner(&bad, None, runs).unwrap_err().0,
+            1
+        );
+        let bad = format!("{BASE}Review rounds: 0\n");
+        assert_eq!(
+            do_check_brief_with_owner(&bad, None, runs).unwrap_err().0,
+            1
+        );
     }
 }
