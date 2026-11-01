@@ -307,15 +307,29 @@ pub fn run_grid_hook(grid_tab: &str, owner: Option<&str>) -> Result<(), (i32, St
 }
 
 /// The repo to clean `name` against: the explicit argument, else the repo
-/// recorded at spawn (`runs/<name>.repo`). `None` = cannot infer.
+/// recorded at spawn (`runs/<name>.repo`). `Ok(None)` = cannot infer; an
+/// explicit repo that disagrees with the record is an error, so a typo cannot
+/// clean (and consume the metadata of) a worker of another repo.
 pub fn resolve_cleanup_repo(
     name: &str,
     explicit: Option<&Path>,
     runs_dir: &Path,
-) -> Option<PathBuf> {
-    explicit
-        .map(Path::to_path_buf)
-        .or_else(|| WorkerMetadata::load_repo(runs_dir, name))
+) -> Result<Option<PathBuf>, String> {
+    let recorded = WorkerMetadata::load_repo(runs_dir, name);
+    match (explicit, recorded) {
+        (Some(e), Some(r)) => {
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon(e) != canon(&r) {
+                return Err(format!(
+                    "error: repo {} does not match the repo recorded for {name} at spawn ({}) — refusing to clean up\n",
+                    e.display(),
+                    r.display()
+                ));
+            }
+            Ok(Some(e.to_path_buf()))
+        }
+        (e, r) => Ok(e.map(Path::to_path_buf).or(r)),
+    }
 }
 
 pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
@@ -334,6 +348,17 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
         Some(parent) => parent.join(".wt").join(name),
         None => PathBuf::from(".wt").join(name),
     };
+
+    // A Lead has no worker worktree: it is cleaned by `quaqua lead cleanup
+    // <slug>`, which also closes the team workspace and returns the project to
+    // cos. `is_valid_name` never lets a worker take this name.
+    if name.ends_with("-lead") {
+        let slug = name.trim_end_matches("-lead");
+        return Err((
+            1,
+            format!("error: {name} is a Lead, not a worker — use `quaqua lead cleanup {slug}`\n"),
+        ));
+    }
 
     // agent_not_found alone is not "gone": liveness confirms it with
     // `agent list` before the worktree is removed (issue #69).
@@ -361,6 +386,31 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
                 format!("error: refusing to close CoS pane '{pane}' (grid_role=cos)\n"),
             ));
         }
+    }
+
+    // "Nothing to remove" may only be reported when this repo proves the worker
+    // belonged to it: git still registers a worktree at the derived path, or
+    // the spawn's branch survives (cleanup keeps it). A wrong or foreign repo
+    // has neither, and must not close the pane, print "cleaned" and delete the
+    // record that finds the real worktree (#170 F1).
+    let registered = git
+        .worktree_list_porcelain(&repo)
+        .map_err(|e| (1, format!("error: git worktree list failed in {}: {e}", repo.display())))?
+        .iter()
+        .any(|p| Path::new(p) == wt);
+    let branch = format!("quaqua/{name}");
+    if !wt.is_dir() && !registered && !git.branch_exists(&repo, &branch) {
+        return Err((
+            1,
+            format!(
+                "error: nothing to remove in {}: no worktree {} and no branch {branch} — refusing to clean up (wrong repo?)\n",
+                repo.display(),
+                wt.display()
+            ),
+        ));
+    }
+
+    if let Some(pane) = &pane_to_close {
         let _ = herdr.pane_close(pane);
     }
 
@@ -380,8 +430,10 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
         .or_else(|| WorkerMetadata::load_grid(&runs_dir, name))
         .unwrap_or_else(|| format!("{repo_name}-workers"));
 
-    // A Lead has no worktree; an already-removed one has nothing left to do.
-    if wt.is_dir() {
+    // A registration whose directory is already gone is still a worktree to
+    // git: `worktree remove` drops it, so a later same-name spawn does not die
+    // on "missing but already registered worktree" (#170 F3).
+    if wt.is_dir() || registered {
         let rm_out = git
             .worktree_remove(&repo, &wt)
             .map_err(|e| (1, format!("error: worktree remove failed: {e}")))?;
@@ -757,15 +809,22 @@ pub(crate) mod metrics {
         let _ = std::fs::remove_dir_all(&tmp);
         let runs_dir = tmp.join("runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
-        assert_eq!(resolve_cleanup_repo("w-infer", None, &runs_dir), None);
+        assert_eq!(resolve_cleanup_repo("w-infer", None, &runs_dir), Ok(None));
         WorkerMetadata::save_repo(&runs_dir, "w-infer", &tmp.join("repo")).unwrap();
         assert_eq!(
             resolve_cleanup_repo("w-infer", None, &runs_dir),
-            Some(tmp.join("repo"))
+            Ok(Some(tmp.join("repo")))
         );
         assert_eq!(
-            resolve_cleanup_repo("w-infer", Some(Path::new("/x/explicit")), &runs_dir),
-            Some(PathBuf::from("/x/explicit"))
+            resolve_cleanup_repo("w-infer", Some(&tmp.join("repo")), &runs_dir),
+            Ok(Some(tmp.join("repo")))
+        );
+        // The record wins over an explicit repo for any other repo (#170 F1).
+        let err = resolve_cleanup_repo("w-infer", Some(Path::new("/x/explicit")), &runs_dir)
+            .expect_err("an explicit repo that disagrees with the record must be refused");
+        assert!(
+            err.contains("/x/explicit") && err.contains(&tmp.join("repo").display().to_string()),
+            "the refusal must name both repos: {err}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
