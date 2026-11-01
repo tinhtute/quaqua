@@ -6,6 +6,7 @@ pub mod observer;
 pub mod outcome;
 pub mod playbook_check;
 pub mod readonly;
+pub mod retry;
 pub mod verdict;
 pub mod watchdog;
 pub mod workflow;
@@ -537,6 +538,11 @@ impl Activity for PromptActivities {
     }
 }
 
+/// `prompt_worker_once`, plus provider-error retry (#177): a turn that ends
+/// idle/stalled (exit 3) or blocked (exit 5) without a report is classified
+/// from the pane. A transient provider error is resumed after a capped
+/// exponential backoff; a non-retryable one, or the retry cap, escalates with
+/// exit 7. Every attempt and escalation is journaled on `worker:<name>`.
 pub fn prompt_worker<G: GitOps>(
     name: &str,
     task: Option<&str>,
@@ -545,6 +551,84 @@ pub fn prompt_worker<G: GitOps>(
     git: &G,
     herdr: &Herdr,
 ) -> Result<(), (i32, String)> {
+    let mut ended = retry::Ended::NotLanded;
+    let mut res = prompt_worker_once(name, task, resume, extend, git, herdr, &mut ended);
+    let runs_dir = default_runs_dir();
+    let mut attempt: u32 = 0;
+    while let Err((code, _)) = &res {
+        let code = *code;
+        if !matches!(code, 3 | 5) || ended != retry::Ended::Watched {
+            break;
+        }
+        let pane = herdr
+            .agent_read(name, "recent-unwrapped", 80)
+            .unwrap_or_default();
+        let Some(err) = retry::decide(code, ended, &pane, attempt > 0) else {
+            break;
+        };
+        let (reason, retryable) = match err {
+            retry::ProviderError::Retryable(r) => (r, true),
+            retry::ProviderError::Fatal(r) => (r, false),
+        };
+        attempt += 1;
+        if !retryable || attempt > retry::max_retries() {
+            let attempts = attempt - 1;
+            retry::journal(
+                &runs_dir,
+                name,
+                "provider_escalate",
+                serde_json::json!({ "reason": reason, "retryable": retryable, "retries": attempts, "exit": code }),
+            );
+            let _ = std::fs::remove_file(WorkerMetadata::provider_retry_path(&runs_dir, name));
+            eprintln!(
+                "WATCHDOG exit={} provider error ({reason}, {}) | name={name} retries={attempts}",
+                retry::EXIT_PROVIDER,
+                if retryable {
+                    "retry cap reached"
+                } else {
+                    "non-retryable"
+                }
+            );
+            return Err((retry::EXIT_PROVIDER, String::new()));
+        }
+        let delay_ms = retry::backoff_ms(attempt);
+        retry::journal(
+            &runs_dir,
+            name,
+            "provider_retry",
+            serde_json::json!({ "attempt": attempt, "reason": reason, "delay_ms": delay_ms }),
+        );
+        let _ = WorkerMetadata::record_provider_retry(&runs_dir, name, now_sec());
+        eprintln!(
+            "WATCHDOG provider-retry {attempt}/{} ({reason}) in {delay_ms}ms | name={name}",
+            retry::max_retries()
+        );
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        let _ = herdr.agent_prompt_nowait(name, "continue");
+        res = prompt_worker_once(name, None, true, None, git, herdr, &mut ended);
+    }
+    if attempt > 0 && res.is_ok() {
+        let _ = std::fs::remove_file(WorkerMetadata::provider_retry_path(&runs_dir, name));
+    }
+    res
+}
+
+fn prompt_worker_once<G: GitOps>(
+    name: &str,
+    task: Option<&str>,
+    resume: bool,
+    extend: Option<u64>,
+    git: &G,
+    herdr: &Herdr,
+    ended: &mut retry::Ended,
+) -> Result<(), (i32, String)> {
+    // A resume watches a turn whose brief already landed; a fresh task only
+    // after the land check below.
+    *ended = if task.is_none() {
+        retry::Ended::Watched
+    } else {
+        retry::Ended::NotLanded
+    };
     validate_env_budget()?;
 
     let runs_dir = default_runs_dir();
@@ -833,6 +917,7 @@ pub fn prompt_worker<G: GitOps>(
         // The worker only got the steps if the prompt landed, so the pin
         // (`runs/.<name>.playbook`) is written here, after the land check.
         brief::pin_playbook(&runs_dir, name, injection.as_ref());
+        *ended = retry::Ended::Watched;
         // § S8: this session checks the report against the pin it was given.
         config.playbook = playbook_check::PlaybookPin::read(&runs_dir, name);
 
@@ -1259,6 +1344,7 @@ pub fn prompt_worker<G: GitOps>(
             Err(watchdog_exit(4, &reason))
         }
         5 if *acts.cost_stopped.lock().unwrap() => {
+            *ended = retry::Ended::CostCap;
             record_bus_event(
                 "blocked",
                 Some(format!("blocked:{name}:{start_sec}")),
@@ -1452,6 +1538,131 @@ esac
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Stub herdr for #177: the agent sits blocked; `agent read` prints
+    /// the prompts sent so far (`> <text>`, like a real echo), then `FAKE_PANE`;
+    /// each `agent prompt` appends its text to `FAKE_RUNS/prompts`.
+    fn provider_stub(tmp: &std::path::Path) -> std::path::PathBuf {
+        let path = tmp.join("herdr-provider");
+        fs::write(
+            &path,
+            r#"#!/bin/sh
+case "$1 $2" in
+  "agent read") [ -f "$FAKE_RUNS/prompts" ] && sed 's/^/> /' "$FAKE_RUNS/prompts"; printf '%s\n' "$FAKE_PANE" ;;
+  "agent prompt") printf '%s\n' "$4" >> "$FAKE_RUNS/prompts"; echo '{"result": {}}' ;;
+  "agent get") echo '{"result": {"agent": {"name": "'"$3"'", "agent_status": "blocked"}}}' ;;
+  "agent wait") echo '{"result": {"agent": {"agent_status": "blocked", "state_change_seq": 1}}}' ;;
+  *) echo '{"result": {}}' ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Runs `--resume` on a blocked worker whose pane shows `pane`; returns
+    /// the result, the journaled provider events, and the prompts sent.
+    fn run_provider_case(
+        tag: &str,
+        pane: &str,
+    ) -> (
+        Result<(), (i32, String)>,
+        Vec<(String, serde_json::Value)>,
+        usize,
+    ) {
+        let tmp = temp_runs(tag);
+        let stub = provider_stub(&tmp);
+        let _g_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", tmp.to_str().unwrap());
+        let _g_fruns = TestEnvVarGuard::set("FAKE_RUNS", tmp.to_str().unwrap());
+        let _g_pane = TestEnvVarGuard::set("FAKE_PANE", pane);
+        let _g_skip = TestEnvVarGuard::set("GRID_SKIP", "1");
+        let _g_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
+        let _g_poll = TestEnvVarGuard::set("PROMPT_WORKER_POLL_SEC", "1");
+        let _g_base = TestEnvVarGuard::set("PROMPT_WORKER_RETRY_BASE_MS", "1");
+        let _g_herdr = TestEnvVarGuard::set("HERDR_BIN_PATH", stub.to_str().unwrap());
+        let name = format!("sude-{tag}");
+        fs::write(
+            tmp.join(format!(".{name}.state")),
+            format!("blocked {}\n", now_sec() + 3600),
+        )
+        .unwrap();
+        let herdr = Herdr {
+            bin: stub.to_string_lossy().to_string(),
+        };
+        let res = prompt_worker(&name, None, true, None, &crate::git::Git::new(), &herdr);
+        let journal = SqliteJournal::open(&tmp.join("quaqua.db")).unwrap();
+        let events = journal
+            .load_events(&format!("worker:{name}"), 1)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.kind.starts_with("provider_"))
+            .map(|e| {
+                (
+                    e.kind.clone(),
+                    serde_json::from_str(&e.payload_json).unwrap(),
+                )
+            })
+            .collect();
+        let prompts = fs::read_to_string(tmp.join("prompts"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "continue")
+            .count();
+        let _ = fs::remove_dir_all(&tmp);
+        (res, events, prompts)
+    }
+
+    /// #177: an overloaded turn is resumed 4 times with doubling delays,
+    /// each attempt journaled, then escalates with exit 7.
+    #[test]
+    fn test_prompt_retries_an_overloaded_turn_with_backoff_then_escalates() {
+        let _env_lock = lock_env();
+        let (res, events, prompts) = run_provider_case("overload", "API Error: 529 Overloaded");
+        assert_eq!(res, Err((7, String::new())));
+        assert_eq!(prompts, 4, "each retry resumes the turn once");
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|(k, _)| k == "provider_retry")
+            .collect();
+        let delays: Vec<u64> = retries
+            .iter()
+            .map(|(_, p)| p["delay_ms"].as_u64().unwrap())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 4, 8]);
+        assert!(retries.iter().all(|(_, p)| p["reason"] == "overloaded"));
+        let (kind, esc) = events.last().unwrap();
+        assert_eq!(kind, "provider_escalate");
+        assert_eq!(esc["retryable"], true);
+        assert_eq!(esc["retries"], 4);
+    }
+
+    /// #177: a signed-out turn escalates at once — no retry, no resume prompt.
+    #[test]
+    fn test_prompt_escalates_a_signed_out_turn_without_retry() {
+        let _env_lock = lock_env();
+        let (res, events, prompts) =
+            run_provider_case("signout", "Not logged in · Please run /login");
+        assert_eq!(res, Err((7, String::new())));
+        assert_eq!(prompts, 0);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].0, "provider_escalate");
+        assert_eq!(events[0].1["retryable"], false);
+        assert_eq!(events[0].1["reason"], "signed-out");
+    }
+
+    /// A blocked turn with no provider error keeps exit 5 (meaning unchanged).
+    #[test]
+    fn test_prompt_keeps_exit_5_when_the_pane_shows_no_provider_error() {
+        let _env_lock = lock_env();
+        let (res, events, prompts) =
+            run_provider_case("plainblk", "Do you want to proceed? 1. Yes");
+        assert_eq!(res, Err((5, String::new())));
+        assert!(events.is_empty());
+        assert_eq!(prompts, 0);
     }
 
     /// A fresh, isolated runs dir for one prompt case.

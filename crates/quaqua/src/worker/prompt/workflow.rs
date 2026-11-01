@@ -10,6 +10,8 @@
 //! - Exit 6: Malformed report (stable, non-empty report missing `## Lessons` or
 //!   `Verdict:`) or a builder report that does not account for a pinned
 //!   `## Playbook` step
+//! - Exit 7 (set by `prompt_worker`, not this workflow): provider error
+//!   escalated after retries, or non-retryable — see `retry.rs`
 //!
 //! Signals and contracts:
 //! - One blocking `herdr agent wait` per wake; `timeout_ms == 0` is a plain `agent get`.
