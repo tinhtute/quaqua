@@ -451,7 +451,6 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
             let explicit = args.get(2).map(Path::new);
             let Some(repo) =
                 quaqua::worker::cleanup::resolve_cleanup_repo(name, explicit, &default_runs_dir())
-                    .map_err(|e| (1, e))?
             else {
                 return Err((1, format!("{CLEANUP_USAGE}\n")));
             };
