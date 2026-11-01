@@ -9,3 +9,4 @@
 - If the integration branch fails without the branch too, hold the queue and escalate to CoS.
 - Never rewrite integration history except to undo its own last failing merge.
 - Never push or merge to main without anh iu's explicit approval.
+- After every merge into a `*-integ` branch run `cargo check --workspace` before the next merge; a clean merge-tree is not a green build — 2026-11-01, issue #170
