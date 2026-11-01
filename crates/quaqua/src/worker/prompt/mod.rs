@@ -49,6 +49,25 @@ pub const USAGE: &str = "\
 #                                             journal; the cap still wins)
 #        quaqua worker prompt --check-brief \"<task>\"   validate a brief + print its budget";
 
+/// The exit codes a caller branches on (`--help` prints these on top of
+/// [`USAGE`]). Each line names the code `workflow`/`retry` raises, and the
+/// meanings follow `rules/_all/worker-timebox.md`.
+pub const USAGE_HELP: &str = "\
+# Exit codes:
+#   0  report printed: `runs/<name>.md` is ready and readable
+#   1  usage error, or refused before the wait: bad arguments, --check-brief
+#      rejected the brief, empty brief, or no live worker
+#   2  hard cap: no report before PROMPT_WORKER_MAX_SEC (7200s)
+#   3  stall: no progress for PROMPT_WORKER_STALL_SEC (600s), agent idle/done
+#      for PROMPT_WORKER_IDLE_SEC (120s), or agent gone
+#   4  time budget exceeded (the brief's `Time budget`)
+#   5  blocked on a question/permission, or the cost cap was reached on a
+#      kind with on_cost_cap = \"kill\"
+#   6  malformed report: missing or unknown `Outcome:` line, `## Lessons`, or
+#      the `Verdict:` tail; or a pinned playbook step not accounted for
+#   7  provider error needing a human: signed out, quota, billing; or a
+#      transient error still failing after PROMPT_WORKER_RETRY_MAX (4) resumes";
+
 pub fn brief_headers_ok(text: &str) -> bool {
     text.contains("Goal:")
         && text.contains("Hard constraints:")
