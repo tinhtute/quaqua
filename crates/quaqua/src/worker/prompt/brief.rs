@@ -378,3 +378,197 @@ pub fn compose_prompt_body(name: &str, task: &str, injection: Option<&str>) -> S
         None => format!("{task}. {tail}"),
     }
 }
+
+/// Review severity, lowest to highest (#178). The order is the contract: a
+/// finding blocks acceptance when it is at or above the brief's `Must fix:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Trivial,
+    Minor,
+    Major,
+    Critical,
+}
+
+impl Severity {
+    pub const ALL: [Severity; 4] = [
+        Severity::Trivial,
+        Severity::Minor,
+        Severity::Major,
+        Severity::Critical,
+    ];
+
+    pub fn parse(value: &str) -> Option<Severity> {
+        Severity::ALL
+            .into_iter()
+            .find(|s| s.as_str().eq_ignore_ascii_case(value.trim()))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Trivial => "trivial",
+            Severity::Minor => "minor",
+            Severity::Major => "major",
+            Severity::Critical => "critical",
+        }
+    }
+}
+
+/// Default `Must fix:` threshold when the brief does not state one.
+pub const DEFAULT_MUST_FIX: Severity = Severity::Major;
+
+/// The review rule a brief states: `Must fix: <severity>` and
+/// `Review rounds: <N>`. Both optional; `None` means "not stated".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewPolicy {
+    pub must_fix: Option<Severity>,
+    pub rounds: Option<u32>,
+}
+
+impl ReviewPolicy {
+    pub fn must_fix_or_default(&self) -> Severity {
+        self.must_fix.unwrap_or(DEFAULT_MUST_FIX)
+    }
+}
+
+/// Parse the brief's review headers. A stated but invalid value is an error
+/// (exit 1 at `--check-brief`); an absent one is not.
+pub fn review_policy(text: &str) -> Result<ReviewPolicy, String> {
+    let must_fix = match header_value(text, "Must fix") {
+        None => None,
+        Some(v) => Some(Severity::parse(v).ok_or_else(|| {
+            format!(
+                "error: 'Must fix: {v}' is not a severity — use one of critical, major, minor, trivial (rules/_all/brief.md)\n"
+            )
+        })?),
+    };
+    let rounds = match header_value(text, "Review rounds") {
+        None => None,
+        Some(v) => match v.trim().parse::<u32>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                return Err(format!(
+                    "error: 'Review rounds: {v}' must be an integer >= 1 (rules/_all/brief.md)\n"
+                ))
+            }
+        },
+    };
+    Ok(ReviewPolicy { must_fix, rounds })
+}
+
+/// Severity of a reviewer finding line `- [<severity>] <finding>` (also `*`
+/// bullets and `1.` numbering). `None` for any other line.
+pub fn finding_severity(line: &str) -> Option<Severity> {
+    let t = line.trim_start();
+    let rest = if let Some(r) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+        r
+    } else {
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        t[digits..].strip_prefix(". ")?
+    };
+    let inner = rest.trim_start().strip_prefix('[')?;
+    let (tag, _) = inner.split_once(']')?;
+    Severity::parse(tag)
+}
+
+/// Lines of the report's `## Findings` section (the whole report when it has
+/// no such heading), up to the next `## ` heading or the verdict line.
+fn findings_section(report: &str) -> Vec<&str> {
+    let has_heading = report.lines().any(|l| l.trim() == "## Findings");
+    let mut inside = !has_heading;
+    let mut out = Vec::new();
+    for line in report.lines() {
+        let t = line.trim();
+        if t == "## Findings" {
+            inside = true;
+            continue;
+        }
+        if t.to_ascii_lowercase().starts_with("verdict:") || (has_heading && t.starts_with("## ")) {
+            inside = false;
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Findings in a review report that block acceptance under `must_fix`:
+/// those tagged at or above it, plus every finding of `Verdict: <N>` that
+/// carries no valid tag (`N - tagged`, fail closed).
+pub fn blocking_findings(report: &str, must_fix: Severity, verdict_count: u32) -> u32 {
+    let tagged: Vec<Severity> = findings_section(report)
+        .into_iter()
+        .filter_map(finding_severity)
+        .collect();
+    let at_or_above = tagged.iter().filter(|s| **s >= must_fix).count() as u32;
+    at_or_above + verdict_count.saturating_sub(tagged.len() as u32)
+}
+
+/// Tagged findings below `must_fix`: recorded, not fixed.
+pub fn below_threshold_findings(report: &str, must_fix: Severity) -> Vec<String> {
+    findings_section(report)
+        .into_iter()
+        .filter(|l| finding_severity(l).is_some_and(|s| s < must_fix))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod review_severity_tests {
+    use super::*;
+
+    const BASE: &str =
+        "Topology: solo — x\nGoal: g\nHard constraints: h\nCurrent design (open to challenge): d\n";
+
+    #[test]
+    fn review_policy_reads_stated_fields_and_defaults_when_absent() {
+        let p = review_policy(&format!("{BASE}Must fix: minor\nReview rounds: 3\n")).unwrap();
+        assert_eq!(p.must_fix, Some(Severity::Minor));
+        assert_eq!(p.rounds, Some(3));
+        let p = review_policy(BASE).unwrap();
+        assert_eq!(
+            p,
+            ReviewPolicy {
+                must_fix: None,
+                rounds: None
+            }
+        );
+        assert_eq!(p.must_fix_or_default(), Severity::Major);
+    }
+
+    #[test]
+    fn review_policy_rejects_bad_values() {
+        assert!(review_policy(&format!("{BASE}Must fix: severe\n")).is_err());
+        assert!(review_policy(&format!("{BASE}Review rounds: 0\n")).is_err());
+        assert!(review_policy(&format!("{BASE}Review rounds: two\n")).is_err());
+    }
+
+    #[test]
+    fn blocking_findings_counts_at_or_above_threshold() {
+        let report = "## Findings\n- [critical] a\n- [major] b\n1. [minor] c\n* [trivial] d\nVerdict: 4 findings\n";
+        assert_eq!(blocking_findings(report, Severity::Major, 4), 2);
+        assert_eq!(blocking_findings(report, Severity::Critical, 4), 1);
+        assert_eq!(blocking_findings(report, Severity::Trivial, 4), 4);
+        let minor_only = "- [minor] a\n- [trivial] b\nVerdict: 2 findings\n";
+        assert_eq!(blocking_findings(minor_only, Severity::Major, 2), 0);
+        assert_eq!(
+            below_threshold_findings(minor_only, Severity::Major),
+            vec!["- [minor] a", "- [trivial] b"]
+        );
+        // Untagged review: every verdict finding blocks.
+        assert_eq!(
+            blocking_findings("1. a\nVerdict: 1 findings\n", Severity::Major, 1),
+            1
+        );
+        // Malformed tags count as untagged.
+        let bad = "## Findings\n- **[major]** x\n### [major] y\n- [blocker] z\n- [trivial] t\nVerdict: 4 findings\n";
+        assert_eq!(blocking_findings(bad, Severity::Major, 4), 3);
+        // Tags outside `## Findings` do not count against a clean verdict.
+        let clean = "## Resolved\n- [major] X — fixed\n## Findings\nnone\nVerdict: clean\n";
+        assert_eq!(blocking_findings(clean, Severity::Major, 0), 0);
+    }
+}

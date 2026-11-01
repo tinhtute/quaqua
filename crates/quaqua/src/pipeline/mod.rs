@@ -463,6 +463,7 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
         let mut reviewer_opt: Option<String> = None;
         let mut review = "auto".to_string();
         let mut rounds = 2u32;
+        let mut rounds_explicit = false;
         let mut brief_opt: Option<PathBuf> = None;
         let mut base = String::new();
         let mut approve_kinds: Vec<String> = Vec::new();
@@ -515,11 +516,13 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                     .parse()
                     .map_err(|_| (1, "--rounds must be an integer >= 1\n".to_string()))?;
                 i += 2;
+                rounds_explicit = true;
             } else if let Some(v) = arg.strip_prefix("--rounds=") {
                 rounds = v
                     .parse()
                     .map_err(|_| (1, "--rounds must be an integer >= 1\n".to_string()))?;
                 i += 1;
+                rounds_explicit = true;
             } else if arg == "--base" {
                 if i + 1 >= args.len() {
                     return Err((1, format!("{}\n", USAGE)));
@@ -595,6 +598,11 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                 1,
                 "brief must carry the Goal:/Hard constraints:/Current design headers (rules/_all/brief.md)\n".to_string(),
             ));
+        }
+        // #178: the brief's review rule; --rounds on the command line wins.
+        let policy = crate::worker::prompt::brief::review_policy(&brief_str).map_err(|e| (1, e))?;
+        if let (false, Some(r)) = (rounds_explicit, policy.rounds) {
+            rounds = r;
         }
 
         let base_cfg = load_team_config()?;
@@ -1939,11 +1947,32 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                                 verdict_line.as_deref().unwrap_or("NO VERDICT LINE"),
                                 child_input.name
                             ));
+                            let brief_text =
+                                std::fs::read_to_string(&state.brief).unwrap_or_default();
+                            let recorded = crate::worker::prompt::brief::below_threshold_findings(
+                                &rev_content,
+                                review_must_fix(&brief_text),
+                            );
+                            if !recorded.is_empty() {
+                                pcontent.push_str(&format!(
+                                    "  - recorded, below Must fix ({}):\n",
+                                    recorded.len()
+                                ));
+                                for f in &recorded {
+                                    pcontent.push_str(&format!("    {f}\n"));
+                                }
+                                eprintln!(
+                                    "pipeline: {} finding(s) below Must fix recorded in {}",
+                                    recorded.len(),
+                                    ctx.pfile.display()
+                                );
+                            }
                             let _ = std::fs::write(&ctx.pfile, pcontent);
 
                             state.reviewer_spawned = 0;
                             state.rounds_run = state.round;
                             if let Ok((n, _)) = parse_report_content(&rev_content) {
+                                let n = blocking_review_findings(&brief_text, &rev_content, n);
                                 state.last_findings = n;
                                 if n > 0 {
                                     state.review_changed = true;
@@ -2183,7 +2212,7 @@ impl PipelineWorkflow {
             })
             .unwrap_or("HEAD");
         let review_prompt = format!(
-            "Goal: review changes for task '{}' (round {})\nHard constraints: review only diff between base {base_ref} and branch quaqua/{bname}; do not edit code; foreground tests only.\nCurrent design: brief in {}\nEvidence: runs file MUST end with exactly one line: 'Verdict: clean' or 'Verdict: <N> findings' (findings numbered under ## Findings; dispute with ## Challenge).\n{REVIEWER_METHOD}\nPipeline phase: REVIEW (round {})",
+            "Goal: review changes for task '{}' (round {})\nHard constraints: review only diff between base {base_ref} and branch quaqua/{bname}; do not edit code; foreground tests only.\nCurrent design: brief in {}\nEvidence: runs file MUST end with exactly one line: 'Verdict: clean' or 'Verdict: <N> findings' (each finding under ## Findings as '- [critical|major|minor|trivial] <finding>'; findings at or above the brief's 'Must fix:' (default major) block acceptance; dispute with ## Challenge).\n{REVIEWER_METHOD}\nPipeline phase: REVIEW (round {})",
             state.input.task, state.round, state.input.brief_path, state.round
         );
         let worker_input = SingleWorkerInput::new(
@@ -2668,11 +2697,18 @@ impl Workflow for PipelineWorkflow {
                                         state.last_review_report = Some(pending_path.clone());
                                     }
                                     match parse_report_content(&content) {
-                                        Ok((findings, is_challenge)) => self.handle_review_verdict(
-                                            state,
-                                            findings,
-                                            is_challenge,
-                                        ),
+                                        Ok((findings, is_challenge)) => {
+                                            let findings = blocking_review_findings(
+                                                &state.input.brief,
+                                                &content,
+                                                findings,
+                                            );
+                                            self.handle_review_verdict(
+                                                state,
+                                                findings,
+                                                is_challenge,
+                                            )
+                                        }
                                         Err(reason) => block(
                                             state,
                                             PipelinePhase::Review,
@@ -2897,6 +2933,21 @@ fn resolve_child_report_content(
             _ => String::new(),
         }
     }
+}
+
+/// #178: findings that block acceptance — those tagged at or above the
+/// brief's `Must fix:` (default major), plus every untagged finding of the
+/// `Verdict: <N> findings` count.
+pub(crate) fn blocking_review_findings(brief: &str, report: &str, verdict_count: u32) -> u32 {
+    use crate::worker::prompt::brief::blocking_findings;
+    blocking_findings(report, review_must_fix(brief), verdict_count)
+}
+
+fn review_must_fix(brief: &str) -> crate::worker::prompt::brief::Severity {
+    use crate::worker::prompt::brief::{review_policy, DEFAULT_MUST_FIX};
+    review_policy(brief)
+        .map(|p| p.must_fix_or_default())
+        .unwrap_or(DEFAULT_MUST_FIX)
 }
 
 pub(crate) fn parse_report_content(content: &str) -> Result<(u32, bool), String> {
@@ -3559,6 +3610,59 @@ mod tests {
         );
         assert_eq!(state.blocked_code, 5);
         assert_eq!(state.blocked_from, Some(PipelinePhase::Review));
+    }
+
+    fn review_step(
+        brief: &str,
+        report: &str,
+    ) -> (StepDecision<PipelineOutput>, PipelineWorkflowState) {
+        let wf = PipelineWorkflow;
+        let mut input = PipelineInput::new("task-sev", "/repo", "sude", "suhuynh", brief);
+        input.max_rounds = 1;
+        let mut state = PipelineWorkflowState::new(input);
+        state.phase = PipelinePhase::Review;
+        state.round = 1;
+        state.pending_report_read = Some("runs/suhuynh-task-sevr1.md".to_string());
+        let mut ctx = WorkflowContext::new(1000);
+        let d = wf.step(
+            &mut state,
+            &mut ctx,
+            Some(WorkflowEvent::ActivityCompleted {
+                id: "read-report-r1".to_string(),
+                result: ActivityResult::ReportFile(ReportFileResult::Content(report.to_string())),
+            }),
+        );
+        (d, state)
+    }
+
+    #[test]
+    fn test_review_severity_below_must_fix_completes_clean() {
+        // #178: findings below the brief's Must fix (default major) do not block.
+        let report = "## Findings\n- [minor] a\n- [trivial] b\nVerdict: 2 findings\n";
+        match review_step("brief", report).0 {
+            StepDecision::Complete(out) => assert_eq!(out.status, "clean"),
+            other => panic!("expected clean, got {other:?}"),
+        }
+        // Same report, brief lowers the bar to minor: one finding blocks.
+        match review_step("Must fix: minor\n", report).0 {
+            StepDecision::PauseForApproval { reason } => {
+                assert!(reason.contains("1 findings remain"), "{reason}")
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        // An untagged finding next to a tagged minor still blocks (fail closed).
+        let mixed = "## Findings\n1. SQL injection in login\n- [minor] typo\nVerdict: 2 findings\n";
+        match review_step("brief", mixed).0 {
+            StepDecision::PauseForApproval { reason } => {
+                assert!(reason.contains("1 findings remain"), "{reason}")
+            }
+            other => panic!("expected blocked, got {other:?}"),
+        }
+        // Untagged findings keep counting in full.
+        match review_step("brief", "- a\nVerdict: 1 findings\n").0 {
+            StepDecision::PauseForApproval { .. } => {}
+            other => panic!("expected blocked, got {other:?}"),
+        }
     }
 
     #[test]

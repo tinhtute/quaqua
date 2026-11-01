@@ -13,6 +13,8 @@ Unknowns: <what is not known yet + how to verify it>
 Evidence: <checkable lines: the exact verify command (one filter per run) and its real output, files, decisions>
 Time budget: <N> min
 Cost budget: $<x>
+Must fix: <critical|major|minor|trivial>   (optional, default major)
+Review rounds: <N>                        (optional, default the pipeline's --rounds)
 ```
 
 - `Topology:` is required (exit 1 without it). `solo — <reason>` for one worker with no Lead; `lead — <reason>` when the unit is part of a project Lead's plan. It is the coordinator's declaration, not a promise the engine can check on its own.
@@ -22,6 +24,7 @@ Cost budget: $<x>
 - `Context:` is a relay: an upstream unit's report pasted in full is exempt from brief sizing. Only the header block counts — a `Playbook:` line inside pasted text is prose, not this brief's header.
 
 - `Time budget` and `Cost budget` are the two caps; the time one is machine-read (`rules/_all/worker-timebox.md`), the cost one is recorded at acceptance in the project card.
+- Review severity (#178): reviewers tag each finding `- [critical|major|minor|trivial] <finding>`. Findings at or above `Must fix:` block acceptance and go to a fix round; lower ones are recorded, not fixed. Untagged findings all block. `Review rounds:` caps the fix rounds (`quaqua pipeline --rounds` overrides it). `--check-brief` rejects an invalid value; an absent line takes the default.
 - Mechanical task (≤2 files, no shared code path)? Skip the `Current design` paragraph and the plan file; Goal + Evidence is the whole contract.
 
 - No pre-solve: a brief never fixes the cause or the solution — the worker finds it.
