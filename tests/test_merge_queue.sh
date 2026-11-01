@@ -81,7 +81,7 @@ chmod +x "$T/check.sh"
 rc=0
 "$bin" merge --check "$T/check.sh" --repo "$T/repo" myapp feature-a feature-b >"$T/out" 2>"$T/err" || rc=$?
 [[ $rc -eq 2 ]] || fail "failing check: exit $rc, want 2 (rework to Peer)"
-grep -q "check failed with branch 'feature-a' — undoing merge and returning rework to Peer" "$T/err" \
+grep -q "with branch 'feature-a' merged into .* returning rework to Peer" "$T/err" \
   || fail "failing check: wrong error message: $(cat "$T/err")"
 
 # Verify integ HEAD was restored to base_commit
@@ -101,7 +101,7 @@ chmod +x "$T/check_always_fail.sh"
 rc=0
 "$bin" merge --check "$T/check_always_fail.sh" --repo "$T/repo" myapp feature-b >"$T/out" 2>"$T/err" || rc=$?
 [[ $rc -eq 3 ]] || fail "integ base fail: exit $rc, want 3 (ask CoS and hold queue)"
-grep -q "check fails on integ base without 'feature-b' — ask CoS and hold queue" "$T/err" \
+grep -q "on integ base without 'feature-b' — ask CoS and hold queue" "$T/err" \
   || fail "integ base fail: wrong error message: $(cat "$T/err")"
 curr_integ=$(git -C "$T/repo" rev-parse HEAD)
 [[ "$curr_integ" == "$base_commit" ]] || fail "integ not reset after base failure"

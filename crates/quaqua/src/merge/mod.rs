@@ -324,7 +324,7 @@ impl<'a> Drop for MergeWorktreeGuard<'a> {
 /// Default build check for a Rust `*-integ` target when no check is configured (#170):
 /// a merge that is clean as text can still fail to compile.
 /// `QUAQUA_INTEG_CHECK_CMD` replaces the command (tests inject a fake).
-const INTEG_CHECK_CMD: &str = "cargo check --workspace";
+const INTEG_CHECK_CMD: &str = "cargo check --workspace --locked";
 
 fn resolve_check_cmd(explicit: Option<&str>, integ: &str, target: &Path) -> Option<String> {
     let configured = explicit
@@ -337,21 +337,31 @@ fn resolve_check_cmd(explicit: Option<&str>, integ: &str, target: &Path) -> Opti
     if integ.ends_with("-integ") && target.join("Cargo.toml").is_file() {
         return Some(
             std::env::var("QUAQUA_INTEG_CHECK_CMD").unwrap_or_else(|_| INTEG_CHECK_CMD.to_string()),
-        );
+        )
+        .filter(|cmd| !cmd.trim().is_empty());
     }
     None
 }
 
+/// A check passes only if it exits 0 and leaves tracked files untouched: a modified
+/// tracked file (e.g. a rewritten Cargo.lock) would otherwise make the next merge fail
+/// as a misattributed conflict.
 fn run_check(repo: &Path, check_cmd: Option<&str>) -> bool {
     let Some(cmd_str) = check_cmd else {
         return true;
     };
-    Command::new("sh")
+    let ok = Command::new("sh")
         .arg("-c")
         .arg(cmd_str)
         .current_dir(repo)
         .status()
         .map(|s| s.success())
+        .unwrap_or(false);
+    ok && Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(repo)
+        .output()
+        .map(|o| o.status.success() && o.stdout.is_empty())
         .unwrap_or(false)
 }
 
@@ -544,12 +554,12 @@ pub fn handle_merge_with_sink<W: std::io::Write>(
             if !base_check_pass {
                 return Err((
                     3,
-                    format!("error: check fails on integ base without '{branch}' — ask CoS and hold queue\n"),
+                    format!("error: check `{}` fails (or modifies tracked files) on integ base without '{branch}' — ask CoS and hold queue\n", check_cmd.as_deref().unwrap_or("")),
                 ));
             } else {
                 return Err((
                     2,
-                    format!("error: check `{}` failed with branch '{branch}' merged into '{integ}' — undoing merge and returning rework to Peer\n", check_cmd.as_deref().unwrap_or("")),
+                    format!("error: check `{}` failed (or modified tracked files) with branch '{branch}' merged into '{integ}' — undoing merge and returning rework to Peer\n", check_cmd.as_deref().unwrap_or("")),
                 ));
             }
         }
