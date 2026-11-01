@@ -73,6 +73,23 @@ pub fn classify(pane: &str) -> Option<ProviderError> {
         .or_else(|| hit(RETRYABLE).map(ProviderError::Retryable))
 }
 
+pub const TAIL_LINES: usize = 15;
+
+/// How a `prompt_worker_once` run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    Watched,
+    CostCap,
+    NotLanded,
+}
+
+pub fn decide(code: i32, _ended: Ended, pane: &str, _nudged: bool) -> Option<ProviderError> {
+    if !matches!(code, 3 | 5) {
+        return None;
+    }
+    classify(pane)
+}
+
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -114,7 +131,7 @@ mod tests {
                 ProviderError::Retryable("overloaded"),
             ),
             (
-                "Error: rate limit exceeded",
+                "  ⎿  API Error: 429 rate_limit_error",
                 ProviderError::Retryable("rate-limit"),
             ),
             (
@@ -122,25 +139,72 @@ mod tests {
                 ProviderError::Retryable("5xx"),
             ),
             (
-                "request failed: ECONNRESET",
+                "API Error: Connection error (ECONNRESET)",
                 ProviderError::Retryable("network"),
+            ),
+            ("Request timed out.", ProviderError::Retryable("timeout")),
+            (
+                "⎿  API Error: Request timed out.",
+                ProviderError::Retryable("timeout"),
             ),
             (
                 "Not logged in · Please run /login",
                 ProviderError::Fatal("signed-out"),
             ),
             (
-                "You exceeded your current quota",
-                ProviderError::Fatal("quota"),
+                "OAuth token has expired. Please obtain a new token or run /login.",
+                ProviderError::Fatal("signed-out"),
             ),
             ("Credit balance is too low", ProviderError::Fatal("billing")),
             (
-                "overloaded earlier\nnow: signed out",
+                "API Error: 529 Overloaded\n\nInvalid API key · Please run /login",
                 ProviderError::Fatal("signed-out"),
             ),
         ] {
             assert_eq!(classify(text), Some(want), "{text}");
         }
         assert_eq!(classify("I finished the task and wrote the report."), None);
+    }
+
+    /// rev177 F1: the worker's own output that mentions a table word is not
+    /// a provider error.
+    #[test]
+    fn classify_ignores_free_text_that_only_mentions_provider_words() {
+        for pane in [
+            "Edit crates/billing/src/invoice.rs?\n❯ 1. Yes  2. No",
+            "Allow Bash(cargo test -p ratelimit -- rate limit)?\n1. Yes 2. No",
+            "warning: method `fmt` is overloaded here\nDo you want to proceed?",
+            "⏺ Done. Added retry on `fetch failed`; report pending.",
+        ] {
+            assert_eq!(classify(pane), None, "{pane}");
+        }
+    }
+
+    /// Only the tail of the pane counts: an error far above the last lines
+    /// is history, not the reason the turn stopped.
+    #[test]
+    fn classify_reads_only_the_last_lines() {
+        let mut pane = String::from("API Error: 529 Overloaded\n");
+        for i in 0..TAIL_LINES {
+            pane.push_str(&format!("line {i}\n"));
+        }
+        assert_eq!(classify(&pane), None);
+    }
+
+    #[test]
+    fn decide_skips_cost_cap_unlanded_and_pre_nudge_text() {
+        let pane = "API Error: 529 Overloaded";
+        let hit = Some(ProviderError::Retryable("overloaded"));
+        assert_eq!(decide(5, Ended::Watched, pane, false), hit);
+        assert_eq!(decide(3, Ended::Watched, pane, false), hit);
+        assert_eq!(decide(5, Ended::CostCap, pane, false), None, "rev177 F2");
+        assert_eq!(decide(5, Ended::NotLanded, pane, false), None, "rev177 F4");
+        assert_eq!(decide(3, Ended::NotLanded, pane, false), None, "rev177 F4");
+        assert_eq!(decide(4, Ended::Watched, pane, false), None);
+        // rev177 F3: after a "continue", the old error is history.
+        let after = "API Error: 529 Overloaded\n> continue\n⏺ Working\nDo you want to proceed?";
+        assert_eq!(decide(5, Ended::Watched, after, true), None);
+        let again = "API Error: 529 Overloaded\n> continue\nAPI Error: 529 Overloaded";
+        assert_eq!(decide(5, Ended::Watched, again, true), hit);
     }
 }
