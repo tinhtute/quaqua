@@ -699,9 +699,18 @@ mod tests {
         std::env::remove_var("QUAQUA_CHECK_CMD");
         std::env::remove_var("MERGE_CHECK_CMD");
         let git = Git::new();
-        for (fake, want_ok) in [("false", false), ("true", true)] {
+        // (case, fake check, expected exit code; 0 = all merged)
+        let cases = [
+            // Passes on the base, fails once b1 is merged: rework, b1 undone.
+            ("rework", "test ! -f b1.txt", 2),
+            // Passes, but rewrites a tracked file once b1 is merged (a stale merged
+            // Cargo.lock): rework for b1, never a misattributed merge conflict.
+            ("dirty", "if [ -f b1.txt ]; then echo '# x' >> Cargo.toml; fi", 2),
+            ("pass", "true", 0),
+        ];
+        for (case, fake, want) in cases {
             let tmp = std::env::temp_dir()
-                .join(format!("test-merge-integ-{}-{fake}", std::process::id()));
+                .join(format!("test-merge-integ-{}-{case}", std::process::id()));
             let _ = fs::remove_dir_all(&tmp);
             let repo = tmp.join("repo");
             let runs = tmp.join("runs");
@@ -745,14 +754,15 @@ mod tests {
                 .status
                 .success()
             };
-            if want_ok {
+            if want == 0 {
                 assert!(res.is_ok(), "passing check must merge all: {res:?}");
                 assert!(merged("b1") && merged("b2"));
             } else {
-                // The fake fails on the base too, so this may be exit 3 (hold) or 2 (rework).
-                let (code, msg) = res.expect_err("failing build check must fail the merge");
-                assert!(code == 2 || code == 3, "code {code}: {msg}");
-                assert!(!merged("b2"), "queue must stop before the next branch");
+                let Err((code, msg)) = res else { panic!("{case}: failing check must fail the merge") };
+                assert_eq!(code, want, "{case}: {msg}");
+                assert!(msg.contains(fake), "{case}: message must name the check: {msg}");
+                assert!(!merged("b1"), "{case}: failing branch must be undone");
+                assert!(!merged("b2"), "{case}: queue must stop before the next branch");
             }
             let _ = fs::remove_dir_all(&tmp);
         }
