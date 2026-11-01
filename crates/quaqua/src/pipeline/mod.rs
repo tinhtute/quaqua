@@ -1947,16 +1947,32 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                                 verdict_line.as_deref().unwrap_or("NO VERDICT LINE"),
                                 child_input.name
                             ));
+                            let brief_text =
+                                std::fs::read_to_string(&state.brief).unwrap_or_default();
+                            let recorded = crate::worker::prompt::brief::below_threshold_findings(
+                                &rev_content,
+                                review_must_fix(&brief_text),
+                            );
+                            if !recorded.is_empty() {
+                                pcontent.push_str(&format!(
+                                    "  - recorded, below Must fix ({}):\n",
+                                    recorded.len()
+                                ));
+                                for f in &recorded {
+                                    pcontent.push_str(&format!("    {f}\n"));
+                                }
+                                eprintln!(
+                                    "pipeline: {} finding(s) below Must fix recorded in {}",
+                                    recorded.len(),
+                                    ctx.pfile.display()
+                                );
+                            }
                             let _ = std::fs::write(&ctx.pfile, pcontent);
 
                             state.reviewer_spawned = 0;
                             state.rounds_run = state.round;
                             if let Ok((n, _)) = parse_report_content(&rev_content) {
-                                let n = blocking_review_findings(
-                                    &std::fs::read_to_string(&state.brief).unwrap_or_default(),
-                                    &rev_content,
-                                    n,
-                                );
+                                let n = blocking_review_findings(&brief_text, &rev_content, n);
                                 state.last_findings = n;
                                 if n > 0 {
                                     state.review_changed = true;
@@ -2920,14 +2936,18 @@ fn resolve_child_report_content(
 }
 
 /// #178: findings that block acceptance — those tagged at or above the
-/// brief's `Must fix:` (default major). An untagged review keeps its
+/// brief's `Must fix:` (default major), plus every untagged finding of the
 /// `Verdict: <N> findings` count.
 pub(crate) fn blocking_review_findings(brief: &str, report: &str, verdict_count: u32) -> u32 {
-    use crate::worker::prompt::brief::{blocking_findings, review_policy, DEFAULT_MUST_FIX};
-    let must_fix = review_policy(brief)
+    use crate::worker::prompt::brief::blocking_findings;
+    blocking_findings(report, review_must_fix(brief), verdict_count)
+}
+
+fn review_must_fix(brief: &str) -> crate::worker::prompt::brief::Severity {
+    use crate::worker::prompt::brief::{review_policy, DEFAULT_MUST_FIX};
+    review_policy(brief)
         .map(|p| p.must_fix_or_default())
-        .unwrap_or(DEFAULT_MUST_FIX);
-    blocking_findings(report, must_fix).unwrap_or(verdict_count)
+        .unwrap_or(DEFAULT_MUST_FIX)
 }
 
 pub(crate) fn parse_report_content(content: &str) -> Result<(u32, bool), String> {

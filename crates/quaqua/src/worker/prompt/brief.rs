@@ -473,16 +473,48 @@ pub fn finding_severity(line: &str) -> Option<Severity> {
     Severity::parse(tag)
 }
 
-/// Findings in a review report that block acceptance under `must_fix`.
-/// `None` when the report tags no finding with a severity — the caller falls
-/// back to the `Verdict: <N> findings` count, so an untagged review keeps
-/// counting every finding (fail safe).
-pub fn blocking_findings(report: &str, must_fix: Severity) -> Option<u32> {
-    let tagged: Vec<Severity> = report.lines().filter_map(finding_severity).collect();
-    if tagged.is_empty() {
-        return None;
+/// Lines of the report's `## Findings` section (the whole report when it has
+/// no such heading), up to the next `## ` heading or the verdict line.
+fn findings_section(report: &str) -> Vec<&str> {
+    let has_heading = report.lines().any(|l| l.trim() == "## Findings");
+    let mut inside = !has_heading;
+    let mut out = Vec::new();
+    for line in report.lines() {
+        let t = line.trim();
+        if t == "## Findings" {
+            inside = true;
+            continue;
+        }
+        if t.to_ascii_lowercase().starts_with("verdict:") || (has_heading && t.starts_with("## ")) {
+            inside = false;
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
     }
-    Some(tagged.into_iter().filter(|s| *s >= must_fix).count() as u32)
+    out
+}
+
+/// Findings in a review report that block acceptance under `must_fix`:
+/// those tagged at or above it, plus every finding of `Verdict: <N>` that
+/// carries no valid tag (`N - tagged`, fail closed).
+pub fn blocking_findings(report: &str, must_fix: Severity, verdict_count: u32) -> u32 {
+    let tagged: Vec<Severity> = findings_section(report)
+        .into_iter()
+        .filter_map(finding_severity)
+        .collect();
+    let at_or_above = tagged.iter().filter(|s| **s >= must_fix).count() as u32;
+    at_or_above + verdict_count.saturating_sub(tagged.len() as u32)
+}
+
+/// Tagged findings below `must_fix`: recorded, not fixed.
+pub fn below_threshold_findings(report: &str, must_fix: Severity) -> Vec<String> {
+    findings_section(report)
+        .into_iter()
+        .filter(|l| finding_severity(l).is_some_and(|s| s < must_fix))
+        .map(|l| l.trim().to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -517,15 +549,26 @@ mod review_severity_tests {
 
     #[test]
     fn blocking_findings_counts_at_or_above_threshold() {
-        let report = "## Findings\n- [critical] a\n- [major] b\n1. [minor] c\n* [trivial] d\n- not tagged\nVerdict: 4 findings\n";
-        assert_eq!(blocking_findings(report, Severity::Major), Some(2));
-        assert_eq!(blocking_findings(report, Severity::Critical), Some(1));
-        assert_eq!(blocking_findings(report, Severity::Trivial), Some(4));
+        let report = "## Findings\n- [critical] a\n- [major] b\n1. [minor] c\n* [trivial] d\nVerdict: 4 findings\n";
+        assert_eq!(blocking_findings(report, Severity::Major, 4), 2);
+        assert_eq!(blocking_findings(report, Severity::Critical, 4), 1);
+        assert_eq!(blocking_findings(report, Severity::Trivial, 4), 4);
         let minor_only = "- [minor] a\n- [trivial] b\nVerdict: 2 findings\n";
-        assert_eq!(blocking_findings(minor_only, Severity::Major), Some(0));
+        assert_eq!(blocking_findings(minor_only, Severity::Major, 2), 0);
         assert_eq!(
-            blocking_findings("1. a\nVerdict: 1 findings\n", Severity::Major),
-            None
+            below_threshold_findings(minor_only, Severity::Major),
+            vec!["- [minor] a", "- [trivial] b"]
         );
+        // Untagged review: every verdict finding blocks.
+        assert_eq!(
+            blocking_findings("1. a\nVerdict: 1 findings\n", Severity::Major, 1),
+            1
+        );
+        // Malformed tags count as untagged.
+        let bad = "## Findings\n- **[major]** x\n### [major] y\n- [blocker] z\n- [trivial] t\nVerdict: 4 findings\n";
+        assert_eq!(blocking_findings(bad, Severity::Major, 4), 3);
+        // Tags outside `## Findings` do not count against a clean verdict.
+        let clean = "## Resolved\n- [major] X — fixed\n## Findings\nnone\nVerdict: clean\n";
+        assert_eq!(blocking_findings(clean, Severity::Major, 0), 0);
     }
 }
