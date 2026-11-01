@@ -12,11 +12,14 @@ Lead decides its own Peers.
 
 ## Signals
 
-- **Worker count** — this spawn would be the 3rd or later live build worker on the same repo
-  (kinds `tieude`/`sude`/`ni`; `--review` workers hold no build slot). A running pipeline counts
-  as `limits.weights.pipeline` slots (2) together. Attribution is `runs/<name>.repo`, written at
-  spawn: a worktree path is `<repo-parent>/.wt/<name>`, so it cannot name the repo when several
-  repos share that parent, and a worker spawned before this metadata existed is not counted.
+- **Worker count** — this spawn would be the 3rd or later live build worker on the same repo.
+  Which kinds hold a build slot is `team.toml`'s business, not this file's: `strategy.build_kinds`
+  (`quaqua config get strategy.build_kinds` prints it), and a kind the list does not name — a
+  reviewer kind, a `--review` worker — holds none; with the key absent, every configured kind
+  holds one. A running pipeline counts as `limits.weights.pipeline` slots (2) together.
+  Attribution is `runs/<name>.repo`, written at spawn: a worktree path is
+  `<repo-parent>/.wt/<name>`, so it cannot name the repo when several repos share that parent,
+  and a worker spawned before this metadata existed is not counted.
 - **Plan phases** — the project's active plan declares `phases_left: N` with N > 1. The plan is
   the `docs/plans/active/*.md` the project card names, else `docs/plans/active/<slug>.md`. Frontmatter
   only: no checkbox counting.
