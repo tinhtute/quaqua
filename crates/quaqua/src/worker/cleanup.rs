@@ -306,6 +306,18 @@ pub fn run_grid_hook(grid_tab: &str, owner: Option<&str>) -> Result<(), (i32, St
     Ok(())
 }
 
+/// The repo to clean `name` against: the explicit argument, else the repo
+/// recorded at spawn (`runs/<name>.repo`). `None` = cannot infer.
+pub fn resolve_cleanup_repo(
+    name: &str,
+    explicit: Option<&Path>,
+    runs_dir: &Path,
+) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| WorkerMetadata::load_repo(runs_dir, name))
+}
+
 pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
     name: &str,
     repo_path: &Path,
@@ -368,13 +380,16 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
         .or_else(|| WorkerMetadata::load_grid(&runs_dir, name))
         .unwrap_or_else(|| format!("{repo_name}-workers"));
 
-    let rm_out = git
-        .worktree_remove(&repo, &wt)
-        .map_err(|e| (1, format!("error: worktree remove failed: {e}")))?;
+    // A Lead has no worktree; an already-removed one has nothing left to do.
+    if wt.is_dir() {
+        let rm_out = git
+            .worktree_remove(&repo, &wt)
+            .map_err(|e| (1, format!("error: worktree remove failed: {e}")))?;
 
-    if !rm_out.status.success() {
-        let err_text = String::from_utf8_lossy(&rm_out.stderr).to_string();
-        return Err((rm_out.status.code().unwrap_or(1), err_text));
+        if !rm_out.status.success() {
+            let err_text = String::from_utf8_lossy(&rm_out.stderr).to_string();
+            return Err((rm_out.status.code().unwrap_or(1), err_text));
+        }
     }
 
     run_grid_hook(&grid_tab, Some(&owner))?;
@@ -733,6 +748,55 @@ pub(crate) mod metrics {
         );
         assert!(!runs_dir.join("telemetry.jsonl").exists());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_cleanup_repo_inferred_from_spawn_record() {
+        let tmp = std::env::temp_dir().join(format!("cleanup-infer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let runs_dir = tmp.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        assert_eq!(resolve_cleanup_repo("w-infer", None, &runs_dir), None);
+        WorkerMetadata::save_repo(&runs_dir, "w-infer", &tmp.join("repo")).unwrap();
+        assert_eq!(
+            resolve_cleanup_repo("w-infer", None, &runs_dir),
+            Some(tmp.join("repo"))
+        );
+        assert_eq!(
+            resolve_cleanup_repo("w-infer", Some(Path::new("/x/explicit")), &runs_dir),
+            Some(PathBuf::from("/x/explicit"))
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_cleanup_lead_without_worktree_succeeds() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let tmp = std::env::temp_dir().join(format!("cleanup-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let runs_dir = tmp.join("runs");
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let _env_owner = crate::test_env::TestEnvVarGuard::remove("QUAQUA_OWNER");
+        let _env_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", &runs_dir);
+        let _env_skip = TestEnvVarGuard::set("GRID_SKIP", "1");
+        let _env_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
+        WorkerMetadata::save_owner(&runs_dir, "mu-lead", "cos").unwrap();
+
+        let herdr = MockHerdr {
+            agent_list_response: LIST_COS.to_string(),
+            agent_get_response: r#"{"result":{"agent":{"agent":"claude","pane_id":"%9"}}}"#
+                .to_string(),
+        };
+        // git would fail like `'<wt>/mu-lead' is not a working tree` if called.
+        let git = MockGit {
+            worktree_remove_ok: false,
+        };
+        cleanup_worker_in("mu-lead", &repo, &git, &herdr, Some(&runs_dir)).unwrap();
+        assert!(!runs_dir.join("mu-lead.owner").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
