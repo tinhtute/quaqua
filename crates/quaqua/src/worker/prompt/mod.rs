@@ -571,6 +571,8 @@ pub fn prompt_worker<G: GitOps>(
     herdr: &Herdr,
 ) -> Result<(), (i32, String)> {
     let mut ended = retry::Ended::NotLanded;
+    // A harness error record older than this moment belongs to an earlier turn.
+    let turn_start = now_sec();
     let mut res = prompt_worker_once(name, task, resume, extend, git, herdr, &mut ended);
     let runs_dir = default_runs_dir();
     let mut attempt: u32 = 0;
@@ -582,31 +584,41 @@ pub fn prompt_worker<G: GitOps>(
         let pane = herdr
             .agent_read(name, "recent-unwrapped", 80)
             .unwrap_or_default();
-        let Some(err) = retry::decide(code, ended, &pane, attempt > 0) else {
+        let worker = retry::Worker {
+            name,
+            runs_dir: &runs_dir,
+            harness: retry::harness_of(name),
+            since: turn_start,
+        };
+        let Some(decision) = retry::decide(code, ended, &pane, attempt > 0, &worker) else {
             break;
         };
-        let (reason, retryable) = match err {
+        let (reason, retryable) = match decision.error {
             retry::ProviderError::Retryable(r) => (r, true),
             retry::ProviderError::Fatal(r) => (r, false),
         };
+        // A harness that already printed its terminal retry line gets one
+        // short quaqua retry, not a second full ladder (#196).
+        let cap = retry::retry_cap(&decision);
         attempt += 1;
-        if !retryable || attempt > retry::max_retries() {
+        if !retryable || attempt > cap {
             let attempts = attempt - 1;
             retry::journal(
                 &runs_dir,
                 name,
                 "provider_escalate",
-                serde_json::json!({ "reason": reason, "retryable": retryable, "retries": attempts, "exit": code }),
+                serde_json::json!({ "reason": reason, "retryable": retryable, "retries": attempts, "harness_exhausted": decision.exhausted, "exit": code }),
             );
             let _ = std::fs::remove_file(WorkerMetadata::provider_retry_path(&runs_dir, name));
             eprintln!(
-                "WATCHDOG exit={} provider error ({reason}, {}) | name={name} retries={attempts}",
+                "WATCHDOG exit={} provider error ({reason}, {}) | name={name} retries={attempts} harness_exhausted={}",
                 retry::EXIT_PROVIDER,
                 if retryable {
                     "retry cap reached"
                 } else {
                     "non-retryable"
-                }
+                },
+                decision.exhausted
             );
             return Err((retry::EXIT_PROVIDER, String::new()));
         }
@@ -615,12 +627,11 @@ pub fn prompt_worker<G: GitOps>(
             &runs_dir,
             name,
             "provider_retry",
-            serde_json::json!({ "attempt": attempt, "reason": reason, "delay_ms": delay_ms }),
+            serde_json::json!({ "attempt": attempt, "reason": reason, "delay_ms": delay_ms, "harness_exhausted": decision.exhausted }),
         );
         let _ = WorkerMetadata::record_provider_retry(&runs_dir, name, now_sec());
         eprintln!(
-            "WATCHDOG provider-retry {attempt}/{} ({reason}) in {delay_ms}ms | name={name}",
-            retry::max_retries()
+            "WATCHDOG provider-retry {attempt}/{cap} ({reason}) in {delay_ms}ms | name={name}"
         );
         std::thread::sleep(Duration::from_millis(delay_ms));
         let _ = herdr.agent_prompt_nowait(name, "continue");
@@ -1635,12 +1646,35 @@ exit 0
         (res, events, prompts)
     }
 
+    /// #196: a harness that already printed its terminal retry line gets one
+    /// short quaqua retry, not a second full ladder.
+    #[test]
+    fn test_prompt_caps_retries_after_a_harness_exhausted_line() {
+        let _env_lock = lock_env();
+        let (res, events, prompts) = run_provider_case(
+            "exhausted",
+            "Retry budget exhausted after 10 retries: 429 Rate limit reached",
+        );
+        assert_eq!(res, Err((7, String::new())));
+        assert_eq!(prompts, 1, "the single retry resumes the turn once");
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|(k, _)| k == "provider_retry")
+            .collect();
+        assert_eq!(retries.len(), 1, "one short retry, not the full ladder");
+        assert_eq!(retries[0].1["harness_exhausted"], true);
+        let (kind, esc) = events.last().unwrap();
+        assert_eq!(kind, "provider_escalate");
+        assert_eq!(esc["harness_exhausted"], true);
+        assert_eq!(esc["retries"], 1);
+    }
+
     /// #177: an overloaded turn is resumed 4 times with doubling delays,
     /// each attempt journaled, then escalates with exit 7.
     #[test]
     fn test_prompt_retries_an_overloaded_turn_with_backoff_then_escalates() {
         let _env_lock = lock_env();
-        let (res, events, prompts) = run_provider_case("overload", "API Error: 529 Overloaded");
+        let (res, events, prompts) = run_provider_case("overload", "Error: 529 Overloaded");
         assert_eq!(res, Err((7, String::new())));
         assert_eq!(prompts, 4, "each retry resumes the turn once");
         let retries: Vec<_> = events
@@ -1663,8 +1697,10 @@ exit 0
     #[test]
     fn test_prompt_escalates_a_signed_out_turn_without_retry() {
         let _env_lock = lock_env();
-        let (res, events, prompts) =
-            run_provider_case("signout", "Not logged in · Please run /login");
+        let (res, events, prompts) = run_provider_case(
+            "signout",
+            "401 Incorrect API key provided: sk-fake. (type=invalid_request_error param=invalid_api_key)",
+        );
         assert_eq!(res, Err((7, String::new())));
         assert_eq!(prompts, 0);
         assert_eq!(events.len(), 1, "{events:?}");
