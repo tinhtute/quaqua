@@ -571,6 +571,8 @@ pub fn prompt_worker<G: GitOps>(
     herdr: &Herdr,
 ) -> Result<(), (i32, String)> {
     let mut ended = retry::Ended::NotLanded;
+    // A harness error record older than this moment belongs to an earlier turn.
+    let turn_start = now_sec();
     let mut res = prompt_worker_once(name, task, resume, extend, git, herdr, &mut ended);
     let runs_dir = default_runs_dir();
     let mut attempt: u32 = 0;
@@ -586,6 +588,7 @@ pub fn prompt_worker<G: GitOps>(
             name,
             runs_dir: &runs_dir,
             harness: retry::harness_of(name),
+            since: turn_start,
         };
         let Some(decision) = retry::decide(code, ended, &pane, attempt > 0, &worker) else {
             break;

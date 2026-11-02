@@ -45,6 +45,10 @@ pub struct Worker<'a> {
     /// `None` when team.toml does not name this worker's kind: every harness
     /// shape is tried then, rather than losing the classification.
     pub harness: Option<Harness>,
+    /// Epoch second the turn being watched started. A record older than this
+    /// belongs to an earlier turn (the harness failed it before quaqua began
+    /// watching) and is never trusted; 0 trusts any record.
+    pub since: u64,
 }
 
 /// `runs/.<name>.error`: the structured verdict the harness extension writes
@@ -285,11 +289,12 @@ fn classify_line(h: Option<Harness>, line: &str) -> Option<Decision> {
     };
     match h {
         Some(Harness::Claude) => claude(),
-        // opencode prints `Error: NNN …` like omp, so it shares omp's matchers.
-        Some(Harness::Omp) | Some(Harness::Opencode) => omp_line(&l),
+        Some(Harness::Omp) => omp_line(&l),
         Some(Harness::Pi) => pi_line(&l),
-        // No kind in team.toml: try each shape rather than drop the error.
-        None => omp_line(&l).or_else(|| pi_line(&l)).or_else(claude),
+        // No kind in team.toml, and opencode (no fixture of its own yet, and it
+        // had the Claude tables before #196): try each shape rather than drop
+        // the error or lose a classification it used to get.
+        None | Some(Harness::Opencode) => omp_line(&l).or_else(|| pi_line(&l)).or_else(claude),
     }
 }
 
@@ -338,7 +343,7 @@ pub fn decide(
     if !matches!(code, 3 | 5) || ended != Ended::Watched {
         return None;
     }
-    if let Some(d) = read_error_file(worker.runs_dir, worker.name) {
+    if let Some(d) = read_error_file(worker.runs_dir, worker.name, worker.since) {
         return Some(d);
     }
     let text = if nudged { after_nudge(pane) } else { pane };
@@ -347,11 +352,28 @@ pub fn decide(
 
 /// Parse `runs/.<name>.error` into a decision, then delete it: one record
 /// answers one decision (idempotent to re-run — a second call finds nothing).
-fn read_error_file(runs_dir: &Path, name: &str) -> Option<Decision> {
+/// A record written before the turn start is stale: the harness produced it
+/// for an earlier turn, so it is dropped and the text decides.
+fn read_error_file(runs_dir: &Path, name: &str, since: u64) -> Option<Decision> {
     let path = error_path(runs_dir, name);
+    let written = mtime_sec(&path);
     let text = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
+    if written.is_some_and(|m| m < since) {
+        return None;
+    }
     parse_error_record(&text)
+}
+
+/// `path`'s mtime in epoch seconds, when the filesystem reports one.
+fn mtime_sec(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn parse_error_record(text: &str) -> Option<Decision> {
@@ -370,7 +392,14 @@ fn parse_error_record(text: &str) -> Option<Decision> {
 }
 
 fn record_error(class: &str, status: u16) -> Option<ProviderError> {
-    match (class, status_error(status, "")) {
+    // A record carries no reason word, so a 401/403 cannot be told apart as a
+    // signed-out key or an exhausted quota: name it neutrally rather than
+    // claim one.
+    let by_status = match status {
+        401 | 403 => ProviderError::Fatal("auth-or-quota"),
+        _ => status_error(status, ""),
+    };
+    match (class, by_status) {
         ("retryable", ProviderError::Retryable(r)) => Some(ProviderError::Retryable(r)),
         // Fail closed: a status that needs a human is never retried, and a
         // record the writer already called fatal is never retried either.
@@ -684,6 +713,7 @@ mod tests {
             name: "sude-x",
             runs_dir: &dir.0,
             harness: Some(Harness::Omp),
+            since: 0,
         };
         std::fs::write(error_path(&dir.0, "sude-x"), "fatal 401 0\n").unwrap();
         // The pane says retryable; the structured record says a human is needed.
@@ -691,7 +721,7 @@ mod tests {
         assert_eq!(
             decide(3, Ended::Watched, pane, false, &w),
             Some(Decision {
-                error: ProviderError::Fatal("signed-out"),
+                error: ProviderError::Fatal("auth-or-quota"),
                 exhausted: false,
             })
         );
@@ -709,6 +739,7 @@ mod tests {
             name: "w",
             runs_dir: &dir.0,
             harness: Some(Harness::Pi),
+            since: 0,
         };
         std::fs::write(error_path(&dir.0, "w"), "retryable 429 3\n").unwrap();
         let d = decide(5, Ended::Watched, "", false, &w).unwrap();
@@ -732,6 +763,7 @@ mod tests {
                 name: "w",
                 runs_dir: &dir.0,
                 harness: Some(Harness::Omp),
+                since: 0,
             };
             std::fs::write(error_path(&dir.0, "w"), record).unwrap();
             assert_eq!(
@@ -751,6 +783,7 @@ mod tests {
             name: "w",
             runs_dir: &dir.0,
             harness: Some(Harness::Omp),
+            since: 0,
         };
         std::fs::write(error_path(&dir.0, "w"), "fatal 429 0\n").unwrap();
         assert_eq!(
@@ -760,8 +793,99 @@ mod tests {
         std::fs::write(error_path(&dir.0, "w"), "retryable 401 0\n").unwrap();
         assert_eq!(
             decide(3, Ended::Watched, "", false, &w),
-            hit(ProviderError::Fatal("signed-out"))
+            hit(ProviderError::Fatal("auth-or-quota"))
         );
+    }
+
+    /// #196 review: a record carries a status but no reason word, so its
+    /// 401/403 must not claim "signed-out" when it may be an exhausted quota.
+    #[test]
+    fn record_auth_status_gets_a_neutral_label() {
+        let dir = TempDir::new("auth-label");
+        let w = Worker {
+            name: "w",
+            runs_dir: &dir.0,
+            harness: Some(Harness::Omp),
+            since: 0,
+        };
+        for (record, want) in [
+            ("fatal 403 0", "auth-or-quota"),
+            ("fatal 401 0", "auth-or-quota"),
+            ("fatal 402 0", "billing"),
+        ] {
+            std::fs::write(error_path(&dir.0, "w"), record).unwrap();
+            assert_eq!(
+                decide(3, Ended::Watched, "", false, &w),
+                hit(ProviderError::Fatal(want)),
+                "{record}"
+            );
+        }
+    }
+
+    /// #196 review: a record written before the watched turn started belongs
+    /// to an earlier turn — the harness failed that one before quaqua began
+    /// watching — so the pane decides, not the stale verdict.
+    #[test]
+    fn a_record_from_before_the_turn_start_is_ignored() {
+        let dir = TempDir::new("stale-record");
+        let path = error_path(&dir.0, "w");
+        let now = now_sec();
+        let w = Worker {
+            name: "w",
+            runs_dir: &dir.0,
+            harness: Some(Harness::Omp),
+            since: now.saturating_sub(5),
+        };
+        std::fs::write(&path, "fatal 401 0\n").unwrap();
+        assert_eq!(
+            decide(3, Ended::Watched, "", false, &w),
+            hit(ProviderError::Fatal("auth-or-quota")),
+            "a record written during this turn is trusted"
+        );
+        std::fs::write(&path, "fatal 401 0\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let pane = "Error: 503 Service Unavailable";
+        assert_eq!(
+            decide(3, Ended::Watched, pane, false, &w),
+            hit(ProviderError::Retryable("5xx")),
+            "the previous turn's verdict must not escalate this stall"
+        );
+        assert!(
+            !path.exists(),
+            "the stale record is dropped, not left behind"
+        );
+    }
+
+    /// #196 review: opencode has no fixture of its own, so it keeps every
+    /// shape — including the Claude tables it had before #196.
+    #[test]
+    fn classify_opencode_keeps_every_shape() {
+        for (text, want) in [
+            (
+                "API Error: 529 Overloaded",
+                ProviderError::Retryable("overloaded"),
+            ),
+            (
+                "Error: 503 Service Unavailable",
+                ProviderError::Retryable("5xx"),
+            ),
+            (
+                "529: {\"type\":\"overloaded_error\"}",
+                ProviderError::Retryable("overloaded"),
+            ),
+            (
+                "Not logged in · Please run /login",
+                ProviderError::Fatal("signed-out"),
+            ),
+        ] {
+            assert_eq!(classify(Some(Harness::Opencode), text), hit(want), "{text}");
+        }
     }
 
     #[test]
@@ -771,6 +895,7 @@ mod tests {
             name: "w",
             runs_dir: &dir.0,
             harness: Some(Harness::Claude),
+            since: 0,
         };
         let pane = "API Error: 529 Overloaded";
         let overloaded = hit(ProviderError::Retryable("overloaded"));
@@ -800,6 +925,7 @@ mod tests {
         // pi and omp panes classify through the same decide.
         let pi = Worker {
             harness: Some(Harness::Pi),
+            since: 0,
             ..w
         };
         assert_eq!(
