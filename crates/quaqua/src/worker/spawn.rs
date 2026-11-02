@@ -890,4 +890,28 @@ mod credential_env_tests {
             .iter()
             .any(|(k, v)| *k == "OPENCODE_CONFIG_CONTENT" && !v.is_empty()));
     }
+
+    #[test]
+    fn worker_pane_env_preserves_state_and_error_files() {
+        let cmd = LaunchCmd {
+            split_envs: vec![
+                (
+                    "QUAQUA_STATE_FILE".to_string(),
+                    "/runs/.sude.state".to_string(),
+                ),
+                (
+                    "QUAQUA_ERROR_FILE".to_string(),
+                    "/runs/.sude.error".to_string(),
+                ),
+            ],
+            agent_args: Vec::new(),
+        };
+        let envs = worker_split_envs(&cmd);
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "QUAQUA_STATE_FILE" && *v == "/runs/.sude.state"));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "QUAQUA_ERROR_FILE" && *v == "/runs/.sude.error"));
+    }
 }

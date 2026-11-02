@@ -153,6 +153,32 @@ pub fn review_read_root(wt: &str) -> String {
         .unwrap_or_else(|| wt.to_string())
 }
 
+/// Resolve the path to the `omp-worker-state.ts` extension.
+pub fn omp_worker_state_hook_path(runs_dir: &str) -> String {
+    if let Ok(p) = std::env::var("QUAQUA_OMP_STATE_HOOK") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    if let Some(parent) = Path::new(runs_dir).parent() {
+        let candidate = parent.join("scripts/hooks/omp-worker-state.ts");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    let ws_hook = crate::workspace::workspace_root().join("scripts/hooks/omp-worker-state.ts");
+    if ws_hook.is_file() {
+        return ws_hook.to_string_lossy().to_string();
+    }
+    let tmpl = Path::new("templates/workspace/scripts/hooks/omp-worker-state.ts");
+    if tmpl.is_file() {
+        if let Ok(canon) = tmpl.canonicalize() {
+            return canon.to_string_lossy().to_string();
+        }
+    }
+    ws_hook.to_string_lossy().to_string()
+}
+
 /// Build settings JSON for Claude Code containing per-worker hooks for liveness
 /// state (`runs/.<name>.state`), and reviewer permissions if `read_root` is provided.
 pub fn claude_settings(name: &str, runs_dir: &str, read_root: Option<&str>) -> serde_json::Value {
@@ -246,6 +272,11 @@ pub fn build_launch_cmd(
             ]
         }
         "omp" => {
+            let state_file = format!("{runs_dir}/.{name}.state");
+            let error_file = format!("{runs_dir}/.{name}.error");
+            split_envs.push(("QUAQUA_STATE_FILE".to_string(), state_file));
+            split_envs.push(("QUAQUA_ERROR_FILE".to_string(), error_file));
+
             let mut args = vec![
                 "--".to_string(),
                 "--model".to_string(),
@@ -261,6 +292,18 @@ pub fn build_launch_cmd(
             }
             args.push("--append-system-prompt".to_string());
             args.push(rules_file.to_string());
+            args.push("--no-extensions".to_string());
+
+            let home = std::env::var("HOME").unwrap_or_default();
+            let herdr_omp_ext = format!("{home}/.omp/agent/extensions/herdr-omp-agent-state.ts");
+            if std::path::Path::new(&herdr_omp_ext).is_file() {
+                args.push("-e".to_string());
+                args.push(herdr_omp_ext);
+            }
+
+            let worker_state_ext = omp_worker_state_hook_path(runs_dir);
+            args.push("-e".to_string());
+            args.push(worker_state_ext);
             args
         }
         "pi" => {
@@ -421,6 +464,107 @@ mod tests {
             let hs = crate::liveness::HookState::parse(&line).unwrap();
             assert!(hs.timestamp_sec > 0, "{line}");
             assert_eq!(reason(&line), want, "{event} {payload} -> {line}");
+        }
+    }
+
+    #[test]
+    fn omp_launch_cmd_carries_state_and_error_envs_and_extensions() {
+        let launch = super::Launch {
+            harness: "omp".to_string(),
+            model: "google-antigravity/gemini-3.8-flash".to_string(),
+            effort: "high".to_string(),
+        };
+        let cmd = super::build_launch_cmd(
+            &launch,
+            "sude-w1",
+            "/path/to/rules.md",
+            "/workspace/runs",
+            "/workspace/.wt/sude-w1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(cmd.split_envs.len(), 2);
+        assert_eq!(
+            cmd.split_envs[0],
+            (
+                "QUAQUA_STATE_FILE".to_string(),
+                "/workspace/runs/.sude-w1.state".to_string()
+            )
+        );
+        assert_eq!(
+            cmd.split_envs[1],
+            (
+                "QUAQUA_ERROR_FILE".to_string(),
+                "/workspace/runs/.sude-w1.error".to_string()
+            )
+        );
+
+        assert!(cmd.agent_args.iter().any(|a| a == "--no-extensions"));
+        let worker_ext = super::omp_worker_state_hook_path("/workspace/runs");
+        let ext_indices: Vec<usize> = cmd
+            .agent_args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-e")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!ext_indices.is_empty(), "must pass at least one -e");
+        let last_ext_idx = *ext_indices.last().unwrap();
+        assert_eq!(cmd.agent_args[last_ext_idx + 1], worker_ext);
+
+        // Review mode includes OMP_REVIEW_TOOLS
+        let cmd_rev = super::build_launch_cmd(
+            &launch,
+            "sude-rev",
+            "/path/to/rules.md",
+            "/workspace/runs",
+            "/workspace/.wt/sude-rev",
+            true,
+        )
+        .unwrap();
+        assert!(cmd_rev
+            .agent_args
+            .iter()
+            .any(|a| a == &format!("--tools={}", super::OMP_REVIEW_TOOLS)));
+    }
+
+    #[test]
+    fn omp_worker_state_hook_path_respects_env_override() {
+        std::env::set_var("QUAQUA_OMP_STATE_HOOK", "/custom/omp-state.ts");
+        let p = super::omp_worker_state_hook_path("/workspace/runs");
+        std::env::remove_var("QUAQUA_OMP_STATE_HOOK");
+        assert_eq!(p, "/custom/omp-state.ts");
+    }
+
+    #[test]
+    fn omp_worker_state_tokens_parse_cleanly() {
+        use crate::liveness::{HookState, WorkerState};
+        use crate::status::BlockReason;
+
+        let working = "working 1730500000";
+        let hs = HookState::parse(working).unwrap();
+        assert_eq!(hs.state, WorkerState::Working);
+        assert_eq!(hs.timestamp_sec, 1730500000);
+
+        let idle = "idle 1730500001";
+        let hs = HookState::parse(idle).unwrap();
+        assert_eq!(hs.state, WorkerState::Idle);
+        assert_eq!(hs.timestamp_sec, 1730500001);
+
+        let test_cases = [
+            ("blocked 1730500002 permission", BlockReason::AsksPermission),
+            ("blocked 1730500003 plan", BlockReason::PlanToApprove),
+            ("blocked 1730500004 question", BlockReason::QuestionForYou),
+            ("blocked 1730500005 signed-out", BlockReason::SignedOut),
+        ];
+        for (line, expected_reason) in test_cases {
+            let hs = HookState::parse(line).unwrap();
+            assert_eq!(hs.state, WorkerState::Blocked);
+            let mut parts = line.split_whitespace();
+            assert_eq!(parts.next(), Some("blocked"));
+            let token = parts.nth(1);
+            assert_eq!(BlockReason::from_token(token), expected_reason);
         }
     }
 }
