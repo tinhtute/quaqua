@@ -46,7 +46,42 @@ impl Fixture {
         )
         .unwrap();
         fs::set_permissions(&f.shell, fs::Permissions::from_mode(0o755)).unwrap();
+        f.install_systemd_session();
         f
+    }
+
+    /// Model the systemd user session a healthy Linux workstation has: the
+    /// auditor units installed under `$HOME/.config/systemd/user` and a
+    /// `systemctl` stub on the fixture PATH that reports them `enabled` and
+    /// the timer `active`. `doctor` checks both (issue #198), and the check is
+    /// hermetic here because the fixture owns `$HOME` and the whole `PATH`.
+    fn install_systemd_session(&self) {
+        let user_dir = self.home.join(".config/systemd/user");
+        fs::create_dir_all(&user_dir).unwrap();
+        for unit in ["quaqua-auditor.service", "quaqua-auditor.timer"] {
+            fs::write(user_dir.join(unit), "[Unit]\nDescription=fixture auditor\n").unwrap();
+        }
+        self.install_systemctl("active");
+    }
+
+    /// `systemctl --user …` stub: `list-unit-files` reports both auditor units
+    /// enabled, `is-active` reports `timer_state` (and only `active` exits 0,
+    /// like the real one).
+    fn install_systemctl(&self, timer_state: &str) {
+        let path = self.bin_dir.join("systemctl");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                 *is-active*) printf '%s\\n' '{timer_state}'; [ '{timer_state}' = active ] ;;\n\
+                 *list-unit-files*) printf 'quaqua-auditor.service enabled enabled\\nquaqua-auditor.timer enabled enabled\\n' ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Link the built binary into the fixture's PATH: doctor only reads the
@@ -60,8 +95,13 @@ impl Fixture {
     }
 
     fn run(&self, path: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_quaqua"))
-            .arg("doctor")
+        self.run_env(path, &[])
+    }
+
+    /// [`Fixture::run`] with extra environment the case is about.
+    fn run_env(&self, path: &Path, env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_quaqua"));
+        cmd.arg("doctor")
             .env("PATH", path)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -73,9 +113,11 @@ impl Fixture {
             // them set must not redirect the fixture's workspace.
             .env_remove("QUAQUA_HOME")
             .env_remove("QUAQUA_ROOT")
-            .current_dir(&self.cwd)
-            .output()
-            .expect("run quaqua doctor")
+            .current_dir(&self.cwd);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("run quaqua doctor")
     }
 
     /// [`Fixture::run`] with no `QUAQUA_CHECKOUT` and an empty `cwd`: nothing
@@ -246,6 +288,55 @@ fn a_split_workspace_is_quiet() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("warning:"), "{stderr}");
+}
+
+#[test]
+fn a_missing_auditor_unit_fails_the_run() {
+    let f = Fixture::new("no-units", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    fs::remove_dir_all(f.home.join(".config/systemd/user")).unwrap();
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("auditor systemd unit is missing"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("install-auditor.sh"), "{stderr}");
+}
+
+#[test]
+fn an_inactive_auditor_timer_fails_the_run() {
+    let f = Fixture::new("inactive-timer", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    f.install_systemctl("inactive");
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("auditor systemd timer is inactive"),
+        "{stderr}"
+    );
+}
+
+/// `QUAQUA_TEST=1` exists so a suite cannot write live workspace state; the
+/// auditor check only reads `$HOME` and runs `systemctl`, so the switch must
+/// not silence it and hand a broken workstation a green `doctor`.
+#[test]
+fn quaqua_test_does_not_disable_the_auditor_check() {
+    let f = Fixture::new("test-env", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    fs::remove_dir_all(f.home.join(".config/systemd/user")).unwrap();
+
+    let out = f.run_env(&f.bin_dir, &[("QUAQUA_TEST", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("auditor systemd unit is missing"),
+        "{stderr}"
+    );
 }
 
 #[test]
