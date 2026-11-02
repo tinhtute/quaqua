@@ -69,57 +69,47 @@ fn find(table: &[(&str, &'static str)], text: &str) -> Option<&'static str> {
         .map(|(_, r)| *r)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinePrefix {
-    RetryExhausted, // omp "Retry budget exhausted after N retries: "
-    RetryFailed,    // pi "Retry failed after N attempts: "
-    ErrorPrefix,    // "Error: "
-    None,           // bare line
+fn parse_prefix(s: &str) -> (&str, bool) {
+    let mut cur = s;
+    let mut has_prefix = false;
+    if cur
+        .get(..6)
+        .is_some_and(|h| h.eq_ignore_ascii_case("error:"))
+    {
+        cur = cur[6..].trim_start();
+        has_prefix = true;
+    }
+    for (prefix, label) in [
+        ("retry budget exhausted after ", "retries"),
+        ("retry failed after ", "attempts"),
+    ] {
+        if cur
+            .get(..prefix.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(prefix))
+        {
+            let rest = &cur[prefix.len()..];
+            if let Some(pos) = rest.find(':') {
+                let mid = &rest[..pos];
+                if mid.ends_with(label)
+                    && mid[..mid.len() - label.len()]
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                {
+                    return (rest[pos + 1..].trim_start(), true);
+                }
+            }
+        }
+    }
+    (cur, has_prefix)
 }
 
-fn parse_prefix(s: &str) -> (&str, LinePrefix) {
-    let mut cur = s;
-    let mut has_error = false;
-    if cur.len() >= 6 && cur[..6].eq_ignore_ascii_case("error:") {
-        cur = cur[6..].trim_start();
-        has_error = true;
-    }
-
-    if cur.len() >= 29 && cur[..29].eq_ignore_ascii_case("retry budget exhausted after ") {
-        let rest = &cur[29..];
-        if let Some(pos) = rest.find(':') {
-            let mid = &rest[..pos];
-            if mid.ends_with("retries")
-                && mid[..mid.len() - 7]
-                    .trim()
-                    .chars()
-                    .all(|c| c.is_ascii_digit())
-            {
-                return (rest[pos + 1..].trim_start(), LinePrefix::RetryExhausted);
-            }
-        }
-    }
-
-    if cur.len() >= 19 && cur[..19].eq_ignore_ascii_case("retry failed after ") {
-        let rest = &cur[19..];
-        if let Some(pos) = rest.find(':') {
-            let mid = &rest[..pos];
-            if mid.ends_with("attempts")
-                && mid[..mid.len() - 8]
-                    .trim()
-                    .chars()
-                    .all(|c| c.is_ascii_digit())
-            {
-                return (rest[pos + 1..].trim_start(), LinePrefix::RetryFailed);
-            }
-        }
-    }
-
-    if has_error {
-        (cur, LinePrefix::ErrorPrefix)
-    } else {
-        (s, LinePrefix::None)
-    }
+fn has_provider_sig(text: &str, rest: &str) -> bool {
+    text.contains("(type=")
+        || text.contains("(param=")
+        || text.contains("api error (")
+        || text.to_ascii_lowercase().contains("retry budget exhausted")
+        || (rest.starts_with(':') && rest[1..].trim_start().starts_with('{'))
 }
 
 fn classify_status(status: u16, full_text: &str) -> Option<ProviderError> {
@@ -193,51 +183,34 @@ fn classify_line(line: &str) -> Option<ProviderError> {
         }
     }
 
+    // Note: omp's structured `.error` sidecar (`runs/.<name>.error`) does not exist
+    // yet in the engine (no reader or writer in state.rs), so classification is text-only.
+    //
     // Status code patterns (omp and pi):
-    // omp: ^\s*(Error: )?(Retry budget exhausted after \d+ retries: )?(\d{3})
-    // pi:  ^\s*(Error: )?(Retry failed after \d+ attempts: )?(\d{3}):
-    let (after_prefix, prefix) = parse_prefix(trimmed);
+    // omp: ^\s*(Error: )?(Retry budget exhausted after \d+ retries: )?(\d{3}) <msg> (type=...|param=...)
+    // pi:  ^\s*(Error: )?(Retry failed after \d+ attempts: )?(\d{3}): {<json>}
+    let (after_prefix, _) = parse_prefix(trimmed);
     let bytes = after_prefix.as_bytes();
     if bytes.len() >= 3
         && bytes[0].is_ascii_digit()
         && bytes[1].is_ascii_digit()
         && bytes[2].is_ascii_digit()
+        && (bytes.len() == 3 || !bytes[3].is_ascii_digit())
     {
-        if bytes.len() == 3 || !bytes[3].is_ascii_digit() {
-            let status = (bytes[0] - b'0') as u16 * 100
-                + (bytes[1] - b'0') as u16 * 10
-                + (bytes[2] - b'0') as u16;
-            let rest = &after_prefix[3..];
-
-            // pi style: status followed by colon, e.g. "429: {...}"
-            if let Some(body) = rest.strip_prefix(':') {
-                let body = body.trim_start();
-                if prefix != LinePrefix::None || body.starts_with('{') {
-                    if let Some(err) = classify_status(status, trimmed) {
-                        return Some(err);
-                    }
-                } else if matches!(status, 401 | 403) {
-                    if let Some(err) = classify_status(status, trimmed) {
-                        return Some(err);
-                    }
-                }
-            }
-            // omp style: status followed by space, e.g. "429 Rate limit reached..."
-            else if rest.starts_with(' ') || rest.starts_with('\t') {
-                if prefix != LinePrefix::None {
-                    if let Some(err) = classify_status(status, trimmed) {
-                        return Some(err);
-                    }
-                } else if matches!(status, 401 | 403) {
-                    // Bare 401/403 only classifies with explicit quota/credential/key markers
-                    if let Some(err) = classify_status(status, trimmed) {
-                        return Some(err);
-                    }
-                }
+        let status = (bytes[0] - b'0') as u16 * 100
+            + (bytes[1] - b'0') as u16 * 10
+            + (bytes[2] - b'0') as u16;
+        let rest = &after_prefix[3..];
+        let has_sep = rest.starts_with(':')
+            || rest.starts_with(' ')
+            || rest.starts_with('\t')
+            || rest.is_empty();
+        if has_sep && has_provider_sig(line, rest) {
+            if let Some(err) = classify_status(status, line) {
+                return Some(err);
             }
         }
     }
-
     None
 }
 
@@ -249,39 +222,26 @@ pub fn classify(pane: &str) -> Option<ProviderError> {
     let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
     let mut hits = Vec::new();
     for (i, line) in tail.iter().enumerate() {
-        if let Some(err) = classify_line(line) {
-            hits.push(err);
-        } else {
-            // Check if line opened a bare 401/403 whose markers were wrapped into continuation lines
-            let trimmed = line
-                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '⎿' | '⏺' | '●'));
-            let (after_prefix, _) = parse_prefix(trimmed);
-            let bytes = after_prefix.as_bytes();
-            if bytes.len() >= 3
-                && bytes[0].is_ascii_digit()
-                && bytes[1].is_ascii_digit()
-                && bytes[2].is_ascii_digit()
-            {
-                if bytes.len() == 3 || !bytes[3].is_ascii_digit() {
-                    let status = (bytes[0] - b'0') as u16 * 100
-                        + (bytes[1] - b'0') as u16 * 10
-                        + (bytes[2] - b'0') as u16;
-                    if matches!(status, 401 | 403) {
-                        let mut combined = String::from(*line);
-                        for next in &tail[i + 1..tail.len().min(i + 4)] {
-                            if next.starts_with(' ') || next.starts_with('\t') {
-                                combined.push(' ');
-                                combined.push_str(next.trim());
-                            } else {
-                                break;
-                            }
-                        }
-                        if let Some(err) = classify_status(status, &combined) {
-                            hits.push(err);
-                        }
-                    }
+        let mut combined;
+        let candidate = if tail
+            .get(i + 1)
+            .is_some_and(|n| n.starts_with(' ') || n.starts_with('\t'))
+        {
+            combined = String::from(*line);
+            for next in &tail[i + 1..tail.len().min(i + 5)] {
+                if next.starts_with(' ') || next.starts_with('\t') {
+                    combined.push(' ');
+                    combined.push_str(next.trim());
+                } else {
+                    break;
                 }
             }
+            &combined
+        } else {
+            *line
+        };
+        if let Some(err) = classify_line(candidate) {
+            hits.push(err);
         }
     }
     hits.iter()
@@ -561,20 +521,23 @@ mod tests {
     fn classify_status_codes_retryable() {
         for (text, want) in [
             (
-                "Error: 408 Request Timeout",
+                "Error: 408 Request Timeout (type=timeout)",
                 ProviderError::Retryable("timeout"),
             ),
             (
                 r#"408: {"message":"Request Timeout"}"#,
                 ProviderError::Retryable("timeout"),
             ),
-            ("Error: 409 Conflict", ProviderError::Retryable("conflict")),
+            (
+                "Error: 409 Conflict (type=conflict)",
+                ProviderError::Retryable("conflict"),
+            ),
             (
                 r#"409: {"message":"Conflict"}"#,
                 ProviderError::Retryable("conflict"),
             ),
             (
-                "Error: 425 Too Early",
+                "Error: 425 Too Early (type=too_early)",
                 ProviderError::Retryable("too-early"),
             ),
             (
@@ -582,7 +545,7 @@ mod tests {
                 ProviderError::Retryable("too-early"),
             ),
             (
-                "Error: 500 Internal Server Error",
+                "Error: 500 Internal Server Error (type=server_error)",
                 ProviderError::Retryable("5xx"),
             ),
             (
@@ -590,7 +553,7 @@ mod tests {
                 ProviderError::Retryable("5xx"),
             ),
             (
-                "Error: 503 Service Unavailable",
+                "Error: 503 Service Unavailable (type=unavailable)",
                 ProviderError::Retryable("5xx"),
             ),
             (
