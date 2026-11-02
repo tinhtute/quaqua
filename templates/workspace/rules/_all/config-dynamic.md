@@ -1,3 +1,4 @@
+<!-- audience: orchestrator -->
 # Cấu hình động & profile của quaqua
 
 Cấu hình đổi **không cần sửa code**: mọi giá trị nằm trong `team.toml`, đọc lại mỗi lần spawn.

@@ -624,37 +624,15 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     crate::init::ensure_worker_push_guard(&repo).map_err(|e| (1, format!("{e}\n")))?;
 
     // Worker rules dump
-    let rules_dir = crate::workspace::workspace_root().join("rules");
+    let repo_name = repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+    let rules_content = crate::rules::dump(
+        &crate::workspace::workspace_root(),
+        repo_name,
+        crate::rules::Audience::Worker,
+    );
     let rf = runs_dir.join(format!("{}.rules.md", opts.name));
     if let Some(parent) = rf.parent() {
         let _ = std::fs::create_dir_all(parent);
-    }
-
-    let mut rules_content = String::new();
-    let all_rules = rules_dir.join("_all");
-    if let Ok(entries) = std::fs::read_dir(all_rules) {
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for p in paths {
-            if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(c) = std::fs::read_to_string(&p) {
-                    rules_content.push_str(&c);
-                }
-            }
-        }
-    }
-    let repo_name = repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
-    let repo_rules = rules_dir.join(repo_name);
-    if let Ok(entries) = std::fs::read_dir(repo_rules) {
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for p in paths {
-            if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(c) = std::fs::read_to_string(&p) {
-                    rules_content.push_str(&c);
-                }
-            }
-        }
     }
     let _ = std::fs::write(&rf, &rules_content);
 

@@ -1,3 +1,4 @@
+<!-- audience: orchestrator -->
 # Fanout agent grid — MANDATORY
 
 Every spawn/fanout of task workers MUST end with the workers arranged in the agent grid before any `herdr agent prompt`:
