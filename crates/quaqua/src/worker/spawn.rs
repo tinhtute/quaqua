@@ -257,17 +257,22 @@ impl<'a> Drop for LayoutRoleGuard<'a> {
         }
     }
 }
+/// herdr's answer to a failed `agent start`: its stdout, or its stderr when
+/// stdout is empty (a herdr usage error prints nothing on stdout).
+fn herdr_output_text(out: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if stdout.trim().is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        stdout
+    }
+}
+
 /// A short, stable slug for why an agent start failed: herdr's `error.code`
 /// when the output carries one (`agent_not_ready`, auth/quota codes), else
 /// `start-failed`.
 pub fn start_failure_reason(out: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let text = if stdout.trim().is_empty() {
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    } else {
-        stdout.into_owned()
-    };
-    if let Ok(j) = serde_json::from_str::<Value>(&text) {
+    if let Ok(j) = serde_json::from_str::<Value>(&herdr_output_text(out)) {
         if let Some(code) = j
             .get("error")
             .and_then(|e| e.get("code"))
@@ -279,6 +284,34 @@ pub fn start_failure_reason(out: &Output) -> String {
         }
     }
     "start-failed".to_string()
+}
+
+/// What herdr said about a failed `agent start`, for the operator: its
+/// `error.code` and `error.message` (`agent_start_input_failed: input contains
+/// a 1447-byte line ...`), the raw output when it is not herdr's JSON, or the
+/// spawn failure itself when herdr could not be run at all.
+pub fn start_failure_detail(out: &Output) -> String {
+    let text = herdr_output_text(out);
+    if let Ok(j) = serde_json::from_str::<Value>(&text) {
+        let field = |k: &str| {
+            j.get("error")
+                .and_then(|e| e.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        };
+        match (field("code"), field("message")) {
+            ("", "") => {}
+            ("", msg) => return msg.to_string(),
+            (code, "") => return code.to_string(),
+            (code, msg) => return format!("{code}: {msg}"),
+        }
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        "herdr agent start failed with no output".to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Resolve a kind's configured fallback, if any. Returns `Ok(None)` if no fallback
@@ -676,6 +709,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     let mut attempts: Vec<Launch> = vec![primary_launch];
 
     let mut pane_id = String::new();
+    let mut failures: Vec<String> = Vec::new();
     let mut idx = 0;
     while idx < attempts.len() {
         let launch = attempts[idx].clone();
@@ -687,20 +721,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
             &wt_str,
             opts.review,
         )?;
-        if launch.harness == "claude" {
-            let read_root = if opts.review {
-                Some(crate::launch::review_read_root(&wt_str))
-            } else {
-                None
-            };
-            let settings_val =
-                crate::launch::claude_settings(&opts.name, &runs_str, read_root.as_deref());
-            let settings_file = WorkerMetadata::settings_path(runs_dir, &opts.name);
-            let _ = std::fs::write(
-                &settings_file,
-                serde_json::to_string_pretty(&settings_val).unwrap_or_default(),
-            );
-        } else if launch.harness == "omp" {
+        if launch.harness == "omp" {
             let hook_path = crate::launch::omp_worker_state_hook_path(&runs_str);
             warn_if_omp_hook_missing(&hook_path);
         }
@@ -745,7 +766,13 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
         let rep_res = herdr.pane_report_metadata(&pane, &initial_tokens);
         if rep_res.is_err() || !rep_res.unwrap().status.success() {
             let _ = herdr.pane_close(&pane);
-            return Err((1, String::new()));
+            return Err((
+                1,
+                format!(
+                    "error: herdr refused the worker metadata tokens on pane {pane} for '{}'\n",
+                    opts.name
+                ),
+            ));
         }
 
         let arg_refs: Vec<&str> = cmd.agent_args.iter().map(String::as_str).collect();
@@ -754,6 +781,11 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
         let mut reason = match &start_res {
             Ok(out) if !out.status.success() => start_failure_reason(out),
             Err(_) => "start-failed".to_string(),
+            Ok(_) => String::new(),
+        };
+        let mut failure_detail = match &start_res {
+            Ok(out) if !out.status.success() => start_failure_detail(out),
+            Err(e) => format!("herdr could not be run: {e}"),
             Ok(_) => String::new(),
         };
 
@@ -809,6 +841,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
                 if ok {
                     started = true;
                     reason.clear();
+                    failure_detail.clear();
                 }
             }
         }
@@ -817,7 +850,13 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
             let ready_res = herdr.pane_report_metadata(&pane, &["grid_ready=1"]);
             if ready_res.is_err() || !ready_res.unwrap().status.success() {
                 let _ = herdr.pane_close(&pane);
-                return Err((1, String::new()));
+                return Err((
+                    1,
+                    format!(
+                        "error: herdr refused grid_ready=1 on pane {pane} for a started '{}'; the agent was closed\n",
+                        opts.name
+                    ),
+                ));
             }
             pane_id = pane;
             break;
@@ -829,11 +868,13 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
         if idx == 0 {
             if let Some((fb, fb_kind)) = fallback_kind(cfg, kind_info, &kind)? {
                 if opts.review && !fb_kind.can_review {
-                    eprintln!(
-                        "error: fallback '{fb}' cannot review; refusing fallback for review spawn of '{}'",
-                        opts.name
-                    );
-                    return Err((1, String::new()));
+                    return Err((
+                        1,
+                        format!(
+                            "error: fallback '{fb}' cannot review; refusing fallback for review spawn of '{}' ({failure_detail})\n",
+                            opts.name
+                        ),
+                    ));
                 }
                 crate::config::check_spawn_policy(fb, fb_kind, &opts.approve_kinds)?;
                 let fb_launch = resolve_launch(fb_kind, fb, cfg)?;
@@ -843,11 +884,31 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
                 continue;
             }
         }
-        return Err((1, String::new()));
+        let detail = if failure_detail.is_empty() {
+            reason.clone()
+        } else {
+            failure_detail.clone()
+        };
+        failures.push(format!("{kind}/{}: {detail}", launch.harness));
+        return Err((
+            1,
+            format!(
+                "error: herdr agent start failed for '{}' — {}\nnothing was sent to the worker\n",
+                opts.name,
+                failures.join("; ")
+            ),
+        ));
     }
 
     if pane_id.is_empty() {
-        return Err((1, String::new()));
+        return Err((
+            1,
+            format!(
+                "error: no herdr pane carries the agent for '{}' after start ({})\n",
+                opts.name,
+                failures.join("; ")
+            ),
+        ));
     }
     // Invariant: runs/<name>.layout_role exists iff this spawn produced a live agent.
     // The agent is confirmed live in pane_id. Disarm the guard so subsequent grid

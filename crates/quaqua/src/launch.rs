@@ -235,6 +235,32 @@ pub fn claude_settings(name: &str, runs_dir: &str, read_root: Option<&str>) -> s
     }
 }
 
+/// Write a worker's Claude settings and return the file path.
+///
+/// The settings travel as a file, never inline: herdr types the whole launch
+/// command into the pane's terminal, and a canonical-mode tty (macOS) refuses a
+/// line over 1024 bytes (`agent_start_input_failed`) before Claude Code ever
+/// runs — a review's inline settings alone are ~2 KB.
+pub fn write_claude_settings(
+    name: &str,
+    runs_dir: &str,
+    read_root: Option<&str>,
+) -> Result<String, (i32, String)> {
+    let path = crate::state::WorkerMetadata::settings_path(Path::new(runs_dir), name);
+    let body = serde_json::to_string_pretty(&claude_settings(name, runs_dir, read_root))
+        .map_err(|e| (1, format!("error: cannot render claude settings for '{name}': {e}\n")))?;
+    std::fs::write(&path, body).map_err(|e| {
+        (
+            1,
+            format!(
+                "error: cannot write claude settings for '{name}' to {} (fix: create the runs directory): {e}\n",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// One attempt's `herdr` invocation: the pane-split envs and the args after
 /// `herdr agent start <name> --kind <harness> --pane <p> --timeout <ms>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +275,10 @@ pub struct LaunchCmd {
 /// config `model` object `{"providerID": "...", "model": "...", "variant": "..."}`
 /// in OPENCODE_CONFIG_CONTENT in the pane env.
 /// omp and pi take `--model`/`--thinking`, claude takes `--model`/`--effort`.
+///
+/// Building a claude command writes `runs/.<name>.settings.json` (the caller
+/// must have created `runs_dir`) and names it on `--settings`, so the launch
+/// line stays one short typed line.
 pub fn build_launch_cmd(
     launch: &Launch,
     name: &str,
@@ -352,10 +382,10 @@ pub fn build_launch_cmd(
                 args.push(runs_dir.to_string());
                 args.push(read_root.clone());
                 args.push("--settings".to_string());
-                args.push(claude_settings(name, runs_dir, Some(&read_root)).to_string());
+                args.push(write_claude_settings(name, runs_dir, Some(&read_root))?);
             } else {
                 args.push("--settings".to_string());
-                args.push(claude_settings(name, runs_dir, None).to_string());
+                args.push(write_claude_settings(name, runs_dir, None)?);
             }
             args.push("--append-system-prompt-file".to_string());
             args.push(rules_file.to_string());
