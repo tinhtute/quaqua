@@ -201,14 +201,13 @@ fn dispatch_activity(
     journal: &mut dyn Journal,
     activities: &mut dyn Activity,
     clock: &impl RunnerClock,
-    max_seq: &mut u64,
+    cursor: &mut JournalCursor,
     events_since_snapshot: &mut u64,
 ) -> Result<WorkflowEvent, RunnerError> {
-    *max_seq += 1;
     append_at_cursor(
         journal,
         workflow_id,
-        max_seq,
+        cursor,
         clock.now_ms(),
         "activity_scheduled",
         serde_json::to_string(&ActivityScheduledData {
@@ -220,11 +219,10 @@ fn dispatch_activity(
     *events_since_snapshot += 1;
 
     let result = activities.execute(activity)?;
-    *max_seq += 1;
     append_at_cursor(
         journal,
         workflow_id,
-        max_seq,
+        cursor,
         clock.now_ms(),
         "activity_completed",
         serde_json::to_string(&ActivityCompletedData {
@@ -246,14 +244,13 @@ fn dispatch_timer(
     duration: Duration,
     journal: &mut dyn Journal,
     clock: &mut impl RunnerClock,
-    max_seq: &mut u64,
+    cursor: &mut JournalCursor,
     events_since_snapshot: &mut u64,
 ) -> Result<(), RunnerError> {
-    *max_seq += 1;
     append_at_cursor(
         journal,
         workflow_id,
-        max_seq,
+        cursor,
         clock.now_ms(),
         "timer_scheduled",
         serde_json::to_string(&TimerScheduledData {
@@ -263,16 +260,39 @@ fn dispatch_timer(
         .map_err(|e| RunnerError::Serialization(e.to_string()))?,
     )?;
     *events_since_snapshot += 1;
-    // Format tag with unique instance seq so re-armed timers don't conflict
-    clock.schedule_timer(&format!("{}:{id}", *max_seq), duration);
+    // Format tag with the landed seq so re-armed timers don't conflict
+    clock.schedule_timer(&format!("{}:{id}", cursor.seq), duration);
     Ok(())
+}
+
+/// Where this run writes next, and whether the journal still matches the state
+/// it has applied.
+///
+/// One value, so a rebase cannot advance the write cursor without also marking
+/// the run as diverged: the two facts are the same fact.
+struct JournalCursor {
+    /// The next sequence number to try, then the seq the journal assigned.
+    seq: u64,
+    /// Set on the first refused append, i.e. the first time another writer on
+    /// this workflow id committed past the cursor. From that point the history
+    /// holds events this run never applied, so it must not claim them.
+    diverged: bool,
+}
+
+impl JournalCursor {
+    fn new(head: u64) -> Self {
+        Self {
+            seq: head,
+            diverged: false,
+        }
+    }
 }
 
 /// Append tries spent on a sequence conflict before giving up. Each retry
 /// re-reads the head the journal reports, so this only bounds a writer storm.
 const SEQUENCE_REBASE_TRIES: u32 = 16;
 
-/// Append one event at the runner's in-memory cursor.
+/// Append one event at the runner's cursor, taking the next sequence number.
 ///
 /// The cursor is read once per process ([`run_until_blocked`]), so a second
 /// writer on the same workflow id can commit past it while this run is blocked
@@ -280,22 +300,36 @@ const SEQUENCE_REBASE_TRIES: u32 = 16;
 /// trace, not corruption: `expected_seq` is the free slot the journal reports,
 /// so rebase the cursor there and retry. The refused append inserted nothing,
 /// which keeps the event exactly once in a contiguous chain.
+///
+/// A rebase skips events this run never applied, so it marks the cursor
+/// diverged and prints one warning per run ([`warn_divergence`]).
 fn append_at_cursor(
     journal: &mut dyn Journal,
     workflow_id: &str,
-    cursor: &mut u64,
+    cursor: &mut JournalCursor,
     ts_ms: u64,
     kind: &str,
     payload: impl Into<String>,
 ) -> Result<(), RunnerError> {
     let payload = payload.into();
+    cursor.seq += 1;
     let mut last_conflict = None;
     for _ in 0..SEQUENCE_REBASE_TRIES {
-        let event = EventRecord::new(*cursor, ts_ms, kind, payload.clone());
+        let event = EventRecord::new(cursor.seq, ts_ms, kind, payload.clone());
         match journal.append_event(workflow_id, &event) {
             Ok(_) => return Ok(()),
             Err(e @ JournalError::SequenceConflict { expected_seq, .. }) => {
-                *cursor = expected_seq;
+                assert!(
+                    expected_seq > cursor.seq,
+                    "journal reports the free slot {expected_seq} for {workflow_id} \
+                     while this run holds seq {}: a conflict can only sit past this cursor",
+                    cursor.seq
+                );
+                if !cursor.diverged {
+                    cursor.diverged = true;
+                    warn_divergence(workflow_id, expected_seq - cursor.seq);
+                }
+                cursor.seq = expected_seq;
                 last_conflict = Some(e);
             }
             Err(e) => return Err(RunnerError::Journal(e)),
@@ -304,6 +338,45 @@ fn append_at_cursor(
     Err(RunnerError::Journal(
         last_conflict.expect("the loop ran at least once"),
     ))
+}
+
+/// Name the divergence once per run. Without it the rebase is invisible, and a
+/// second writer on the same workflow id (two watchdogs, a stray `--resume`)
+/// leaves no trace anywhere.
+fn warn_divergence(workflow_id: &str, unapplied: u64) {
+    eprintln!(
+        "WATCHDOG journal divergence: {workflow_id}: another writer committed \
+         {unapplied} event(s) this run did not apply; rebasing the cursor and \
+         writing no further snapshots this run"
+    );
+}
+
+/// Snapshot only while this run's state still matches the journal history.
+///
+/// `SnapshotRecord.seq` claims every event up to that seq is inside
+/// `state_json`, and [`run_until_blocked`] replays only events past the latest
+/// snapshot. After a rebase the journal holds events this run never applied
+/// while `state` already carries later events of its own, so no seq is honest:
+/// recording the cursor would mark foreign events incorporated forever, and
+/// recording an earlier seq would replay this run's own events onto a state
+/// that has them. Skip the snapshot instead; the next resume replays the gap.
+fn snapshot_if_contiguous<S: Serialize>(
+    journal: &mut dyn Journal,
+    workflow_id: &str,
+    cursor: &JournalCursor,
+    state: &S,
+) -> Result<(), RunnerError> {
+    if cursor.diverged {
+        return Ok(());
+    }
+    journal.append_snapshot(
+        workflow_id,
+        &SnapshotRecord::new(
+            cursor.seq,
+            serde_json::to_string(state).map_err(|e| RunnerError::Serialization(e.to_string()))?,
+        ),
+    )?;
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -390,7 +463,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
 ) -> Result<RunnerOutcome<W::Output>, RunnerError> {
     // 1. Inspect full history to handle terminal states and index activities/timers
     let all_events = journal.load_events(workflow_id, 1)?;
-    let mut current_seq = all_events.iter().map(|e| e.seq).max().unwrap_or(0);
+    let mut cursor = JournalCursor::new(all_events.iter().map(|e| e.seq).max().unwrap_or(0));
 
     // Finding 4: Resuming already completed or failed workflow returns terminal outcome immediately
     for rec in &all_events {
@@ -507,8 +580,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 *history_activity_completed
                     .entry(data.id.clone())
                     .or_default() += 1;
-                let result = serde_json::from_value(data.result)
-                    .unwrap_or(ActivityResult::Unknown);
+                let result = serde_json::from_value(data.result).unwrap_or(ActivityResult::Unknown);
                 historical_events_to_deliver.push_back(WorkflowEvent::ActivityCompleted {
                     id: data.id,
                     result,
@@ -724,11 +796,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
         match effect {
             ReplayEffect::ExecuteInFlightActivity { id, activity } => {
                 let result = activities.execute(&activity)?;
-                current_seq += 1;
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "activity_completed",
                     serde_json::to_string(&ActivityCompletedData {
@@ -749,7 +820,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         journal,
                         activities,
                         clock,
-                        &mut current_seq,
+                        &mut cursor,
                         &mut events_since_snapshot,
                     )?;
                     event_queue.push_back(ev);
@@ -761,7 +832,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         duration,
                         journal,
                         clock,
-                        &mut current_seq,
+                        &mut cursor,
                         &mut events_since_snapshot,
                     )?;
                 }
@@ -770,11 +841,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     workflow_type,
                     input,
                 } => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "child_started",
                         serde_json::to_string(&ChildStartedData {
@@ -796,7 +866,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         journal,
                         activities,
                         clock,
-                        &mut current_seq,
+                        &mut cursor,
                         &mut events_since_snapshot,
                     )?;
                     event_queue.push_back(ev);
@@ -808,7 +878,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         duration,
                         journal,
                         clock,
-                        &mut current_seq,
+                        &mut cursor,
                         &mut events_since_snapshot,
                     )?;
                 }
@@ -817,11 +887,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     workflow_type,
                     input,
                 } => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "child_started",
                         serde_json::to_string(&ChildStartedData {
@@ -834,11 +903,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     events_since_snapshot += 1;
                 }
                 StepDecision::Continue => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "continue",
                         "",
@@ -846,11 +914,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     events_since_snapshot += 1;
                 }
                 StepDecision::PauseForApproval { reason } => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "pause_for_approval",
                         serde_json::to_string(&PauseForApprovalData {
@@ -859,46 +926,30 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     if options.snapshot_at_blocked {
-                        journal.append_snapshot(
-                            workflow_id,
-                            &SnapshotRecord::new(
-                                current_seq,
-                                serde_json::to_string(&state)
-                                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                            ),
-                        )?;
+                        snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
                     }
                     return Ok(RunnerOutcome::Blocked(format!(
                         "pause_for_approval: {reason}"
                     )));
                 }
                 StepDecision::Complete(output) => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "workflow_completed",
                         serde_json::to_string(&output)
                             .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
-                    journal.append_snapshot(
-                        workflow_id,
-                        &SnapshotRecord::new(
-                            current_seq,
-                            serde_json::to_string(&state)
-                                .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
-                    )?;
+                    snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
                     return Ok(RunnerOutcome::Completed(output));
                 }
                 StepDecision::Fail { code, reason } => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "workflow_failed",
                         serde_json::to_string(&WorkflowFailedData {
@@ -914,13 +965,12 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
     }
     // Append and queue any new incoming external events in FIFO order
     for ev in incoming_events {
-        current_seq += 1;
         match &ev {
             WorkflowEvent::ApprovalResolved { approved, reason } => {
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "approval_resolved",
                     serde_json::to_string(&ApprovalResolvedData {
@@ -934,7 +984,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "activity_completed",
                     serde_json::to_string(&ActivityCompletedData {
@@ -948,7 +998,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "timer_fired",
                     serde_json::to_string(&TimerFiredData { id: id.clone() })
@@ -959,7 +1009,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "child_completed",
                     serde_json::to_string(&ChildCompletedData {
@@ -973,7 +1023,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "child_failed",
                     serde_json::to_string(&ChildFailedData {
@@ -1020,11 +1070,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         fired_timer_seqs.insert(sched_seq);
                     }
 
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "timer_fired",
                         serde_json::to_string(&TimerFiredData {
@@ -1042,14 +1091,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 Some(ev)
             } else {
                 if options.snapshot_at_blocked {
-                    journal.append_snapshot(
-                        workflow_id,
-                        &SnapshotRecord::new(
-                            current_seq,
-                            serde_json::to_string(&state)
-                                .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
-                    )?;
+                    snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
                 }
                 return Ok(RunnerOutcome::Blocked(
                     "no pending events or timers".to_string(),
@@ -1058,14 +1100,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
         } else {
             // Quiescent point: event queue empty and no pending timers can fire
             if options.snapshot_at_blocked {
-                journal.append_snapshot(
-                    workflow_id,
-                    &SnapshotRecord::new(
-                        current_seq,
-                        serde_json::to_string(&state)
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
-                )?;
+                snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
             }
             return Ok(RunnerOutcome::Blocked(
                 "no pending events or timers".to_string(),
@@ -1086,7 +1121,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         journal,
                         activities,
                         clock,
-                        &mut current_seq,
+                        &mut cursor,
                         &mut events_since_snapshot,
                     )?;
                     event_queue.push_back(ev);
@@ -1098,7 +1133,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                         duration,
                         journal,
                         clock,
-                        &mut current_seq,
+                        &mut cursor,
                         &mut events_since_snapshot,
                     )?;
                 }
@@ -1107,11 +1142,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     workflow_type,
                     input,
                 } => {
-                    current_seq += 1;
                     append_at_cursor(
                         journal,
                         workflow_id,
-                        &mut current_seq,
+                        &mut cursor,
                         clock.now_ms(),
                         "child_started",
                         serde_json::to_string(&ChildStartedData {
@@ -1129,11 +1163,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
         // Process step decision
         match decision {
             StepDecision::Continue => {
-                current_seq += 1;
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "continue",
                     "",
@@ -1148,7 +1181,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     journal,
                     activities,
                     clock,
-                    &mut current_seq,
+                    &mut cursor,
                     &mut events_since_snapshot,
                 )?;
                 event_queue.push_back(ev);
@@ -1160,16 +1193,15 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     duration,
                     journal,
                     clock,
-                    &mut current_seq,
+                    &mut cursor,
                     &mut events_since_snapshot,
                 )?;
             }
             StepDecision::PauseForApproval { reason } => {
-                current_seq += 1;
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "pause_for_approval",
                     serde_json::to_string(&PauseForApprovalData {
@@ -1178,46 +1210,30 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
                 if options.snapshot_at_blocked {
-                    journal.append_snapshot(
-                        workflow_id,
-                        &SnapshotRecord::new(
-                            current_seq,
-                            serde_json::to_string(&state)
-                                .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
-                    )?;
+                    snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
                 }
                 return Ok(RunnerOutcome::Blocked(format!(
                     "pause_for_approval: {reason}"
                 )));
             }
             StepDecision::Complete(output) => {
-                current_seq += 1;
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "workflow_completed",
                     serde_json::to_string(&output)
                         .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
-                journal.append_snapshot(
-                    workflow_id,
-                    &SnapshotRecord::new(
-                        current_seq,
-                        serde_json::to_string(&state)
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
-                )?;
+                snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
                 return Ok(RunnerOutcome::Completed(output));
             }
             StepDecision::Fail { code, reason } => {
-                current_seq += 1;
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "workflow_failed",
                     serde_json::to_string(&WorkflowFailedData {
@@ -1233,11 +1249,10 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 workflow_type,
                 input,
             } => {
-                current_seq += 1;
                 append_at_cursor(
                     journal,
                     workflow_id,
-                    &mut current_seq,
+                    &mut cursor,
                     clock.now_ms(),
                     "child_started",
                     serde_json::to_string(&ChildStartedData {
@@ -1257,14 +1272,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
             && events_since_snapshot >= options.snapshot_interval
             && event_queue.is_empty()
         {
-            journal.append_snapshot(
-                workflow_id,
-                &SnapshotRecord::new(
-                    current_seq,
-                    serde_json::to_string(&state)
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                ),
-            )?;
+            snapshot_if_contiguous(journal, workflow_id, &cursor, &state)?;
             events_since_snapshot = 0;
         }
     }
@@ -3431,9 +3439,9 @@ mod tests {
             event: &EventRecord,
         ) -> Result<u64, JournalError> {
             self.events.append(&mut self.pending_foreign);
-            let expected_seq = self.stale_slot.unwrap_or_else(|| {
-                self.events.iter().map(|e| e.seq).max().unwrap_or(0) + 1
-            });
+            let expected_seq = self
+                .stale_slot
+                .unwrap_or_else(|| self.events.iter().map(|e| e.seq).max().unwrap_or(0) + 1);
             if event.seq != expected_seq {
                 return Err(JournalError::SequenceConflict {
                     workflow_id: workflow_id.to_string(),
