@@ -103,11 +103,18 @@ Một lệnh mới, tường minh: `quaqua bus migrate [--dry-run]`, code trong 
 | Lệnh | Trạng thái | Hành vi |
 |---|---|---|
 | `quaqua mail send --to <n> --kind <k> --body-file -` | giữ | Ghi một trigger `source='mail'`. Không ghi `<to>.inbox.md`. Sau khi ghi gọi wake (§7) |
-| `quaqua mail inbox` | giữ, đổi nguồn | Render digest (§6) từ cursor của caller, rồi đẩy cursor tới trigger cuối đã in |
+| `quaqua mail inbox [--for <n>] [--peek]` | giữ, đổi nguồn | Render digest (§6) từ cursor của consumer, rồi đẩy cursor tới trigger cuối đã in. Consumer và quyền đẩy cursor: xem dưới bảng |
 | `quaqua mail ack` | **xoá** | Không có alias. Template và rule ngừng nhắc tới |
 | `quaqua recall <id>` | **mới**, seam cần anh iu duyệt | In trigger `<id>`, Thread của nó, và đối tượng `ref` (§8) |
 | `quaqua source github-ci poll` | **mới**, seam cần anh iu duyệt | Một lần poll (§9). Chạy bằng systemd user timer, cùng kiểu auditor |
 | `quaqua bus migrate [--dry-run]` | **mới**, seam cần anh iu duyệt | §4 |
+
+Consumer của `mail inbox` (đọc mà tự đánh dấu đã đọc nên phải chặn đọc hộ):
+
+- Không `--for`: consumer = caller từ `identity::resolve_caller`. Caller Unknown (mất tag pane #163, hoặc `HERDR_BIN_PATH` trỏ tới binary không tồn tại) → exit 1 với lỗi "unresolved caller", không render, không đẩy cursor nào.
+- `--for <n>`: render digest của `<n>`. Chỉ đẩy cursor khi caller đã resolve trùng `<n>`. Caller khác `<n>` hoặc Unknown → render như `--peek` và in một dòng cảnh báo ra stderr. Không ai đọc hộ làm mất tin của consumer khác.
+- `--peek`: render, không bao giờ đẩy cursor.
+- Hook CoS (§6) giữ `--for cos`, không dựa vào caller ngầm. Nếu identity CoS hỏng, hook vẫn hiện tin (peek) thay vì lỗi im lặng; digest lặp lại ở mỗi prompt là tín hiệu để sửa identity.
 
 Exit code: 0 thành công, 1 lỗi dùng sai, 2 lỗi DB. Output digest là text thuần một dòng mỗi trigger. `--json` cho `inbox` và `recall` in đúng các cột của bảng.
 
