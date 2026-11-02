@@ -42,7 +42,7 @@ The Rust engine lives in its own checkout `~/Lab/quaqua`. `~/quaqua` holds only 
 ### What goes where
 | Path in the repo (after B1) | Role | Note |
 |---|---|---|
-| `templates/workspace/**` | **managed** template, embedded | mirrors the workspace root: `AGENTS.md`, `identity.md`, `SOUL.md`, `PEER.md`, `models.md`, `team.toml`, `rules/_all/**`, `.claude/settings.json`, `.claude/rules/**`, `.claude/skills/herdr-orchestration/**`, `scripts/hooks/herdr-gate.sh`, `scripts/auditor/**` |
+| `templates/workspace/**` | **managed** template, embedded | mirrors the workspace root: `AGENTS.md`, `identity.md`, `SOUL.md`, `PEER.md`, `models.md`, `team.toml`, `rules/_all/**`, `.claude/settings.json`, `.claude/rules/**`, `.claude/skills/herdr-orchestration/**`, `scripts/hooks/herdr-gate.sh`, `scripts/hooks/omp-worker-state.ts`, `scripts/auditor/**` |
 | `templates/seed/**` | **seed-once**, embedded | `memory-rules.md`, `projects-INDEX.md`, `projects-_template.md`, `USER.example.md`; copied only when the target is missing (`init.rs:195`, `:268`), never updated |
 | `crates/**`, `Cargo.*`, `plugins/**`, `tests/**`, `.github/**`, `docs/**`, `LICENSE`, `README.md`, `SETUP-PROMPT.md` | engine-only | never copied into a workspace |
 | `AGENTS.md` (new, root) | engine-only | ≤20-line contributor stub for workers in engine worktrees: the CoS doc is `templates/workspace/AGENTS.md`; worker rules arrive via `runs/<name>.rules.md` (`worker/spawn.rs:309`) |

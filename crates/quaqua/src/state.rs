@@ -244,11 +244,14 @@ impl WorkerMetadata {
         let _ = fs::remove_file(Self::cost80_path(runs_dir, name));
         let _ = fs::remove_file(Self::cost100_path(runs_dir, name));
         let _ = fs::remove_file(Self::cost200_path(runs_dir, name));
+        // A harness verdict belongs to the turn that produced it (#196): a
+        // fresh prompt must not inherit the previous turn's error.
+        let _ = fs::remove_file(crate::worker::prompt::retry::error_path(runs_dir, name));
     }
 
     /// Clean up all metadata and transient state files for a worker.
     /// Ensures `.cost80`, `.cost100`, `.cost200`, `.owner`, `.grid`, `.pipeline`,
-    /// `.provider_retry`, etc. are all deleted.
+    /// `.provider_retry`, `.error`, etc. are all deleted.
     pub fn cleanup_worker_files(runs_dir: &Path, name: &str) {
         let _ = fs::remove_file(Self::owner_path(runs_dir, name));
         let _ = fs::remove_file(Self::grid_path(runs_dir, name));
@@ -256,6 +259,7 @@ impl WorkerMetadata {
         let _ = fs::remove_file(Self::pipeline_path(runs_dir, name));
         let _ = fs::remove_file(Self::taskforce_path(runs_dir, name));
         let _ = fs::remove_file(Self::review_path(runs_dir, name));
+        let _ = fs::remove_file(crate::worker::prompt::retry::error_path(runs_dir, name));
         let _ = fs::remove_file(Self::provider_retry_path(runs_dir, name));
         let _ = fs::remove_file(Self::cost80_path(runs_dir, name));
         let _ = fs::remove_file(Self::cost100_path(runs_dir, name));
@@ -423,12 +427,70 @@ impl ExecutionState {
     pub fn owner(&self) -> &str {
         let lead = match self {
             ExecutionState::Pipeline(p) => &p.lead,
-            ExecutionState::Taskforce(t) => &t.lead,
+            ExecutionState::Taskforce(p) => &p.lead,
         };
         if lead.is_empty() {
             "cos"
         } else {
             lead
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "quaqua-state-{}-{}-{tag}",
+                std::process::id(),
+                crate::util::now_sec()
+            ));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// #196 review: the harness verdict belongs to one turn, so a fresh prompt
+    /// drops it instead of letting the next stall inherit it.
+    #[test]
+    fn reset_prompt_state_drops_the_harness_error_record() {
+        let dir = TempDir::new("reset");
+        let record = crate::worker::prompt::retry::error_path(&dir.0, "sude-x");
+        fs::write(&record, "fatal 401 0\n").unwrap();
+        let elapsed = WorkerMetadata::elapsed_path(&dir.0, "sude-x");
+        fs::write(&elapsed, "5\n").unwrap();
+
+        WorkerMetadata::reset_prompt_state(&dir.0, "sude-x");
+
+        assert!(!record.exists(), "the previous turn's verdict is gone");
+        assert!(!elapsed.exists(), "the other transient files still reset");
+    }
+
+    /// #196 review: a cleaned-up worker leaves no verdict behind that a later
+    /// worker of the same name would read.
+    #[test]
+    fn cleanup_worker_files_drops_the_harness_error_record() {
+        let dir = TempDir::new("cleanup");
+        let record = crate::worker::prompt::retry::error_path(&dir.0, "sude-x");
+        fs::write(&record, "retryable 429 3\n").unwrap();
+        let owner = WorkerMetadata::owner_path(&dir.0, "sude-x");
+        fs::write(&owner, "cos\n").unwrap();
+
+        WorkerMetadata::cleanup_worker_files(&dir.0, "sude-x");
+
+        assert!(!record.exists());
+        assert!(!owner.exists(), "the other metadata files still go");
     }
 }
