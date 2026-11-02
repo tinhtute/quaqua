@@ -153,11 +153,15 @@ pub fn review_read_root(wt: &str) -> String {
         .unwrap_or_else(|| wt.to_string())
 }
 
-/// Resolve the path to the `omp-worker-state.ts` extension.
-pub fn omp_worker_state_hook_path(runs_dir: &str) -> String {
-    if let Ok(p) = std::env::var("QUAQUA_OMP_STATE_HOOK") {
+/// Pure helper for resolving the path to the `omp-worker-state.ts` extension.
+pub fn omp_worker_state_hook_path_from_env(
+    runs_dir: &str,
+    env_override: Option<&str>,
+    workspace_root: &Path,
+) -> String {
+    if let Some(p) = env_override {
         if !p.is_empty() {
-            return p;
+            return p.to_string();
         }
     }
     if let Some(parent) = Path::new(runs_dir).parent() {
@@ -166,17 +170,20 @@ pub fn omp_worker_state_hook_path(runs_dir: &str) -> String {
             return candidate.to_string_lossy().to_string();
         }
     }
-    let ws_hook = crate::workspace::workspace_root().join("scripts/hooks/omp-worker-state.ts");
+    let ws_hook = workspace_root.join("scripts/hooks/omp-worker-state.ts");
     if ws_hook.is_file() {
         return ws_hook.to_string_lossy().to_string();
     }
-    let tmpl = Path::new("templates/workspace/scripts/hooks/omp-worker-state.ts");
-    if tmpl.is_file() {
-        if let Ok(canon) = tmpl.canonicalize() {
-            return canon.to_string_lossy().to_string();
-        }
-    }
     ws_hook.to_string_lossy().to_string()
+}
+
+/// Resolve the path to the `omp-worker-state.ts` extension.
+pub fn omp_worker_state_hook_path(runs_dir: &str) -> String {
+    omp_worker_state_hook_path_from_env(
+        runs_dir,
+        std::env::var("QUAQUA_OMP_STATE_HOOK").ok().as_deref(),
+        &crate::workspace::workspace_root(),
+    )
 }
 
 /// Build settings JSON for Claude Code containing per-worker hooks for liveness
@@ -292,15 +299,6 @@ pub fn build_launch_cmd(
             }
             args.push("--append-system-prompt".to_string());
             args.push(rules_file.to_string());
-            args.push("--no-extensions".to_string());
-
-            let home = std::env::var("HOME").unwrap_or_default();
-            let herdr_omp_ext = format!("{home}/.omp/agent/extensions/herdr-omp-agent-state.ts");
-            if std::path::Path::new(&herdr_omp_ext).is_file() {
-                args.push("-e".to_string());
-                args.push(herdr_omp_ext);
-            }
-
             let worker_state_ext = omp_worker_state_hook_path(runs_dir);
             args.push("-e".to_string());
             args.push(worker_state_ext);
@@ -500,8 +498,9 @@ mod tests {
             )
         );
 
-        assert!(cmd.agent_args.iter().any(|a| a == "--no-extensions"));
-        let worker_ext = super::omp_worker_state_hook_path("/workspace/runs");
+        // Finding 1 [major]: No --no-extensions, discovery remains enabled, exactly one -e
+        assert!(!cmd.agent_args.iter().any(|a| a == "--no-extensions"));
+        assert!(!cmd.agent_args.iter().any(|a| a.contains("herdr-omp-agent-state.ts")));
         let ext_indices: Vec<usize> = cmd
             .agent_args
             .iter()
@@ -509,9 +508,9 @@ mod tests {
             .filter(|(_, a)| *a == "-e")
             .map(|(i, _)| i)
             .collect();
-        assert!(!ext_indices.is_empty(), "must pass at least one -e");
-        let last_ext_idx = *ext_indices.last().unwrap();
-        assert_eq!(cmd.agent_args[last_ext_idx + 1], worker_ext);
+        assert_eq!(ext_indices.len(), 1, "must pass exactly one -e for worker state extension");
+        let worker_ext = super::omp_worker_state_hook_path("/workspace/runs");
+        assert_eq!(cmd.agent_args[ext_indices[0] + 1], worker_ext);
 
         // Review mode includes OMP_REVIEW_TOOLS
         let cmd_rev = super::build_launch_cmd(
@@ -530,11 +529,22 @@ mod tests {
     }
 
     #[test]
-    fn omp_worker_state_hook_path_respects_env_override() {
-        std::env::set_var("QUAQUA_OMP_STATE_HOOK", "/custom/omp-state.ts");
-        let p = super::omp_worker_state_hook_path("/workspace/runs");
-        std::env::remove_var("QUAQUA_OMP_STATE_HOOK");
+    fn omp_worker_state_hook_path_pure_resolver_respects_override() {
+        let p = super::omp_worker_state_hook_path_from_env(
+            "/workspace/runs",
+            Some("/custom/omp-state.ts"),
+            std::path::Path::new("/dummy/workspace"),
+        );
         assert_eq!(p, "/custom/omp-state.ts");
+    }
+
+    #[test]
+    fn omp_hook_path_ignores_cwd_templates_and_falls_back_to_workspace() {
+        // Finding 3 [minor]: Does not check cwd-relative templates/ directory;
+        // falls back to <workspace_root>/scripts/hooks/omp-worker-state.ts.
+        let ws = std::path::Path::new("/nonexistent/ws");
+        let p = super::omp_worker_state_hook_path_from_env("/nonexistent/runs", None, ws);
+        assert_eq!(p, "/nonexistent/ws/scripts/hooks/omp-worker-state.ts");
     }
 
     #[test]
