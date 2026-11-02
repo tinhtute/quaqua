@@ -114,3 +114,66 @@ fn test_live_db_detected_even_when_home_is_overridden_first() {
         "live DB must still be recognized as live even when HOME was mutated to a temp directory"
     );
 }
+
+#[test]
+fn test_sqlite_open_conn_refused_for_live_db() {
+    let _guard = EnvGuard::new(&[]);
+    let live_db = quaqua::workspace::live_workspace_db().expect("system user home");
+
+    let open_res = quaqua::engine::sqlite::open_conn(&live_db);
+
+    assert!(
+        open_res.is_err(),
+        "open_conn() must refuse the live workspace database at {live_db:?} under test"
+    );
+}
+
+#[test]
+fn test_cost_query_activity_refused_for_live_db() {
+    use quaqua::engine::activity::{ActivityRequest, CostRequest};
+    use quaqua::engine::Activity;
+
+    let _guard = EnvGuard::new(&["QUAQUA_COST_DB_PATH", "HOME"]);
+    let live_db = quaqua::workspace::live_workspace_db().expect("system user home");
+    // Only the live DB is a candidate: the state dir and the opencode home DB
+    // must not exist, so the activity has nothing else to read.
+    let fake_home = std::env::temp_dir().join("quaqua-guard-fake-home");
+    let _ = std::fs::remove_dir_all(&fake_home);
+    std::env::set_var("HOME", &fake_home);
+    std::env::set_var("QUAQUA_COST_DB_PATH", &live_db);
+
+    let activities = quaqua::engine::activities::SystemActivities::with_repo_dir(&fake_home);
+    let req = ActivityRequest::Cost(CostRequest::QuerySpend {
+        session_pattern: "ses-guard".to_string(),
+    });
+
+    let res = activities.execute(&req);
+
+    assert!(
+        res.is_err(),
+        "cost QuerySpend must refuse the live workspace database at {live_db:?} under test, got {res:?}"
+    );
+}
+
+#[test]
+fn test_opencode_spend_refused_for_live_db() {
+    let _guard = EnvGuard::new(&["HOME"]);
+    let live_db = quaqua::workspace::live_workspace_db().expect("system user home");
+
+    let spend = quaqua::worker::prompt::cost::read_worker_spend_with(
+        "guard-worker",
+        "ses-guard",
+        "/tmp/quaqua-guard-cwd",
+        "opencode",
+        None,
+        Some(&live_db),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        spend.spend_src, "live-db-refused",
+        "reading spend from the live workspace database at {live_db:?} must report the refusal, not a missing db"
+    );
+    assert!(spend.usd.is_none(), "a refused live DB yields no spend");
+}

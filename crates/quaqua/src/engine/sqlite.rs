@@ -51,6 +51,9 @@ pub fn retry_while_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> rusql
 /// and enables WAL journal mode with retry while busy.
 /// Creates parent directories if they do not exist.
 pub fn open_conn(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    if crate::workspace::live_db_open_refused(path) {
+        return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             let _ = std::fs::create_dir_all(parent);

@@ -682,6 +682,12 @@ impl SystemActivities {
                 }
 
                 for db_path in db_candidates {
+                    if crate::workspace::live_db_open_refused(&db_path) {
+                        return Err(ActivityError::ExecutionFailed(format!(
+                            "refusing to read live workspace database under test: {}",
+                            db_path.display()
+                        )));
+                    }
                     if !db_path.is_file() {
                         continue;
                     }
