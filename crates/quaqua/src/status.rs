@@ -19,6 +19,10 @@ use crate::engine::journal_sqlite::{
 use crate::git::{Git, GitOps};
 use crate::herdr::HerdrOps;
 use crate::state::WorkerMetadata;
+#[path = "estimate.rs"]
+pub mod estimate;
+
+use estimate::{estimate, query_active_worker_start_ms, query_completed_durations, Estimate};
 
 /// A workflow row extracted from the journal SQLite database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +76,8 @@ pub struct OrchestrationRow {
     pub flags: Vec<WarningFlag>,
     /// Why a blocked worker needs the Principal; `None` unless blocked (#179).
     pub blocked_reason: Option<BlockReason>,
+    /// Remaining runtime estimate backed by historical completed runs (#180).
+    pub estimate: Option<Estimate>,
 }
 
 /// The fixed set of reasons a blocked worker shows in `quaqua status` (#179).
@@ -586,6 +592,17 @@ pub fn scan_orchestration<H: HerdrOps>(
             }
         }
     }
+    let db_path = runs_dir.join("quaqua.db");
+    let duration_groups = query_completed_durations(&db_path).unwrap_or_default();
+    let db_conn = if db_path.exists() {
+        rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()
+    } else {
+        None
+    };
 
     let now_sec = crate::util::now_sec();
     let mut rows = Vec::new();
@@ -668,29 +685,18 @@ pub fn scan_orchestration<H: HerdrOps>(
             flags.push(WarningFlag::DoneNotCleaned);
         }
 
-        let has_session = {
-            let db_path = runs_dir.join("quaqua.db");
-            if db_path.exists() {
-                rusqlite::Connection::open_with_flags(
-                    &db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        let has_session = db_conn
+            .as_ref()
+            .and_then(|conn| {
+                let pattern = format!("worker:{name}#%");
+                conn.query_row(
+                    "SELECT 1 FROM events WHERE workflow_id LIKE ? LIMIT 1;",
+                    [&pattern],
+                    |_| Ok(()),
                 )
                 .ok()
-                .and_then(|conn| {
-                    let pattern = format!("worker:{name}#%");
-                    conn.query_row(
-                        "SELECT 1 FROM events WHERE workflow_id LIKE ? LIMIT 1;",
-                        [&pattern],
-                        |_| Ok(()),
-                    )
-                    .ok()
-                })
-                .is_some()
-            } else {
-                false
-            }
-        };
+            })
+            .is_some();
         let has_progress = WorkerMetadata::progress_path(runs_dir, &name).exists();
         if is_task_worker_name(&name, cfg)
             && agent_status == "idle"
@@ -718,8 +724,34 @@ pub fn scan_orchestration<H: HerdrOps>(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".to_string());
 
-        let elapsed = WorkerMetadata::load_elapsed(runs_dir, &name);
-        let wait_time = if elapsed > 0 {
+        let mut elapsed = WorkerMetadata::load_elapsed(runs_dir, &name);
+        if elapsed == 0 && agent_status == "working" {
+            if let Some(conn) = &db_conn {
+                if let Some(start_ms) = query_active_worker_start_ms(conn, &name) {
+                    elapsed = now_sec.saturating_sub(start_ms / 1000);
+                }
+            }
+        }
+
+        let estimate = if agent_status == "working" {
+            let kind = crate::config::kind_of_worker(cfg, &name);
+            let playbook =
+                crate::worker::prompt::playbook_check::PlaybookPin::read(runs_dir, &name)
+                    .map(|p| p.name);
+            match (kind, playbook) {
+                (Some(k), Some(p)) => {
+                    let key = (k.to_string(), p);
+                    duration_groups.get(&key).and_then(|samples| {
+                        estimate(samples, std::time::Duration::from_secs(elapsed))
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let elapsed_str = if elapsed > 0 {
             if elapsed >= 60 {
                 format!("{}m", elapsed / 60)
             } else {
@@ -727,6 +759,18 @@ pub fn scan_orchestration<H: HerdrOps>(
             }
         } else {
             "-".to_string()
+        };
+
+        let wait_time = match &estimate {
+            Some(est) => {
+                let base = if elapsed > 0 {
+                    elapsed_str
+                } else {
+                    "0s".to_string()
+                };
+                format!("{base} ({})", est.label())
+            }
+            None => elapsed_str,
         };
 
         flags.sort();
@@ -743,6 +787,7 @@ pub fn scan_orchestration<H: HerdrOps>(
             wait_time,
             flags,
             blocked_reason: reason,
+            estimate,
         });
     }
 
@@ -799,8 +844,14 @@ pub fn format_status_report(
             out.push_str("no active agents or workers\n");
         }
         Ok(orch_rows) => {
+            let wait_width = orch_rows
+                .iter()
+                .map(|r| r.wait_time.len())
+                .max()
+                .unwrap_or(4)
+                .max(8);
             out.push_str(&format!(
-                "{:<18} {:<16} {:<12} {:<10} {:<8} {:<10} {:<8} {}\n",
+                "{:<18} {:<16} {:<12} {:<10} {:<8} {:<10} {:<wait_width$} {}\n",
                 "NAME", "OWNER", "TEAM", "STATUS", "REPORT", "PHASE", "WAIT", "WARNINGS"
             ));
             for r in orch_rows {
@@ -819,7 +870,7 @@ pub fn format_status_report(
                         .join(", ")
                 };
                 out.push_str(&format!(
-                    "{:<18} {:<16} {:<12} {:<10} {:<8} {:<10} {:<8} {}\n",
+                    "{:<18} {:<16} {:<12} {:<10} {:<8} {:<10} {:<wait_width$} {}\n",
                     r.name,
                     r.owner,
                     r.team,
@@ -2775,6 +2826,237 @@ mod tests {
         assert!(out.contains("sude-w1"));
         assert!(out.contains("WAIT"));
         assert!(out.contains("TEAM"));
+    }
+    #[test]
+    fn test_status_orchestration_shows_estimate_when_group_has_at_least_min_samples() {
+        let _env_lock = crate::test_env::lock_env();
+        let tmp = temp_test_dir("est-min-samples");
+        let _cleaner = TempDirCleaner(tmp.clone());
+
+        let db_path = tmp.join("quaqua.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE events (
+                    workflow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    ts_ms INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                CREATE TABLE snapshots (
+                    workflow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                "#,
+            )
+            .expect("init tables");
+
+            // Insert 5 successful runs: 100s, 200s, 300s, 400s, 500s -> median 300s (5m)
+            for (i, dur_ms) in [100_000, 200_000, 300_000, 400_000, 500_000]
+                .iter()
+                .enumerate()
+            {
+                let wf = format!("worker:sude-p{i}#1");
+                conn.execute(
+                    "INSERT INTO events VALUES (?, 10, 1000, 'workflow_completed', '{\"exit\":0}');",
+                    [&wf],
+                )
+                .unwrap();
+                let state = format!(
+                    "{{\"input\":{{\"kind\":\"sude\"}},\"config\":{{\"playbook\":{{\"name\":\"feature\"}}}},\"prev_elapsed_ms\":{dur_ms}}}"
+                );
+                conn.execute("INSERT INTO snapshots VALUES (?, 10, ?);", [&wf, &state])
+                    .unwrap();
+            }
+
+            // Also insert an exit=3 (failed) run that should be ignored
+            conn.execute(
+                "INSERT INTO events VALUES ('worker:sude-bad#1', 10, 2000, 'workflow_completed', '{\"exit\":3}');",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots VALUES ('worker:sude-bad#1', 10, '{\"input\":{\"kind\":\"sude\"},\"config\":{\"playbook\":{\"name\":\"feature\"}},\"prev_elapsed_ms\":10000}');",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mock_json = r#"{
+            "result": {
+                "agents": [
+                    {"name": "sude-w1", "agent_status": "working"}
+                ]
+            }
+        }"#;
+        let mock = MockHerdr::new(mock_json);
+        fs::write(tmp.join("sude-w1.owner"), "cos\n").unwrap();
+        // Playbook pin for sude-w1: feature
+        fs::write(
+            tmp.join(".sude-w1.playbook"),
+            "name=feature\nids=1,2,3,4,5\n",
+        )
+        .unwrap();
+        // Elapsed: 60s (1m)
+        fs::write(tmp.join(".sude-w1.elapsed"), "60\n").unwrap();
+
+        let rows = scan_orchestration(&tmp, &mock, &test_team_cfg()).expect("scan orchestration");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.name, "sude-w1");
+        assert!(row.estimate.is_some(), "must have estimate with 5 samples");
+        let est = row.estimate.as_ref().unwrap();
+        assert_eq!(est.sample_size, 5);
+        assert_eq!(est.median_duration, std::time::Duration::from_secs(300));
+        assert_eq!(est.time_left, std::time::Duration::from_secs(240));
+        // wait_time formatted with estimate: 1m (~4m left, n=5)
+        assert_eq!(row.wait_time, "1m (~4m left, n=5)");
+
+        let out = format_status_report(Ok(&[]), Ok(&rows), Ok(&[]));
+        assert!(out.contains("sude-w1"));
+        assert!(out.contains("1m (~4m left, n=5)"));
+    }
+
+    #[test]
+    fn test_status_orchestration_no_estimate_when_fewer_than_min_samples() {
+        let _env_lock = crate::test_env::lock_env();
+        let tmp = temp_test_dir("est-few-samples");
+        let _cleaner = TempDirCleaner(tmp.clone());
+
+        let db_path = tmp.join("quaqua.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE events (
+                    workflow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    ts_ms INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                CREATE TABLE snapshots (
+                    workflow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                "#,
+            )
+            .expect("init tables");
+
+            // Insert only 4 successful runs (N=5 required)
+            for (i, dur_ms) in [100_000, 200_000, 300_000, 400_000].iter().enumerate() {
+                let wf = format!("worker:sude-p{i}#1");
+                conn.execute(
+                    "INSERT INTO events VALUES (?, 10, 1000, 'workflow_completed', '{\"exit\":0}');",
+                    [&wf],
+                )
+                .unwrap();
+                let state = format!(
+                    "{{\"input\":{{\"kind\":\"sude\"}},\"config\":{{\"playbook\":{{\"name\":\"bug-fix\"}}}},\"prev_elapsed_ms\":{dur_ms}}}"
+                );
+                conn.execute("INSERT INTO snapshots VALUES (?, 10, ?);", [&wf, &state])
+                    .unwrap();
+            }
+        }
+
+        let mock_json = r#"{
+            "result": {
+                "agents": [
+                    {"name": "sude-w1", "agent_status": "working"}
+                ]
+            }
+        }"#;
+        let mock = MockHerdr::new(mock_json);
+        fs::write(tmp.join("sude-w1.owner"), "cos\n").unwrap();
+        fs::write(
+            tmp.join(".sude-w1.playbook"),
+            "name=bug-fix\nids=1,2,3,4,5\n",
+        )
+        .unwrap();
+        fs::write(tmp.join(".sude-w1.elapsed"), "60\n").unwrap();
+
+        let rows = scan_orchestration(&tmp, &mock, &test_team_cfg()).expect("scan orchestration");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.estimate, None);
+        assert_eq!(row.wait_time, "1m");
+    }
+
+    #[test]
+    fn test_status_orchestration_no_estimate_for_idle_or_done_worker() {
+        let _env_lock = crate::test_env::lock_env();
+        let tmp = temp_test_dir("est-idle-worker");
+        let _cleaner = TempDirCleaner(tmp.clone());
+
+        let db_path = tmp.join("quaqua.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE events (
+                    workflow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    ts_ms INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                CREATE TABLE snapshots (
+                    workflow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                "#,
+            )
+            .expect("init tables");
+
+            for (i, dur_ms) in [100_000, 200_000, 300_000, 400_000, 500_000]
+                .iter()
+                .enumerate()
+            {
+                let wf = format!("worker:sude-p{i}#1");
+                conn.execute(
+                    "INSERT INTO events VALUES (?, 10, 1000, 'workflow_completed', '{\"exit\":0}');",
+                    [&wf],
+                )
+                .unwrap();
+                let state = format!(
+                    "{{\"input\":{{\"kind\":\"sude\"}},\"config\":{{\"playbook\":{{\"name\":\"feature\"}}}},\"prev_elapsed_ms\":{dur_ms}}}"
+                );
+                conn.execute("INSERT INTO snapshots VALUES (?, 10, ?);", [&wf, &state])
+                    .unwrap();
+            }
+        }
+
+        let mock_json = r#"{
+            "result": {
+                "agents": [
+                    {"name": "sude-w1", "agent_status": "idle"}
+                ]
+            }
+        }"#;
+        let mock = MockHerdr::new(mock_json);
+        fs::write(tmp.join("sude-w1.owner"), "cos\n").unwrap();
+        fs::write(
+            tmp.join(".sude-w1.playbook"),
+            "name=feature\nids=1,2,3,4,5\n",
+        )
+        .unwrap();
+        fs::write(tmp.join(".sude-w1.elapsed"), "60\n").unwrap();
+
+        let rows = scan_orchestration(&tmp, &mock, &test_team_cfg()).expect("scan orchestration");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].estimate, None);
+        assert_eq!(rows[0].wait_time, "1m");
     }
 
     #[test]
