@@ -3409,4 +3409,207 @@ mod tests {
         assert_eq!(resumed, RunnerOutcome::Completed("total: 30".to_string()));
         assert_eq!(activities.count_for(&req2), 1, "forward run executes act 2");
     }
+
+    /// Journal with the production sequence contract: an append takes the next
+    /// free slot or is refused with [`JournalError::SequenceConflict`] and
+    /// inserts nothing. `pending_foreign` is a second writer's batch, landing
+    /// just before this run's first append attempt.
+    #[derive(Default)]
+    struct RacingJournal {
+        events: Vec<EventRecord>,
+        snapshots: Vec<SnapshotRecord>,
+        pending_foreign: Vec<EventRecord>,
+        /// Report a free slot behind the caller's cursor: a journal bug this
+        /// run must refuse to paper over.
+        stale_slot: Option<u64>,
+    }
+
+    impl Journal for RacingJournal {
+        fn append_event(
+            &mut self,
+            workflow_id: &str,
+            event: &EventRecord,
+        ) -> Result<u64, JournalError> {
+            self.events.append(&mut self.pending_foreign);
+            let expected_seq = self.stale_slot.unwrap_or_else(|| {
+                self.events.iter().map(|e| e.seq).max().unwrap_or(0) + 1
+            });
+            if event.seq != expected_seq {
+                return Err(JournalError::SequenceConflict {
+                    workflow_id: workflow_id.to_string(),
+                    expected_seq,
+                    actual_seq: event.seq,
+                });
+            }
+            self.events.push(event.clone());
+            Ok(event.seq)
+        }
+
+        fn append_snapshot(
+            &mut self,
+            _workflow_id: &str,
+            snapshot: &SnapshotRecord,
+        ) -> Result<(), JournalError> {
+            self.snapshots.push(snapshot.clone());
+            Ok(())
+        }
+
+        fn load_events(
+            &self,
+            _workflow_id: &str,
+            since_seq: u64,
+        ) -> Result<Vec<EventRecord>, JournalError> {
+            Ok(self
+                .events
+                .iter()
+                .filter(|e| e.seq >= since_seq)
+                .cloned()
+                .collect())
+        }
+
+        fn load_latest_snapshot(
+            &self,
+            _workflow_id: &str,
+        ) -> Result<Option<SnapshotRecord>, JournalError> {
+            Ok(self.snapshots.iter().max_by_key(|s| s.seq).cloned())
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    struct ApprovalCountState {
+        approvals_applied: u32,
+    }
+
+    struct ApprovalCountWorkflow;
+
+    impl Workflow for ApprovalCountWorkflow {
+        type Input = ();
+        type State = ApprovalCountState;
+        type Output = ();
+
+        fn step(
+            &self,
+            state: &mut Self::State,
+            _ctx: &mut WorkflowContext,
+            event: Option<WorkflowEvent>,
+        ) -> StepDecision<Self::Output> {
+            match event {
+                None => StepDecision::PauseForApproval {
+                    reason: "awaiting approval".to_string(),
+                },
+                Some(WorkflowEvent::ApprovalResolved { .. }) => {
+                    state.approvals_applied += 1;
+                    StepDecision::Continue
+                }
+                _ => StepDecision::Continue,
+            }
+        }
+    }
+
+    /// Issue #191: a rebase skips events another writer committed, so this
+    /// run's state never saw them. A snapshot taken after that rebase claims
+    /// them incorporated, and resume replays only events past the snapshot —
+    /// they would be lost for good. Pause right after the rebase, then resume:
+    /// the skipped events must still reach the workflow.
+    #[test]
+    fn test_pause_after_a_rebase_leaves_the_skipped_events_replayable() {
+        let workflow = ApprovalCountWorkflow;
+        let id = "rebase_pause";
+        let foreign = (1..=12)
+            .map(|seq| {
+                EventRecord::new(
+                    seq,
+                    1,
+                    "approval_resolved",
+                    r#"{"approved":true,"reason":null}"#,
+                )
+            })
+            .collect();
+        let mut journal = RacingJournal {
+            pending_foreign: foreign,
+            ..RacingJournal::default()
+        };
+        let mut activities = MockActivityRegistry::new();
+        let mut clock = VirtualClock::new(1000);
+
+        let first = run(
+            &workflow,
+            id,
+            ApprovalCountState::default(),
+            &mut journal,
+            &mut activities,
+            &mut clock,
+        )
+        .expect("the paused run must block, not fail");
+        assert_eq!(
+            first,
+            RunnerOutcome::Blocked("pause_for_approval: awaiting approval".to_string())
+        );
+        assert_eq!(
+            journal
+                .load_events(id, 1)
+                .expect("events")
+                .iter()
+                .filter(|e| e.kind == "approval_resolved")
+                .count(),
+            12,
+            "the second writer's events stay in the journal"
+        );
+        let paused_after = journal
+            .load_latest_snapshot(id)
+            .expect("snapshot")
+            .expect("the starting state is snapshotted");
+        assert_eq!(
+            paused_after.seq, 0,
+            "a pause snapshot after the rebase would claim the 12 unapplied events incorporated"
+        );
+
+        // Resume the way `prompt_worker --resume` does: no initial state, no
+        // incoming events. Only replay can bring the skipped events in.
+        let resumed = resume(
+            &workflow,
+            id,
+            &mut journal,
+            &mut activities,
+            &mut clock,
+            Vec::new(),
+        )
+        .expect("resume after a rebase");
+        assert_eq!(
+            resumed,
+            RunnerOutcome::Blocked("no pending events or timers".to_string())
+        );
+        let latest = journal
+            .load_latest_snapshot(id)
+            .expect("snapshot")
+            .expect("the resumed run snapshots its state");
+        let state: ApprovalCountState =
+            serde_json::from_str(&latest.state_json).expect("state json");
+        assert_eq!(
+            state.approvals_applied, 12,
+            "the 12 events the first run never applied must be replayed on resume"
+        );
+    }
+
+    /// The rebase only moves forward. A journal that reports a free slot behind
+    /// this run's cursor is a bug, and rebasing to it would silently skip a
+    /// sequence while writing an event below it.
+    #[test]
+    #[should_panic(expected = "a conflict can only sit past this cursor")]
+    fn test_rebase_never_moves_the_cursor_backwards() {
+        let mut journal = RacingJournal {
+            stale_slot: Some(0),
+            ..RacingJournal::default()
+        };
+        let mut activities = MockActivityRegistry::new();
+        let mut clock = VirtualClock::new(1000);
+        let _ = run(
+            &ApprovalCountWorkflow,
+            "rebase_backwards",
+            ApprovalCountState::default(),
+            &mut journal,
+            &mut activities,
+            &mut clock,
+        );
+    }
 }
