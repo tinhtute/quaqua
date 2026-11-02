@@ -253,11 +253,7 @@ pub fn diagnose() -> Report {
         shell.as_deref(),
     );
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if std::env::var("QUAQUA_TEST").as_deref() != Ok("1")
-        || std::env::var("QUAQUA_AUDITOR_CHECK").as_deref() == Ok("1")
-    {
-        check_auditor_units(home.as_deref(), &mut report);
-    }
+    check_auditor_units(home.as_deref(), &mut report);
     report
 }
 
