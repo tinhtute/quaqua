@@ -8,11 +8,22 @@ use quaqua::launch::{build_launch_cmd, Launch};
 use quaqua::lead::spawn::{update_index_content, update_project_index_owner};
 use quaqua::worker::cleanup::{resolve_default_runs_dir, resolve_home_quaqua_runs};
 use quaqua::worker::prompt::{brief_budget_sec, brief_headers_ok, validate_env_budget_val};
-use quaqua::worker::spawn::{fallback_kind, parse_spawn_args, start_failure_reason};
+use quaqua::worker::spawn::{
+    fallback_kind, parse_spawn_args, start_failure_detail, start_failure_reason,
+};
 use quaqua::workspace::resolve_workspace_root;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::Mutex;
+
+/// A runs directory a launch can actually write into: a claude launch homes its
+/// settings JSON at `runs/.<name>.settings.json` and names that file on
+/// `--settings`, so `build_launch_cmd` needs the directory to exist.
+fn launch_runs_dir(tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("quaqua-launch-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.to_string_lossy().to_string()
+}
 
 #[test]
 fn test_task_worker_name_validation() {
@@ -1261,11 +1272,12 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
     assert_eq!(launch.model, "opus-5.5");
     assert_eq!(launch.effort, "low");
 
+    let runs = launch_runs_dir("lead-launch");
     let cmd = build_launch_cmd(
         &launch,
         "quaqua-rs-lead",
         "/runs/test.rules.md",
-        "/runs",
+        &runs,
         "/repo",
         false,
     )
@@ -1279,8 +1291,11 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
         .iter()
         .position(|a| a == "--settings")
         .expect("claude lead must launch with hook settings");
-    let settings: serde_json::Value = serde_json::from_str(&cmd.agent_args[settings_at + 1])
-        .expect("lead settings must be valid JSON");
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&cmd.agent_args[settings_at + 1])
+            .expect("the --settings file claude reads"),
+    )
+    .expect("lead settings must be valid JSON");
     assert_eq!(
         cmd.agent_args[..settings_at].to_vec(),
         vec!["--", "--model", "claude-opus-5-5", "--effort", "low"]
@@ -1297,7 +1312,7 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
         .as_str()
         .expect("lead Stop hook");
     assert!(
-        stop_hook.contains("/runs/.quaqua-rs-lead.state") && stop_hook.contains("idle"),
+        stop_hook.contains(&format!("{runs}/.quaqua-rs-lead.state")) && stop_hook.contains("idle"),
         "lead Stop hook must report idle: {stop_hook}"
     );
 
@@ -1946,7 +1961,7 @@ fn test_launch_args_carry_exact_model_and_effort() {
         &cl,
         "truonglao-test",
         "/r/x.rules.md",
-        "~/quaqua/runs",
+        &launch_runs_dir("model-effort"),
         "/repo/.wt/x",
         true,
     )
@@ -2012,13 +2027,14 @@ fn test_launch_args_pi_exact_and_isolated() {
 
 #[test]
 fn test_launch_review_args_per_harness() {
+    let runs = launch_runs_dir("review-per-harness");
     let cmd = |harness: &str, model: &str, effort: &str, review: bool| {
         let l = resolve_launch(&kind(harness, model, Some(effort)), "k").unwrap();
         build_launch_cmd(
             &l,
             "rev",
             "/r/x.rules.md",
-            "/w/runs",
+            &runs,
             "/repo/.wt/rev",
             review,
         )
@@ -2062,7 +2078,7 @@ fn test_launch_review_args_per_harness() {
     // readable working directories
     assert_eq!(
         &cl.agent_args[7..11],
-        ["--add-dir", "/w/runs", "/repo/.wt", "--settings"]
+        ["--add-dir", runs.as_str(), "/repo/.wt", "--settings"]
     );
     let tail = &cl.agent_args[cl.agent_args.len() - 2..];
     assert_eq!(tail, ["--append-system-prompt-file", "/r/x.rules.md"]);
@@ -2084,11 +2100,12 @@ fn test_launch_review_args_per_harness() {
 #[test]
 fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
     let l = resolve_launch(&kind("claude", "opus-5.5", Some("high")), "suhuynh").unwrap();
+    let runs = launch_runs_dir("review-settings");
     let cmd = build_launch_cmd(
         &l,
         "suhuynh-r1",
         "/r/x.rules.md",
-        "/w/runs",
+        &runs,
         "/repo/.wt/suhuynh-r1",
         true,
     )
@@ -2115,7 +2132,7 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
         }
         dirs.push(a.as_str());
     }
-    assert!(dirs.contains(&"/w/runs"), "runs dir not readable: {dirs:?}");
+    assert!(dirs.contains(&runs.as_str()), "runs dir not readable: {dirs:?}");
     assert!(
         dirs.contains(&"/repo/.wt"),
         "builder worktree not readable: {dirs:?}"
@@ -2125,8 +2142,10 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
         .iter()
         .position(|a| a == "--settings")
         .expect("--settings");
-    let settings: serde_json::Value =
-        serde_json::from_str(&args[si + 1]).expect("settings must be JSON");
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&args[si + 1]).expect("the --settings file claude reads"),
+    )
+    .expect("settings must be JSON");
     let rules = |key: &str| -> Vec<String> {
         settings["permissions"][key]
             .as_array()
@@ -2188,8 +2207,9 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
     }
 
     // the report is the only file it may write
+    let report_rule = format!("Edit(//{}/**)", runs.trim_start_matches('/'));
     assert!(
-        allow.iter().any(|r| r == "Edit(//w/runs/**)"),
+        allow.iter().any(|r| *r == report_rule),
         "report not writable: {allow:?}"
     );
 }
@@ -2197,13 +2217,14 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
 #[test]
 fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
     let cl = resolve_launch(&kind("claude", "opus-5.5", Some("high")), "truonglao").unwrap();
+    let runs = launch_runs_dir("hooks");
 
     // 1. Regular worker (review = false): must have --settings with PreToolUse, Stop, Notification hooks
     let cmd_regular = build_launch_cmd(
         &cl,
         "truonglao-build",
         "/r/x.rules.md",
-        "/my/runs",
+        &runs,
         "/repo/.wt/truonglao-build",
         false,
     )
@@ -2213,8 +2234,10 @@ fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
         .iter()
         .position(|a| a == "--settings")
         .expect("regular claude launch must pass --settings");
-    let settings_reg: serde_json::Value =
-        serde_json::from_str(&args_reg[si_reg + 1]).expect("settings must be valid JSON");
+    let settings_reg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&args_reg[si_reg + 1]).expect("the --settings file claude reads"),
+    )
+    .expect("settings must be valid JSON");
     assert!(
         settings_reg.get("permissions").is_none(),
         "regular worker should have no permissions block in settings"
@@ -2235,7 +2258,7 @@ fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
         .as_str()
         .unwrap();
     assert!(
-        pre_cmd.contains("/my/runs/.truonglao-build.state"),
+        pre_cmd.contains(&format!("{runs}/.truonglao-build.state")),
         "{pre_cmd}"
     );
     assert!(pre_cmd.contains("AskUserQuestion"), "{pre_cmd}");
@@ -2245,7 +2268,7 @@ fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
         .as_str()
         .unwrap();
     assert!(
-        stop_cmd.contains("/my/runs/.truonglao-build.state"),
+        stop_cmd.contains(&format!("{runs}/.truonglao-build.state")),
         "{stop_cmd}"
     );
     assert!(stop_cmd.contains("idle"), "{stop_cmd}");
@@ -2254,7 +2277,7 @@ fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
         .as_str()
         .unwrap();
     assert!(
-        notif_cmd.contains("/my/runs/.truonglao-build.state"),
+        notif_cmd.contains(&format!("{runs}/.truonglao-build.state")),
         "{notif_cmd}"
     );
     assert!(notif_cmd.contains("blocked"), "{notif_cmd}");
@@ -2264,7 +2287,7 @@ fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
         &cl,
         "truonglao-rev",
         "/r/x.rules.md",
-        "/my/runs",
+        &runs,
         "/repo/.wt/truonglao-rev",
         true,
     )
@@ -2274,8 +2297,10 @@ fn test_claude_launch_settings_hooks_for_regular_and_review_worker() {
         .iter()
         .position(|a| a == "--settings")
         .expect("review claude launch must pass --settings");
-    let settings_rev: serde_json::Value =
-        serde_json::from_str(&args_rev[si_rev + 1]).expect("settings must be valid JSON");
+    let settings_rev: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&args_rev[si_rev + 1]).expect("the --settings file claude reads"),
+    )
+    .expect("settings must be valid JSON");
     assert!(
         settings_rev.get("permissions").is_some(),
         "review must have permissions block"
@@ -2450,6 +2475,34 @@ fn test_start_failure_reason_reads_herdr_error_code() {
     assert_eq!(
         start_failure_reason(&out("plain text, not json")),
         "start-failed"
+    );
+}
+
+/// The operator-facing text keeps herdr's code *and* its message: the code
+/// alone (`agent_start_input_failed`) says nothing about what to fix.
+#[test]
+fn test_start_failure_detail_keeps_herdr_code_and_message() {
+    fn out(stdout: &str) -> Output {
+        Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+    assert_eq!(
+        start_failure_detail(&out(
+            r#"{"error":{"code":"agent_start_input_failed","message":"input contains a 1447-byte line but the terminal is in canonical mode with a 1024-byte limit; wait for the shell prompt and retry"}}"#
+        )),
+        "agent_start_input_failed: input contains a 1447-byte line but the terminal \
+         is in canonical mode with a 1024-byte limit; wait for the shell prompt and retry"
+    );
+    // herdr's usage errors print on stderr, not stdout
+    let mut e = out("");
+    e.stderr = b"unknown option: --nope".to_vec();
+    assert_eq!(start_failure_detail(&e), "unknown option: --nope");
+    assert_eq!(
+        start_failure_detail(&out("")),
+        "herdr agent start failed with no output"
     );
 }
 
@@ -2706,6 +2759,63 @@ fn test_spawn_worker_resolving_purpose() {
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].0, "suhuynh-purptest");
     assert_eq!(starts[0].1, "claude");
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// A failed agent start must tell the operator what herdr said: a spawn that
+/// dies with an empty message leaves the caller guessing (and the launch-line
+/// fault was invisible until herdr's own error text was relayed).
+#[test]
+fn test_spawn_worker_reports_herdr_start_error() {
+    let _env_lock = lock_env();
+    let temp = std::env::temp_dir().join(format!("quaqua-spawn-start-err-{}", std::process::id()));
+    let repo_dir = temp.join("repo");
+    let runs_dir = temp.join("quaqua/runs");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    std::env::set_var("QUAQUA_RUNS_DIR", &runs_dir);
+    std::env::set_var("QUAQUA_TEST", "1");
+    std::env::set_var("GRID_SKIP", "1");
+
+    let cfg = test_cfg_with_fallback();
+    let git = SpawnTestGit;
+    let mut mock = MockActivities::new();
+    mock.register(
+        "herdr.pane_split",
+        ActivityResult::Herdr(HerdrResult::AgentOutput {
+            content: r#"{"result":{"pane":{"pane_id":"%1"}}}"#.to_string(),
+        }),
+    );
+    mock.register(
+        "herdr.agent_start:claude",
+        ActivityResult::Herdr(HerdrResult::AgentOutput {
+            content: r#"{"error":{"code":"agent_start_input_failed","message":"input contains a 1447-byte line but the terminal is in canonical mode with a 1024-byte limit; wait for the shell prompt and retry"}}"#
+                .to_string(),
+        }),
+    );
+    mock.set_default(ActivityResult::Herdr(HerdrResult::Spawned {
+        name: String::new(),
+    }));
+    let herdr = MockActivitiesHerdr::new(mock);
+
+    let opts = parse_spawn_args(&[
+        "ni-launchfail".to_string(),
+        "ni".to_string(),
+        repo_dir.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    let (_code, msg) =
+        quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli)
+            .expect_err("a failed agent start must fail the spawn");
+    assert!(
+        msg.contains("agent_start_input_failed"),
+        "herdr's error code must reach the operator: {msg}"
+    );
+    assert!(
+        msg.contains("canonical mode with a 1024-byte limit"),
+        "herdr's error message must reach the operator: {msg}"
+    );
 
     let _ = std::fs::remove_dir_all(&temp);
 }

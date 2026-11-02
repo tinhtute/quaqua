@@ -235,6 +235,32 @@ pub fn claude_settings(name: &str, runs_dir: &str, read_root: Option<&str>) -> s
     }
 }
 
+/// Write a worker's Claude settings and return the file path.
+///
+/// The settings travel as a file, never inline: herdr types the whole launch
+/// command into the pane's terminal, and a canonical-mode tty (macOS) refuses a
+/// line over 1024 bytes (`agent_start_input_failed`) before Claude Code ever
+/// runs — a review's inline settings alone are ~2 KB.
+pub fn write_claude_settings(
+    name: &str,
+    runs_dir: &str,
+    read_root: Option<&str>,
+) -> Result<String, (i32, String)> {
+    let path = crate::state::WorkerMetadata::settings_path(Path::new(runs_dir), name);
+    let body = serde_json::to_string_pretty(&claude_settings(name, runs_dir, read_root))
+        .map_err(|e| (1, format!("error: cannot render claude settings for '{name}': {e}\n")))?;
+    std::fs::write(&path, body).map_err(|e| {
+        (
+            1,
+            format!(
+                "error: cannot write claude settings for '{name}' to {} (fix: create the runs directory): {e}\n",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// One attempt's `herdr` invocation: the pane-split envs and the args after
 /// `herdr agent start <name> --kind <harness> --pane <p> --timeout <ms>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +275,10 @@ pub struct LaunchCmd {
 /// config `model` object `{"providerID": "...", "model": "...", "variant": "..."}`
 /// in OPENCODE_CONFIG_CONTENT in the pane env.
 /// omp and pi take `--model`/`--thinking`, claude takes `--model`/`--effort`.
+///
+/// Building a claude command writes `runs/.<name>.settings.json` (the caller
+/// must have created `runs_dir`) and names it on `--settings`, so the launch
+/// line stays one short typed line.
 pub fn build_launch_cmd(
     launch: &Launch,
     name: &str,
@@ -352,10 +382,10 @@ pub fn build_launch_cmd(
                 args.push(runs_dir.to_string());
                 args.push(read_root.clone());
                 args.push("--settings".to_string());
-                args.push(claude_settings(name, runs_dir, Some(&read_root)).to_string());
+                args.push(write_claude_settings(name, runs_dir, Some(&read_root))?);
             } else {
                 args.push("--settings".to_string());
-                args.push(claude_settings(name, runs_dir, None).to_string());
+                args.push(write_claude_settings(name, runs_dir, None)?);
             }
             args.push("--append-system-prompt-file".to_string());
             args.push(rules_file.to_string());
@@ -545,6 +575,113 @@ mod tests {
         let ws = std::path::Path::new("/nonexistent/ws");
         let p = super::omp_worker_state_hook_path_from_env("/nonexistent/runs", None, ws);
         assert_eq!(p, "/nonexistent/ws/scripts/hooks/omp-worker-state.ts");
+    }
+
+    /// Length of the line herdr types into the pane: the harness binary, then
+    /// every arg, shell-quoted wherever the shell would need a quote.
+    fn typed_line_len(harness: &str, args: &[String]) -> usize {
+        std::iter::once(harness.to_string())
+            .chain(args.iter().cloned())
+            .map(|a| {
+                let plain = !a.is_empty()
+                    && a.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:/=,@+".contains(&b));
+                if plain {
+                    a
+                } else {
+                    format!("'{}'", a.replace('\'', r"'\''"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .len()
+    }
+
+    /// herdr types the whole launch command into the pane's terminal, and a
+    /// canonical-mode tty (macOS) refuses a line over 1024 bytes with
+    /// `agent_start_input_failed` before the agent ever runs. Every claude
+    /// launch line must stay under that cap for the longest name a spawn allows
+    /// (20 chars) and a real runs path.
+    #[test]
+    fn claude_launch_line_fits_one_typed_terminal_line() {
+        const HERDR_TYPED_LINE_LIMIT: usize = 1024;
+        let runs = std::env::temp_dir().join("quaqua-cl-line/runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let runs = runs.to_string_lossy().to_string();
+        // `is_valid_name` caps a spawn name at 20 chars (`worker/spawn.rs`).
+        let name = "suhuynh-reviewer-w1x";
+        assert_eq!(name.len(), 20, "worst-case spawn name");
+        let launch = super::Launch {
+            harness: "claude".to_string(),
+            model: "opus-5.5".to_string(),
+            effort: "high".to_string(),
+        };
+        for review in [false, true] {
+            let cmd = super::build_launch_cmd(
+                &launch,
+                name,
+                &format!("{runs}/{name}.rules.md"),
+                &runs,
+                &format!("/Users/someone/Lab/.wt/{name}"),
+                review,
+            )
+            .unwrap();
+            let len = typed_line_len("claude", &cmd.agent_args);
+            assert!(
+                len < HERDR_TYPED_LINE_LIMIT,
+                "review={review}: claude launch line is {len} bytes, over herdr's \
+                 {HERDR_TYPED_LINE_LIMIT}-byte typed-line limit: {}",
+                cmd.agent_args.join(" ")
+            );
+        }
+    }
+
+    /// The line has to stay short *and* still hand claude its settings: the
+    /// file named after `--settings` must exist and carry this worker's
+    /// liveness hooks (and, for a review, the read-only permission boundary),
+    /// because claude loads hooks and permissions from that file.
+    #[test]
+    fn claude_launch_hands_claude_a_written_settings_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "quaqua-cl-settings-{}-{}",
+            std::process::id(),
+            "suhuynh-rev"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.to_string_lossy().to_string();
+        let launch = super::Launch {
+            harness: "claude".to_string(),
+            model: "opus-5.5".to_string(),
+            effort: "high".to_string(),
+        };
+        for review in [false, true] {
+            let cmd = super::build_launch_cmd(
+                &launch,
+                "suhuynh-rev",
+                "/r/x.rules.md",
+                &runs,
+                "/r/.wt/suhuynh-rev",
+                review,
+            )
+            .unwrap();
+            let at = cmd
+                .agent_args
+                .iter()
+                .position(|a| a == "--settings")
+                .expect("claude takes its settings through --settings");
+            let body = std::fs::read_to_string(&cmd.agent_args[at + 1])
+                .unwrap_or_else(|e| panic!("review={review}: --settings must name a file claude can read: {e}"));
+            assert!(
+                body.contains(&format!("{runs}/.suhuynh-rev.state")),
+                "review={review}: hooks must record this worker's state: {body}"
+            );
+            assert!(body.contains("\"PreToolUse\""), "review={review}: {body}");
+            assert_eq!(
+                body.contains("\"deny\""),
+                review,
+                "review={review}: only a review carries the write-denying boundary: {body}"
+            );
+        }
     }
 
     #[test]
