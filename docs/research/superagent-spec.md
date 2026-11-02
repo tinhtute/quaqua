@@ -1,6 +1,6 @@
 # Spec: superagent bus (Source → Trigger → Thread → Subscription)
 
-Status: **locked** (2026-11-02). Plan thực thi: `.harness/plans/active/superagent-bus.md`. Bằng chứng và quyết định: [superagent-audit.md](superagent-audit.md).
+Status: **locked** (2026-11-02). Plan thực thi: `.harness/plans/active/superagent-bus.md`. Bằng chứng và quyết định: [superagent-audit.md](superagent-audit.md). Đây là track T1 của [superagent.md](superagent.md).
 Baseline: `main` @ `a189d30`. Mọi `file:line` dưới đây đúng tại baseline đó.
 
 ## 1. Vì sao

@@ -2,7 +2,7 @@
 
 Status: **final** (2026-11-02, CoS + anh iu, brainstorm grill 3 vòng).
 Baseline: engine `main` @ `a189d30`. Spec gốc (đầu vào, giữ nguyên văn): [superagent-source-spec.md](superagent-source-spec.md), ghim `4f1acbf`. Integ `quaqua/quaqua-rs-integ` (#197–#200 + fix #198) chưa merge: nó thêm auditor precheck đọc `*-lead.inbox.md` (#199), ảnh hưởng R2.
-Đi kèm: [superagent-spec.md](superagent-spec.md) (thiết kế) · plan `.harness/plans/active/superagent-bus.md`.
+Đi kèm: [superagent-spec.md](superagent-spec.md) (thiết kế) · plan `.harness/plans/active/superagent-bus.md` · index toàn chương trình [superagent.md](superagent.md).
 Prior art đã đọc: prototype `deepseek-ai/dsh-superagent-prototype@6337fc8` docs 001-domain, 002-authorization, 003-execution, `src/policy.ts`.
 
 ## 1. Kết luận

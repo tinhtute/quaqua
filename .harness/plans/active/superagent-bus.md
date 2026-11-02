@@ -27,6 +27,7 @@ lane: high-risk
   - NG5: per-channel reply norms.
   - NG6: PR comments/reviews as a Source (decision 8).
   - NG7: `triggers` retention/pruning.
+  - NG1–NG6 are separate draft tracks T2–T6 in `docs/research/superagent.md`; they stay out of this plan.
 - adr candidates: drop ack (cursor only); drop legacy tables in the same wave; Thread = branch.
 
 ## Phases and Verification
