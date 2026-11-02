@@ -1523,8 +1523,8 @@ design = "suhuynh"
     let state_content = fs::read_to_string(&state_file).unwrap();
     assert!(
         state_content
-            .contains("members=truonglao-myfallbackc1,truonglao-myfallbackc2,suhuynh-myfallbackc3"),
-        "expected fallback 3 members (review, review, design), but state had:\n{state_content}"
+            .contains("members=truonglao-myfallbackc1,suhuynh-myfallbackc2,sude-myfallbackc3"),
+        "expected fallback 3 distinct members, but state had:\n{state_content}"
     );
     assert!(
         state_content.contains("n=3"),
