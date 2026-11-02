@@ -205,35 +205,33 @@ fn dispatch_activity(
     events_since_snapshot: &mut u64,
 ) -> Result<WorkflowEvent, RunnerError> {
     *max_seq += 1;
-    journal.append_event(
+    append_at_cursor(
+        journal,
         workflow_id,
-        &EventRecord::new(
-            *max_seq,
-            clock.now_ms(),
-            "activity_scheduled",
-            serde_json::to_string(&ActivityScheduledData {
-                id: id.to_string(),
-                activity: serde_json::to_value(activity).unwrap_or_default(),
-            })
-            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-        ),
+        max_seq,
+        clock.now_ms(),
+        "activity_scheduled",
+        serde_json::to_string(&ActivityScheduledData {
+            id: id.to_string(),
+            activity: serde_json::to_value(activity).unwrap_or_default(),
+        })
+        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
     )?;
     *events_since_snapshot += 1;
 
     let result = activities.execute(activity)?;
     *max_seq += 1;
-    journal.append_event(
+    append_at_cursor(
+        journal,
         workflow_id,
-        &EventRecord::new(
-            *max_seq,
-            clock.now_ms(),
-            "activity_completed",
-            serde_json::to_string(&ActivityCompletedData {
-                id: id.to_string(),
-                result: serde_json::to_value(&result).unwrap_or_default(),
-            })
-            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-        ),
+        max_seq,
+        clock.now_ms(),
+        "activity_completed",
+        serde_json::to_string(&ActivityCompletedData {
+            id: id.to_string(),
+            result: serde_json::to_value(&result).unwrap_or_default(),
+        })
+        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
     )?;
     *events_since_snapshot += 1;
     Ok(WorkflowEvent::ActivityCompleted {
@@ -252,24 +250,60 @@ fn dispatch_timer(
     events_since_snapshot: &mut u64,
 ) -> Result<(), RunnerError> {
     *max_seq += 1;
-    let scheduled_seq = *max_seq;
-    journal.append_event(
+    append_at_cursor(
+        journal,
         workflow_id,
-        &EventRecord::new(
-            scheduled_seq,
-            clock.now_ms(),
-            "timer_scheduled",
-            serde_json::to_string(&TimerScheduledData {
-                id: id.to_string(),
-                duration_ms: duration.as_millis() as u64,
-            })
-            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-        ),
+        max_seq,
+        clock.now_ms(),
+        "timer_scheduled",
+        serde_json::to_string(&TimerScheduledData {
+            id: id.to_string(),
+            duration_ms: duration.as_millis() as u64,
+        })
+        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
     )?;
     *events_since_snapshot += 1;
-    // Format tag with unique instance scheduled_seq so re-armed timers don't conflict
-    clock.schedule_timer(&format!("{scheduled_seq}:{id}"), duration);
+    // Format tag with unique instance seq so re-armed timers don't conflict
+    clock.schedule_timer(&format!("{}:{id}", *max_seq), duration);
     Ok(())
+}
+
+/// Append tries spent on a sequence conflict before giving up. Each retry
+/// re-reads the head the journal reports, so this only bounds a writer storm.
+const SEQUENCE_REBASE_TRIES: u32 = 16;
+
+/// Append one event at the runner's in-memory cursor.
+///
+/// The cursor is read once per process ([`run_until_blocked`]), so a second
+/// writer on the same workflow id can commit past it while this run is blocked
+/// inside an activity. [`JournalError::SequenceConflict`] is that writer's
+/// trace, not corruption: `expected_seq` is the free slot the journal reports,
+/// so rebase the cursor there and retry. The refused append inserted nothing,
+/// which keeps the event exactly once in a contiguous chain.
+fn append_at_cursor(
+    journal: &mut dyn Journal,
+    workflow_id: &str,
+    cursor: &mut u64,
+    ts_ms: u64,
+    kind: &str,
+    payload: impl Into<String>,
+) -> Result<(), RunnerError> {
+    let payload = payload.into();
+    let mut last_conflict = None;
+    for _ in 0..SEQUENCE_REBASE_TRIES {
+        let event = EventRecord::new(*cursor, ts_ms, kind, payload.clone());
+        match journal.append_event(workflow_id, &event) {
+            Ok(_) => return Ok(()),
+            Err(e @ JournalError::SequenceConflict { expected_seq, .. }) => {
+                *cursor = expected_seq;
+                last_conflict = Some(e);
+            }
+            Err(e) => return Err(RunnerError::Journal(e)),
+        }
+    }
+    Err(RunnerError::Journal(
+        last_conflict.expect("the loop ran at least once"),
+    ))
 }
 
 // ----------------------------------------------------------------------------
@@ -691,18 +725,17 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
             ReplayEffect::ExecuteInFlightActivity { id, activity } => {
                 let result = activities.execute(&activity)?;
                 current_seq += 1;
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "activity_completed",
-                        serde_json::to_string(&ActivityCompletedData {
-                            id: id.clone(),
-                            result: serde_json::to_value(&result).unwrap_or_default(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "activity_completed",
+                    serde_json::to_string(&ActivityCompletedData {
+                        id: id.clone(),
+                        result: serde_json::to_value(&result).unwrap_or_default(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
                 events_since_snapshot += 1;
                 event_queue.push_back(WorkflowEvent::ActivityCompleted { id, result });
@@ -738,19 +771,18 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     input,
                 } => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "child_started",
-                            serde_json::to_string(&ChildStartedData {
-                                id,
-                                workflow_type,
-                                input,
-                            })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "child_started",
+                        serde_json::to_string(&ChildStartedData {
+                            id,
+                            workflow_type,
+                            input,
+                        })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     events_since_snapshot += 1;
                 }
@@ -786,43 +818,45 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     input,
                 } => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "child_started",
-                            serde_json::to_string(&ChildStartedData {
-                                id,
-                                workflow_type,
-                                input,
-                            })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "child_started",
+                        serde_json::to_string(&ChildStartedData {
+                            id,
+                            workflow_type,
+                            input,
+                        })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     events_since_snapshot += 1;
                 }
                 StepDecision::Continue => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(current_seq, clock.now_ms(), "continue", ""),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "continue",
+                        "",
                     )?;
                     events_since_snapshot += 1;
                 }
                 StepDecision::PauseForApproval { reason } => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "pause_for_approval",
-                            serde_json::to_string(&PauseForApprovalData {
-                                reason: reason.clone(),
-                            })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "pause_for_approval",
+                        serde_json::to_string(&PauseForApprovalData {
+                            reason: reason.clone(),
+                        })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     if options.snapshot_at_blocked {
                         journal.append_snapshot(
@@ -840,15 +874,14 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 }
                 StepDecision::Complete(output) => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "workflow_completed",
-                            serde_json::to_string(&output)
-                                .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "workflow_completed",
+                        serde_json::to_string(&output)
+                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     journal.append_snapshot(
                         workflow_id,
@@ -862,18 +895,17 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 }
                 StepDecision::Fail { code, reason } => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "workflow_failed",
-                            serde_json::to_string(&WorkflowFailedData {
-                                code,
-                                reason: reason.clone(),
-                            })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "workflow_failed",
+                        serde_json::to_string(&WorkflowFailedData {
+                            code,
+                            reason: reason.clone(),
+                        })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     return Ok(RunnerOutcome::Failed { code, reason });
                 }
@@ -885,76 +917,71 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
         current_seq += 1;
         match &ev {
             WorkflowEvent::ApprovalResolved { approved, reason } => {
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "approval_resolved",
-                        serde_json::to_string(&ApprovalResolvedData {
-                            approved: *approved,
-                            reason: reason.clone(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "approval_resolved",
+                    serde_json::to_string(&ApprovalResolvedData {
+                        approved: *approved,
+                        reason: reason.clone(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
             }
             WorkflowEvent::ActivityCompleted { id, result } => {
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "activity_completed",
-                        serde_json::to_string(&ActivityCompletedData {
-                            id: id.clone(),
-                            result: serde_json::to_value(&result).unwrap_or_default(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "activity_completed",
+                    serde_json::to_string(&ActivityCompletedData {
+                        id: id.clone(),
+                        result: serde_json::to_value(&result).unwrap_or_default(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
             }
             WorkflowEvent::TimerFired { id } => {
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "timer_fired",
-                        serde_json::to_string(&TimerFiredData { id: id.clone() })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "timer_fired",
+                    serde_json::to_string(&TimerFiredData { id: id.clone() })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
             }
             WorkflowEvent::ChildCompleted { id, output } => {
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "child_completed",
-                        serde_json::to_string(&ChildCompletedData {
-                            id: id.clone(),
-                            output: output.clone(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "child_completed",
+                    serde_json::to_string(&ChildCompletedData {
+                        id: id.clone(),
+                        output: output.clone(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
             }
             WorkflowEvent::ChildFailed { id, code, reason } => {
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "child_failed",
-                        serde_json::to_string(&ChildFailedData {
-                            id: id.clone(),
-                            code: *code,
-                            reason: reason.clone(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "child_failed",
+                    serde_json::to_string(&ChildFailedData {
+                        id: id.clone(),
+                        code: *code,
+                        reason: reason.clone(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
             }
         }
@@ -994,17 +1021,16 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     }
 
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "timer_fired",
-                            serde_json::to_string(&TimerFiredData {
-                                id: user_id.to_string(),
-                            })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "timer_fired",
+                        serde_json::to_string(&TimerFiredData {
+                            id: user_id.to_string(),
+                        })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     events_since_snapshot += 1;
                     event_queue.push_back(WorkflowEvent::TimerFired {
@@ -1082,19 +1108,18 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     input,
                 } => {
                     current_seq += 1;
-                    journal.append_event(
+                    append_at_cursor(
+                        journal,
                         workflow_id,
-                        &EventRecord::new(
-                            current_seq,
-                            clock.now_ms(),
-                            "child_started",
-                            serde_json::to_string(&ChildStartedData {
-                                id,
-                                workflow_type,
-                                input,
-                            })
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                        ),
+                        &mut current_seq,
+                        clock.now_ms(),
+                        "child_started",
+                        serde_json::to_string(&ChildStartedData {
+                            id,
+                            workflow_type,
+                            input,
+                        })
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                     )?;
                     events_since_snapshot += 1;
                 }
@@ -1105,9 +1130,13 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
         match decision {
             StepDecision::Continue => {
                 current_seq += 1;
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(current_seq, clock.now_ms(), "continue", ""),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "continue",
+                    "",
                 )?;
                 events_since_snapshot += 1;
             }
@@ -1137,17 +1166,16 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
             }
             StepDecision::PauseForApproval { reason } => {
                 current_seq += 1;
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "pause_for_approval",
-                        serde_json::to_string(&PauseForApprovalData {
-                            reason: reason.clone(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "pause_for_approval",
+                    serde_json::to_string(&PauseForApprovalData {
+                        reason: reason.clone(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
                 if options.snapshot_at_blocked {
                     journal.append_snapshot(
@@ -1165,15 +1193,14 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
             }
             StepDecision::Complete(output) => {
                 current_seq += 1;
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "workflow_completed",
-                        serde_json::to_string(&output)
-                            .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "workflow_completed",
+                    serde_json::to_string(&output)
+                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
                 journal.append_snapshot(
                     workflow_id,
@@ -1187,18 +1214,17 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
             }
             StepDecision::Fail { code, reason } => {
                 current_seq += 1;
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "workflow_failed",
-                        serde_json::to_string(&WorkflowFailedData {
-                            code,
-                            reason: reason.clone(),
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "workflow_failed",
+                    serde_json::to_string(&WorkflowFailedData {
+                        code,
+                        reason: reason.clone(),
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
                 return Ok(RunnerOutcome::Failed { code, reason });
             }
@@ -1208,19 +1234,18 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                 input,
             } => {
                 current_seq += 1;
-                journal.append_event(
+                append_at_cursor(
+                    journal,
                     workflow_id,
-                    &EventRecord::new(
-                        current_seq,
-                        clock.now_ms(),
-                        "child_started",
-                        serde_json::to_string(&ChildStartedData {
-                            id,
-                            workflow_type,
-                            input,
-                        })
-                        .map_err(|e| RunnerError::Serialization(e.to_string()))?,
-                    ),
+                    &mut current_seq,
+                    clock.now_ms(),
+                    "child_started",
+                    serde_json::to_string(&ChildStartedData {
+                        id,
+                        workflow_type,
+                        input,
+                    })
+                    .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;
                 events_since_snapshot += 1;
             }
@@ -3287,10 +3312,17 @@ mod tests {
             3,
             "replay must re-dispatch nothing; journal event count must remain 3"
         );
-        for (i, (before, after)) in events_before_kill.iter().zip(events_after_replay.iter()).enumerate() {
+        for (i, (before, after)) in events_before_kill
+            .iter()
+            .zip(events_after_replay.iter())
+            .enumerate()
+        {
             assert_eq!(before.seq, after.seq, "event {i} seq mismatch");
             assert_eq!(before.kind, after.kind, "event {i} kind mismatch");
-            assert_eq!(before.payload_json, after.payload_json, "event {i} payload mismatch");
+            assert_eq!(
+                before.payload_json, after.payload_json,
+                "event {i} payload mismatch"
+            );
         }
 
         // 4. Finally deliver approval for pause_2 (Cycle 2 resolve) -> workflow completes cleanly
@@ -3308,12 +3340,11 @@ mod tests {
             }],
         )
         .expect("resume to completion");
-        assert_eq!(
-            out_final,
-            RunnerOutcome::Completed("pauses: 2".to_string())
-        );
+        assert_eq!(out_final, RunnerOutcome::Completed("pauses: 2".to_string()));
 
-        let final_events = journal.load_events("two_cycle_wf", 1).expect("load final events");
+        let final_events = journal
+            .load_events("two_cycle_wf", 1)
+            .expect("load final events");
         assert_eq!(final_events.len(), 5);
         assert_eq!(final_events[3].kind, "approval_resolved");
         assert_eq!(final_events[4].kind, "workflow_completed");
@@ -3375,10 +3406,7 @@ mod tests {
             Vec::new(),
         )
         .expect("resume must find the run's starting state instead of failing NoInitialState");
-        assert_eq!(
-            resumed,
-            RunnerOutcome::Completed("total: 30".to_string())
-        );
+        assert_eq!(resumed, RunnerOutcome::Completed("total: 30".to_string()));
         assert_eq!(activities.count_for(&req2), 1, "forward run executes act 2");
     }
 }

@@ -2051,10 +2051,8 @@ esac
         let _g_herdr = TestEnvVarGuard::set("HERDR_BIN_PATH", stub.to_str().unwrap());
         let _g_db = TestEnvVarGuard::set("RACE_DB", db_path.to_str().unwrap());
         let _g_wf = TestEnvVarGuard::set("RACE_WF", &wf);
-        let _g_seen = TestEnvVarGuard::set(
-            "RACE_SEEN",
-            tmp.join(".raced").to_str().unwrap_or_default(),
-        );
+        let _g_seen =
+            TestEnvVarGuard::set("RACE_SEEN", tmp.join(".raced").to_str().unwrap_or_default());
 
         let herdr = Herdr {
             bin: stub.to_string_lossy().to_string(),
@@ -2077,13 +2075,24 @@ esac
             12,
             "no second-writer event is lost"
         );
-        for kind in ["activity_completed", "workflow_completed"] {
-            assert_eq!(
-                events.iter().filter(|e| e.kind == kind).count(),
-                1,
-                "{kind} must be journalled exactly once"
-            );
-        }
+        // The append that lost the race was `wake_0`'s completion; the refused
+        // insert rolled back, so the rebased event must land once, not twice.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "activity_completed" && e.payload_json.contains("wake_0"))
+                .count(),
+            1,
+            "the rebased activity_completed must land exactly once"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "workflow_completed")
+                .count(),
+            1,
+            "the workflow completes exactly once"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
