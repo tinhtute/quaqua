@@ -66,6 +66,17 @@ case $(uname -s) in
       ln -sfn "$src/$unit" "$dst/$unit"
     done
     systemctl --user daemon-reload
+    for unit in quaqua-auditor.service quaqua-auditor.timer; do
+      if [[ ! -e "$dst/$unit" ]]; then
+        echo "error: unit symlink $dst/$unit does not resolve (target $src/$unit is missing)" >&2
+        exit 1
+      fi
+      resolved="$(readlink -f "$dst/$unit" 2>/dev/null || readlink "$dst/$unit")"
+      echo "unit $unit: resolved -> $resolved"
+    done
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user list-unit-files 'quaqua-auditor*' || true
+    fi
     echo "installed into $dst — enable with: systemctl --user enable --now quaqua-auditor.timer"
     ;;
   *) echo 'error: unsupported OS (expected Darwin or Linux)' >&2; exit 1 ;;
