@@ -159,8 +159,12 @@ impl<'a, G: crate::git::GitOps + Clone + Send + Sync + 'static> CouncilMemberRun
             match rx.recv_timeout(Duration::from_millis(25)) {
                 Ok(prompt_res) => {
                     let runs_dir = crate::worker::cleanup::default_runs_dir();
-                    let report_path = runs_dir.join(format!("{name}.md"));
-
+                    let sealed_path = runs_dir.join(".sealed").join(format!("{name}.md"));
+                    let report_path = if sealed_path.is_file() {
+                        sealed_path
+                    } else {
+                        runs_dir.join(format!("{name}.md"))
+                    };
                     return match prompt_res {
                         Ok(()) => Ok(SingleWorkerOutput::new(0, report_path).unwrap()),
                         Err((code, msg)) => Err((code, msg)),
@@ -222,8 +226,67 @@ pub fn write_state_file(
     crate::state::atomic_write(path, content)
 }
 
-/// Build member prompt text for a given taskforce mode (F5).
-pub fn build_member_prompt(mode: &str, task: &str, worker_name: &str, brief: &str) -> String {
+/// Strip the `Current design (open to challenge):` section from a brief for neutral seat prompts.
+pub fn strip_current_design(brief: &str) -> String {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in brief.lines() {
+        if line.starts_with("Current design (open to challenge):") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Topology:")
+                || trimmed.starts_with("Playbook:")
+                || trimmed.starts_with("Context:")
+                || trimmed.starts_with("Goal:")
+                || trimmed.starts_with("Hard constraints:")
+                || trimmed.starts_with("Unknowns:")
+                || trimmed.starts_with("Evidence:")
+                || trimmed.starts_with("Time budget:")
+                || trimmed.starts_with("Cost budget:")
+                || trimmed.starts_with("Must fix:")
+                || trimmed.starts_with("Review rounds:")
+                || trimmed.starts_with('#')
+            {
+                skipping = false;
+                out.push(line);
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// Reveal intermediate sealed member reports by moving them into the active runs directory.
+/// Idempotent across repeated calls and journal replays.
+pub fn reveal_sealed_reports(runs_dir: &Path, member_names: &[String]) {
+    let sealed_dir = runs_dir.join(".sealed");
+    for name in member_names {
+        let sealed_file = sealed_dir.join(format!("{name}.md"));
+        let target_file = runs_dir.join(format!("{name}.md"));
+        if sealed_file.is_file() {
+            if let Err(e) = std::fs::rename(&sealed_file, &target_file) {
+                if std::fs::copy(&sealed_file, &target_file).is_ok() {
+                    let _ = std::fs::remove_file(&sealed_file);
+                } else {
+                    eprintln!("warning: failed to reveal sealed report for {name}: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Build member prompt text for a given taskforce mode with neutral seat flag.
+pub fn build_member_prompt_with_neutral(
+    mode: &str,
+    task: &str,
+    worker_name: &str,
+    brief: &str,
+    is_neutral: bool,
+) -> String {
     match mode {
         "advisor" => format!(
             "Goal: advisor recommendation for task '{task}'\nHard constraints: read-only — do not edit or create files outside ~/quaqua/runs.\nCurrent design (open to challenge): {brief}\nEvidence: recommendation + confidence, evidence, alternatives, strongest downside, and the smallest check that would prove it wrong (marked not run). Write to a temp file and rename it to ~/quaqua/runs/{worker_name}.md — publish atomically, never a partial file."
@@ -231,10 +294,30 @@ pub fn build_member_prompt(mode: &str, task: &str, worker_name: &str, brief: &st
         "dual-lens" => format!(
             "Goal: dual-lens assessment for task '{task}'\nHard constraints: read-only — do not edit or create files outside ~/quaqua/runs.\nCurrent design (open to challenge): {brief}\nEvidence: assessment, agreements, and concerns. Write to a temp file and rename it to ~/quaqua/runs/{worker_name}.md — publish atomically, never a partial file."
         ),
-        _ => format!(
-            "Goal: council review assessment for task '{task}'\nHard constraints: read-only — do not edit or create files outside ~/quaqua/runs.\nCurrent design (open to challenge): {brief}\nEvidence: assessment, agreements, and concerns. End with exactly one 'Verdict: clean | <N> findings' line. Write to a temp file and rename it to ~/quaqua/runs/{worker_name}.md — publish atomically, never a partial file."
-        ),
+        _ => {
+            if is_neutral {
+                let stripped = strip_current_design(brief);
+                let trimmed = stripped.trim();
+                let context_line = if trimmed.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nContext: {trimmed}")
+                };
+                format!(
+                    "Goal: council review assessment for task '{task}'\nHard constraints: read-only — do not edit or create files outside ~/quaqua/runs.\nNeutral seat instruction: Reconstruct the problem first independently from requirements without relying on a proposed design.{context_line}\nEvidence: assessment, agreements, and concerns. End with exactly one 'Verdict: clean | <N> findings' line. Write to a temp file and rename it to ~/quaqua/runs/.sealed/{worker_name}.md — publish atomically, never a partial file."
+                )
+            } else {
+                format!(
+                    "Goal: council review assessment for task '{task}'\nHard constraints: read-only — do not edit or create files outside ~/quaqua/runs.\nCurrent design (open to challenge): {brief}\nEvidence: assessment, agreements, and concerns. End with exactly one 'Verdict: clean | <N> findings' line. Write to a temp file and rename it to ~/quaqua/runs/.sealed/{worker_name}.md — publish atomically, never a partial file."
+                )
+            }
+        }
     }
+}
+
+/// Build member prompt text for a given taskforce mode (F5).
+pub fn build_member_prompt(mode: &str, task: &str, worker_name: &str, brief: &str) -> String {
+    build_member_prompt_with_neutral(mode, task, worker_name, brief, false)
 }
 
 /// Reconstruct taskforce state from loaded journal events.
@@ -249,12 +332,19 @@ fn rebuild_state_from_events(
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&rec.payload_json) {
                 if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
                     if let Some(m) = st.members.iter_mut().find(|slot| slot.id == id) {
-                        let rpath = data
-                            .get("output")
-                            .and_then(|o| o.get("report_path"))
-                            .and_then(|p| p.as_str())
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| runs_dir.join(format!("{id}.md")));
+                        let unsealed_path = runs_dir.join(format!("{id}.md"));
+                        let sealed_path = runs_dir.join(".sealed").join(format!("{id}.md"));
+                        let rpath = if unsealed_path.is_file() {
+                            unsealed_path
+                        } else if sealed_path.is_file() {
+                            sealed_path
+                        } else {
+                            data.get("output")
+                                .and_then(|o| o.get("report_path"))
+                                .and_then(|p| p.as_str())
+                                .map(PathBuf::from)
+                                .unwrap_or(unsealed_path)
+                        };
                         let v = data
                             .get("output")
                             .and_then(|o| o.get("verdict"))
@@ -332,10 +422,16 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
         snapshot_at_blocked: false,
     };
 
+    if mode == "council" {
+        let _ = std::fs::create_dir_all(runs_dir.join(".sealed"));
+    }
+
     let single_worker_inputs: Vec<SingleWorkerInput> = member_specs
         .iter()
-        .map(|(name, kind)| {
-            let prompt_text = build_member_prompt(mode, task, name, brief);
+        .enumerate()
+        .map(|(i, (name, kind))| {
+            let is_neutral = mode == "council" && i == 0;
+            let prompt_text = build_member_prompt_with_neutral(mode, task, name, brief, is_neutral);
             SingleWorkerInput::new(
                 name.clone(),
                 kind.clone(),
@@ -394,6 +490,7 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
     // If the journal already recorded completion or failure, return it immediately without spawning!
     if let Some(mut out) = already_completed {
         if mode == "council" {
+            reveal_sealed_reports(runs_dir, &member_names);
             let merged_path = runs_dir.join(format!("council-{task}.md"));
             if !merged_path.is_file() {
                 // Idempotent report generation if missing on terminal replay (F7)
@@ -405,6 +502,11 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
             } else {
                 out.merged_report = Some(merged_path);
             }
+            out.report_paths = member_names
+                .iter()
+                .map(|n| runs_dir.join(format!("{n}.md")))
+                .filter(|p| p.is_file())
+                .collect();
         }
         let _ = write_state_file(
             &st_file,
@@ -515,6 +617,7 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
     match first_outcome {
         RunnerOutcome::Completed(mut out) => {
             if mode == "council" {
+                reveal_sealed_reports(runs_dir, &member_names);
                 let merged_path = runs_dir.join(format!("council-{task}.md"));
                 if !merged_path.is_file() {
                     let final_state =
@@ -526,6 +629,11 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
                 } else {
                     out.merged_report = Some(merged_path);
                 }
+                out.report_paths = member_names
+                    .iter()
+                    .map(|n| runs_dir.join(format!("{n}.md")))
+                    .filter(|p| p.is_file())
+                    .collect();
             }
             let _ = write_state_file(
                 &st_file,
@@ -573,7 +681,12 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
         for (name, _) in &pending_members {
             let tx_c = tx.clone();
             let name_c = name.clone();
-            let brief_text = build_member_prompt(mode, task, name, brief);
+            let is_neutral = mode == "council"
+                && member_specs
+                    .first()
+                    .map(|(n, _)| n == name)
+                    .unwrap_or(false);
+            let brief_text = build_member_prompt_with_neutral(mode, task, name, brief, is_neutral);
             let cancel_c = cancel_flag.clone();
             s.spawn(move || {
                 let res = runner.prompt_member(&name_c, &brief_text, repo, cancel_c);
@@ -588,8 +701,14 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
 
             let event = match prompt_res {
                 Ok(out) => {
-                    let report_content =
-                        std::fs::read_to_string(&out.report_path).unwrap_or_default();
+                    let mut report_path = out.report_path.clone();
+                    if mode == "council" {
+                        let sealed_path = runs_dir.join(".sealed").join(format!("{name}.md"));
+                        if sealed_path.is_file() {
+                            report_path = sealed_path;
+                        }
+                    }
+                    let report_content = std::fs::read_to_string(&report_path).unwrap_or_default();
                     if mode == "council" {
                         match parse_member_verdict(&report_content) {
                             Ok((verdict_str, findings, is_challenge)) => {
@@ -597,7 +716,7 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
                                     id: name.clone(),
                                     output: serde_json::json!({
                                         "exit": 0,
-                                        "report_path": out.report_path,
+                                        "report_path": report_path,
                                         "verdict": verdict_str,
                                         "findings": findings,
                                         "is_challenge": is_challenge,
@@ -663,7 +782,13 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
                     }
                     break;
                 }
-                Ok(RunnerOutcome::Completed(_)) | Ok(RunnerOutcome::Blocked(_)) => {}
+                Ok(RunnerOutcome::Completed(_)) => {
+                    if mode == "council" {
+                        reveal_sealed_reports(runs_dir, &member_names);
+                    }
+                    break;
+                }
+                Ok(RunnerOutcome::Blocked(_)) => {}
             }
         }
     });
@@ -685,6 +810,9 @@ pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
     }
 
     // 6. Reconstruct final state from journal events (F7)
+    if mode == "council" {
+        reveal_sealed_reports(runs_dir, &member_names);
+    }
     let final_events = journal.load_events(&workflow_id, 1).unwrap_or_default();
     let final_state = rebuild_state_from_events(&initial_state, &final_events, runs_dir);
     let mut final_out = build_taskforce_output(&final_state);
