@@ -66,6 +66,33 @@ fn doctor(path_dir: &Path, home: &Path, cwd: &Path, shell: &Path) -> Output {
         .expect("failed to spawn quaqua doctor")
 }
 
+/// Model the systemd user session a healthy Linux workstation has: the auditor
+/// units under `$HOME/.config/systemd/user` and a `systemctl` stub on the
+/// fixture PATH reporting them enabled and the timer active — `doctor` checks
+/// both (issue #198) and the fixture owns `$HOME` and the whole `PATH`.
+fn healthy_systemd(home: &Path, path_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let user_dir = home.join(".config/systemd/user");
+    fs::create_dir_all(&user_dir).expect("systemd user dir");
+    for unit in ["quaqua-auditor.service", "quaqua-auditor.timer"] {
+        fs::write(user_dir.join(unit), "[Unit]\nDescription=fixture auditor\n")
+            .expect("write unit");
+    }
+    let systemctl = path_dir.join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *is-active*) printf '%s\\n' active ;;\n\
+         *list-unit-files*) printf 'quaqua-auditor.service enabled enabled\\nquaqua-auditor.timer enabled enabled\\n' ;;\n\
+         *) exit 1 ;;\n\
+         esac\n",
+    )
+    .expect("write systemctl stub");
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).expect("chmod systemctl");
+}
+
 #[test]
 fn doctor_fails_when_quaqua_is_missing_from_path() {
     let dir = temp_dir("missing");
@@ -129,6 +156,7 @@ fn doctor_accepts_a_healthy_setup() {
     fs::create_dir_all(checkout.join("crates/quaqua/src")).expect("checkout");
     let installed = path_dir.join("quaqua");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_quaqua"), &installed).expect("symlink");
+    healthy_systemd(&home, &path_dir);
     let shell = stub_shell(&dir, "quaqua is /tmp/bin/quaqua");
 
     let out = Command::new(env!("CARGO_BIN_EXE_quaqua"))

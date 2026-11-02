@@ -3,7 +3,7 @@
 use crate::git::GitOps;
 use crate::herdr::HerdrOps;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use std::time::Duration;
 
@@ -17,8 +17,8 @@ pub const USAGE: &str = "\
 #   herdr workspace labelled <slug> (the Lead in its first tab, its Peers grid
 #   beside it or in <repo>-workers there); the CoS stays the one Supervisor in
 #   its own workspace and reaches the Lead by agent name. quaqua lead cleanup <slug>
-#   closes the workspace when the project is done. rules/_all/*.md are the
-#   appended system prompt (the spawn-worker convention); the first prompt
+#   closes the workspace when the project is done. rules/_all/*.md and rules/<repo>/*.md
+#   are the appended system prompt (the spawn-worker convention); the first prompt
 #   is a short lead brief pointing at AGENTS.md, projects/<slug>.md and
 #   quaqua pipeline. The project integration branch quaqua/<slug>-integ
 #   is created from the project repo's default branch when missing —
@@ -313,24 +313,13 @@ pub fn spawn_lead<G: GitOps, H: HerdrOps>(
         }
     }
 
-    // Lead rules: rules/_all/*.md -> runs/<name>.rules.md
+    // Lead rules: rules/_all/*.md + rules/<repo>/*.md -> runs/<name>.rules.md
     let runs_dir = root.join("runs");
     let _ = std::fs::create_dir_all(&runs_dir);
     let rf = runs_dir.join(format!("{name}.rules.md"));
 
-    let all_rules_dir = root.join("rules/_all");
-    let mut rules_content = String::new();
-    if let Ok(entries) = std::fs::read_dir(&all_rules_dir) {
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for p in paths {
-            if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(c) = std::fs::read_to_string(&p) {
-                    rules_content.push_str(&c);
-                }
-            }
-        }
-    }
+    let repo_name = repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+    let rules_content = crate::rules::dump(&root, repo_name, crate::rules::Audience::Orchestrator);
     let _ = std::fs::write(&rf, rules_content);
 
     // Resolve caller identity and log at spawn
@@ -881,7 +870,7 @@ mod tests {
         }
     }
 
-    struct CleanupDir(PathBuf);
+    struct CleanupDir(std::path::PathBuf);
     impl Drop for CleanupDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);

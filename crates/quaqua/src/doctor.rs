@@ -92,6 +92,153 @@ pub fn run_workspace(
     }
 }
 
+pub const AUDITOR_FIX_CMD: &str =
+    "bash scripts/auditor/install-auditor.sh && systemctl --user enable --now quaqua-auditor.timer";
+pub const AUDITOR_UNITS: [&str; 2] = ["quaqua-auditor.service", "quaqua-auditor.timer"];
+
+pub trait SystemdRunner {
+    fn list_unit_files(&self, pattern: &str) -> Result<String, String>;
+    fn is_active(&self, unit: &str) -> Result<bool, String>;
+}
+
+pub struct RealSystemd;
+
+impl SystemdRunner for RealSystemd {
+    fn list_unit_files(&self, pattern: &str) -> Result<String, String> {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["--user", "list-unit-files", pattern]);
+        cmd.stdin(Stdio::null());
+        let out = run_with_timeout(cmd, PROBE_TIMEOUT)?;
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    fn is_active(&self, unit: &str) -> Result<bool, String> {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["--user", "is-active", unit]);
+        cmd.stdin(Stdio::null());
+        let out = run_with_timeout(cmd, PROBE_TIMEOUT)?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(out.status.success() && s == "active")
+    }
+}
+
+/// Check auditor systemd units ($HOME/.config/systemd/user/quaqua-auditor.{timer,service}).
+///
+/// On Linux:
+/// - Fails if unit files are missing
+/// - Fails if unit symlinks are dangling
+/// - Fails if `systemctl --user list-unit-files` reports `bad`
+/// - Fails if `systemctl --user is-active quaqua-auditor.timer` is not active
+/// Each failure records a problem with the fix line:
+/// `bash scripts/auditor/install-auditor.sh && systemctl --user enable --now quaqua-auditor.timer`.
+///
+/// On macOS:
+/// - Reports manual activation required in notes rather than failing.
+pub fn check_auditor_units_with<S: SystemdRunner>(
+    home: Option<&Path>,
+    is_macos: bool,
+    runner: &S,
+    report: &mut Report,
+) {
+    if is_macos {
+        report
+            .notes
+            .push("auditor: macOS manual activation required".to_string());
+        return;
+    }
+
+    let Some(home_path) = home else {
+        report.problems.push(format!(
+            "cannot resolve HOME directory to check auditor systemd units — fix: {AUDITOR_FIX_CMD}"
+        ));
+        return;
+    };
+
+    let user_dir = home_path.join(".config/systemd/user");
+    let mut files_ok = true;
+
+    for unit in AUDITOR_UNITS {
+        let path = user_dir.join(unit);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if meta.is_symlink() {
+                    if !path.exists() {
+                        files_ok = false;
+                        report.problems.push(format!(
+                            "auditor systemd unit symlink is dangling: {} — fix: {AUDITOR_FIX_CMD}",
+                            path.display()
+                        ));
+                    }
+                } else if !path.exists() {
+                    files_ok = false;
+                    report.problems.push(format!(
+                        "auditor systemd unit is missing: {} — fix: {AUDITOR_FIX_CMD}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(_) => {
+                files_ok = false;
+                report.problems.push(format!(
+                    "auditor systemd unit is missing: {} — fix: {AUDITOR_FIX_CMD}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if !files_ok {
+        return;
+    }
+
+    match runner.list_unit_files("quaqua-auditor*") {
+        Ok(output) => {
+            let mut bad_unit = false;
+            for line in output.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let unit_name = parts[0];
+                    let state = parts[1];
+                    if AUDITOR_UNITS.contains(&unit_name) && state == "bad" {
+                        bad_unit = true;
+                        report.problems.push(format!(
+                            "auditor systemd unit file is bad: {unit_name} — fix: {AUDITOR_FIX_CMD}"
+                        ));
+                    }
+                }
+            }
+            if bad_unit {
+                return;
+            }
+        }
+        Err(e) => {
+            report.problems.push(format!(
+                "failed to query systemctl list-unit-files: {e} — fix: {AUDITOR_FIX_CMD}"
+            ));
+            return;
+        }
+    }
+
+    match runner.is_active("quaqua-auditor.timer") {
+        Ok(true) => {}
+        Ok(false) => {
+            report.problems.push(format!(
+                "auditor systemd timer is inactive (quaqua-auditor.timer) — fix: {AUDITOR_FIX_CMD}"
+            ));
+        }
+        Err(e) => {
+            report.problems.push(format!(
+                "failed to query systemctl is-active: {e} — fix: {AUDITOR_FIX_CMD}"
+            ));
+        }
+    }
+}
+
+pub fn check_auditor_units(home: Option<&Path>, report: &mut Report) {
+    let is_macos = cfg!(target_os = "macos");
+    check_auditor_units_with(home, is_macos, &RealSystemd, report);
+}
+
 /// The real checks: PATH lookup, checkout discovery, and `$SHELL`.
 pub fn diagnose() -> Report {
     let path = std::env::var_os("PATH");
@@ -99,12 +246,15 @@ pub fn diagnose() -> Report {
     let checkout = checkout_root();
     let workspace = crate::workspace::workspace_root();
     let shell = shell_path();
-    evaluate(
+    let mut report = evaluate(
         binary.as_deref(),
         checkout.as_deref(),
         Some(&workspace),
         shell.as_deref(),
-    )
+    );
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    check_auditor_units(home.as_deref(), &mut report);
+    report
 }
 
 /// The check core with explicit inputs, so tests can drive every branch
@@ -1402,6 +1552,240 @@ command = ["quaqua", "events", "hook"]
                 && workers.warnings[1].contains("quaqua lead repair llmhub"),
             "{:?}",
             workers.warnings
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn doctor_auditor_unit() {
+        let dir = temp_dir("auditor-unit");
+        let valid_home = dir.join("valid-home");
+        let dangling_home = dir.join("dangling-home");
+        let missing_home = dir.join("missing-home");
+
+        for h in [&valid_home, &dangling_home, &missing_home] {
+            fs::create_dir_all(h).unwrap();
+        }
+
+        // Target files for symlinks
+        let target_dir = dir.join("targets");
+        fs::create_dir_all(&target_dir).unwrap();
+        let svc_target = target_dir.join("quaqua-auditor.service");
+        let tmr_target = target_dir.join("quaqua-auditor.timer");
+        fs::write(&svc_target, "[Unit]\nDescription=Auditor\n").unwrap();
+        fs::write(&tmr_target, "[Unit]\nDescription=Auditor Timer\n").unwrap();
+
+        // (a) Valid symlink/unit
+        let valid_systemd = valid_home.join(".config/systemd/user");
+        fs::create_dir_all(&valid_systemd).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&svc_target, valid_systemd.join("quaqua-auditor.service"))
+                .unwrap();
+            std::os::unix::fs::symlink(&tmr_target, valid_systemd.join("quaqua-auditor.timer"))
+                .unwrap();
+        }
+
+        // (b) Dangling symlink
+        let dangling_systemd = dangling_home.join(".config/systemd/user");
+        fs::create_dir_all(&dangling_systemd).unwrap();
+        let nonexistent = dir.join("nonexistent");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                nonexistent.join("quaqua-auditor.service"),
+                dangling_systemd.join("quaqua-auditor.service"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                nonexistent.join("quaqua-auditor.timer"),
+                dangling_systemd.join("quaqua-auditor.timer"),
+            )
+            .unwrap();
+        }
+
+        // (c) Missing unit: missing_home has no .config/systemd/user units
+
+        // Mock systemd runner that returns clean output and active timer
+        struct MockSystemdSuccess;
+        impl SystemdRunner for MockSystemdSuccess {
+            fn list_unit_files(&self, _pattern: &str) -> Result<String, String> {
+                Ok("quaqua-auditor.service enabled enabled\nquaqua-auditor.timer enabled enabled\n"
+                    .to_string())
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(true)
+            }
+        }
+
+        // (a) Valid symlink/unit: passes
+        let mut report_valid = Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        };
+        check_auditor_units_with(
+            Some(&valid_home),
+            false,
+            &MockSystemdSuccess,
+            &mut report_valid,
+        );
+        assert!(
+            report_valid.problems.is_empty(),
+            "valid symlinks should pass, got: {:?}",
+            report_valid.problems
+        );
+
+        // (b) Dangling symlink: fail-with-fix
+        let mut report_dangling = Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        };
+        check_auditor_units_with(
+            Some(&dangling_home),
+            false,
+            &MockSystemdSuccess,
+            &mut report_dangling,
+        );
+        assert!(
+            !report_dangling.problems.is_empty(),
+            "dangling symlinks must fail"
+        );
+        for p in &report_dangling.problems {
+            assert!(
+                p.contains(AUDITOR_FIX_CMD),
+                "problem must contain fix command: {p}"
+            );
+            assert!(
+                p.contains("dangling"),
+                "problem must report dangling symlink: {p}"
+            );
+        }
+
+        // (c) Missing unit: fail-with-fix
+        let mut report_missing = Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        };
+        check_auditor_units_with(
+            Some(&missing_home),
+            false,
+            &MockSystemdSuccess,
+            &mut report_missing,
+        );
+        assert!(
+            !report_missing.problems.is_empty(),
+            "missing units must fail"
+        );
+        for p in &report_missing.problems {
+            assert!(
+                p.contains(AUDITOR_FIX_CMD),
+                "problem must contain fix command: {p}"
+            );
+            assert!(
+                p.contains("missing"),
+                "problem must report missing unit: {p}"
+            );
+        }
+
+        // Bad unit file in systemctl: fail-with-fix
+        struct MockSystemdBad;
+        impl SystemdRunner for MockSystemdBad {
+            fn list_unit_files(&self, _pattern: &str) -> Result<String, String> {
+                Ok(
+                    "quaqua-auditor.service bad enabled\nquaqua-auditor.timer bad enabled\n"
+                        .to_string(),
+                )
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(true)
+            }
+        }
+        let mut report_bad = Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        };
+        check_auditor_units_with(Some(&valid_home), false, &MockSystemdBad, &mut report_bad);
+        assert!(
+            !report_bad.problems.is_empty(),
+            "bad units in list-unit-files must fail"
+        );
+        for p in &report_bad.problems {
+            assert!(
+                p.contains(AUDITOR_FIX_CMD),
+                "problem must contain fix command: {p}"
+            );
+            assert!(p.contains("bad"), "problem must report bad unit: {p}");
+        }
+
+        // Inactive timer in systemctl: fail-with-fix
+        struct MockSystemdInactive;
+        impl SystemdRunner for MockSystemdInactive {
+            fn list_unit_files(&self, _pattern: &str) -> Result<String, String> {
+                Ok(
+                    "quaqua-auditor.service enabled enabled\nquaqua-auditor.timer enabled enabled\n"
+                        .to_string(),
+                )
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+        }
+        let mut report_inactive = Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        };
+        check_auditor_units_with(
+            Some(&valid_home),
+            false,
+            &MockSystemdInactive,
+            &mut report_inactive,
+        );
+        assert!(
+            !report_inactive.problems.is_empty(),
+            "inactive timer must fail"
+        );
+        for p in &report_inactive.problems {
+            assert!(
+                p.contains(AUDITOR_FIX_CMD),
+                "problem must contain fix command: {p}"
+            );
+            assert!(p.contains("inactive"), "problem must report inactive: {p}");
+        }
+
+        // macOS branch reports manual activation required rather than failing
+        let mut report_macos = Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        };
+        check_auditor_units_with(
+            Some(&missing_home),
+            true,
+            &MockSystemdSuccess,
+            &mut report_macos,
+        );
+        assert!(
+            report_macos.problems.is_empty(),
+            "macOS branch must not record problem"
+        );
+        assert!(
+            report_macos
+                .notes
+                .iter()
+                .any(|n| n.contains("manual activation required")),
+            "macOS branch must note manual activation required: {:?}",
+            report_macos.notes
         );
 
         let _ = fs::remove_dir_all(&dir);

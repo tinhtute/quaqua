@@ -1,3 +1,4 @@
+<!-- audience: orchestrator -->
 # Lead gate
 
 AGENTS.md '## Roles (SLP)' requires a Lead when 3 or more task workers run in parallel, or when

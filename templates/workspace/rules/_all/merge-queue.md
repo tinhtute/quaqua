@@ -1,3 +1,4 @@
+<!-- audience: orchestrator -->
 # Merge Queue Discipline
 
 - Leads merge Peer branches only via `quaqua merge <slug> <branch>...`.

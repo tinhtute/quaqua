@@ -5,7 +5,8 @@ pub mod report;
 pub mod workflow;
 
 pub use driver::{
-    build_member_prompt, run_taskforce_workflow, state_file_path, write_state_file,
+    build_member_prompt, build_member_prompt_with_neutral, reveal_sealed_reports,
+    run_taskforce_workflow, state_file_path, strip_current_design, write_state_file,
     CouncilMemberRunner, LiveCouncilMemberRunner,
 };
 pub use report::{parse_member_verdict, render_council_report, write_council_report};
@@ -113,6 +114,14 @@ pub fn parse_taskforce_args(args: &[String]) -> Result<TaskforceArgs, (i32, Stri
 /// 1. `[taskforce.council]` in team.toml if configured and non-empty
 /// 2. Active layout role members if defined
 /// 3. Sane default fallback: 3 members (`review`, `review`, `design`)
+fn is_can_review(cfg: &crate::config::Config, kind: &str) -> bool {
+    if let Some(k) = cfg.kinds.get(kind) {
+        k.can_review
+    } else {
+        true
+    }
+}
+
 pub fn resolve_council_members(
     cfg: &crate::config::Config,
     role_opt: Option<&crate::layout::LayoutRole>,
@@ -144,20 +153,37 @@ pub fn resolve_council_members(
         }
     }
     if members.is_empty() {
-        // Default fallback: 3 members
-        let r1 = cfg
-            .purposes
-            .get("review")
-            .cloned()
-            .unwrap_or_else(|| cfg.strategy.default_kind.clone());
-        let r2 = cfg
-            .purposes
-            .get("design")
-            .cloned()
-            .unwrap_or_else(|| cfg.strategy.default_kind.clone());
-        members.push((format!("{r1}-{}c1", task), r1.clone()));
-        members.push((format!("{r1}-{}c2", task), r1));
-        members.push((format!("{r2}-{}c3", task), r2));
+        // Default fallback: pick up to 3 distinct can_review kinds (or 2 if fewer available)
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(r) = cfg.purposes.get("review") {
+            if is_can_review(cfg, r) && !candidates.contains(r) {
+                candidates.push(r.clone());
+            }
+        }
+        if let Some(d) = cfg.purposes.get("design") {
+            if is_can_review(cfg, d) && !candidates.contains(d) {
+                candidates.push(d.clone());
+            }
+        }
+        for rev in &cfg.strategy.default_reviewer {
+            if is_can_review(cfg, rev) && !candidates.contains(rev) {
+                candidates.push(rev.clone());
+            }
+        }
+        for (name, kinfo) in &cfg.kinds {
+            if kinfo.can_review && !candidates.contains(name) {
+                candidates.push(name.clone());
+            }
+        }
+        if candidates.is_empty() && is_can_review(cfg, &cfg.strategy.default_kind) {
+            candidates.push(cfg.strategy.default_kind.clone());
+        }
+
+        let count = candidates.len().min(3);
+        for (i, kind) in candidates.into_iter().take(count).enumerate() {
+            let member_name = format!("{kind}-{}c{}", task, i + 1);
+            members.push((member_name, kind));
+        }
     }
     let q = role_opt
         .and_then(|r| r.effective_quorum())
@@ -849,10 +875,226 @@ mod tests {
             members,
             vec![
                 ("suhuynh-t2c1".to_string(), "suhuynh".to_string()),
-                ("suhuynh-t2c2".to_string(), "suhuynh".to_string()),
-                ("truonglao-t2c3".to_string(), "truonglao".to_string()),
+                ("truonglao-t2c2".to_string(), "truonglao".to_string()),
             ]
         );
         assert_eq!(quorum, 2);
+    }
+
+    #[test]
+    fn test_resolve_council_members_fallback_picks_three_distinct_when_available() {
+        let mut cfg = crate::config::Config::default();
+        cfg.purposes
+            .insert("review".to_string(), "suhuynh".to_string());
+        cfg.purposes
+            .insert("design".to_string(), "truonglao".to_string());
+        cfg.strategy.default_reviewer.push("sude".to_string());
+
+        let (members, quorum) = resolve_council_members(&cfg, None, "t3");
+        assert_eq!(
+            members,
+            vec![
+                ("suhuynh-t3c1".to_string(), "suhuynh".to_string()),
+                ("truonglao-t3c2".to_string(), "truonglao".to_string()),
+                ("sude-t3c3".to_string(), "sude".to_string()),
+            ]
+        );
+        assert_eq!(quorum, 2);
+    }
+
+    #[test]
+    fn council_neutral_seat() {
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "quaqua-cns-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runs_dir = tmp.join("runs");
+        let repo_dir = tmp.join("repo");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        struct NeutralSeatMock {
+            runs_dir: PathBuf,
+            prompts: Mutex<std::collections::HashMap<String, String>>,
+        }
+
+        impl CouncilMemberRunner for NeutralSeatMock {
+            fn spawn_member(
+                &self,
+                _name: &str,
+                _kind: &str,
+                _repo: &Path,
+                _task: &str,
+                _approve_kinds: &[String],
+                _base: Option<&str>,
+            ) -> Result<(), (i32, String)> {
+                Ok(())
+            }
+
+            fn prompt_member(
+                &self,
+                name: &str,
+                brief: &str,
+                _repo: &Path,
+                _cancel: Arc<AtomicBool>,
+            ) -> Result<SingleWorkerOutput, (i32, String)> {
+                self.prompts
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_string(), brief.to_string());
+
+                let sealed_dir = self.runs_dir.join(".sealed");
+                std::fs::create_dir_all(&sealed_dir).unwrap();
+                let sealed_report = sealed_dir.join(format!("{name}.md"));
+                let unsealed_report = self.runs_dir.join(format!("{name}.md"));
+
+                // Write member report to runs/.sealed/<name>.md
+                std::fs::write(&sealed_report, "# Report\nVerdict: clean\n").unwrap();
+
+                // (2) Sealed member report is NOT readable under runs/<name>.md before round closes
+                assert!(
+                    !unsealed_report.exists(),
+                    "sealed member report must NOT be readable under runs/<name>.md before round closes"
+                );
+                assert!(
+                    sealed_report.exists(),
+                    "sealed report must exist in runs/.sealed/<name>.md while round is open"
+                );
+
+                Ok(SingleWorkerOutput::new(0, sealed_report).unwrap())
+            }
+
+            fn cleanup_member(&self, _name: &str, _repo: &Path) -> Result<(), (i32, String)> {
+                Ok(())
+            }
+        }
+
+        let runner = NeutralSeatMock {
+            runs_dir: runs_dir.clone(),
+            prompts: Mutex::new(std::collections::HashMap::new()),
+        };
+
+        let task = "cnstest";
+        let brief = "Goal: audit neutral seat\nHard constraints: none\nCurrent design (open to challenge): use approach X\nEvidence: clean";
+        let m1 = format!("suhuynh-{}c1", task);
+        let m2 = format!("truonglao-{}c2", task);
+        let member_specs = vec![
+            (m1.clone(), "suhuynh".to_string()),
+            (m2.clone(), "truonglao".to_string()),
+        ];
+
+        let out = run_taskforce_workflow(
+            "council",
+            task,
+            &repo_dir,
+            brief,
+            "council",
+            &member_specs,
+            2,
+            "cos",
+            &[],
+            None,
+            &runs_dir,
+            &runner,
+        )
+        .expect("taskforce workflow should complete successfully");
+
+        // Assertion (1): neutral seat prompt omits Current design while others retain it
+        let prompts = runner.prompts.lock().unwrap();
+        let prompt_m1 = prompts
+            .get(&m1)
+            .expect("prompt for neutral seat m1 must be recorded");
+        let prompt_m2 = prompts
+            .get(&m2)
+            .expect("prompt for second seat m2 must be recorded");
+
+        assert!(
+            !prompt_m1.contains("Current design"),
+            "neutral seat prompt must omit Current design, got: {prompt_m1}"
+        );
+        assert!(
+            prompt_m1.contains("Reconstruct the problem first")
+                || prompt_m1.contains("reconstruct the problem first"),
+            "neutral seat prompt must instruct to reconstruct the problem first, got: {prompt_m1}"
+        );
+        assert!(
+            prompt_m2.contains("Current design"),
+            "non-neutral seat prompt must retain Current design, got: {prompt_m2}"
+        );
+        drop(prompts);
+
+        // Assertion (2): sealed member report revealed into runs/<name>.md upon round completion
+        let unsealed_m1 = runs_dir.join(format!("{m1}.md"));
+        let unsealed_m2 = runs_dir.join(format!("{m2}.md"));
+        let sealed_m1 = runs_dir.join(".sealed").join(format!("{m1}.md"));
+        let sealed_m2 = runs_dir.join(".sealed").join(format!("{m2}.md"));
+
+        assert!(
+            unsealed_m1.exists(),
+            "unsealed m1 report must exist after round closes"
+        );
+        assert!(
+            unsealed_m2.exists(),
+            "unsealed m2 report must exist after round closes"
+        );
+        assert!(
+            !sealed_m1.exists(),
+            "sealed m1 file must be moved into runs/ after round closes"
+        );
+        assert!(
+            !sealed_m2.exists(),
+            "sealed m2 file must be moved into runs/ after round closes"
+        );
+        assert_eq!(
+            out.report_paths,
+            vec![unsealed_m1.clone(), unsealed_m2.clone()]
+        );
+
+        let content_before = std::fs::read_to_string(&unsealed_m1).unwrap();
+
+        // Assertion (3): replaying journal does not double-move
+        let replay_out = run_taskforce_workflow(
+            "council",
+            task,
+            &repo_dir,
+            brief,
+            "council",
+            &member_specs,
+            2,
+            "cos",
+            &[],
+            None,
+            &runs_dir,
+            &runner,
+        )
+        .expect("journal replay must succeed");
+
+        assert_eq!(
+            replay_out.report_paths,
+            vec![unsealed_m1.clone(), unsealed_m2.clone()],
+            "replay must preserve report paths pointing to runs/<name>.md"
+        );
+        assert!(
+            unsealed_m1.exists(),
+            "unsealed m1 report must still exist after journal replay"
+        );
+        assert!(
+            !sealed_m1.exists(),
+            "sealed m1 report must not be re-created on journal replay"
+        );
+        let content_after = std::fs::read_to_string(&unsealed_m1).unwrap();
+        assert_eq!(
+            content_before, content_after,
+            "report content must not be modified or corrupted by replay"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
