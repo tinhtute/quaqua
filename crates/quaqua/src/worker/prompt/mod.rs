@@ -1988,6 +1988,138 @@ esac
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    /// Issue #191: while the watchdog is blocked inside an activity, a second
+    /// writer on the same `worker:<name>#k` session can commit a tick of its
+    /// own, leaving the runner's in-memory cursor behind the journal head. The
+    /// append must rebase onto the current head and land, not kill the
+    /// watchdog with a sequence-conflict exit 3.
+    #[test]
+    fn test_prompt_rebases_a_stale_cursor_from_a_second_writer() {
+        let _env_lock = lock_env();
+        let tmp = temp_runs("seq-rebase");
+        let name = "sude-rebase";
+        let wf = format!("worker:{name}#1");
+        let db_path = tmp.join("quaqua.db");
+        fs::write(
+            tmp.join(format!("{name}.md")),
+            "Outcome: COMPLETE\n# Report\n\n## Lessons\nnone\n",
+        )
+        .unwrap();
+
+        // Stub herdr for the watchdog's polls. On its first `agent` call it
+        // signals the test's second writer and blocks until that writer has
+        // committed, so the foreign tick lands inside the activity — the
+        // 13:08 -> 13:09 shape of the incident, without a timing race.
+        let race_req = tmp.join(".race-req");
+        let race_done = tmp.join(".race-done");
+        let stub = tmp.join("herdr-race-stub");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+if [ "$1" = "agent" ] && [ -n "$RACE_REQ" ] && [ ! -f "$RACE_REQ" ]; then
+  : > "$RACE_REQ"
+  i=0
+  while [ ! -f "$RACE_DONE" ] && [ "$i" -lt 300 ]; do
+    sleep 0.01
+    i=$((i+1))
+  done
+fi
+case "$1" in
+  agent)
+    case "$2" in
+      wait) echo '{"result": {"agent": {"agent_status": "idle", "state_change_seq": 1}}}'; exit 0 ;;
+      get) echo '{"result": {"agent": {"name": "'"$3"'", "agent_status": "idle"}}}'; exit 0 ;;
+      *) echo '{"result": {}}'; exit 0 ;;
+    esac ;;
+  *) echo '{"result": {}}'; exit 0 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _g_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", tmp.to_str().unwrap());
+        let _g_skip = TestEnvVarGuard::set("GRID_SKIP", "1");
+        let _g_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
+        let _g_poll = TestEnvVarGuard::set("PROMPT_WORKER_POLL_SEC", "1");
+        let _g_herdr = TestEnvVarGuard::set("HERDR_BIN_PATH", stub.to_str().unwrap());
+        let _g_req = TestEnvVarGuard::set("RACE_REQ", race_req.to_str().unwrap());
+        let _g_done = TestEnvVarGuard::set("RACE_DONE", race_done.to_str().unwrap());
+
+        // The second writer: a 12-event tick committed in-process through
+        // rusqlite while the watchdog is parked inside its first herdr poll.
+        let racer = {
+            let db_path = db_path.clone();
+            let wf = wf.clone();
+            let (req, done) = (race_req.clone(), race_done.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !req.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(req.exists(), "the stub never reached its first agent wait");
+                let conn = rusqlite::Connection::open(&db_path).expect("open the journal db");
+                conn.busy_timeout(std::time::Duration::from_millis(5000))
+                    .expect("set a busy timeout");
+                conn.execute_batch("BEGIN IMMEDIATE;").expect("begin");
+                for _ in 0..12 {
+                    conn.execute(
+                        "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) \
+                         SELECT ?1, COALESCE(MAX(seq), 0) + 1, 1, 'other_writer', '{}' \
+                         FROM events WHERE workflow_id = ?1;",
+                        rusqlite::params![wf],
+                    )
+                    .expect("insert a second-writer event");
+                }
+                conn.execute_batch("COMMIT;").expect("commit");
+                fs::write(&done, b"done").expect("signal the stub");
+            })
+        };
+
+        let herdr = Herdr {
+            bin: stub.to_string_lossy().to_string(),
+        };
+        let git = crate::git::Git::new();
+        let res = prompt_worker(name, None, true, None, &git, &herdr);
+        racer.join().expect("the second writer must finish");
+        assert_eq!(
+            res,
+            Ok(()),
+            "a stale cursor must be rebased, not end the watchdog at exit 3"
+        );
+
+        let journal = SqliteJournal::open(&db_path).unwrap();
+        let events = journal.load_events(&wf, 1).unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        let want: Vec<u64> = (1..=events.len() as u64).collect();
+        assert_eq!(seqs, want, "the journal must stay one contiguous chain");
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "other_writer").count(),
+            12,
+            "no second-writer event is lost"
+        );
+        // The append that lost the race was `wake_0`'s completion; the refused
+        // insert rolled back, so the rebased event must land once, not twice.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "activity_completed" && e.payload_json.contains("wake_0"))
+                .count(),
+            1,
+            "the rebased activity_completed must land exactly once"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "workflow_completed")
+                .count(),
+            1,
+            "the workflow completes exactly once"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_worker_prompt_runner_error_gives_non_zero_watchdog_exit() {
         let _env_lock = lock_env();
