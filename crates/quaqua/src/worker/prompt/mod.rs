@@ -1988,6 +1988,105 @@ esac
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    /// Issue #191: while the watchdog is blocked inside an activity, a second
+    /// writer on the same `worker:<name>#k` session can commit a tick of its
+    /// own, leaving the runner's in-memory cursor behind the journal head. The
+    /// append must rebase onto the current head and land, not kill the
+    /// watchdog with a sequence-conflict exit 3.
+    #[test]
+    fn test_prompt_rebases_a_stale_cursor_from_a_second_writer() {
+        let _env_lock = lock_env();
+        let tmp = temp_runs("seq-rebase");
+        let name = "sude-rebase";
+        let wf = format!("worker:{name}#1");
+        let db_path = tmp.join("quaqua.db");
+        fs::write(
+            tmp.join(format!("{name}.md")),
+            "Outcome: COMPLETE\n# Report\n\n## Lessons\nnone\n",
+        )
+        .unwrap();
+
+        // Stub herdr that also plays the second writer: the first herdr call
+        // made after this watchdog journalled an event appends a 12-event tick
+        // of its own — the 13:08 -> 13:09 shape of the incident.
+        let stub = tmp.join("herdr-race-stub");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+if [ -n "$RACE_DB" ] && [ ! -f "$RACE_SEEN" ]; then
+  n=$(sqlite3 "$RACE_DB" "select count(*) from events where workflow_id='$RACE_WF';" 2>/dev/null || echo 0)
+  if [ "$n" -ge 1 ]; then
+    : > "$RACE_SEEN"
+    {
+      echo "PRAGMA busy_timeout=5000;"
+      echo "BEGIN IMMEDIATE;"
+      i=0
+      while [ "$i" -lt 12 ]; do
+        echo "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) SELECT '$RACE_WF', COALESCE(MAX(seq),0)+1, 1, 'other_writer', '{}' FROM events WHERE workflow_id='$RACE_WF';"
+        i=$((i+1))
+      done
+      echo "COMMIT;"
+    } | sqlite3 "$RACE_DB"
+  fi
+fi
+case "$1" in
+  agent)
+    case "$2" in
+      wait) echo '{"result": {"agent": {"agent_status": "idle", "state_change_seq": 1}}}'; exit 0 ;;
+      get) echo '{"result": {"agent": {"name": "'"$3"'", "agent_status": "idle"}}}'; exit 0 ;;
+      *) echo '{"result": {}}'; exit 0 ;;
+    esac ;;
+  *) echo '{"result": {}}'; exit 0 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _g_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", tmp.to_str().unwrap());
+        let _g_skip = TestEnvVarGuard::set("GRID_SKIP", "1");
+        let _g_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
+        let _g_poll = TestEnvVarGuard::set("PROMPT_WORKER_POLL_SEC", "1");
+        let _g_herdr = TestEnvVarGuard::set("HERDR_BIN_PATH", stub.to_str().unwrap());
+        let _g_db = TestEnvVarGuard::set("RACE_DB", db_path.to_str().unwrap());
+        let _g_wf = TestEnvVarGuard::set("RACE_WF", &wf);
+        let _g_seen = TestEnvVarGuard::set(
+            "RACE_SEEN",
+            tmp.join(".raced").to_str().unwrap_or_default(),
+        );
+
+        let herdr = Herdr {
+            bin: stub.to_string_lossy().to_string(),
+        };
+        let git = crate::git::Git::new();
+        let res = prompt_worker(name, None, true, None, &git, &herdr);
+        assert_eq!(
+            res,
+            Ok(()),
+            "a stale cursor must be rebased, not end the watchdog at exit 3"
+        );
+
+        let journal = SqliteJournal::open(&db_path).unwrap();
+        let events = journal.load_events(&wf, 1).unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        let want: Vec<u64> = (1..=events.len() as u64).collect();
+        assert_eq!(seqs, want, "the journal must stay one contiguous chain");
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "other_writer").count(),
+            12,
+            "no second-writer event is lost"
+        );
+        for kind in ["activity_completed", "workflow_completed"] {
+            assert_eq!(
+                events.iter().filter(|e| e.kind == kind).count(),
+                1,
+                "{kind} must be journalled exactly once"
+            );
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_worker_prompt_runner_error_gives_non_zero_watchdog_exit() {
         let _env_lock = lock_env();
