@@ -23,4 +23,4 @@
 - entrypoints: `crates/quaqua/src/main.rs`; PreToolUse gate `crates/quaqua/src/gate/`.
 
 ## What are we working on right now?
-- plan: .harness/plans/active/remaining-work-2026-10-25.md (active)
+- plan: .harness/plans/active/superagent-bus.md (active, high-risk, next: work full phase hermetic)
