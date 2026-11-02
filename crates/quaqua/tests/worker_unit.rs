@@ -1321,7 +1321,7 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
     assert_eq!(cmd_sude.split_envs.len(), 2);
     assert_eq!(cmd_sude.split_envs[0].0, "QUAQUA_STATE_FILE");
     assert_eq!(cmd_sude.split_envs[1].0, "QUAQUA_ERROR_FILE");
-    assert!(cmd_sude.agent_args.iter().any(|a| a == "--no-extensions"));
+    assert!(!cmd_sude.agent_args.iter().any(|a| a == "--no-extensions"));
     assert!(cmd_sude
         .agent_args
         .iter()
@@ -1347,7 +1347,7 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
     assert_eq!(cmd_tieude.split_envs.len(), 2);
     assert_eq!(cmd_tieude.split_envs[0].0, "QUAQUA_STATE_FILE");
     assert_eq!(cmd_tieude.split_envs[1].0, "QUAQUA_ERROR_FILE");
-    assert!(cmd_tieude.agent_args.iter().any(|a| a == "--no-extensions"));
+    assert!(!cmd_tieude.agent_args.iter().any(|a| a == "--no-extensions"));
     assert!(cmd_tieude
         .agent_args
         .iter()
@@ -1937,7 +1937,7 @@ fn test_launch_args_carry_exact_model_and_effort() {
         "{joined}"
     );
     assert!(joined.contains("--thinking high"), "{joined}");
-    assert!(joined.contains("--no-extensions"), "{joined}");
+    assert!(!joined.contains("--no-extensions"));
     assert!(joined.contains("omp-worker-state.ts"), "{joined}");
 
     // claude: `--model` (mapped to claude-*) + `--effort` (`claude --help`).
@@ -2031,7 +2031,7 @@ fn test_launch_review_args_per_harness() {
     assert!(omp
         .agent_args
         .contains(&"--tools=read,bash,grep,glob".to_string()));
-    assert!(omp.agent_args.contains(&"--no-extensions".to_string()));
+    assert!(!omp.agent_args.contains(&"--no-extensions".to_string()));
     assert!(omp
         .agent_args
         .iter()

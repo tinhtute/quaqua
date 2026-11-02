@@ -8,9 +8,8 @@ root="$(cd "$here/.." && pwd -P)"
 ext="$root/templates/workspace/scripts/hooks/omp-worker-state.ts"
 T=$(mktemp -d "${TMPDIR:-/tmp}/test-omp-state.XXXXXX")
 trap 'rm -rf "$T"' EXIT
-
+fail() { echo "FAIL: $*" >&2; exit 1; }
 unset OMPCODE
-
 
 [[ -f $ext ]] || fail "missing extension at $ext"
 
@@ -101,13 +100,13 @@ assert.match(readState(), /^working \d+$/);
 pi.emit("agent_end", {});
 assert.match(readState(), /^idle \d+$/);
 
-// 11. credential_disabled -> blocked signed-out + fatal 401
+// 11. credential_disabled -> blocked signed-out + fatal 401 0 (0 retries)
 pi.emit("credential_disabled");
 assert.match(readState(), /^blocked \d+ signed-out$/);
-assert.match(readError(), /^fatal 401 \d+$/);
+assert.equal(readError(), "fatal 401 0");
 fs.unlinkSync(errorFile);
 
-// 12. agent_end with terminal error (connection refused)
+// 12. agent_end with terminal error (connection refused, 0 retries run)
 pi.emit("agent_start");
 pi.emit("agent_end", {
   messages: [{
@@ -117,10 +116,10 @@ pi.emit("agent_end", {
   }]
 });
 assert.match(readState(), /^idle \d+$/);
-assert.equal(readError(), "retryable 0 1");
+assert.equal(readError(), "retryable 0 0");
 fs.unlinkSync(errorFile);
 
-// 13. agent_end with terminal 429 rate limit
+// 13. agent_end with terminal 429 rate limit (exhausted after 10 retries)
 pi.emit("agent_start");
 pi.emit("agent_end", {
   messages: [{
@@ -133,7 +132,33 @@ pi.emit("agent_end", {
 assert.equal(readError(), "retryable 429 10");
 fs.unlinkSync(errorFile);
 
-// 14. agent_end with terminal 401 auth error -> blocked signed-out + fatal 401
+// 13b. Pinning regex for singular retry: "failed after 1 retry: 429"
+pi.emit("agent_start");
+pi.emit("agent_end", {
+  messages: [{
+    role: "assistant",
+    stopReason: "error",
+    errorStatus: 429,
+    errorMessage: "Error: Retry failed after 1 retry: 429: Too Many Requests"
+  }]
+});
+assert.equal(readError(), "retryable 429 1");
+fs.unlinkSync(errorFile);
+
+// 13c. Pinning agent_start count: 2 agent_start calls = 1 retry run
+pi.emit("agent_start");
+pi.emit("agent_start");
+pi.emit("agent_end", {
+  messages: [{
+    role: "assistant",
+    stopReason: "error",
+    errorMessage: "Connection dropped"
+  }]
+});
+assert.equal(readError(), "retryable 0 1");
+fs.unlinkSync(errorFile);
+
+// 14. agent_end with terminal 401 auth error -> blocked signed-out + fatal 401 0
 pi.emit("agent_start");
 pi.emit("agent_end", {
   messages: [{
@@ -144,7 +169,7 @@ pi.emit("agent_end", {
   }]
 });
 assert.match(readState(), /^blocked \d+ signed-out$/);
-assert.equal(readError(), "fatal 401 1");
+assert.equal(readError(), "fatal 401 0");
 fs.unlinkSync(errorFile);
 
 // 15. Nested session ignores events

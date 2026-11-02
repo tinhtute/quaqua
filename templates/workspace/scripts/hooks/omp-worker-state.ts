@@ -148,10 +148,14 @@ export function extractErrorDetails(event: unknown): {
 
   const { errorClass, status } = classifyError(rawStatus, errorMessage);
 
-  let attempts = 1;
-  const retryMatch = errorMessage.match(
-    /(?:retries|attempts):\s*|after\s+(\d+)\s+(?:retries|attempts)/i
-  );
+  let attempts = 0;
+  const retryMatch =
+    errorMessage.match(
+      /(?:exhausted|failed)\s+after\s+(\d+)\s+(?:retries|retry|attempts|attempt)/i
+    ) ||
+    errorMessage.match(
+      /after\s+(\d+)\s+(?:retries|retry|attempts|attempt)/i
+    );
   if (retryMatch && retryMatch[1]) {
     attempts = parseInt(retryMatch[1], 10);
   }
@@ -255,7 +259,7 @@ export default function (pi: OmpExtensionApi) {
 
   pi.on("credential_disabled", () => {
     writeState("blocked", "signed-out");
-    writeError("fatal", 401, Math.max(1, sessionAttempts));
+    writeError("fatal", 401, Math.max(0, sessionAttempts - 1));
   });
 
   pi.on("agent_end", (event: unknown) => {
@@ -269,8 +273,11 @@ export default function (pi: OmpExtensionApi) {
 
     const errorDetails = extractErrorDetails(event);
     if (errorDetails) {
-      const finalAttempts = Math.max(sessionAttempts, errorDetails.attempts);
-      writeError(errorDetails.errorClass, errorDetails.status, finalAttempts);
+      const retriesRun = Math.max(
+        Math.max(0, sessionAttempts - 1),
+        errorDetails.attempts
+      );
+      writeError(errorDetails.errorClass, errorDetails.status, retriesRun);
       sessionAttempts = 0;
 
       if (errorDetails.isAuth) {

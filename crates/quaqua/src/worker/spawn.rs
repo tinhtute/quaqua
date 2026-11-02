@@ -372,6 +372,17 @@ fn worker_split_envs<'a>(cmd: &'a LaunchCmd) -> Vec<(&'a str, &'a str)> {
     }
     envs
 }
+pub(crate) fn warn_if_omp_hook_missing(hook_path: &str) -> bool {
+    if !std::path::Path::new(hook_path).is_file() {
+        eprintln!(
+            "warning: omp worker-state hook '{hook_path}' missing; run `quaqua init` to install it"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 
 pub fn spawn_worker<G: GitOps, H: HerdrOps>(
     opts: SpawnOptions,
@@ -689,6 +700,9 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
                 &settings_file,
                 serde_json::to_string_pretty(&settings_val).unwrap_or_default(),
             );
+        } else if launch.harness == "omp" {
+            let hook_path = crate::launch::omp_worker_state_hook_path(&runs_str);
+            warn_if_omp_hook_missing(&hook_path);
         }
         let split_envs = worker_split_envs(&cmd);
 
@@ -913,5 +927,10 @@ mod credential_env_tests {
         assert!(envs
             .iter()
             .any(|(k, v)| *k == "QUAQUA_ERROR_FILE" && *v == "/runs/.sude.error"));
+    }
+
+    #[test]
+    fn spawn_warns_when_omp_hook_missing() {
+        assert!(warn_if_omp_hook_missing("/nonexistent/omp-worker-state.ts"));
     }
 }
