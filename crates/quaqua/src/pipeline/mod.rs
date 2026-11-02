@@ -1397,30 +1397,34 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                             .any(|l| l.trim().starts_with("## Challenge"))
                 };
 
-                while !already_delivered {
-                    let mut is_terminal_err = false;
-                    for rec in &child_events {
-                        if rec.kind == "workflow_completed" {
-                            if let Ok(out) =
-                                serde_json::from_str::<SingleWorkerOutput>(&rec.payload_json)
-                            {
-                                if out.exit != 0 {
-                                    is_terminal_err = true;
+                // A delivered report needs no generation walk; otherwise advance
+                // `cur_k` while the child's latest journal ends in a terminal
+                // error, so the phase resumes from the live generation.
+                if !already_delivered {
+                    loop {
+                        let mut is_terminal_err = false;
+                        for rec in &child_events {
+                            if rec.kind == "workflow_completed" {
+                                if let Ok(out) =
+                                    serde_json::from_str::<SingleWorkerOutput>(&rec.payload_json)
+                                {
+                                    if out.exit != 0 {
+                                        is_terminal_err = true;
+                                    }
                                 }
+                            } else if rec.kind == "workflow_failed" {
+                                is_terminal_err = true;
                             }
-                        } else if rec.kind == "workflow_failed" {
-                            is_terminal_err = true;
                         }
-                    }
-                    if is_terminal_err {
+                        if !is_terminal_err {
+                            break;
+                        }
                         cur_k += 1;
                         child_wf_id = format!("pipeline:{}:{}#{}", ctx.task, child_id, cur_k);
                         child_events = journal
                             .load_events(&child_wf_id, 1)
                             .map_err(|e| (1, format!("journal error: {e}\n")))?;
                         state.prompted = 1;
-                    } else {
-                        break;
                     }
                 }
 

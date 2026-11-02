@@ -290,6 +290,10 @@ fn a_split_workspace_is_quiet() {
     assert!(!stderr.contains("warning:"), "{stderr}");
 }
 
+// `doctor` fails on missing or inactive auditor systemd units on Linux only
+// (issue #198); macOS reports manual activation instead, so these three cases
+// can only be exercised where the check runs.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_missing_auditor_unit_fails_the_run() {
     let f = Fixture::new("no-units", "quaqua is /tmp/bin/quaqua");
@@ -306,6 +310,7 @@ fn a_missing_auditor_unit_fails_the_run() {
     assert!(stderr.contains("install-auditor.sh"), "{stderr}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_inactive_auditor_timer_fails_the_run() {
     let f = Fixture::new("inactive-timer", "quaqua is /tmp/bin/quaqua");
@@ -324,6 +329,7 @@ fn an_inactive_auditor_timer_fails_the_run() {
 /// `QUAQUA_TEST=1` exists so a suite cannot write live workspace state; the
 /// auditor check only reads `$HOME` and runs `systemctl`, so the switch must
 /// not silence it and hand a broken workstation a green `doctor`.
+#[cfg(target_os = "linux")]
 #[test]
 fn quaqua_test_does_not_disable_the_auditor_check() {
     let f = Fixture::new("test-env", "quaqua is /tmp/bin/quaqua");
@@ -336,6 +342,25 @@ fn quaqua_test_does_not_disable_the_auditor_check() {
     assert!(
         stderr.contains("auditor systemd unit is missing"),
         "{stderr}"
+    );
+}
+
+/// macOS has no systemd user session, so `doctor` notes manual auditor
+/// activation instead of failing on units the workstation can never install —
+/// even with the fixture's units removed, the run stays green.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_notes_manual_auditor_activation_instead_of_failing() {
+    let f = Fixture::new("macos-auditor", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    fs::remove_dir_all(f.home.join(".config/systemd/user")).unwrap();
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("auditor: macOS manual activation required"),
+        "{stdout}"
     );
 }
 
