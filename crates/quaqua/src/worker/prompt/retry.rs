@@ -622,4 +622,22 @@ mod tests {
             assert_eq!(classify(pane), None, "{pane}");
         }
     }
+
+    #[test]
+    fn classify_handles_non_ascii_pane_text_without_panicking() {
+        for pane in ["all ✅ tests pass", "done 🚀 ok", "abcdế xong roi"] {
+            assert_eq!(classify(pane), None, "{pane}");
+        }
+    }
+
+    #[test]
+    fn classify_ignores_worker_prose_with_error_and_status() {
+        for pane in [
+            "Error: 500 lines are over the limit, fix the fixture",
+            "error: 503 backend flaked in the test run",
+            "Error: 429 rate limit from the mock server in tests/retry.rs",
+        ] {
+            assert_eq!(classify(pane), None, "{pane}");
+        }
+    }
 }
