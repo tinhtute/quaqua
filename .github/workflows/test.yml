@@ -42,7 +42,10 @@ jobs:
       # The suite must be hermetic with respect to the live workspace database:
       # no test may open <passwd home>/quaqua/runs/quaqua.db* (the file the
       # owner's real workspace runs on). tests/test_hermetic_db.sh traces every
-      # open(2) of that path across the whole suite and fails listing each hit.
+      # open(2) of that path across the whole suite and fails listing each hit,
+      # and plants a decoy there for the traced run: an existence-gated open of
+      # a path that does not exist calls no open(2) at all, which the runner's
+      # missing workspace directory would otherwise hide.
       #
       # A second full run is deliberate: this step gates a second, independent
       # property, and the step above keeps reporting the suite's own result.

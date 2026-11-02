@@ -8,6 +8,14 @@
 # fallback. A tracker that trusted $HOME would report a false clean on any run
 # with HOME overridden (CI isolation, a fixture, a sandbox).
 #
+# A decoy file is planted at the live DB path for the duration of the traced
+# run: code that opens the live DB only when the file exists calls no open(2) on
+# a missing path, so a trace from a host where the path is absent (CI) would
+# never see it. An existing file is never overwritten - a real DB there is
+# already the file this guard catches, and a decoy left by a crashed run is
+# recognised by its marker and reused. The decoy and any directory this script
+# created for it are removed on exit, so a repeat run finds nothing left to do.
+#
 # Usage:
 #   tests/test_hermetic_db.sh                 trace `cargo test --locked`
 #   tests/test_hermetic_db.sh --scan-only LOG replay a saved trace through the
@@ -95,6 +103,72 @@ keep_trace() {
   workdir=''
 }
 
+# First line of a decoy file, so a run that crashed before its cleanup does not
+# leave something indistinguishable from a real database.
+decoy_marker='quaqua hermetic-db guard decoy (not a database)'
+
+# Plants the decoy at $live_db and returns 1 when it cannot. Directories the
+# planting needed are created one level at a time and remembered, so cleanup can
+# remove exactly what this run made.
+plant_decoy() {
+  local dir=$live_db missing=() d tmp
+  if [[ -e $live_db ]]; then
+    if head -c 128 -- "$live_db" 2>/dev/null | grep -qF -- "$decoy_marker"; then
+      decoy=$live_db
+      printf 'note: reusing the decoy an earlier run left at %s\n' "$live_db"
+    else
+      printf 'note: a file already exists at %s; no decoy planted\n' "$live_db"
+    fi
+    return 0
+  fi
+  dir=${dir%/*}
+  while [[ ! -d $dir ]]; do
+    missing=("$dir" "${missing[@]}")
+    dir=${dir%/*}
+  done
+  for d in "${missing[@]}"; do
+    if ! mkdir -- "$d" 2>/dev/null; then
+      printf 'error: cannot create %s for the decoy\n' "$d" >&2
+      return 1
+    fi
+    created_dirs+=("$d")
+  done
+  tmp="$live_db.hermetic-decoy.$$"
+  if ! printf '%s\n' "$decoy_marker" >"$tmp" || ! mv -f -- "$tmp" "$live_db"; then
+    printf 'error: cannot write the decoy %s\n' "$live_db" >&2
+    rm -f -- "$tmp"
+    return 1
+  fi
+  decoy=$live_db
+  printf 'planted decoy: %s (removed at exit)\n' "$live_db"
+}
+
+# Removes the decoy and the directories this run created for it. Anything else
+# found in those directories is left in place and reported: it was not written
+# by this guard, so it is evidence, not litter.
+# shellcheck disable=SC2329  # reached through on_exit below
+cleanup_decoy() {
+  local d i
+  if [[ -n $decoy ]]; then
+    rm -f -- "$decoy" "$decoy".hermetic-decoy.* 2>/dev/null
+    decoy=''
+  fi
+  for ((i = ${#created_dirs[@]} - 1; i >= 0; i--)); do
+    d=${created_dirs[i]}
+    if ! rmdir -- "$d" 2>/dev/null && [[ -d $d ]]; then
+      printf 'note: %s is not empty; left in place\n' "$d" >&2
+    fi
+  done
+  created_dirs=()
+}
+
+# shellcheck disable=SC2329  # installed as the EXIT trap
+on_exit() {
+  cleanup_decoy
+  [[ -n $workdir ]] && rm -rf -- "$workdir"
+  return 0
+}
+
 main() {
   local arg=${1:-}
   case $arg in
@@ -137,6 +211,7 @@ main() {
   fi
 
   printf 'tracing: cargo test --locked (live db: %s)\n' "$live_db"
+  plant_decoy || return 1
   # -s 4096: strace truncates strings to 32 bytes by default, which would cut
   # every live path into ".../quaqua" and hide the hit. -f: follow each test
   # process; -qq: drop attach/exit noise; -o: keep stdout/stderr of the suite
@@ -175,9 +250,11 @@ fi
 live_db="$live_home/quaqua/runs/quaqua.db"
 workdir=''
 trace_log=''
-# A crashed or interrupted run leaves nothing behind: the trace lives only for
-# the duration of this script.
-trap '[[ -n $workdir ]] && rm -rf "$workdir"' EXIT
+decoy=''
+created_dirs=()
+# A crashed or interrupted run leaves nothing behind: the trace and the decoy
+# live only for the duration of this script.
+trap 'on_exit' EXIT
 
 main "$@"
 exit $?
