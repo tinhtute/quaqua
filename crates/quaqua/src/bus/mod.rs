@@ -112,7 +112,7 @@ impl FarmBus {
 
     /// Opens or creates the bus at `path`, initializing schema idempotently.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        if crate::workspace::is_test_environment() && crate::workspace::is_live_workspace_db(path) {
+        if crate::workspace::live_db_open_refused(path) {
             return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
         }
         let runs_dir = path.parent().unwrap_or(path);
@@ -441,7 +441,7 @@ impl FarmBus {
 /// Safely records a farm event to the database at `db_path`.
 /// Logs on error and returns `false`, ensuring bus write failures never break callers.
 pub fn record_event_safely(db_path: &Path, event: &FarmEvent) -> bool {
-    if crate::workspace::is_test_environment() && crate::workspace::is_live_workspace_db(db_path) {
+    if crate::workspace::live_db_open_refused(db_path) {
         eprintln!(
             "warning: bus refused write to live workspace database under test: {}",
             db_path.display()

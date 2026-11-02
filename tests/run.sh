@@ -88,11 +88,14 @@ for t in "$here"/test_*.sh; do
     printf 'RUN  %s (slow suite; touched: %s)\n' "$name" "$hit"
   fi
   if bash "$t" >"$T/$name.log" 2>&1; then
-    # A suite that skips itself (its subject was replaced by the Rust binary)
-    # exits 0 but ran nothing: report it as SKIP, never as a silent pass
-    # (finding 2, suhuynh-r6r1). Its cases must be mapped in the test file.
-    if grep -q '^SKIP' "$T/$name.log"; then
-      printf 'SKIP %s (%s)\n' "$name" "$(head -n1 "$T/$name.log")"
+    # A suite that skips itself (its subject is missing on this host, or was
+    # replaced by the Rust binary) exits 0 but ran nothing: report it as SKIP,
+    # never as a silent pass (finding 2, suhuynh-r6r1). Its cases must be mapped
+    # in the test file. A suite declares the skip on its first line, either
+    # "SKIP ..." or "skipped: <reason>".
+    if grep -qE '^(SKIP|skipped:)' "$T/$name.log"; then
+      reason=$(head -n1 "$T/$name.log")
+      printf 'SKIP %s (%s)\n' "$name" "${reason#skipped: }"
       skipped+=("$name")
     else
       printf 'PASS %s\n' "$name"

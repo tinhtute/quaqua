@@ -582,6 +582,17 @@ pub fn opencode_spend_in(
     cwd: &str,
     since_ms: Option<u64>,
 ) -> Option<Spend> {
+    if crate::workspace::live_db_open_refused(db_path) {
+        // `spend_src` says why there is no number, like `cost-file-invalid`:
+        // a test that handed the live workspace DB learns it was refused
+        // rather than seeing a silent "not found".
+        return Some(Spend {
+            usd: None,
+            tokens: None,
+            spend_src: "live-db-refused".to_string(),
+            model: None,
+        });
+    }
     if !db_path.is_file() {
         return None;
     }
@@ -850,6 +861,9 @@ fn opencode_session_mtime(session_id: &str) -> Option<u64> {
             .push(std::path::PathBuf::from(home).join(".local/share/opencode/opencode.db"));
     }
     for db_path in db_candidates {
+        if crate::workspace::live_db_open_refused(&db_path) {
+            continue;
+        }
         if !db_path.is_file() {
             continue;
         }

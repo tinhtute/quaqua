@@ -24,3 +24,4 @@
 
 ## What are we working on right now?
 - plan: .harness/plans/active/superagent-bus.md (active, high-risk, next: work full phase hermetic)
+- program: docs/research/superagent.md (index; T1 = this plan, T2–T6 draft)

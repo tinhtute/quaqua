@@ -148,6 +148,16 @@ pub fn is_live_workspace_runs(path: &Path) -> bool {
     let db = path.join("quaqua.db");
     is_live_workspace_db(&db)
 }
+
+/// True when a test must not touch `path` at all: it is the owner's live workspace DB.
+///
+/// Every SQLite opener calls this before its first filesystem access, so a test
+/// can never create, migrate, or read the live journal through a default path or
+/// an env override.
+pub fn live_db_open_refused(path: &Path) -> bool {
+    is_test_environment() && is_live_workspace_db(path)
+}
+
 /// A dedicated per-process temporary runs directory under test.
 pub fn test_default_runs_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("quaqua-test-runs-{}", std::process::id()));

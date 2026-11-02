@@ -1,7 +1,7 @@
 # Spec: superagent bus (Source → Trigger → Thread → Subscription)
 
-Status: **locked** (2026-11-02). Plan thực thi: `.harness/plans/active/superagent-bus.md`. Bằng chứng và quyết định: [superagent-audit.md](superagent-audit.md).
-Baseline: `main` @ `a189d30`. Mọi `file:line` dưới đây đúng tại baseline đó.
+Status: **locked** (2026-11-02). Plan thực thi: `.harness/plans/active/superagent-bus.md`. Bằng chứng và quyết định: [superagent-audit.md](superagent-audit.md). Đây là track T1 của [superagent.md](superagent.md).
+Baseline: `main` @ `5b7bd1e` (spec revised after the PR #203 plan review). Mọi `file:line` dưới đây đúng tại baseline đó; các dòng khác không đổi so với `a189d30`.
 
 ## 1. Vì sao
 
@@ -98,16 +98,25 @@ Một lệnh mới, tường minh: `quaqua bus migrate [--dry-run]`, code trong 
 
 `--dry-run` chạy trên bản copy và in số dòng trước/sau từng bảng cùng cursor mới của từng consumer. Đổi tên cột hay xoá bảng phải xong trong cùng wave với việc chuyển caller (Migrate Callers Then Delete Legacy APIs).
 
+Lệnh `quaqua bus migrate` chạy thật trên DB live chỉ sau khi phase P1 đã merge vào `main` và binary từ bản merge đó đã được cài (không bao giờ cài binary từ branch chưa merge), với 0 worker live, ở thời điểm anh iu chọn. `--dry-run` trên bản copy thì chạy được trước đó.
+
 ## 5. CLI contract
 
 | Lệnh | Trạng thái | Hành vi |
 |---|---|---|
 | `quaqua mail send --to <n> --kind <k> --body-file -` | giữ | Ghi một trigger `source='mail'`. Không ghi `<to>.inbox.md`. Sau khi ghi gọi wake (§7) |
-| `quaqua mail inbox` | giữ, đổi nguồn | Render digest (§6) từ cursor của caller, rồi đẩy cursor tới trigger cuối đã in |
+| `quaqua mail inbox [--for <n>] [--peek]` | giữ, đổi nguồn | Render digest (§6) từ cursor của consumer, rồi đẩy cursor tới trigger cuối đã in. Consumer và quyền đẩy cursor: xem dưới bảng |
 | `quaqua mail ack` | **xoá** | Không có alias. Template và rule ngừng nhắc tới |
 | `quaqua recall <id>` | **mới**, seam cần anh iu duyệt | In trigger `<id>`, Thread của nó, và đối tượng `ref` (§8) |
-| `quaqua source github-ci poll` | **mới**, seam cần anh iu duyệt | Một lần poll (§9). Chạy bằng systemd user timer, cùng kiểu auditor |
-| `quaqua bus migrate [--dry-run]` | **mới**, seam cần anh iu duyệt | §4 |
+| `quaqua source github-ci poll` | **mới**, seam cần anh iu duyệt | Một lần poll (§9). Chạy bằng user timer: systemd trên Linux, launchd trên macOS, cùng kiểu auditor |
+| `quaqua bus migrate [--dry-run]` | **mới**, seam cần anh iu duyệt | §4; bản chạy thật chỉ sau khi P1 merge vào `main` và binary đã cài, 0 worker live |
+
+Consumer của `mail inbox` (đọc mà tự đánh dấu đã đọc nên phải chặn đọc hộ):
+
+- Không `--for`: consumer = caller từ `identity::resolve_caller`. Caller Unknown (mất tag pane #163, hoặc `HERDR_BIN_PATH` trỏ tới binary không tồn tại) → exit 1 với lỗi "unresolved caller", không render, không đẩy cursor nào.
+- `--for <n>`: render digest của `<n>`. Chỉ đẩy cursor khi caller đã resolve trùng `<n>`. Caller khác `<n>` hoặc Unknown → render như `--peek` và in một dòng cảnh báo ra stderr. Không ai đọc hộ làm mất tin của consumer khác.
+- `--peek`: render, không bao giờ đẩy cursor.
+- Hook CoS (§6) giữ `--for cos`, không dựa vào caller ngầm. Nếu identity CoS hỏng, hook vẫn hiện tin (peek) thay vì lỗi im lặng; digest lặp lại ở mỗi prompt là tín hiệu để sửa identity.
 
 Exit code: 0 thành công, 1 lỗi dùng sai, 2 lỗi DB. Output digest là text thuần một dòng mỗi trigger. `--json` cho `inbox` và `recall` in đúng các cột của bảng.
 
@@ -123,7 +132,7 @@ Mỗi dòng:
 - Một lần render = một batch: mọi trigger từ `cursor+1` tới id lớn nhất hiện có, gộp theo Thread, Thread có trigger mới nhất lên trước.
 - Trong một Thread, các trigger cùng `kind` liên tiếp gộp thành một dòng `#<first>..#<last> <kind> ×N …`.
 - Giới hạn 20 dòng. Vượt → dòng cuối `… +N more: quaqua mail inbox --all`.
-- Hook UserPromptSubmit của CoS (`templates/workspace/scripts/hooks/cos-inbox.sh`) gọi đúng renderer này; không giữ định dạng riêng.
+- Hook UserPromptSubmit của CoS (`templates/workspace/scripts/hooks/cos-inbox.sh`) gọi đúng renderer này; không giữ định dạng riêng. Template mới tới workspace bằng `quaqua init --update` (bước P2·T3), không sửa tay.
 
 ## 7. Wake (R3)
 
@@ -131,7 +140,7 @@ Nguồn sự kiện: `handle_event_hook` (`bus/events.rs:882`) đã nhận `pane
 
 Thuật toán, chạy trong hook và ngay sau `send_mail`:
 
-1. Xác định consumer của pane (tên agent).
+1. Xác định consumer của pane (tên agent). Tên này mất sau khi restart herdr (#163), nên P3 chỉ chạy sau khi #163 xong; trước đó nudge có thể gọi sai consumer.
 2. Nếu agent không idle → không làm gì. Trigger chờ trong DB.
 3. Nếu idle và có trigger chưa đọc (id > cursor, thuộc `to_name = consumer` hoặc Thread consumer đang subscribe) → gửi **một dòng** vào pane: `quaqua: <N> new (#<min>..#<max>), run quaqua mail inbox`, rồi Enter.
 4. Ghi `last_nudge_trigger_id` cho consumer (cột trong `cursors` hoặc `source_state`). Không nudge lại nếu không có trigger nào mới hơn giá trị đó. Tối đa một nudge mỗi batch.
@@ -167,16 +176,16 @@ GitHub CI Source (`quaqua source github-ci poll`):
 - `dedupe_key = 'gh-run:<databaseId>'`. Vị trí đọc (id run lớn nhất đã xem) lưu ở `source_state`.
 - Trigger: `source='github-ci'`, `kind='ci_failed'`, `actor='github'`, `summary` = `<workflowName> failed on <branch>`, `ref` = URL run. Gửi tới owner của Thread qua subscription, sau đó chạy wake.
 - `gh` lỗi mạng → exit 0, ghi log, không đẩy vị trí đọc (lần sau đọc lại). Đây là đọc, không phải ghi; không chạm `gate/policy.rs`.
-- Không dùng webhook. Chu kỳ timer: mặc định 5 phút, anh iu chỉnh trong unit.
+- Không dùng webhook. User timer chạy poll: systemd unit (`.service` + `.timer`) trên Linux, launchd LaunchAgent trên macOS — cùng mẫu với auditor (`templates/workspace/scripts/auditor/systemd/` và `.../launchd/com.quaqua.auditor.plist.in`). Chu kỳ: mặc định 5 phút, anh iu chỉnh trong unit.
 
 ## 10. Watchdog: Lead đang chờ (R8)
 
-Ở `worker/prompt/mod.rs:1347` (`stall: no worktree diff or session write for {quiet}s`): trước khi báo stall cho agent X, kiểm tra X có subscription còn hạn trên một Thread mà owner Peer của nó còn live (`herdr agent list`) hoặc có trigger trong cửa sổ quiet. Có → trạng thái `waiting`, không exit 3, không ghi trigger `stalled`. Không → giữ hành vi cũ.
+Ở nhánh stall của `worker/prompt/mod.rs:1358` (`stall: no worktree diff or session write for {quiet}s`): trước khi báo stall cho agent X, kiểm tra X có subscription còn hạn trên một Thread mà owner Peer của nó còn live (`herdr agent list`) hoặc có trigger trong cửa sổ quiet. Có → trạng thái `waiting`, không exit 3, không ghi trigger `stalled`. Không → giữ hành vi cũ.
 
 ## 11. Bỏ đi trong đợt này
 
-- `<lead>.inbox.md` và mọi chỗ ghi/đọc nó: `bus/mail.rs:440`, `:465`; drift check trong `doctor.rs` (~1095–1129); `templates/workspace/rules/_all/lead-inbox.md`; phần nói về inbox.md trong `templates/workspace/AGENTS.md`.
-- Auditor precheck của #199 (đọc `runs/*-lead.inbox.md`) nếu integ đã merge: đổi sang đọc trigger chưa đọc của Lead từ DB.
+- `<lead>.inbox.md` và mọi chỗ ghi/đọc nó: `bus/mail.rs:440`, `:465`; drift check trong `doctor.rs` (~1245–1279); `templates/workspace/rules/_all/lead-inbox.md`; phần nói về inbox.md trong `templates/workspace/AGENTS.md`.
+- Auditor precheck của #199 (đọc `runs/*-lead.inbox.md`): đổi sang đọc trigger chưa đọc của Lead từ DB. `0af6002` đã lên `main` qua #201, nên việc này chắc chắn phải làm, không còn phụ thuộc integ.
 - Cột `deliveries`, `last_delivered_ms`, `acked_ms`, `acked_by`; sự kiện `mail_unacked`, `mail_acked`.
 - `read_unacked_mail_since` (`mail.rs:808`), `ack_mail` (`mail.rs:912`).
 

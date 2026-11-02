@@ -252,7 +252,7 @@ impl SqliteJournal {
 
     /// Opens or creates the SQLite journal at the specified path.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
-        if crate::workspace::is_test_environment() && crate::workspace::is_live_workspace_db(path) {
+        if crate::workspace::live_db_open_refused(path) {
             return Err(JournalError::StorageError(format!(
                 "refusing to open live workspace database at {} under test",
                 path.display()
