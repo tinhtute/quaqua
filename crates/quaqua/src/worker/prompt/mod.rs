@@ -2006,28 +2006,23 @@ esac
         )
         .unwrap();
 
-        // Stub herdr that also plays the second writer: the first herdr call
-        // made after this watchdog journalled an event appends a 12-event tick
-        // of its own — the 13:08 -> 13:09 shape of the incident.
+        // Stub herdr for the watchdog's polls. On its first `agent` call it
+        // signals the test's second writer and blocks until that writer has
+        // committed, so the foreign tick lands inside the activity — the
+        // 13:08 -> 13:09 shape of the incident, without a timing race.
+        let race_req = tmp.join(".race-req");
+        let race_done = tmp.join(".race-done");
         let stub = tmp.join("herdr-race-stub");
         fs::write(
             &stub,
             r#"#!/bin/sh
-if [ -n "$RACE_DB" ] && [ ! -f "$RACE_SEEN" ]; then
-  n=$(sqlite3 "$RACE_DB" "select count(*) from events where workflow_id='$RACE_WF';" 2>/dev/null || echo 0)
-  if [ "$n" -ge 1 ]; then
-    : > "$RACE_SEEN"
-    {
-      echo "PRAGMA busy_timeout=5000;"
-      echo "BEGIN IMMEDIATE;"
-      i=0
-      while [ "$i" -lt 12 ]; do
-        echo "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) SELECT '$RACE_WF', COALESCE(MAX(seq),0)+1, 1, 'other_writer', '{}' FROM events WHERE workflow_id='$RACE_WF';"
-        i=$((i+1))
-      done
-      echo "COMMIT;"
-    } | sqlite3 "$RACE_DB"
-  fi
+if [ "$1" = "agent" ] && [ -n "$RACE_REQ" ] && [ ! -f "$RACE_REQ" ]; then
+  : > "$RACE_REQ"
+  i=0
+  while [ ! -f "$RACE_DONE" ] && [ "$i" -lt 300 ]; do
+    sleep 0.01
+    i=$((i+1))
+  done
 fi
 case "$1" in
   agent)
@@ -2049,16 +2044,45 @@ esac
         let _g_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
         let _g_poll = TestEnvVarGuard::set("PROMPT_WORKER_POLL_SEC", "1");
         let _g_herdr = TestEnvVarGuard::set("HERDR_BIN_PATH", stub.to_str().unwrap());
-        let _g_db = TestEnvVarGuard::set("RACE_DB", db_path.to_str().unwrap());
-        let _g_wf = TestEnvVarGuard::set("RACE_WF", &wf);
-        let _g_seen =
-            TestEnvVarGuard::set("RACE_SEEN", tmp.join(".raced").to_str().unwrap_or_default());
+        let _g_req = TestEnvVarGuard::set("RACE_REQ", race_req.to_str().unwrap());
+        let _g_done = TestEnvVarGuard::set("RACE_DONE", race_done.to_str().unwrap());
+
+        // The second writer: a 12-event tick committed in-process through
+        // rusqlite while the watchdog is parked inside its first herdr poll.
+        let racer = {
+            let db_path = db_path.clone();
+            let wf = wf.clone();
+            let (req, done) = (race_req.clone(), race_done.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !req.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(req.exists(), "the stub never reached its first agent wait");
+                let conn = rusqlite::Connection::open(&db_path).expect("open the journal db");
+                conn.busy_timeout(std::time::Duration::from_millis(5000))
+                    .expect("set a busy timeout");
+                conn.execute_batch("BEGIN IMMEDIATE;").expect("begin");
+                for _ in 0..12 {
+                    conn.execute(
+                        "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) \
+                         SELECT ?1, COALESCE(MAX(seq), 0) + 1, 1, 'other_writer', '{}' \
+                         FROM events WHERE workflow_id = ?1;",
+                        rusqlite::params![wf],
+                    )
+                    .expect("insert a second-writer event");
+                }
+                conn.execute_batch("COMMIT;").expect("commit");
+                fs::write(&done, b"done").expect("signal the stub");
+            })
+        };
 
         let herdr = Herdr {
             bin: stub.to_string_lossy().to_string(),
         };
         let git = crate::git::Git::new();
         let res = prompt_worker(name, None, true, None, &git, &herdr);
+        racer.join().expect("the second writer must finish");
         assert_eq!(
             res,
             Ok(()),
