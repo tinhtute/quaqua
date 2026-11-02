@@ -9,7 +9,7 @@ Every spawn/fanout of task workers MUST end with the workers arranged in the age
 - Enforced: `.claude/settings.json` runs `quaqua gate` (`scripts/hooks/herdr-gate.sh`), which blocks a direct `herdr pane split|move`, `herdr tab create`, `herdr workspace create|close` or `herdr agent start` from the CoS/Leads. On unparseable stdin, `quaqua gate` fails closed with exit 2 (intended difference from bash jq error, anh iu decision 2026-10-16).
 - One project per workers tab; never mix projects or owners, or put 2+ workers in the CoS tab.
 - `GRID_SKIP=1` is for `quaqua pipeline` (grids its own workers) and tests (`QUAQUA_TEST=1`) only; anywhere else it is ignored with a warning — never use it to dodge the grid.
-- Label each pane with the worker name. Moving or swapping a pane while its agent runs is allowed — the move keeps the agent process and session (isolated herdr smoke, issue #79); still avoid moving panes during `--wait`.
+- Label each pane with the worker name. Moving or swapping a pane while its agent runs is allowed — the move keeps the pane, its terminal, the agent process and its session, and a tool call started before the move still completes (`tests/test_panemove_working_agent.sh`, issue #192). The grid still defers a `working` pane (`[grid] deferred_statuses = ["working"]`), so the allowance is a herdr capability, not a licence for the repair to move a busy pane; still avoid moving panes during `--wait`.
 
 
 - A pipeline that spawns with GRID_SKIP=1 must repair (not only --check) across all of the owner's workers; a per-worker --check passes on a layout that is wrong in total — 2026-10-16, quaqua-rs-lead wP:t1
