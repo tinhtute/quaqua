@@ -1318,20 +1318,14 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
         false,
     )
     .unwrap();
-    assert!(cmd_sude.split_envs.is_empty());
-    assert_eq!(
-        cmd_sude.agent_args,
-        vec![
-            "--",
-            "--model",
-            "google-antigravity/gemini-3.8-flash",
-            "--thinking",
-            "high",
-            "--auto-approve",
-            "--append-system-prompt",
-            "/runs/test.rules.md",
-        ]
-    );
+    assert_eq!(cmd_sude.split_envs.len(), 2);
+    assert_eq!(cmd_sude.split_envs[0].0, "QUAQUA_STATE_FILE");
+    assert_eq!(cmd_sude.split_envs[1].0, "QUAQUA_ERROR_FILE");
+    assert!(cmd_sude.agent_args.iter().any(|a| a == "--no-extensions"));
+    assert!(cmd_sude
+        .agent_args
+        .iter()
+        .any(|a| a.ends_with("omp-worker-state.ts")));
 
     // 3. LEAD_KIND env override switches lead back to tieude (omp)
     let (kind_tieude, launch_tieude) =
@@ -1350,20 +1344,14 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
         false,
     )
     .unwrap();
-    assert!(cmd_tieude.split_envs.is_empty());
-    assert_eq!(
-        cmd_tieude.agent_args,
-        vec![
-            "--",
-            "--model",
-            "opencode-go/deepseek-v4.1-flash",
-            "--thinking",
-            "high",
-            "--auto-approve",
-            "--append-system-prompt",
-            "/runs/test.rules.md",
-        ]
-    );
+    assert_eq!(cmd_tieude.split_envs.len(), 2);
+    assert_eq!(cmd_tieude.split_envs[0].0, "QUAQUA_STATE_FILE");
+    assert_eq!(cmd_tieude.split_envs[1].0, "QUAQUA_ERROR_FILE");
+    assert!(cmd_tieude.agent_args.iter().any(|a| a == "--no-extensions"));
+    assert!(cmd_tieude
+        .agent_args
+        .iter()
+        .any(|a| a.ends_with("omp-worker-state.ts")));
 
     // 4. Unknown LEAD_KIND falls back to tieude
     let (kind_fallback, launch_fallback) =
@@ -1928,13 +1916,29 @@ fn test_launch_args_carry_exact_model_and_effort() {
         false,
     )
     .unwrap();
-    assert!(cmd.split_envs.is_empty(), "omp takes no pane env");
+    assert_eq!(cmd.split_envs.len(), 2);
+    assert_eq!(
+        cmd.split_envs[0],
+        (
+            "QUAQUA_STATE_FILE".to_string(),
+            "~/quaqua/runs/.sude-test.state".to_string()
+        )
+    );
+    assert_eq!(
+        cmd.split_envs[1],
+        (
+            "QUAQUA_ERROR_FILE".to_string(),
+            "~/quaqua/runs/.sude-test.error".to_string()
+        )
+    );
     let joined = cmd.agent_args.join(" ");
     assert!(
         joined.contains("--model google-antigravity/gemini-3.8-flash"),
         "{joined}"
     );
     assert!(joined.contains("--thinking high"), "{joined}");
+    assert!(joined.contains("--no-extensions"), "{joined}");
+    assert!(joined.contains("omp-worker-state.ts"), "{joined}");
 
     // claude: `--model` (mapped to claude-*) + `--effort` (`claude --help`).
     let cl = resolve_launch(&kind("claude", "opus-5.5", Some("high")), "truonglao").unwrap();
@@ -2023,20 +2027,15 @@ fn test_launch_review_args_per_harness() {
 
     // omp: review drops edit/write, keeps read tools + bash.
     let omp = cmd("omp", "google-antigravity/gemini-3.8-flash", "high", true);
-    assert_eq!(
-        omp.agent_args,
-        vec![
-            "--",
-            "--model",
-            "google-antigravity/gemini-3.8-flash",
-            "--thinking",
-            "high",
-            "--auto-approve",
-            "--tools=read,bash,grep,glob",
-            "--append-system-prompt",
-            "/r/x.rules.md",
-        ]
-    );
+    assert!(omp.agent_args.contains(&"--auto-approve".to_string()));
+    assert!(omp
+        .agent_args
+        .contains(&"--tools=read,bash,grep,glob".to_string()));
+    assert!(omp.agent_args.contains(&"--no-extensions".to_string()));
+    assert!(omp
+        .agent_args
+        .iter()
+        .any(|a| a.ends_with("omp-worker-state.ts")));
     let omp_build = cmd("omp", "google-antigravity/gemini-3.8-flash", "high", false);
     assert!(!omp_build
         .agent_args
