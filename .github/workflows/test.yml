@@ -39,6 +39,32 @@ jobs:
       - name: cargo test --locked
         run: cargo test --locked
 
+      # The suite must be hermetic with respect to the live workspace database:
+      # no test may open <passwd home>/quaqua/runs/quaqua.db* (the file the
+      # owner's real workspace runs on). tests/test_hermetic_db.sh traces every
+      # open(2) of that path across the whole suite and fails listing each hit.
+      #
+      # A second full run is deliberate: this step gates a second, independent
+      # property, and the step above keeps reporting the suite's own result.
+      # The build is already warm in target/, so the cost is suite runtime only.
+      #
+      # ubuntu-latest ships no strace; install it, and set
+      # HERMETIC_REQUIRE_STRACE=1 so a failed install fails the step instead of
+      # turning the guard into a silent skip.
+      - name: Install strace
+        run: |
+          set -euo pipefail
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends strace
+          fi
+          strace --version
+
+      - name: hermetic workspace (no live workspace DB opens)
+        env:
+          HERMETIC_REQUIRE_STRACE: '1'
+        run: bash tests/test_hermetic_db.sh
+
   # Lints .github/workflows/*.yml itself. Separate job so a lint failure never
   # hides the test result, and the two are required independently.
   #
