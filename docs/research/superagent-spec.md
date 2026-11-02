@@ -81,18 +81,22 @@ Quy tắc:
 
 ## 4. Migration (R1)
 
-Một lệnh: `quaqua bus migrate` (đã có hay chưa, worker xác nhận ở P1; nếu chưa có thì migration chạy trong `open_bus` như hiện tại và chỉ có thêm cờ `--dry-run`).
+Một lệnh mới, tường minh: `quaqua bus migrate [--dry-run]`, code trong `bus/migrate.rs` (file duy nhất được đọc bảng cũ). Hiện migration chạy ngầm trong `open_bus` (`bus/mod.rs:161–280`, bảng `bus_migration` giữ watermark). Sau đợt này `open_bus` **không bao giờ** drop bảng: gặp DB còn bảng cũ thì trả lỗi `run quaqua bus migrate` (exit 2), còn hook thì exit 0 và không ghi gì. Lý do: nếu migrate ngầm thì lần gọi hook đầu tiên sau khi cài binary mới sẽ xoá bảng cũ mà không qua bước kiểm tra worker live và không có backup.
 
 1. Kiểm tra không có worker live (`herdr agent list`). Có → từ chối, exit khác 0.
 2. Sao lưu: `VACUUM INTO 'raw/<date>-quaqua-db-pre-superagent.db'`.
-3. Tạo bảng mới. Chép:
-   - `farm_events` → `triggers` (`source` suy từ `actor`/`type`; `thread_id` = `agent:<subject|owner>`; `summary` = 80 ký tự đầu của type + subject; `incident_key` → `dedupe_key`).
-   - `mail` → `triggers` (`source='mail'`, `to_name`, thân → `payload_json`, `summary` = dòng đầu ≤80).
-   - `cursors(consumer, seq, mail_id)` → `cursors(consumer, trigger_id)` = id mới lớn nhất đã map từ max(seq, mail_id) của consumer đó.
-4. Drop `farm_events`, `mail`, `cursors` cũ. Ghi version vào `bus_migration`.
-5. Chạy lần hai là no-op.
+3. Trong một transaction:
+   1. Tạo bảng mới.
+   2. Tạo `threads` trước: một dòng `agent:<name>` cho mỗi giá trị khác nhau của `farm_events.subject|owner` và `mail.to_name`, `owner = <name>`, `state='open'`, `last_trigger_ms` = ts lớn nhất. Làm trước vì `triggers.thread_id` là FK và `owner` NOT NULL.
+   3. Trộn hai nguồn theo `(ts_ms, nguồn, id cũ)` rồi insert theo thứ tự đó, để id mới tăng theo thời gian (digest dựa vào điều này):
+      - `farm_events` → `source` suy từ `actor`/`type`; `thread_id = agent:<subject|owner>`; `summary` = 80 ký tự đầu của `type subject`; `incident_key` → `dedupe_key`.
+      - `mail` → `source='mail'`, `to_name`, thân → `payload_json`, `summary` = dòng đầu cắt ≤80.
+      - Giữ bảng map tạm `(nguồn, id cũ) → id mới`.
+   4. Cursor: với mỗi consumer có cursor cũ `(seq, mail_id)`, một dòng cũ là "đã đọc" khi `farm_events.seq <= seq` hoặc `mail.id <= mail_id`. Cursor mới = id mới lớn nhất `N` sao cho **mọi** dòng có id mới `<= N` đều đã đọc. Dòng đã đọc nằm sau dòng chưa đọc đầu tiên sẽ hiện lại một lần; không dòng chưa đọc nào bị mất.
+4. Drop `farm_events`, `mail`, `cursors` cũ. Ghi version `superagent-v1` vào `bus_migration`.
+5. Chạy lần hai là no-op (version đã có).
 
-`--dry-run` chạy trên bản copy và in số dòng trước/sau từng bảng. Đổi tên cột hay xoá bảng phải xong trong cùng wave với việc chuyển caller (Migrate Callers Then Delete Legacy APIs).
+`--dry-run` chạy trên bản copy và in số dòng trước/sau từng bảng cùng cursor mới của từng consumer. Đổi tên cột hay xoá bảng phải xong trong cùng wave với việc chuyển caller (Migrate Callers Then Delete Legacy APIs).
 
 ## 5. CLI contract
 
@@ -103,7 +107,7 @@ Một lệnh: `quaqua bus migrate` (đã có hay chưa, worker xác nhận ở P
 | `quaqua mail ack` | **xoá** | Không có alias. Template và rule ngừng nhắc tới |
 | `quaqua recall <id>` | **mới**, seam cần anh iu duyệt | In trigger `<id>`, Thread của nó, và đối tượng `ref` (§8) |
 | `quaqua source github-ci poll` | **mới**, seam cần anh iu duyệt | Một lần poll (§9). Chạy bằng systemd user timer, cùng kiểu auditor |
-| `quaqua bus migrate [--dry-run]` | mới hoặc cờ mới | §4 |
+| `quaqua bus migrate [--dry-run]` | **mới**, seam cần anh iu duyệt | §4 |
 
 Exit code: 0 thành công, 1 lỗi dùng sai, 2 lỗi DB. Output digest là text thuần một dòng mỗi trigger. `--json` cho `inbox` và `recall` in đúng các cột của bảng.
 
@@ -131,7 +135,7 @@ Thuật toán, chạy trong hook và ngay sau `send_mail`:
 2. Nếu agent không idle → không làm gì. Trigger chờ trong DB.
 3. Nếu idle và có trigger chưa đọc (id > cursor, thuộc `to_name = consumer` hoặc Thread consumer đang subscribe) → gửi **một dòng** vào pane: `quaqua: <N> new (#<min>..#<max>), run quaqua mail inbox`, rồi Enter.
 4. Ghi `last_nudge_trigger_id` cho consumer (cột trong `cursors` hoặc `source_state`). Không nudge lại nếu không có trigger nào mới hơn giá trị đó. Tối đa một nudge mỗi batch.
-5. CoS là ngoại lệ: CoS đã có hook UserPromptSubmit, chỉ nudge khi CoS idle quá 60 giây.
+5. CoS không bao giờ bị nudge. Pane CoS là nơi anh iu gõ, nên send-text + Enter có thể submit prompt anh đang viết dở. CoS nhận tin qua hook UserPromptSubmit như hiện tại.
 
 Không bao giờ gõ vào pane đang busy. Không dùng desktop notification làm kênh chính (có thể giữ như phụ).
 
@@ -152,7 +156,9 @@ Subscription:
 - `worker spawn` mở Thread `quaqua/<name>`, owner = người spawn (CoS hoặc Lead), subscribe owner với `until_ms = now + 14 ngày`.
 - `worker cleanup` **không** đóng Thread và không xoá subscription. Branch còn sống thì Thread còn sống.
 - Mỗi trigger mới trên Thread gia hạn `until_ms = ts_ms + 14 ngày` cho mọi subscriber.
-- Lead nhận Peer → Lead là owner; khi Lead merge vào `quaqua/<slug>-integ`, Thread của integ có owner là Lead, CoS subscribe thêm.
+- Lead spawn Peer → Lead là owner của Thread Peer.
+- `lead spawn` (`lead/spawn.rs:222`, nơi tạo `quaqua/<slug>-integ`) mở Thread `quaqua/<slug>-integ`, owner là Lead, CoS cũng subscribe. Đây là branch thật sự được push và mở PR, nên CI fail thường rơi vào Thread này.
+- CI (`.github/workflows/test.yml`) chỉ chạy trên `pull_request` và `push` vào `main`. Vì vậy `headBranch` của run fail là branch nguồn của PR. Muốn có trigger `ci_failed` thì phải có push và PR, mà cả hai đều cần anh iu duyệt.
 
 GitHub CI Source (`quaqua source github-ci poll`):
 
@@ -180,5 +186,6 @@ Cloud, BYOM, bỏ tầng Lead, watchdog LLM, auto-fix CI, chuẩn trả lời th
 
 ## 13. Câu hỏi mở cho phiên thực thi
 
-- `open_question:` `quaqua bus migrate` đã tồn tại chưa, hay migration chạy ngầm khi mở DB? | owner: worker P1 (tự tra code, không phải quyết định).
+- `open_question:` duyệt 3 seam mới `quaqua bus migrate`, `quaqua recall`, `quaqua source github-ci poll` + timer? | owner: anh iu (chặn P1, P4, P5).
 - `open_question:` chu kỳ poll CI 5 phút có ổn không? | owner: anh iu (không chặn requirement).
+- Quyết định CoS tự chọn khi viết spec (anh iu có thể đổi): Source `worker` mới, bảng `source_state`, digest tối đa 20 dòng, poll 5 phút, CoS không bao giờ bị nudge.
