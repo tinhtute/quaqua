@@ -1,6 +1,6 @@
 //! Inter-team and worker mail: storage, verbs, dual-write, and fallback.
 //!
-//! Stores messages in the `mail` table in `runs/quaqua.db`.
+//! Stores messages in the `triggers` table in `runs/quaqua.db`.
 //! Verbs:
 //! - `send`: inserts row + `mail_sent` farm event in one transaction; dual-writes to markdown for leads;
 //!   falls back to markdown append on missing/corrupt database.
@@ -511,7 +511,7 @@ pub fn get_mail_ack_timeout_ms() -> u64 {
     DEFAULT_MAIL_ACK_TIMEOUT_MS
 }
 
-/// Lazily inserts `mail_unacked:<id>` incident into `farm_events` for rows unacked past `ack_timeout_ms`.
+/// Lazily inserts `mail_unacked:<id>` incident into `triggers` for rows unacked past `ack_timeout_ms`.
 pub fn check_unacked_incidents(
     conn: &rusqlite::Connection,
     ack_timeout_ms: u64,
@@ -521,9 +521,13 @@ pub fn check_unacked_incidents(
     let cutoff = now.saturating_sub(ack_timeout_ms);
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT id, ts_ms, from_name, to_name, kind, project, farm
-        FROM mail
-        WHERE acked_ms IS NULL AND ts_ms <= ?1 AND (farm = ?2 OR farm IS NULL)
+        SELECT t.id, t.ts_ms, t.actor, t.to_name, t.kind, t.farm
+        FROM triggers t
+        LEFT JOIN cursors c ON c.consumer = t.to_name
+        WHERE t.source = 'mail'
+          AND t.ts_ms <= ?1
+          AND (c.trigger_id IS NULL OR c.trigger_id < t.id)
+          AND (t.farm = ?2 OR t.farm IS NULL)
         "#,
     )?;
     let rows = stmt.query_map(rusqlite::params![cutoff as i64, farm], |row| {
@@ -531,10 +535,9 @@ pub fn check_unacked_incidents(
             row.get::<_, i64>(0)? as u64,
             row.get::<_, i64>(1)? as u64,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(3)?.unwrap_or_default(),
             row.get::<_, String>(4)?,
             row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
         ))
     })?;
 
@@ -545,7 +548,7 @@ pub fn check_unacked_incidents(
     drop(stmt);
 
     let mut inserted_count = 0;
-    for (id, ts_ms, from_name, to_name, kind, project, row_farm) in incidents {
+    for (id, ts_ms, from_name, to_name, kind, row_farm) in incidents {
         let incident_key = format!("mail_unacked:{id}");
         let payload = serde_json::json!({
             "mail_id": id,
@@ -555,21 +558,30 @@ pub fn check_unacked_incidents(
         .to_string();
 
         let farm_to_insert = row_farm.as_deref().unwrap_or(farm);
+        let thread_id = format!("agent:{to_name}");
+        let summary = format!("mail_unacked #{id} to {to_name}");
+        let summary_trunc: String = summary.chars().take(80).collect();
+
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
+            rusqlite::params![&thread_id, &to_name, now as i64],
+        );
+
         let mut insert_stmt = conn.prepare_cached(
             r#"
-            INSERT OR IGNORE INTO farm_events (
-                ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-            ) VALUES (?1, 'mail_unacked', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            INSERT OR IGNORE INTO triggers (
+                ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+            ) VALUES (?1, 'watchdog', 'mail_unacked', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)
             "#,
         )?;
         let rows_affected = insert_stmt.execute(rusqlite::params![
             now as i64,
-            from_name,
-            to_name,
-            to_name,
-            project,
-            incident_key,
-            payload,
+            &from_name,
+            &to_name,
+            &thread_id,
+            &summary_trunc,
+            &payload,
+            &incident_key,
             farm_to_insert,
         ])?;
         if rows_affected > 0 {
@@ -614,7 +626,7 @@ pub fn send_mail<H: HerdrOps>(
         .unwrap_or_else(|| sha256_hex(opts.body.as_bytes()));
     let msg_key = sha256_hex(format!("{from_name}|{client_id}").as_bytes());
 
-    let project = opts.project.clone().or_else(|| {
+    let _project = opts.project.clone().or_else(|| {
         if from_name.ends_with("-lead") {
             from_name.strip_suffix("-lead").map(|s| s.to_string())
         } else {
@@ -634,6 +646,13 @@ pub fn send_mail<H: HerdrOps>(
     let bus = match FarmBus::open(&db_path) {
         Ok(b) => b,
         Err(e) => {
+            if crate::bus::is_legacy_db_error(&e) {
+                return Err(format!(
+                    "{}: {}",
+                    db_path.display(),
+                    crate::bus::LEGACY_DB_ERROR_MSG
+                ));
+            }
             if crate::engine::sqlite::is_lock_error(&e) {
                 return Err(format!("database locked at {}: {e}", db_path.display()));
             }
@@ -667,77 +686,69 @@ pub fn send_mail<H: HerdrOps>(
 
     let tx_res: rusqlite::Result<SendMailResult> = crate::engine::sqlite::retry_while_busy(|| {
         let tx = conn.transaction()?;
+        let thread_id = format!("agent:{}", opts.to);
+        tx.execute(
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
+            rusqlite::params![&thread_id, &opts.to, now as i64],
+        )?;
+        tx.execute(
+            "UPDATE threads SET last_trigger_ms = MAX(last_trigger_ms, ?1) WHERE id = ?2",
+            rusqlite::params![now as i64, &thread_id],
+        )?;
 
-        let rows = {
-            let mut insert_mail = tx.prepare_cached(
-                r#"
-                INSERT INTO mail (
-                    msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, farm
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ON CONFLICT(msg_key) DO NOTHING
-                "#,
-            )?;
-            insert_mail.execute(rusqlite::params![
-                msg_key,
-                now as i64,
-                from_name,
-                from_role,
-                opts.to,
-                opts.kind,
-                project,
-                opts.reply_to.map(|id| id as i64),
-                opts.body,
-                bus.farm(),
-            ])?
+        let first_line = opts.body.lines().next().unwrap_or("").trim();
+        let summary_trunc: String = first_line.chars().take(80).collect();
+        let summary_final = if summary_trunc.is_empty() {
+            opts.kind.chars().take(80).collect()
+        } else {
+            summary_trunc
         };
+
+        let dedupe_key = format!("mail:{msg_key}");
+        let mut ref_parts = Vec::new();
+        if let Some(r) = opts.reply_to {
+            ref_parts.push(format!("mail:{r}"));
+        }
+        if let Some(ref p) = opts.project {
+            ref_parts.push(format!("project:{p}"));
+        }
+        let ref_val = if ref_parts.is_empty() {
+            None
+        } else {
+            Some(ref_parts.join(";"))
+        };
+        let rows = tx.execute(
+            r#"
+            INSERT OR IGNORE INTO triggers (
+                ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+            ) VALUES (?1, 'mail', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            rusqlite::params![
+                now as i64,
+                opts.kind,
+                from_name,
+                opts.to,
+                thread_id,
+                summary_final,
+                ref_val,
+                opts.body,
+                dedupe_key,
+                bus.farm(),
+            ],
+        )?;
 
         if rows > 0 {
             let id = tx.last_insert_rowid() as u64;
-
-            // In the same transaction: insert mail_sent event
-            let payload = serde_json::json!({
-                "mail_id": id,
-                "kind": opts.kind,
-                "msg_key": msg_key,
-            })
-            .to_string();
-
-            let incident_key = if opts.kind == "escalate" || opts.kind == "blocked" {
-                Some(format!("mail:{id}"))
-            } else {
-                None
-            };
-
-            {
-                let mut insert_event = tx.prepare_cached(
-                    r#"
-                    INSERT INTO farm_events (
-                        ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-                    ) VALUES (?1, 'mail_sent', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                    "#,
-                )?;
-                insert_event.execute(rusqlite::params![
-                    now as i64,
-                    from_name,
-                    opts.to,
-                    from_name,
-                    project,
-                    incident_key,
-                    payload,
-                    bus.farm(),
-                ])?;
-            }
-
             tx.commit()?;
             Ok(SendMailResult {
                 id,
                 already_sent: false,
             })
         } else {
-            // Already sent: query existing id
             let existing_id: i64 = {
-                let mut select = tx.prepare_cached("SELECT id FROM mail WHERE msg_key = ?1")?;
-                select.query_row(rusqlite::params![msg_key], |row| row.get(0))?
+                let mut select =
+                    tx.prepare_cached("SELECT id FROM triggers WHERE dedupe_key = ?1")?;
+                select.query_row(rusqlite::params![dedupe_key], |row| row.get(0))?
             };
             tx.commit()?;
             Ok(SendMailResult {
@@ -816,15 +827,29 @@ pub fn read_unacked_mail_since(
 
     let timeout_ms = get_mail_ack_timeout_ms();
     let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
-
     let now = crate::bus::now_ms();
+    let min_id = if since_id > 0 {
+        since_id
+    } else {
+        let mut c_stmt = conn
+            .prepare_cached("SELECT trigger_id FROM cursors WHERE consumer = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut c_rows = c_stmt
+            .query(rusqlite::params![to_name])
+            .map_err(|e| e.to_string())?;
+        if let Some(c_row) = c_rows.next().map_err(|e| e.to_string())? {
+            c_row.get::<_, i64>(0).map_err(|e| e.to_string())? as u64
+        } else {
+            0
+        }
+    };
+
     let mut stmt = conn
         .prepare_cached(
             r#"
-            SELECT id, msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to,
-                   body, deliveries, last_delivered_ms, acked_ms, acked_by
-            FROM mail
-            WHERE to_name = ?1 AND acked_ms IS NULL AND id > ?2 AND (farm = ?3 OR farm IS NULL)
+            SELECT id, dedupe_key, ts_ms, actor, to_name, kind, payload_json, ref, farm
+            FROM triggers
+            WHERE source = 'mail' AND to_name = ?1 AND id > ?2 AND (farm = ?3 OR farm IS NULL)
             ORDER BY id ASC
             "#,
         )
@@ -832,23 +857,40 @@ pub fn read_unacked_mail_since(
 
     let rows = stmt
         .query_map(
-            rusqlite::params![to_name, since_id as i64, bus.farm()],
+            rusqlite::params![to_name, min_id as i64, bus.farm()],
             |row| {
+                let id = row.get::<_, i64>(0)? as u64;
+                let dedupe_key: Option<String> = row.get(1)?;
+                let msg_key = dedupe_key
+                    .as_deref()
+                    .and_then(|k| k.strip_prefix("mail:"))
+                    .unwrap_or("")
+                    .to_string();
+                let ts_ms = row.get::<_, i64>(2)? as u64;
+                let from_name: String = row.get(3)?;
+                let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+                let kind: String = row.get(5)?;
+                let raw_payload: Option<String> = row.get(6)?;
+                let ref_val: Option<String> = row.get(7)?;
+                let _farm: Option<String> = row.get(8)?;
+                let (body, from_role, project, reply_to) =
+                    decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
+
                 Ok(MailMessage {
-                    id: row.get::<_, i64>(0)? as u64,
-                    msg_key: row.get(1)?,
-                    ts_ms: row.get::<_, i64>(2)? as u64,
-                    from_name: row.get(3)?,
-                    from_role: row.get(4)?,
-                    to_name: row.get(5)?,
-                    kind: row.get(6)?,
-                    project: row.get(7)?,
-                    reply_to: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                    body: row.get(9)?,
-                    deliveries: row.get::<_, i64>(10)? as u64,
-                    last_delivered_ms: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-                    acked_ms: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                    acked_by: row.get(13)?,
+                    id,
+                    msg_key,
+                    ts_ms,
+                    from_name,
+                    from_role,
+                    to_name,
+                    kind,
+                    project,
+                    reply_to,
+                    body,
+                    deliveries: 1,
+                    last_delivered_ms: Some(ts_ms),
+                    acked_ms: None,
+                    acked_by: None,
                 })
             },
         )
@@ -861,20 +903,24 @@ pub fn read_unacked_mail_since(
     drop(stmt);
 
     for msg in &mut messages {
-        msg.deliveries += 1;
+        let key = format!("mail_delivery:{}", msg.id);
+        let delivery_count: u64 = conn
+            .query_row(
+                "SELECT value FROM source_state WHERE source = ?1",
+                rusqlite::params![&key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+            + 1;
+        let _ = conn.execute(
+            "INSERT INTO source_state (source, value) VALUES (?1, ?2) ON CONFLICT(source) DO UPDATE SET value = excluded.value",
+            rusqlite::params![&key, delivery_count.to_string()],
+        );
+        msg.deliveries = delivery_count;
         msg.last_delivered_ms = Some(now);
-        let mut update = conn
-            .prepare_cached("UPDATE mail SET deliveries = ?1, last_delivered_ms = ?2 WHERE id = ?3")
-            .map_err(|e| e.to_string())?;
-        update
-            .execute(rusqlite::params![
-                msg.deliveries as i64,
-                now as i64,
-                msg.id as i64
-            ])
-            .map_err(|e| e.to_string())?;
     }
-
     Ok(messages)
 }
 
@@ -917,13 +963,13 @@ pub fn ack_mail(runs_dir: &Path, caller_name: &str, mail_ids: &[u64]) -> Result<
     let timeout_ms = get_mail_ack_timeout_ms();
     let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
 
-    let now = crate::bus::now_ms();
+    let _now = crate::bus::now_ms();
     let mut acked_ids = Vec::new();
 
     for &id in mail_ids {
         let mut query = conn
             .prepare_cached(
-                "SELECT to_name, acked_ms FROM mail WHERE id = ?1 AND (farm = ?2 OR farm IS NULL)",
+                "SELECT to_name FROM triggers WHERE id = ?1 AND (farm = ?2 OR farm IS NULL)",
             )
             .map_err(|e| e.to_string())?;
 
@@ -931,12 +977,10 @@ pub fn ack_mail(runs_dir: &Path, caller_name: &str, mail_ids: &[u64]) -> Result<
             .query(rusqlite::params![id as i64, bus.farm()])
             .map_err(|e| e.to_string())?;
         if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let to_name: String = row.get(0).map_err(|e| e.to_string())?;
-            let acked_ms: Option<i64> = row.get(1).map_err(|e| e.to_string())?;
-
-            if acked_ms.is_some() {
-                return Err(format!("mail #{id} is already acked"));
-            }
+            let to_name: String = row
+                .get::<_, Option<String>>(0)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
 
             if caller_name != to_name {
                 return Err(format!(
@@ -947,42 +991,34 @@ pub fn ack_mail(runs_dir: &Path, caller_name: &str, mail_ids: &[u64]) -> Result<
             drop(rows);
             drop(query);
 
-            let mut update = conn
+            let current_cursor: Option<u64> = {
+                let mut c_stmt = conn
+                    .prepare_cached("SELECT trigger_id FROM cursors WHERE consumer = ?1")
+                    .map_err(|e| e.to_string())?;
+                let mut c_rows = c_stmt
+                    .query(rusqlite::params![caller_name])
+                    .map_err(|e| e.to_string())?;
+                if let Some(c_row) = c_rows.next().map_err(|e| e.to_string())? {
+                    Some(c_row.get::<_, i64>(0).map_err(|e| e.to_string())? as u64)
+                } else {
+                    None
+                }
+            };
+
+            let new_cursor = current_cursor.map(|c| c.max(id)).unwrap_or(id);
+            let mut set_stmt = conn
                 .prepare_cached(
-                    "UPDATE mail SET acked_ms = ?1, acked_by = ?2 WHERE id = ?3 AND acked_ms IS NULL",
+                    r#"
+                    INSERT INTO cursors (consumer, trigger_id) VALUES (?1, ?2)
+                    ON CONFLICT(consumer) DO UPDATE SET trigger_id = MAX(trigger_id, excluded.trigger_id)
+                    "#,
                 )
                 .map_err(|e| e.to_string())?;
-            let affected = update
-                .execute(rusqlite::params![now as i64, caller_name, id as i64])
+            set_stmt
+                .execute(rusqlite::params![caller_name, new_cursor as i64])
                 .map_err(|e| e.to_string())?;
 
-            if affected > 0 {
-                acked_ids.push(id);
-
-                let payload = serde_json::json!({
-                    "mail_id": id,
-                    "acked_by": caller_name,
-                })
-                .to_string();
-
-                let mut ev_stmt = conn
-                    .prepare_cached(
-                        r#"
-                        INSERT INTO farm_events (
-                            ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-                        ) VALUES (?1, 'mail_acked', ?2, ?3, ?4, NULL, NULL, ?5, ?6)
-                        "#,
-                    )
-                    .map_err(|e| e.to_string())?;
-                let _ = ev_stmt.execute(rusqlite::params![
-                    now as i64,
-                    caller_name,
-                    format!("mail:{id}"),
-                    caller_name,
-                    payload,
-                    bus.farm(),
-                ]);
-            }
+            acked_ids.push(id);
         } else {
             return Err(format!("mail #{id} not found"));
         }
@@ -1094,7 +1130,7 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
             (to_name_opt.unwrap_or(default_to), parts[2])
         };
 
-        let from_role = if from_name == "cos" {
+        let _from_role = if from_name == "cos" {
             "cos"
         } else if from_name.ends_with("-lead") {
             "lead"
@@ -1103,7 +1139,7 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
         };
 
         let ts_ms = parse_iso_timestamp(time_str).unwrap_or_else(crate::bus::now_ms);
-        let project = from_name
+        let _project = from_name
             .strip_suffix("-lead")
             .unwrap_or(from_name)
             .to_string();
@@ -1117,27 +1153,46 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
             &clean_body
         };
 
+        let first_line = body_str.lines().next().unwrap_or("").trim();
+        let summary_trunc: String = first_line.chars().take(80).collect();
+        let summary_final = if summary_trunc.is_empty() {
+            kind.chars().take(80).collect()
+        } else {
+            summary_trunc
+        };
+        let dedupe_key = format!("mail:{msg_key}");
+        let thread_id = format!("agent:{to_name}");
+
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
+            rusqlite::params![&thread_id, to_name, ts_ms as i64],
+        );
+        let _ = conn.execute(
+            "UPDATE threads SET last_trigger_ms = MAX(last_trigger_ms, ?1) WHERE id = ?2",
+            rusqlite::params![ts_ms as i64, &thread_id],
+        );
+
         let mut stmt = conn
             .prepare_cached(
                 r#"
-                INSERT INTO mail (
-                    msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, farm
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)
-                ON CONFLICT(msg_key) DO NOTHING
+                INSERT INTO triggers (
+                    ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+                ) VALUES (?1, 'mail', ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)
+                ON CONFLICT(dedupe_key) DO NOTHING
                 "#,
             )
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
             .execute(rusqlite::params![
-                msg_key,
                 ts_ms as i64,
-                from_name,
-                from_role,
-                to_name,
                 kind,
-                project,
+                from_name,
+                to_name,
+                thread_id,
+                summary_final,
                 body_str,
+                dedupe_key,
                 bus.farm(),
             ])
             .map_err(|e| e.to_string())?;
@@ -1152,7 +1207,7 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
     Ok(result)
 }
 
-/// Lists messages from `mail` table, optionally formatted as markdown inbox view (`--md`).
+/// Lists messages from `triggers` table, optionally formatted as markdown inbox view (`--md`).
 pub fn list_mail(
     runs_dir: &Path,
     md_format: bool,
@@ -1168,42 +1223,70 @@ pub fn list_mail(
     let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
 
     let mut query = String::from(
-        "SELECT id, msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, deliveries, last_delivered_ms, acked_ms, acked_by FROM mail WHERE (farm = ? OR farm IS NULL)"
+        r#"
+        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm, c.trigger_id
+        FROM triggers t
+        LEFT JOIN cursors c ON c.consumer = t.to_name
+        WHERE t.source = 'mail' AND (t.farm = ? OR t.farm IS NULL)
+        "#,
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(bus.farm().to_string())];
     if let Some(to) = filter_to {
-        query.push_str(" AND to_name = ?");
+        query.push_str(" AND t.to_name = ?");
         params.push(Box::new(to.to_string()));
     }
     if let Some(from) = filter_from {
-        query.push_str(" AND from_name = ?");
+        query.push_str(" AND t.actor = ?");
         params.push(Box::new(from.to_string()));
     }
     if let Some(k) = filter_kind {
-        query.push_str(" AND kind = ?");
+        query.push_str(" AND t.kind = ?");
         params.push(Box::new(k.to_string()));
     }
-    query.push_str(" ORDER BY id ASC");
+    query.push_str(" ORDER BY t.id ASC");
 
     let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
     let params_slice: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt
         .query_map(&params_slice[..], |row| {
+            let id = row.get::<_, i64>(0)? as u64;
+            let dedupe_key: Option<String> = row.get(1)?;
+            let msg_key = dedupe_key
+                .as_deref()
+                .and_then(|k| k.strip_prefix("mail:"))
+                .unwrap_or("")
+                .to_string();
+            let ts_ms = row.get::<_, i64>(2)? as u64;
+            let from_name: String = row.get(3)?;
+            let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+            let kind: String = row.get(5)?;
+            let raw_payload: Option<String> = row.get(6)?;
+            let ref_val: Option<String> = row.get(7)?;
+            let _farm: Option<String> = row.get(8)?;
+            let cursor_id: Option<i64> = row.get(9)?;
+            let acked_ms = if cursor_id.map(|cid| cid >= id as i64).unwrap_or(false) {
+                Some(ts_ms)
+            } else {
+                None
+            };
+            let (body, from_role, project, reply_to) =
+                decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
+
             Ok(MailMessage {
-                id: row.get::<_, i64>(0)? as u64,
-                msg_key: row.get(1)?,
-                ts_ms: row.get::<_, i64>(2)? as u64,
-                from_name: row.get(3)?,
-                from_role: row.get(4)?,
-                to_name: row.get(5)?,
-                kind: row.get(6)?,
-                project: row.get(7)?,
-                reply_to: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                body: row.get(9)?,
-                deliveries: row.get::<_, i64>(10)? as u64,
-                last_delivered_ms: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-                acked_ms: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                acked_by: row.get(13)?,
+                id,
+                msg_key,
+                ts_ms,
+                from_name,
+                from_role,
+                to_name,
+                kind,
+                project,
+                reply_to,
+                body,
+                deliveries: 1,
+                last_delivered_ms: Some(ts_ms),
+                acked_ms,
+                acked_by: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1502,4 +1585,43 @@ mod tests {
         let parsed = parse_iso_timestamp(&formatted).expect("parse iso");
         assert_eq!(ts, parsed);
     }
+}
+/// Decodes mail body and metadata (from_role, project, reply_to) from trigger fields.
+pub fn decode_mail_fields(
+    payload_str: Option<&str>,
+    actor: &str,
+    ref_str: Option<&str>,
+) -> (String, String, Option<String>, Option<u64>) {
+    let body = payload_str.unwrap_or_default().to_string();
+    let from_role = if actor == "cos" {
+        "cos"
+    } else if actor.ends_with("-lead") {
+        "lead"
+    } else {
+        "peer"
+    }
+    .to_string();
+
+    let mut reply_to = None;
+    let mut project = None;
+
+    if let Some(r) = ref_str {
+        for part in r.split(';') {
+            if let Some(m) = part.strip_prefix("mail:") {
+                reply_to = m.parse::<u64>().ok();
+            } else if let Some(p) = part.strip_prefix("project:") {
+                project = Some(p.to_string());
+            }
+        }
+    }
+
+    if project.is_none() {
+        project = if actor.ends_with("-lead") {
+            actor.strip_suffix("-lead").map(String::from)
+        } else {
+            None
+        };
+    }
+
+    (body, from_role, project, reply_to)
 }

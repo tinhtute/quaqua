@@ -155,6 +155,21 @@ enum Command {
         #[command(subcommand)]
         cmd: EventsCmd,
     },
+    /// Farm bus operations: migrate.
+    Bus {
+        #[command(subcommand)]
+        cmd: BusCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BusCmd {
+    /// Migrate legacy database schema to superagent triggers and threads.
+    Migrate {
+        /// Dry run: report counts and new cursors without writing changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -903,7 +918,11 @@ fn main() {
                     if !e.is_empty() {
                         eprintln!("{e}");
                     }
-                    1
+                    if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
+                        2
+                    } else {
+                        1
+                    }
                 }
             }
         }
@@ -922,7 +941,11 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
-                        1
+                        if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
+                            2
+                        } else {
+                            1
+                        }
                     }
                 }
             } else {
@@ -971,13 +994,26 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("error opening bus at {}: {e}", db_path.display());
-                        1
+                        if quaqua::bus::is_legacy_db_error(&e) {
+                            2
+                        } else {
+                            1
+                        }
                     }
                 }
             }
         }
         Some(Command::Events { cmd }) => match cmd {
             EventsCmd::Hook => match quaqua::bus::events::run_events_hook() {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    1
+                }
+            },
+        },
+        Some(Command::Bus { cmd }) => match cmd {
+            BusCmd::Migrate { dry_run } => match quaqua::bus::migrate::run_migrate(dry_run) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e}");

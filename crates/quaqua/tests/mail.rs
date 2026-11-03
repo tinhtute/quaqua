@@ -70,42 +70,32 @@ fn test_retried_send_gives_one_row() {
     let res1 = mail::send_mail(&runs, &opts, &herdr).expect("first send");
     assert!(res1.id > 0);
 
-    // Verify exactly 1 mail row and 1 farm_events row
+    // Verify exactly 1 trigger row
     let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
     let mail_count: i64 = bus
         .conn_for_test()
-        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
-        .expect("count mail");
-    let event_count: i64 = bus
-        .conn_for_test()
         .query_row(
-            "SELECT COUNT(*) FROM farm_events WHERE type = 'mail_sent'",
+            "SELECT COUNT(*) FROM triggers WHERE source = 'mail'",
             [],
             |r| r.get(0),
         )
-        .expect("count events");
+        .expect("count mail");
     assert_eq!(mail_count, 1);
-    assert_eq!(event_count, 1);
 
     // Retried send with identical contents
     let res2 = mail::send_mail(&runs, &opts, &herdr).expect("retried send");
     assert_eq!(res1.id, res2.id);
 
-    // Verify still exactly 1 mail row and 1 farm_events row
+    // Verify still exactly 1 trigger row
     let mail_count2: i64 = bus
         .conn_for_test()
-        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
-        .expect("count mail after retry");
-    let event_count2: i64 = bus
-        .conn_for_test()
         .query_row(
-            "SELECT COUNT(*) FROM farm_events WHERE type = 'mail_sent'",
+            "SELECT COUNT(*) FROM triggers WHERE source = 'mail'",
             [],
             |r| r.get(0),
         )
-        .expect("count events after retry");
+        .expect("count mail after retry");
     assert_eq!(mail_count2, 1);
-    assert_eq!(event_count2, 1);
 }
 
 #[test]
@@ -135,31 +125,17 @@ fn test_ack_by_non_recipient_refused() {
         "unexpected error: {err}"
     );
 
-    // Verify still unacked
+    // Verify still unacked: cursor not set
     let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
-    let acked_ms: Option<i64> = bus
-        .conn_for_test()
-        .query_row(
-            "SELECT acked_ms FROM mail WHERE id = ?1",
-            [res.id as i64],
-            |r| r.get(0),
-        )
-        .expect("query acked");
-    assert!(acked_ms.is_none());
+    let cursor_before = bus.get_cursor("cos").expect("get cursor");
+    assert!(cursor_before.is_none());
 
     // Recipient 'cos' acks
     let acked_ids = mail::ack_mail(&runs, "cos", &[res.id]).expect("recipient ack succeeds");
     assert_eq!(acked_ids, vec![res.id]);
 
-    let acked_by: Option<String> = bus
-        .conn_for_test()
-        .query_row(
-            "SELECT acked_by FROM mail WHERE id = ?1",
-            [res.id as i64],
-            |r| r.get(0),
-        )
-        .expect("query acked_by");
-    assert_eq!(acked_by.as_deref(), Some("cos"));
+    let cursor_after = bus.get_cursor("cos").expect("get cursor");
+    assert_eq!(cursor_after, Some(res.id));
 }
 
 #[test]
@@ -213,7 +189,10 @@ fn test_import_live_inbox_files_idempotent() {
     let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inbox");
 
     let mut paths = Vec::new();
-    for entry in std::fs::read_dir(&fixtures_dir).expect("read fixtures").flatten() {
+    for entry in std::fs::read_dir(&fixtures_dir)
+        .expect("read fixtures")
+        .flatten()
+    {
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) == Some("md") {
             paths.push(p);
@@ -253,20 +232,28 @@ fn test_unacked_mail_lazily_inserts_incident() {
 
     bus.conn_for_test()
         .execute(
-            r#"
-        INSERT INTO mail (
-            msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body
-        ) VALUES (?1, ?2, 'bus-lead', 'lead', 'cos', 'accept', 'bus', NULL, 'past deadline')
-        "#,
-            rusqlite::params![msg_key, past_ts as i64],
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES ('agent:cos', 'cos', 'open', ?1)",
+            rusqlite::params![past_ts as i64],
         )
-        .expect("insert past mail");
+        .unwrap();
+
+    let dedupe = format!("mail:{msg_key}");
+    bus.conn_for_test()
+        .execute(
+            r#"
+        INSERT INTO triggers (
+            ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+        ) VALUES (?1, 'mail', 'accept', 'bus-lead', 'cos', 'agent:cos', 'past deadline', NULL, 'past deadline', ?2, ?3)
+        "#,
+            rusqlite::params![past_ts as i64, dedupe, bus.farm()],
+        )
+        .expect("insert past mail trigger");
 
     let mail_id: i64 = bus
         .conn_for_test()
         .query_row(
-            "SELECT id FROM mail WHERE msg_key = ?1",
-            rusqlite::params![msg_key],
+            "SELECT id FROM triggers WHERE dedupe_key = ?1",
+            rusqlite::params![dedupe],
             |r| r.get(0),
         )
         .expect("query mail id");
@@ -274,12 +261,12 @@ fn test_unacked_mail_lazily_inserts_incident() {
     // Trigger inbox read which lazily runs check_unacked_incidents
     let _ = mail::render_inbox(&runs, "cos").expect("render inbox");
 
-    // Check that mail_unacked:<id> incident exists in farm_events
+    // Check that mail_unacked:<id> incident exists in triggers
     let expected_key = format!("mail_unacked:{mail_id}");
     let incident_count: i64 = bus
         .conn_for_test()
         .query_row(
-            "SELECT COUNT(*) FROM farm_events WHERE incident_key = ?1 AND type = 'mail_unacked'",
+            "SELECT COUNT(*) FROM triggers WHERE dedupe_key = ?1 AND kind = 'mail_unacked'",
             rusqlite::params![expected_key],
             |r| r.get(0),
         )
@@ -289,12 +276,12 @@ fn test_unacked_mail_lazily_inserts_incident() {
         "must lazily insert mail_unacked incident"
     );
 
-    // Trigger inbox read again: incident_key is UNIQUE, so insert is ignored
+    // Trigger inbox read again: dedupe_key is UNIQUE, so insert is ignored
     let _ = mail::render_inbox(&runs, "cos").expect("render inbox again");
     let incident_count2: i64 = bus
         .conn_for_test()
         .query_row(
-            "SELECT COUNT(*) FROM farm_events WHERE incident_key = ?1 AND type = 'mail_unacked'",
+            "SELECT COUNT(*) FROM triggers WHERE dedupe_key = ?1 AND kind = 'mail_unacked'",
             rusqlite::params![expected_key],
             |r| r.get(0),
         )
@@ -363,8 +350,42 @@ fn test_body_length_exceeded_error() {
 }
 
 #[test]
+fn test_mail_send_preserves_project_and_reply_to() {
+    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID"]);
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "alpha-lead");
+    let runs = hermetic_temp_dir("mail-metadata");
+    let herdr = Herdr::new();
+
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "handoff".to_string(),
+        body: "testing project and reply-to".to_string(),
+        project: Some("explicit-custom-project".to_string()),
+        reply_to: Some(99),
+        client_id: None,
+    };
+
+    let res = mail::send_mail(&runs, &opts, &herdr).expect("send mail");
+    assert!(res.id > 0);
+
+    let msgs = mail::read_inbox(&runs, "cos").expect("read inbox");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].from_role, "lead");
+    assert_eq!(msgs[0].project.as_deref(), Some("explicit-custom-project"));
+    assert_eq!(msgs[0].reply_to, Some(99));
+    assert_eq!(msgs[0].body, "testing project and reply-to");
+}
+
+#[test]
 fn test_cli_mail_send_inbox_ack_ls() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "bus-lead");
@@ -398,16 +419,18 @@ fn test_cli_mail_send_inbox_ack_ls() {
 
     // 4. CLI ack 1 (caller inferred as cos from harness/env)
     guard.set("QUAQUA_OWNER", "cos");
-    let ack_args = vec![
-        "ack".to_string(),
-        "1".to_string(),
-    ];
+    let ack_args = vec!["ack".to_string(), "1".to_string()];
     let rc_ack = mail::handle_mail(&ack_args, &herdr).expect("cli ack");
     assert_eq!(rc_ack, 0);
 }
 #[test]
 fn test_finding1_ack_inbox_identity_fail_closed() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("QUAQUA_TEST");
     guard.remove("QUAQUA_OWNER");
     guard.remove("HERDR_PANE_ID");
@@ -422,19 +445,32 @@ fn test_finding1_ack_inbox_identity_fail_closed() {
 
     // 2. ack with --as must be refused (no forgeable override)
     let res = mail::handle_mail(
-        &["ack".to_string(), "1".to_string(), "--as".to_string(), "cos".to_string()],
+        &[
+            "ack".to_string(),
+            "1".to_string(),
+            "--as".to_string(),
+            "cos".to_string(),
+        ],
         &herdr,
     );
     assert!(res.is_err(), "ack with --as override must be refused");
 
     // 3. inbox without --for must fail closed when caller identity is unknown (no cos default)
     let res = mail::handle_mail(&["inbox".to_string()], &herdr);
-    assert!(res.is_err(), "inbox without caller identity must fail closed without cos default");
+    assert!(
+        res.is_err(),
+        "inbox without caller identity must fail closed without cos default"
+    );
 }
 
 #[test]
 fn test_finding2_sender_identity_fail_closed_no_from() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("QUAQUA_TEST");
     guard.remove("QUAQUA_OWNER");
     guard.remove("HERDR_PANE_ID");
@@ -473,7 +509,10 @@ fn test_finding2_sender_identity_fail_closed_no_from() {
         ],
         &herdr,
     );
-    assert!(res.is_err(), "send without harness identity must fail closed");
+    assert!(
+        res.is_err(),
+        "send without harness identity must fail closed"
+    );
 }
 
 #[test]
@@ -494,13 +533,24 @@ fn test_finding3_path_traversal_refused() {
         "payload",
         "fake-key",
     );
-    assert!(res.is_err(), "path traversal in sender name must be refused");
-    assert!(!outside_path.exists(), "must not create file outside runs_dir");
+    assert!(
+        res.is_err(),
+        "path traversal in sender name must be refused"
+    );
+    assert!(
+        !outside_path.exists(),
+        "must not create file outside runs_dir"
+    );
 }
 
 #[test]
 fn test_finding4_dual_write_and_import_deduplicated() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "mu-lead");
@@ -529,25 +579,40 @@ fn test_finding4_dual_write_and_import_deduplicated() {
     assert!(md_path.exists(), "mu-lead.inbox.md must exist");
     let md_content = std::fs::read_to_string(&md_path).expect("read md");
     let header_count = md_content.lines().filter(|l| l.starts_with("## ")).count();
-    assert_eq!(header_count, 1, "retried send must write exactly 1 md entry");
+    assert_eq!(
+        header_count, 1,
+        "retried send must write exactly 1 md entry"
+    );
 
     // Import the markdown inbox file
     let imp = mail::import_inbox_file(&runs, &md_path).expect("import inbox");
     assert_eq!(imp.total, 1);
-    assert_eq!(imp.imported, 0, "already-sent dual-write mail must be skipped on import");
+    assert_eq!(
+        imp.imported, 0,
+        "already-sent dual-write mail must be skipped on import"
+    );
 
     // Verify SQLite mail table has exactly 1 row
     let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
     let count: i64 = bus
         .conn_for_test()
-        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM triggers WHERE source = 'mail'",
+            [],
+            |r| r.get(0),
+        )
         .expect("count mail");
     assert_eq!(count, 1, "lead send + import must yield exactly one row");
 }
 
 #[test]
 fn test_finding5_md_fallback_recipient_and_locked_db() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "arch-lead");
@@ -561,7 +626,8 @@ fn test_finding5_md_fallback_recipient_and_locked_db() {
         let bus = FarmBus::open(&db_path).expect("create db");
         // Hold exclusive lock
         let conn = bus.conn_for_test();
-        conn.execute_batch("BEGIN EXCLUSIVE;").expect("begin exclusive lock");
+        conn.execute_batch("BEGIN EXCLUSIVE;")
+            .expect("begin exclusive lock");
 
         let opts = SendMailOpts {
             to: "mu-lead".to_string(),
@@ -596,9 +662,15 @@ fn test_finding5_md_fallback_recipient_and_locked_db() {
     assert_eq!(res.id, 0);
 
     // Must be in mu-lead.inbox.md, NOT tieude-1.inbox.md
-    assert!(!corrupt_runs.join("arch-lead.inbox.md").exists(), "must not write to sender inbox");
+    assert!(
+        !corrupt_runs.join("arch-lead.inbox.md").exists(),
+        "must not write to sender inbox"
+    );
     let target_md = corrupt_runs.join("mu-lead.inbox.md");
-    assert!(target_md.exists(), "must write to recipient inbox mu-lead.inbox.md");
+    assert!(
+        target_md.exists(),
+        "must write to recipient inbox mu-lead.inbox.md"
+    );
 
     // Repair the db to test import
     std::fs::remove_file(corrupt_runs.join("quaqua.db")).unwrap();
@@ -608,9 +680,16 @@ fn test_finding5_md_fallback_recipient_and_locked_db() {
     let bus = FarmBus::open(&corrupt_runs.join("quaqua.db")).expect("open repaired bus");
     let to_name: String = bus
         .conn_for_test()
-        .query_row("SELECT to_name FROM mail LIMIT 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT to_name FROM triggers WHERE source = 'mail' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .expect("query to_name");
-    assert_eq!(to_name, "mu-lead", "import must preserve recipient mu-lead, not default to cos");
+    assert_eq!(
+        to_name, "mu-lead",
+        "import must preserve recipient mu-lead, not default to cos"
+    );
 }
 
 #[test]
@@ -632,7 +711,11 @@ fn test_finding6_import_multibyte_char_boundary_truncation() {
     let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
     let imported_body: String = bus
         .conn_for_test()
-        .query_row("SELECT body FROM mail LIMIT 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT payload_json FROM triggers WHERE source = 'mail' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .expect("query body");
     assert!(imported_body.chars().count() <= 4096);
 }
@@ -649,7 +732,11 @@ fn test_finding7_checked_in_fixtures_idempotent() {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
         .collect();
-    assert!(entries.len() >= 5, "must have at least 5 checked-in fixture files, got {}", entries.len());
+    assert!(
+        entries.len() >= 5,
+        "must have at least 5 checked-in fixture files, got {}",
+        entries.len()
+    );
 
     // First import run
     let mut total_imported = 0;
@@ -664,7 +751,7 @@ fn test_finding7_checked_in_fixtures_idempotent() {
     let beta_lead_body: String = bus
         .conn_for_test()
         .query_row(
-            "SELECT body FROM mail WHERE from_name = 'beta-lead' LIMIT 1",
+            "SELECT payload_json FROM triggers WHERE actor = 'beta-lead' LIMIT 1",
             [],
             |r| r.get(0),
         )
@@ -675,7 +762,7 @@ fn test_finding7_checked_in_fixtures_idempotent() {
     let delta_lead_body: String = bus
         .conn_for_test()
         .query_row(
-            "SELECT body FROM mail WHERE from_name = 'delta-lead' LIMIT 1",
+            "SELECT payload_json FROM triggers WHERE actor = 'delta-lead' LIMIT 1",
             [],
             |r| r.get(0),
         )
@@ -687,7 +774,10 @@ fn test_finding7_checked_in_fixtures_idempotent() {
         let res = mail::import_inbox_file(&runs, path).expect("re-import fixture");
         second_imported += res.imported;
     }
-    assert_eq!(second_imported, 0, "second import must be idempotent (0 new rows)");
+    assert_eq!(
+        second_imported, 0,
+        "second import must be idempotent (0 new rows)"
+    );
 }
 
 #[test]
@@ -699,33 +789,46 @@ fn test_finding8_mail_unacked_check_on_every_verb() {
     let old_ts = (quaqua::bus::now_ms()).saturating_sub(35 * 60 * 1000);
     bus.conn_for_test()
         .execute(
-            r#"
-            INSERT INTO mail (
-                msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body
-            ) VALUES ('test-key-f8', ?1, 'mu-lead', 'lead', 'cos', 'escalate', 'mu', NULL, 'urgent')
-            "#,
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES ('agent:cos', 'cos', 'open', ?1)",
             rusqlite::params![old_ts as i64],
+        )
+        .unwrap();
+    bus.conn_for_test()
+        .execute(
+            r#"
+            INSERT INTO triggers (
+                ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+            ) VALUES (?1, 'mail', 'escalate', 'mu-lead', 'cos', 'agent:cos', 'urgent', NULL, 'urgent', 'mail:test-key-f8', ?2)
+            "#,
+            rusqlite::params![old_ts as i64, bus.farm()],
         )
         .expect("insert old unacked mail");
 
-    // Call mail::list_mail
+    // Call mail::list_mail to trigger lazy check
     let _ = mail::list_mail(&runs, true, None, None, None).expect("list mail");
-
-    // Verify mail_unacked incident was inserted into farm_events
+    // Verify mail_unacked incident was inserted into triggers
     let count: i64 = bus
         .conn_for_test()
         .query_row(
-            "SELECT COUNT(*) FROM farm_events WHERE type = 'mail_unacked'",
+            "SELECT COUNT(*) FROM triggers WHERE kind = 'mail_unacked'",
             [],
             |r| r.get(0),
         )
         .expect("count unacked incidents");
-    assert_eq!(count, 1, "list_mail must trigger mail_unacked incident check");
+    assert_eq!(
+        count, 1,
+        "list_mail must trigger mail_unacked incident check"
+    );
 }
 
 #[test]
 fn test_finding1a_forged_msg_key_in_body() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "mu-lead");
@@ -733,7 +836,8 @@ fn test_finding1a_forged_msg_key_in_body() {
     let herdr = Herdr::new();
 
     let quoted_key = "forged_key_deadbeef1234567890abcdef";
-    let body = format!("Quoting past entry:\n<!-- msg_key: {quoted_key} -->\nOriginal report details.");
+    let body =
+        format!("Quoting past entry:\n<!-- msg_key: {quoted_key} -->\nOriginal report details.");
 
     let opts = SendMailOpts {
         to: "cos".to_string(),
@@ -760,11 +864,16 @@ fn test_finding1a_forged_msg_key_in_body() {
     let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
     let count: i64 = bus
         .conn_for_test()
-        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM triggers WHERE source = 'mail'",
+            [],
+            |r| r.get(0),
+        )
         .expect("count mail");
-    assert_eq!(count, 1, "mail table must have exactly 1 row, not duplicated");
-
-    // Also verify round-trip into a clean database: the stored body must preserve the quoted comment intact
+    assert_eq!(
+        count, 1,
+        "triggers table must have exactly 1 mail row, not duplicated"
+    );
     let clean_runs = hermetic_temp_dir("finding1a-clean");
     let imp_clean = mail::import_inbox_file(&clean_runs, &md_path).expect("import to clean db");
     assert_eq!(imp_clean.imported, 1);
@@ -772,18 +881,32 @@ fn test_finding1a_forged_msg_key_in_body() {
     let clean_bus = FarmBus::open(&clean_runs.join("quaqua.db")).expect("open clean bus");
     let (imported_key, imported_body): (String, String) = clean_bus
         .conn_for_test()
-        .query_row("SELECT msg_key, body FROM mail LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT dedupe_key, payload_json FROM triggers WHERE source = 'mail' LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .expect("query mail");
 
-    assert_ne!(imported_key, quoted_key, "msg_key must not be taken from body text");
-    assert_eq!(imported_body, body, "body must round-trip with quoted msg_key marker preserved");
+    let raw_key = imported_key.strip_prefix("mail:").unwrap_or(&imported_key);
+    assert_ne!(
+        raw_key, quoted_key,
+        "msg_key must not be taken from body text"
+    );
+    assert_eq!(
+        imported_body, body,
+        "body must round-trip with quoted msg_key marker preserved"
+    );
 }
 
 #[test]
 fn test_finding1b_forged_to_in_body_reroutes() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "mu-lead");
@@ -815,18 +938,36 @@ fn test_finding1b_forged_to_in_body_reroutes() {
     let bus = FarmBus::open(&clean_runs.join("quaqua.db")).expect("open bus");
     let (to_name, imported_body): (String, String) = bus
         .conn_for_test()
-        .query_row("SELECT to_name, body FROM mail LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT to_name, payload_json FROM triggers WHERE source = 'mail' LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get(1)?,
+                ))
+            },
+        )
         .expect("query mail");
 
-    assert_eq!(to_name, "cos", "body marker <!-- to: ... --> must not reroute mail recipient");
-    assert_eq!(imported_body, body, "body must round-trip with <!-- to: ... --> preserved");
+    assert_eq!(
+        to_name, "cos",
+        "body marker <!-- to: ... --> must not reroute mail recipient"
+    );
+    assert_eq!(
+        imported_body, body,
+        "body must round-trip with <!-- to: ... --> preserved"
+    );
 }
 
 #[test]
 fn test_finding1c_forged_header_in_body_plants_entry() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "alpha-lead");
@@ -854,30 +995,48 @@ fn test_finding1c_forged_header_in_body_plants_entry() {
     let clean_runs = hermetic_temp_dir("finding1c-clean");
     let imp = mail::import_inbox_file(&clean_runs, &md_path).expect("import clean");
 
-    assert_eq!(imp.total, 1, "body line starting with '## ' must not plant a second entry");
+    assert_eq!(
+        imp.total, 1,
+        "body line starting with '## ' must not plant a second entry"
+    );
     assert_eq!(imp.imported, 1, "must import exactly 1 genuine entry");
 
     let bus = FarmBus::open(&clean_runs.join("quaqua.db")).expect("open bus");
     let forged_count: i64 = bus
         .conn_for_test()
         .query_row(
-            "SELECT COUNT(*) FROM mail WHERE from_name = 'mu-lead' OR kind = 'accept'",
+            "SELECT COUNT(*) FROM triggers WHERE actor = 'mu-lead' OR kind = 'accept'",
             [],
             |r| r.get(0),
         )
         .expect("count forged");
-    assert_eq!(forged_count, 0, "no forged entry from mu-lead should be planted in mail table");
+    assert_eq!(
+        forged_count, 0,
+        "no forged entry from mu-lead should be planted in mail table"
+    );
 
     let imported_body: String = bus
         .conn_for_test()
-        .query_row("SELECT body FROM mail LIMIT 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT payload_json FROM triggers WHERE source = 'mail' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .expect("query body");
-    assert_eq!(imported_body, body, "body must round-trip with ## header line preserved");
+    assert_eq!(
+        imported_body, body,
+        "body must round-trip with ## header line preserved"
+    );
 }
 
 #[test]
 fn test_finding1d_future_marker_in_body_suppresses_dual_write() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
     guard.set("QUAQUA_OWNER", "mu-lead");
@@ -889,7 +1048,8 @@ fn test_finding1d_future_marker_in_body_suppresses_dual_write() {
     let future_msg_key = mail::sha256_hex(format!("mu-lead|{future_client_id}").as_bytes());
 
     // Mail 1 quotes this future marker in its body
-    let body1 = format!("Discussing future marker:\n<!-- msg_key: {future_msg_key} -->\nEnd of mail 1.");
+    let body1 =
+        format!("Discussing future marker:\n<!-- msg_key: {future_msg_key} -->\nEnd of mail 1.");
     let opts1 = SendMailOpts {
         to: "cos".to_string(),
         kind: "handoff".to_string(),
@@ -954,19 +1114,28 @@ All criteria satisfied.
     let rows: Vec<(String, String, String, String)> = {
         let conn = bus.conn_for_test();
         let mut stmt = conn
-            .prepare("SELECT from_name, to_name, kind, body FROM mail ORDER BY id ASC")
+            .prepare("SELECT actor, to_name, kind, payload_json FROM triggers WHERE source = 'mail' ORDER BY id ASC")
             .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get(2)?,
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
     };
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, "freeze-lead");
     assert_eq!(rows[0].1, "cos");
     assert_eq!(rows[0].2, "handoff");
-    assert!(rows[0].3.contains("P7 done: merged into quaqua/freeze-integ"));
+    assert!(rows[0]
+        .3
+        .contains("P7 done: merged into quaqua/freeze-integ"));
     assert!(rows[0].3.contains("Ask: CoS review + push/PR decision."));
 
     assert_eq!(rows[1].0, "freeze-lead");
@@ -1051,29 +1220,62 @@ impl quaqua::herdr::HerdrOps for MockUntaggedLeadHerdr {
         Ok(r#"{"result":{"agents":[{"name":"mu-lead","pane_id":"wB:p1","tokens":{"logo":"\ue1a3"}}]}}"#.to_string())
     }
     fn agent_get(&self, _name: &str) -> std::io::Result<(bool, String)> {
-        Ok((true, r#"{"result":{"agent":{"name":"mu-lead","pane_id":"wB:p1"}}}"#.to_string()))
+        Ok((
+            true,
+            r#"{"result":{"agent":{"name":"mu-lead","pane_id":"wB:p1"}}}"#.to_string(),
+        ))
     }
-    fn agent_read(&self, _n: &str, _s: &str, _l: u32) -> std::io::Result<String> { Ok(String::new()) }
-    fn agent_start(&self, _n: &str, _k: &str, _p: &str, _t: u32, _a: &[&str]) -> std::io::Result<std::process::Output> {
+    fn agent_read(&self, _n: &str, _s: &str, _l: u32) -> std::io::Result<String> {
+        Ok(String::new())
+    }
+    fn agent_start(
+        &self,
+        _n: &str,
+        _k: &str,
+        _p: &str,
+        _t: u32,
+        _a: &[&str],
+    ) -> std::io::Result<std::process::Output> {
         Ok(std::process::Output {
             status: std::os::unix::process::ExitStatusExt::from_raw(0),
             stdout: Vec::new(),
             stderr: Vec::new(),
         })
     }
-    fn pane_split(&self, _c: &str, _o: &str, _e: &[(&str, &str)]) -> std::io::Result<std::process::Output> { unimplemented!() }
-    fn pane_close(&self, _p: &str) -> std::io::Result<std::process::Output> { unimplemented!() }
+    fn pane_split(
+        &self,
+        _c: &str,
+        _o: &str,
+        _e: &[(&str, &str)],
+    ) -> std::io::Result<std::process::Output> {
+        unimplemented!()
+    }
+    fn pane_close(&self, _p: &str) -> std::io::Result<std::process::Output> {
+        unimplemented!()
+    }
     fn pane_report_metadata(&self, _p: &str, _t: &[&str]) -> std::io::Result<std::process::Output> {
         let mut args = vec!["pane", "report-metadata", _p];
         args.extend_from_slice(_t);
         self.run(&args)
     }
-    fn pane_wait_output(&self, _p: &str, _m: &str, _t: u32) -> bool { true }
-    fn pane_read(&self, _p: &str, _s: &str, _l: u32) -> std::io::Result<String> { Ok(String::new()) }
-    fn pane_send_keys(&self, _p: &str, _k: &str) -> std::io::Result<std::process::Output> { unimplemented!() }
-    fn agent_send_keys(&self, _n: &str, _key: &str) -> std::io::Result<std::process::Output> { unimplemented!() }
-    fn agent_wait_idle(&self, _n: &str, _t: u32) -> std::io::Result<std::process::Output> { unimplemented!() }
-    fn agent_prompt_nowait(&self, _n: &str, _p: &str) -> std::io::Result<std::process::Output> { unimplemented!() }
+    fn pane_wait_output(&self, _p: &str, _m: &str, _t: u32) -> bool {
+        true
+    }
+    fn pane_read(&self, _p: &str, _s: &str, _l: u32) -> std::io::Result<String> {
+        Ok(String::new())
+    }
+    fn pane_send_keys(&self, _p: &str, _k: &str) -> std::io::Result<std::process::Output> {
+        unimplemented!()
+    }
+    fn agent_send_keys(&self, _n: &str, _key: &str) -> std::io::Result<std::process::Output> {
+        unimplemented!()
+    }
+    fn agent_wait_idle(&self, _n: &str, _t: u32) -> std::io::Result<std::process::Output> {
+        unimplemented!()
+    }
+    fn agent_prompt_nowait(&self, _n: &str, _p: &str) -> std::io::Result<std::process::Output> {
+        unimplemented!()
+    }
     fn agent_prompt_wait_background(
         &self,
         _n: &str,
@@ -1086,7 +1288,13 @@ impl quaqua::herdr::HerdrOps for MockUntaggedLeadHerdr {
 }
 #[test]
 fn test_mail_send_from_untagged_lead_pane_self_heals() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_ROOT", "HOME"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_ROOT",
+        "HOME",
+    ]);
     guard.remove("QUAQUA_OWNER");
     guard.remove("QUAQUA_TEST");
     guard.set("HERDR_PANE_ID", "wB:p1");
@@ -1115,20 +1323,28 @@ fn test_mail_send_from_untagged_lead_pane_self_heals() {
         client_id: None,
     };
 
-    let res = mail::send_mail(&runs, &opts, &herdr).expect("send_mail must self-heal untagged lead pane");
+    let res =
+        mail::send_mail(&runs, &opts, &herdr).expect("send_mail must self-heal untagged lead pane");
     assert!(res.id > 0);
 
     let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
     let sender: String = bus
         .conn_for_test()
-        .query_row("SELECT from_name FROM mail WHERE id = ?", [res.id], |r| r.get(0))
+        .query_row("SELECT actor FROM triggers WHERE id = ?", [res.id], |r| {
+            r.get(0)
+        })
         .expect("get sender");
     assert_eq!(sender, "mu-lead");
 }
 
 #[test]
 fn test_mail_send_unresolvable_error_names_pane_and_repair_command() {
-    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_ROOT"]);
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_ROOT",
+    ]);
     guard.remove("QUAQUA_OWNER");
     guard.remove("QUAQUA_TEST");
     guard.set("HERDR_PANE_ID", "wX:p99");
@@ -1150,8 +1366,14 @@ fn test_mail_send_unresolvable_error_names_pane_and_repair_command() {
     };
 
     let err = mail::send_mail(&runs, &opts, &herdr).expect_err("unresolvable pane must fail");
-    assert!(err.contains("wX:p99"), "error must name pane wX:p99, got: {err}");
-    assert!(err.contains("quaqua lead repair"), "error must name 'quaqua lead repair', got: {err}");
+    assert!(
+        err.contains("wX:p99"),
+        "error must name pane wX:p99, got: {err}"
+    );
+    assert!(
+        err.contains("quaqua lead repair"),
+        "error must name 'quaqua lead repair', got: {err}"
+    );
 }
 fn farm_gate_opts() -> SendMailOpts {
     SendMailOpts {
@@ -1313,7 +1535,7 @@ fn test_mail_send_same_farm_pane_stamps_local_farm() {
     let (sender, row_farm): (String, String) = bus
         .conn_for_test()
         .query_row(
-            "SELECT from_name, farm FROM mail WHERE id = ?",
+            "SELECT actor, farm FROM triggers WHERE id = ?",
             [res.id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
