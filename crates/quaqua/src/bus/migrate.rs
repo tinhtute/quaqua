@@ -108,10 +108,7 @@ pub fn migrate_bus<H: HerdrOps>(
         let mut active_workers = Vec::new();
         for a in agents {
             let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let status = a
-                .get("agent_status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let status = a.get("agent_status").and_then(|s| s.as_str()).unwrap_or("");
             if status != "dead" && !name.is_empty() && name != "cos" {
                 active_workers.push(format!("{name} ({status})"));
             }
@@ -128,11 +125,8 @@ pub fn migrate_bus<H: HerdrOps>(
     let local_farm = crate::workspace::farm_of_runs_dir(runs_dir);
 
     let mut conn = if dry_run {
-        rusqlite::Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| format!("cannot open database read-only: {e}"))?
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("cannot open database read-only: {e}"))?
     } else {
         crate::engine::sqlite::open_conn(db_path)
             .map_err(|e| format!("cannot open database: {e}"))?
@@ -401,12 +395,14 @@ pub fn migrate_bus<H: HerdrOps>(
 
     // Sort candidates by ts_ms ASC, source priority, legacy id ASC
     candidates.sort_by(|a, b| {
-        a.ts_ms.cmp(&b.ts_ms).then_with(|| match (&a.legacy_ref, &b.legacy_ref) {
-            (LegacyRef::FarmEvent(s1), LegacyRef::FarmEvent(s2)) => s1.cmp(s2),
-            (LegacyRef::Mail(m1), LegacyRef::Mail(m2)) => m1.cmp(m2),
-            (LegacyRef::FarmEvent(_), LegacyRef::Mail(_)) => std::cmp::Ordering::Less,
-            (LegacyRef::Mail(_), LegacyRef::FarmEvent(_)) => std::cmp::Ordering::Greater,
-        })
+        a.ts_ms
+            .cmp(&b.ts_ms)
+            .then_with(|| match (&a.legacy_ref, &b.legacy_ref) {
+                (LegacyRef::FarmEvent(s1), LegacyRef::FarmEvent(s2)) => s1.cmp(s2),
+                (LegacyRef::Mail(m1), LegacyRef::Mail(m2)) => m1.cmp(m2),
+                (LegacyRef::FarmEvent(_), LegacyRef::Mail(_)) => std::cmp::Ordering::Less,
+                (LegacyRef::Mail(_), LegacyRef::FarmEvent(_)) => std::cmp::Ordering::Greater,
+            })
     });
 
     // Compute new cursors
@@ -456,11 +452,15 @@ pub fn migrate_bus<H: HerdrOps>(
     }
 
     // 4. Real migration: Backup via VACUUM INTO
-    let backup_dir_path = backup_dir.map(PathBuf::from).unwrap_or_else(|| {
-        crate::workspace::workspace_root().join("raw")
-    });
-    std::fs::create_dir_all(&backup_dir_path)
-        .map_err(|e| format!("cannot create backup directory {}: {e}", backup_dir_path.display()))?;
+    let backup_dir_path = backup_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::workspace::workspace_root().join("raw"));
+    std::fs::create_dir_all(&backup_dir_path).map_err(|e| {
+        format!(
+            "cannot create backup directory {}: {e}",
+            backup_dir_path.display()
+        )
+    })?;
 
     let date_str = crate::auditor::current_date_hour()
         .chars()

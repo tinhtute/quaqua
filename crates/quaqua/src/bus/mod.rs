@@ -733,10 +733,7 @@ mod tests {
         let count_after: i64 = conn
             .query_row("SELECT count(*) FROM farm_events", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            count_after, count_before,
-            "refusal must not delete any row"
-        );
+        assert_eq!(count_after, count_before, "refusal must not delete any row");
     }
 
     #[test]

@@ -336,7 +336,10 @@ fn test_migrate_live_worker_malformed_json_fails_closed() {
 
     let herdr_bad = MockHerdr::with_raw("not valid json");
     let res = migrate_bus(&db_path, None, false, &herdr_bad);
-    assert!(res.is_err(), "must fail closed on unparseable herdr response");
+    assert!(
+        res.is_err(),
+        "must fail closed on unparseable herdr response"
+    );
     let err_msg = res.err().unwrap();
     assert!(
         err_msg.contains("cannot verify live workers: invalid herdr agent list JSON"),
@@ -551,7 +554,10 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
     let thread_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(thread_count, 2, "threads must only contain agent:w1 and agent:cos");
+    assert_eq!(
+        thread_count, 2,
+        "threads must only contain agent:w1 and agent:cos"
+    );
     let thread_ids: Vec<String> = conn
         .prepare("SELECT id FROM threads ORDER BY id ASC")
         .unwrap()
