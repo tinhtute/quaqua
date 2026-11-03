@@ -945,72 +945,60 @@ pub fn render_inbox(runs_dir: &Path, to_name: &str) -> Result<String, String> {
 pub fn ack_mail(runs_dir: &Path, caller_name: &str, mail_ids: &[u64]) -> Result<Vec<u64>, String> {
     let db_path = runs_dir.join("quaqua.db");
     let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
-    let conn = bus.conn.lock().unwrap();
+    let mut conn = bus.conn.lock().unwrap();
 
     let timeout_ms = get_mail_ack_timeout_ms();
     let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
 
-    let _now = crate::bus::now_ms();
-    let mut acked_ids = Vec::new();
+    let now = crate::bus::now_ms();
 
-    for &id in mail_ids {
-        let mut query = conn
-            .prepare_cached(
-                "SELECT to_name FROM triggers WHERE id = ?1 AND (farm = ?2 OR farm IS NULL)",
-            )
-            .map_err(|e| e.to_string())?;
+    let res: rusqlite::Result<Result<Vec<u64>, String>> =
+        crate::engine::sqlite::retry_while_busy(|| {
+            let tx = conn.transaction()?;
+            let mut acked_ids = Vec::new();
 
-        let mut rows = query
-            .query(rusqlite::params![id as i64, bus.farm()])
-            .map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let to_name: String = row
-                .get::<_, Option<String>>(0)
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default();
+            for &id in mail_ids {
+                let mut query = tx.prepare_cached(
+                    "SELECT to_name FROM triggers WHERE id = ?1 AND (farm = ?2 OR farm IS NULL)",
+                )?;
 
-            if caller_name != to_name {
-                return Err(format!(
-                    "refused: caller '{caller_name}' is not the recipient of mail #{id} (addressed to '{to_name}')"
-                ));
+                let mut rows = query.query(rusqlite::params![id as i64, bus.farm()])?;
+                if let Some(row) = rows.next()? {
+                    let to_name: String = row
+                        .get::<_, Option<String>>(0)?
+                        .unwrap_or_default();
+
+                    if caller_name != to_name {
+                        return Ok(Err(format!(
+                            "refused: caller '{caller_name}' is not the recipient of mail #{id} (addressed to '{to_name}')"
+                        )));
+                    }
+
+                    drop(rows);
+                    drop(query);
+
+                    let mut set_stmt = tx.prepare_cached(
+                        r#"
+                        INSERT INTO trigger_acks (trigger_id, acked_ms, acked_by) VALUES (?1, ?2, ?3)
+                        ON CONFLICT(trigger_id) DO NOTHING
+                        "#,
+                    )?;
+                    set_stmt.execute(rusqlite::params![id as i64, now as i64, caller_name])?;
+
+                    acked_ids.push(id);
+                } else {
+                    return Ok(Err(format!("mail #{id} not found")));
+                }
             }
 
-            drop(rows);
-            drop(query);
+            tx.commit()?;
+            Ok(Ok(acked_ids))
+        });
 
-            let is_already_acked: bool = {
-                let mut a_stmt = conn
-                    .prepare_cached("SELECT 1 FROM trigger_acks WHERE trigger_id = ?1")
-                    .map_err(|e| e.to_string())?;
-                let mut a_rows = a_stmt
-                    .query(rusqlite::params![id as i64])
-                    .map_err(|e| e.to_string())?;
-                a_rows.next().map_err(|e| e.to_string())?.is_some()
-            };
-
-            if is_already_acked {
-                return Err(format!("mail #{id} is already acked"));
-            }
-
-            let mut set_stmt = conn
-                .prepare_cached(
-                    r#"
-                    INSERT INTO trigger_acks (trigger_id, acked_ms, acked_by) VALUES (?1, ?2, ?3)
-                    ON CONFLICT(trigger_id) DO NOTHING
-                    "#,
-                )
-                .map_err(|e| e.to_string())?;
-            set_stmt
-                .execute(rusqlite::params![id as i64, _now as i64, caller_name])
-                .map_err(|e| e.to_string())?;
-
-            acked_ids.push(id);
-        } else {
-            return Err(format!("mail #{id} not found"));
-        }
+    match res {
+        Ok(inner) => inner,
+        Err(e) => Err(e.to_string()),
     }
-
-    Ok(acked_ids)
 }
 
 /// Imports markdown inbox file. Idempotent: msg_key = sha256(header_line) or metadata msg_key.

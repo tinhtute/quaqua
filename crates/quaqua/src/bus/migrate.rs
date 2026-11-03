@@ -589,8 +589,7 @@ pub fn migrate_bus<H: HerdrOps>(
             let mut ack_stmt = tx.prepare_cached(
                 "INSERT INTO trigger_acks (trigger_id, acked_ms, acked_by) VALUES (?1, ?2, ?3)",
             )?;
-            for (idx, cand) in candidates.iter().enumerate() {
-                let new_trigger_id = (idx + 1) as u64;
+            for cand in &candidates {
                 trig_stmt.execute(rusqlite::params![
                     cand.ts_ms as i64,
                     cand.source,
@@ -604,7 +603,7 @@ pub fn migrate_bus<H: HerdrOps>(
                     cand.dedupe_key,
                     cand.farm,
                 ])?;
-
+                let new_trigger_id = tx.last_insert_rowid() as u64;
                 if let LegacyRef::Mail(mail_id) = cand.legacy_ref {
                     if let Some(m) = mails.iter().find(|m| m.id == mail_id) {
                         if let Some(acked_ms) = m.acked_ms {
