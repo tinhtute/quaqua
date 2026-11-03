@@ -7,6 +7,12 @@ pub mod events;
 pub mod mail;
 pub mod migrate;
 pub use events::InboxDigest;
+pub const LEGACY_DB_ERROR_MSG: &str = "legacy database detected; run quaqua bus migrate";
+
+/// Returns true if `err` represents a refused legacy database open.
+pub fn is_legacy_db_error(err: &rusqlite::Error) -> bool {
+    err.to_string().contains(LEGACY_DB_ERROR_MSG)
+}
 
 /// Opens or creates the bus at `path`, initializing schema idempotently.
 /// Refuses a legacy database without dropping anything (returning an error).
@@ -158,7 +164,7 @@ impl FarmBus {
 
         if has_legacy {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::other("legacy database detected; run quaqua bus migrate"),
+                std::io::Error::other(LEGACY_DB_ERROR_MSG),
             )));
         }
 
@@ -263,63 +269,59 @@ impl FarmBus {
     /// If `event.incident_key` is set and a row with that key already exists,
     /// the insert is ignored and this method returns `Ok(false)`.
     /// Otherwise, the event is inserted and this method returns `Ok(true)`.
+    /// Records an event in `triggers` and updates the thread's `last_trigger_ms`
+    /// in a single transaction.
+    ///
+    /// If `event.incident_key` is set and a trigger with that key already exists,
+    /// the insert is ignored and this method returns `Ok(false)`.
+    /// Otherwise, the event is inserted and this method returns `Ok(true)`.
     pub fn record(&self, event: &FarmEvent) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let farm_str = event.farm.as_deref().unwrap_or(&self.farm);
         crate::engine::sqlite::retry_while_busy(|| {
-            let has_triggers: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='triggers'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-
-            if has_triggers {
-                let actor_str = event.actor.as_deref().unwrap_or("worker");
-                let thread_name = event
-                    .subject
-                    .as_deref()
-                    .or(event.owner.as_deref())
-                    .unwrap_or("unknown");
-                let thread_id = format!("agent:{thread_name}");
-                conn.execute(
-                    "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
-                    rusqlite::params![&thread_id, thread_name, event.ts_ms as i64],
-                )?;
-                conn.execute(
-                    "UPDATE threads SET last_trigger_ms = MAX(last_trigger_ms, ?1) WHERE id = ?2",
-                    rusqlite::params![event.ts_ms as i64, &thread_id],
-                )?;
-                let summary = format!(
-                    "{} {}",
-                    event.event_type,
-                    event.subject.as_deref().unwrap_or_default()
-                );
-                let summary_trunc: String = summary.trim().chars().take(80).collect();
-                let summary_final = if summary_trunc.is_empty() {
-                    event.event_type.chars().take(80).collect()
-                } else {
-                    summary_trunc
-                };
-                let source = if actor_str == "herdr" || event.event_type.starts_with("agent_") {
-                    "herdr"
-                } else if actor_str == "watchdog" || event.event_type == "stalled" {
-                    "watchdog"
-                } else if actor_str == "github" || event.event_type.contains("github") {
-                    "github-ci"
-                } else {
-                    "worker"
-                };
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    INSERT OR IGNORE INTO triggers (
-                        ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
-                    ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, ?7, ?8, ?9)
-                    "#,
-                )?;
-                let rows = stmt.execute(rusqlite::params![
+            let tx = conn.transaction()?;
+            let actor_str = event.actor.as_deref().unwrap_or("worker");
+            let thread_name = event
+                .subject
+                .as_deref()
+                .or(event.owner.as_deref())
+                .unwrap_or("unknown");
+            let thread_id = format!("agent:{thread_name}");
+            tx.execute(
+                "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
+                rusqlite::params![&thread_id, thread_name, event.ts_ms as i64],
+            )?;
+            tx.execute(
+                "UPDATE threads SET last_trigger_ms = MAX(last_trigger_ms, ?1) WHERE id = ?2",
+                rusqlite::params![event.ts_ms as i64, &thread_id],
+            )?;
+            let summary = format!(
+                "{} {}",
+                event.event_type,
+                event.subject.as_deref().unwrap_or_default()
+            );
+            let summary_trunc: String = summary.trim().chars().take(80).collect();
+            let summary_final = if summary_trunc.is_empty() {
+                event.event_type.chars().take(80).collect()
+            } else {
+                summary_trunc
+            };
+            let source = if actor_str == "herdr" || event.event_type.starts_with("agent_") {
+                "herdr"
+            } else if actor_str == "watchdog" || event.event_type == "stalled" {
+                "watchdog"
+            } else if actor_str == "github" || event.event_type.contains("github") {
+                "github-ci"
+            } else {
+                "worker"
+            };
+            let rows = tx.execute(
+                r#"
+                INSERT OR IGNORE INTO triggers (
+                    ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+                ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, ?7, ?8, ?9)
+                "#,
+                rusqlite::params![
                     event.ts_ms as i64,
                     source,
                     event.event_type,
@@ -329,109 +331,51 @@ impl FarmBus {
                     event.payload_json,
                     event.incident_key,
                     farm_str,
-                ])?;
-                Ok(rows > 0)
-            } else {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    INSERT OR IGNORE INTO farm_events (
-                        ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    "#,
-                )?;
-                let rows = stmt.execute(rusqlite::params![
-                    event.ts_ms as i64,
-                    event.event_type,
-                    event.actor,
-                    event.subject,
-                    event.owner,
-                    event.project,
-                    event.incident_key,
-                    event.payload_json,
-                    farm_str,
-                ])?;
-                Ok(rows > 0)
-            }
+                ],
+            )?;
+            tx.commit()?;
+            Ok(rows > 0)
         })
     }
 
-    /// Loads all recorded events ordered by `seq` ASC, optionally filtered to `seq > since_seq`.
+    /// Loads all recorded events ordered by `id` ASC, optionally filtered to `id > since_seq`.
     pub fn load_events(&self, since_seq: u64) -> rusqlite::Result<Vec<FarmEventRecord>> {
         let conn = self.conn.lock().unwrap();
         crate::engine::sqlite::retry_while_busy(|| {
-            let has_triggers: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='triggers'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-
-            if has_triggers {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    SELECT id, ts_ms, kind, actor, thread_id, dedupe_key, payload_json, farm
-                    FROM triggers
-                    WHERE id > ?1
-                    ORDER BY id ASC
-                    "#,
-                )?;
-                let rows = stmt.query_map(rusqlite::params![since_seq as i64], |row| {
-                    let thread_id: String = row.get(4)?;
-                    let subject = thread_id
-                        .strip_prefix("agent:")
-                        .unwrap_or(&thread_id)
-                        .to_string();
-                    Ok(FarmEventRecord {
-                        seq: row.get::<_, i64>(0)? as u64,
-                        ts_ms: row.get::<_, i64>(1)? as u64,
-                        event_type: row.get(2)?,
-                        actor: Some(row.get(3)?),
-                        subject: Some(subject),
-                        owner: None,
-                        project: None,
-                        incident_key: row.get(5)?,
-                        payload_json: row
-                            .get::<_, Option<String>>(6)?
-                            .unwrap_or_else(|| "{}".to_string()),
-                        farm: row.get(7)?,
-                    })
-                })?;
-                let mut res = Vec::new();
-                for r in rows {
-                    res.push(r?);
-                }
-                Ok(res)
-            } else {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    SELECT seq, ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-                    FROM farm_events
-                    WHERE seq > ?1
-                    ORDER BY seq ASC
-                    "#,
-                )?;
-                let rows = stmt.query_map(rusqlite::params![since_seq as i64], |row| {
-                    Ok(FarmEventRecord {
-                        seq: row.get::<_, i64>(0)? as u64,
-                        ts_ms: row.get::<_, i64>(1)? as u64,
-                        event_type: row.get(2)?,
-                        actor: row.get(3)?,
-                        subject: row.get(4)?,
-                        owner: row.get(5)?,
-                        project: row.get(6)?,
-                        incident_key: row.get(7)?,
-                        payload_json: row.get(8)?,
-                        farm: row.get(9)?,
-                    })
-                })?;
-                let mut res = Vec::new();
-                for r in rows {
-                    res.push(r?);
-                }
-                Ok(res)
+            let mut stmt = conn.prepare_cached(
+                r#"
+                SELECT id, ts_ms, kind, actor, thread_id, dedupe_key, payload_json, farm
+                FROM triggers
+                WHERE id > ?1
+                ORDER BY id ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(rusqlite::params![since_seq as i64], |row| {
+                let thread_id: String = row.get(4)?;
+                let subject = thread_id
+                    .strip_prefix("agent:")
+                    .unwrap_or(&thread_id)
+                    .to_string();
+                Ok(FarmEventRecord {
+                    seq: row.get::<_, i64>(0)? as u64,
+                    ts_ms: row.get::<_, i64>(1)? as u64,
+                    event_type: row.get(2)?,
+                    actor: Some(row.get(3)?),
+                    subject: Some(subject),
+                    owner: None,
+                    project: None,
+                    incident_key: row.get(5)?,
+                    payload_json: row
+                        .get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "{}".to_string()),
+                    farm: row.get(7)?,
+                })
+            })?;
+            let mut res = Vec::new();
+            for r in rows {
+                res.push(r?);
             }
+            Ok(res)
         })
     }
 
@@ -439,87 +383,8 @@ impl FarmBus {
     pub fn get_cursor(&self, consumer: &str) -> rusqlite::Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         crate::engine::sqlite::retry_while_busy(|| {
-            let has_trigger_id: bool = {
-                let mut stmt = conn.prepare("PRAGMA table_info(cursors)")?;
-                let mut rows = stmt.query([])?;
-                let mut found = false;
-                while let Some(row) = rows.next()? {
-                    let col_name: String = row.get(1)?;
-                    if col_name == "trigger_id" {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-            if has_trigger_id {
-                let mut stmt =
-                    conn.prepare_cached("SELECT trigger_id FROM cursors WHERE consumer = ?1")?;
-                let mut rows = stmt.query(rusqlite::params![consumer])?;
-                if let Some(row) = rows.next()? {
-                    let id: i64 = row.get(0)?;
-                    Ok(Some(id as u64))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                let mut stmt =
-                    conn.prepare_cached("SELECT seq FROM cursors WHERE consumer = ?1")?;
-                let mut rows = stmt.query(rusqlite::params![consumer])?;
-                if let Some(row) = rows.next()? {
-                    let seq: i64 = row.get(0)?;
-                    Ok(Some(seq as u64))
-                } else {
-                    Ok(None)
-                }
-            }
-        })
-    }
-
-    /// Sets or updates the cursor for `consumer`.
-    pub fn set_cursor(&self, consumer: &str, seq: u64) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        crate::engine::sqlite::retry_while_busy(|| {
-            let has_trigger_id: bool = {
-                let mut stmt = conn.prepare("PRAGMA table_info(cursors)")?;
-                let mut rows = stmt.query([])?;
-                let mut found = false;
-                while let Some(row) = rows.next()? {
-                    let col_name: String = row.get(1)?;
-                    if col_name == "trigger_id" {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-            if has_trigger_id {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    INSERT INTO cursors (consumer, trigger_id) VALUES (?1, ?2)
-                    ON CONFLICT(consumer) DO UPDATE SET trigger_id = excluded.trigger_id
-                    "#,
-                )?;
-                stmt.execute(rusqlite::params![consumer, seq as i64])?;
-            } else {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    INSERT INTO cursors (consumer, seq, mail_id) VALUES (?1, ?2, 0)
-                    ON CONFLICT(consumer) DO UPDATE SET seq = excluded.seq
-                    "#,
-                )?;
-                stmt.execute(rusqlite::params![consumer, seq as i64])?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Returns the mail cursor (last seen mail id) for `consumer`, if set.
-    pub fn get_mail_cursor(&self, consumer: &str) -> rusqlite::Result<Option<u64>> {
-        let conn = self.conn.lock().unwrap();
-        crate::engine::sqlite::retry_while_busy(|| {
             let mut stmt =
-                conn.prepare_cached("SELECT mail_id FROM cursors WHERE consumer = ?1")?;
+                conn.prepare_cached("SELECT trigger_id FROM cursors WHERE consumer = ?1")?;
             let mut rows = stmt.query(rusqlite::params![consumer])?;
             if let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
@@ -530,19 +395,29 @@ impl FarmBus {
         })
     }
 
-    /// Sets or updates the mail cursor (last seen mail id) for `consumer`.
-    pub fn set_mail_cursor(&self, consumer: &str, mail_id: u64) -> rusqlite::Result<()> {
+    /// Sets or updates the cursor for `consumer`.
+    pub fn set_cursor(&self, consumer: &str, trigger_id: u64) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         crate::engine::sqlite::retry_while_busy(|| {
             let mut stmt = conn.prepare_cached(
                 r#"
-                INSERT INTO cursors (consumer, seq, mail_id) VALUES (?1, 0, ?2)
-                ON CONFLICT(consumer) DO UPDATE SET mail_id = excluded.mail_id
+                INSERT INTO cursors (consumer, trigger_id) VALUES (?1, ?2)
+                ON CONFLICT(consumer) DO UPDATE SET trigger_id = excluded.trigger_id
                 "#,
             )?;
-            stmt.execute(rusqlite::params![consumer, mail_id as i64])?;
+            stmt.execute(rusqlite::params![consumer, trigger_id as i64])?;
             Ok(())
         })
+    }
+
+    /// Returns the mail cursor for `consumer`, delegating to `get_cursor` on superagent schema.
+    pub fn get_mail_cursor(&self, consumer: &str) -> rusqlite::Result<Option<u64>> {
+        self.get_cursor(consumer)
+    }
+
+    /// Sets or updates the mail cursor for `consumer`, delegating to `set_cursor` on superagent schema.
+    pub fn set_mail_cursor(&self, consumer: &str, mail_id: u64) -> rusqlite::Result<()> {
+        self.set_cursor(consumer, mail_id)
     }
 }
 
