@@ -1245,6 +1245,132 @@ fn test_migrate_preserves_owner_project_and_mail_metadata() {
 }
 
 #[test]
+fn test_migrate_mail_preserves_dedupe_key_and_project() {
+    let tmp = hermetic_temp_dir("migrate-mail-dedupe-project");
+    let db_path = tmp.join("quaqua.db");
+    let backup_dir = tmp.join("raw");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "?1, 'blocked', 'herdr', 'w7:p2', 'cos', 'blocked:w7:p2:1', '{\"msg\":1}'",
+            ),
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        // Non-lead sender: decode_mail_fields cannot re-derive this project from the name,
+        // so project must survive through the migrated `ref`.
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'peer-m1', ?1, 'w2', 'worker', 'cos', 'handoff', 'projX', NULL, 'peer note'",
+            ),
+            rusqlite::params![(now + 1) as i64],
+        )
+        .unwrap();
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'cos-m2', ?1, 'cos', 'cos', 'cos', 'directive', 'projY', 1, 'lead note'",
+            ),
+            rusqlite::params![(now + 2) as i64],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    migrate_bus(&db_path, Some(&backup_dir), false, &herdr).expect("first migration");
+
+    let read_mail_triggers = |conn: &Connection| -> Vec<(String, Option<String>, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT actor, dedupe_key, ref FROM triggers WHERE source = 'mail' ORDER BY id ASC")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let rows = read_mail_triggers(&conn);
+        assert_eq!(rows.len(), 2, "both legacy mails must migrate 1:1");
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("mail:peer-m1"),
+            "migrated mail must keep its identity key (P2·T3 dedupe relies on it)"
+        );
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some("project:projX"),
+            "legacy mail.project must survive for a non-lead sender"
+        );
+        assert_eq!(
+            rows[1].1.as_deref(),
+            Some("mail:cos-m2"),
+            "second mail keeps its own msg_key"
+        );
+        assert_eq!(
+            rows[1].2.as_deref(),
+            Some("mail:2;project:projY"),
+            "ref syntax must match send_mail: reply first, project second, ';' separated"
+        );
+    }
+
+    // Re-running migrate stays a no-op: no duplicated rows, same identity keys.
+    let second = migrate_bus(&db_path, Some(&backup_dir), false, &herdr).expect("second migration");
+    assert!(
+        second.already_migrated,
+        "second run must be a no-op with already_migrated true"
+    );
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM triggers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "re-run must not duplicate migrated triggers");
+        assert_eq!(read_mail_triggers(&conn), {
+            let mut expected = Vec::new();
+            expected.push((
+                "w2".to_string(),
+                Some("mail:peer-m1".to_string()),
+                Some("project:projX".to_string()),
+            ));
+            expected.push((
+                "cos".to_string(),
+                Some("mail:cos-m2".to_string()),
+                Some("mail:2;project:projY".to_string()),
+            ));
+            expected
+        });
+    }
+
+    // The readers derive msg_key from dedupe_key and project from ref: prove the round trip
+    // through the public inbox surface, not just the stored row.
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let digest = bus.inbox_digest(&tmp, "cos").expect("cos inbox digest");
+    assert_eq!(digest.unacked_mail.len(), 2);
+    let peer = digest
+        .unacked_mail
+        .iter()
+        .find(|m| m.msg_key == "peer-m1")
+        .expect("migrated peer mail must expose its legacy msg_key");
+    assert_eq!(peer.project.as_deref(), Some("projX"));
+    assert_eq!(peer.reply_to, None);
+    let lead = digest
+        .unacked_mail
+        .iter()
+        .find(|m| m.msg_key == "cos-m2")
+        .expect("migrated lead mail must expose its legacy msg_key");
+    assert_eq!(lead.project.as_deref(), Some("projY"));
+    assert_eq!(lead.reply_to, Some(1));
+}
+
+#[test]
 fn test_migrated_wal_db_open_succeeds_even_when_uncheckpointed() {
     let tmp = hermetic_temp_dir("migrated-uncheckpointed");
     let db_path = tmp.join("quaqua.db");
