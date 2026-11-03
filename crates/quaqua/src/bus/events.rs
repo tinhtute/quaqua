@@ -700,45 +700,20 @@ impl FarmBus {
     ///
     /// Farm-scoped, and limited to what is addressed to `consumer`: rows with no
     /// recipient (incidents), rows addressed to it, and rows on a thread it is
-    /// currently subscribed to.
+    /// currently subscribed to. `mail inbox --all` reads the whole history this way.
     pub fn digest_rows(&self, consumer: &str, from_id: u64) -> rusqlite::Result<Vec<DigestRow>> {
         let conn = self.conn.lock().unwrap();
         let now = crate::bus::now_ms() as i64;
         crate::engine::sqlite::retry_while_busy(|| {
-            let mut stmt = conn.prepare_cached(DIGEST_ROWS_SQL)?;
-            let rows = stmt.query_map(
-                rusqlite::params![from_id as i64, &self.farm, consumer, now],
-                |row| {
-                    Ok(DigestRow {
-                        id: row.get::<_, i64>(0)? as u64,
-                        kind: row.get(1)?,
-                        actor: row.get(2)?,
-                        thread_id: row.get(3)?,
-                        summary: row.get(4)?,
-                        ref_val: row.get(5)?,
-                    })
-                },
-            )?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
-            }
-            Ok(out)
+            query_digest_rows(&conn, from_id, &self.farm, consumer, now)
         })
     }
 
-    /// Renders one digest batch for `consumer` and, when `advance` is set, moves its
-    /// cursor past the batch — all in one transaction. Returns "" when nothing is new.
-    ///
-    /// `from_id` overrides the cursor start (`Some(0)` for `--all`); the cursor is
-    /// still only moved when `advance` is set. A repeated call with `advance` and no
-    /// new rows leaves the cursor where it is, so re-running converges.
-    pub fn inbox_batch(
-        &self,
-        consumer: &str,
-        from_id: Option<u64>,
-        advance: bool,
-    ) -> Result<String, String> {
+    /// Renders one digest batch for `consumer` from its cursor and, when `advance` is
+    /// set, moves the cursor past the batch — all in one transaction. Returns "" when
+    /// nothing is new. A repeated call with `advance` and no new rows leaves the cursor
+    /// where it is, so re-running converges.
+    pub fn inbox_batch(&self, consumer: &str, advance: bool) -> Result<String, String> {
         use rusqlite::OptionalExtension;
         let mut conn = self.conn.lock().unwrap();
         let now = crate::bus::now_ms() as i64;
@@ -752,41 +727,20 @@ impl FarmBus {
                 )
                 .optional()?
                 .unwrap_or(0) as u64;
-            let start = from_id.unwrap_or(prev_cursor);
 
-            let rows: Vec<DigestRow> = {
-                let mut stmt = tx.prepare_cached(DIGEST_ROWS_SQL)?;
-                let mapped = stmt.query_map(
-                    rusqlite::params![start as i64, &self.farm, consumer, now],
-                    |row| {
-                        Ok(DigestRow {
-                            id: row.get::<_, i64>(0)? as u64,
-                            kind: row.get(1)?,
-                            actor: row.get(2)?,
-                            thread_id: row.get(3)?,
-                            summary: row.get(4)?,
-                            ref_val: row.get(5)?,
-                        })
-                    },
-                )?;
-                let mut out = Vec::new();
-                for r in mapped {
-                    out.push(r?);
-                }
-                out
-            };
-
+            let rows = query_digest_rows(&tx, prev_cursor, &self.farm, consumer, now)?;
             let render = render_digest(&rows);
 
             if advance {
                 // One render is one batch (spec §6): the cursor moves past every row the
                 // batch covered, so a repeat finds nothing left. Rows elided by the 20-line
-                // cap stay reachable through `--all`, which never advances.
+                // cap stay reachable through `--all`, which reads the whole history
+                // uncapped and never advances.
                 let target = rows
                     .iter()
                     .map(|r| r.id)
                     .max()
-                    .unwrap_or(start)
+                    .unwrap_or(prev_cursor)
                     .max(prev_cursor);
                 if target > prev_cursor {
                     tx.execute(
@@ -833,6 +787,34 @@ const DIGEST_ROWS_SQL: &str = r#"
     ORDER BY t.id ASC
 "#;
 
+fn query_digest_rows(
+    conn: &rusqlite::Connection,
+    from_id: u64,
+    farm: &str,
+    consumer: &str,
+    now: i64,
+) -> rusqlite::Result<Vec<DigestRow>> {
+    let mut stmt = conn.prepare_cached(DIGEST_ROWS_SQL)?;
+    let rows = stmt.query_map(
+        rusqlite::params![from_id as i64, farm, consumer, now],
+        |row| {
+            Ok(DigestRow {
+                id: row.get::<_, i64>(0)? as u64,
+                kind: row.get(1)?,
+                actor: row.get(2)?,
+                thread_id: row.get(3)?,
+                summary: row.get(4)?,
+                ref_val: row.get(5)?,
+            })
+        },
+    )?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// Renders a digest batch: `#<id> <kind> <actor> <thread> <summary>[ → <ref>]`, grouped by
 /// thread (newest thread first), consecutive same-kind rows in a thread collapsed to
 /// `#<first>..#<last> <kind> ×N …`, capped at [`DIGEST_MAX_LINES`] lines.
@@ -840,6 +822,16 @@ const DIGEST_ROWS_SQL: &str = r#"
 /// Returns "" for an empty batch; that empty string is what the CoS hook treats as
 /// "nothing new".
 pub fn render_digest(rows: &[DigestRow]) -> String {
+    render_digest_lines(rows, Some(DIGEST_BODY_LINES))
+}
+
+/// Renders every row without the line cap: `mail inbox --all` is the spill line's
+/// escape hatch, so it must be able to show the rows the digest elided.
+pub fn render_digest_all(rows: &[DigestRow]) -> String {
+    render_digest_lines(rows, None)
+}
+
+fn render_digest_lines(rows: &[DigestRow], cap: Option<usize>) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -905,8 +897,9 @@ pub fn render_digest(rows: &[DigestRow]) -> String {
         }
     }
 
-    let spilled = lines.len().saturating_sub(DIGEST_BODY_LINES);
-    let kept = lines.len().min(DIGEST_BODY_LINES);
+    let cap = cap.unwrap_or(lines.len());
+    let spilled = lines.len().saturating_sub(cap);
+    let kept = lines.len().min(cap);
     let mut text = String::new();
     for (line, _) in &lines[..kept] {
         text.push_str(line);

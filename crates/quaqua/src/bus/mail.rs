@@ -1489,23 +1489,44 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
                 }
             };
 
+            // A DB failure is exit 2 (spec §5), so it is reported here rather than as a
+            // generic error the caller would map to exit 1.
             let db_path = runs_dir.join("quaqua.db");
             let bus = match FarmBus::open(&db_path) {
                 Ok(b) => b,
                 Err(e) => {
                     if crate::bus::is_legacy_db_error(&e) {
-                        return Err(format!(
-                            "cannot open database: {}",
+                        eprintln!(
+                            "error: cannot open database: {}",
                             crate::bus::LEGACY_DB_ERROR_MSG
-                        ));
+                        );
+                    } else {
+                        eprintln!("error: cannot open database: {e}");
                     }
-                    return Err(format!("cannot open database: {e}"));
+                    return Ok(2);
                 }
             };
 
-            let from_id = if all { Some(0) } else { None };
-            // `--all` re-reads from the start, so it never marks anything read.
-            let digest = bus.inbox_batch(&consumer, from_id, advance && !all)?;
+            let digest = if all {
+                // `--all` is the spill line's escape hatch: read the whole history and
+                // never cap it, so rows the 20-line digest elided are still shown.
+                match bus.digest_rows(&consumer, 0) {
+                    Ok(rows) => crate::bus::events::render_digest_all(&rows),
+                    Err(e) => {
+                        eprintln!("error: cannot read digest: {e}");
+                        return Ok(2);
+                    }
+                }
+            } else {
+                match bus.inbox_batch(&consumer, advance) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(2);
+                    }
+                }
+            };
+
             // stdout is the digest batch only, so a caller (the CoS hook) can treat
             // empty output as "nothing new"; diagnostics go to stderr.
             if digest.is_empty() {

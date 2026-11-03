@@ -1711,4 +1711,59 @@ fn test_inbox_spill_drains_instead_of_repeating() {
         "a repeat finds nothing left: {}",
         String::from_utf8_lossy(&again.stdout)
     );
+
+    // The spill line advertises `--all`, so that command must reach the elided rows.
+    let all = run_quaqua(
+        &["mail", "inbox", "--for", "cos", "--all"],
+        &runs_dir,
+        &envs,
+    );
+    assert_eq!(all.status.code(), Some(0));
+    let all_stdout = String::from_utf8_lossy(&all.stdout);
+    assert_eq!(
+        all_stdout.lines().count(),
+        25,
+        "--all is not capped, so it shows every trigger: {all_stdout}"
+    );
+    for i in 1..=25u64 {
+        assert!(
+            all_stdout.contains(&format!("#{i} handoff w1 t{i} s{i}")),
+            "--all must show #{i} after the digest elided it: {all_stdout}"
+        );
+    }
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("reopen bus");
+    assert_eq!(
+        bus.get_cursor("cos").expect("cursor"),
+        Some(25),
+        "--all never advances the cursor"
+    );
+}
+
+#[test]
+fn test_inbox_db_error_exits_2() {
+    let runs_dir = hermetic_temp_dir("inbox-dberror");
+    std::fs::write(runs_dir.join("quaqua.db"), b"this is not a sqlite database")
+        .expect("write corrupt db");
+
+    let out = run_quaqua(
+        &["mail", "inbox", "--for", "cos"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("cos")),
+            ("HERDR_PANE_ID", None),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a database failure exits 2 (spec §5): stdout {} stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot open database"),
+        "the failure is reported on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
