@@ -1511,7 +1511,7 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
                 // `--all` is the spill line's escape hatch: read the whole history and
                 // never cap it, so rows the 20-line digest elided are still shown.
                 match bus.digest_rows(&consumer, 0) {
-                    Ok(rows) => crate::bus::events::render_digest_all(&rows),
+                    Ok(rows) => crate::bus::events::render_digest_all(&rows, &consumer),
                     Err(e) => {
                         eprintln!("error: cannot read digest: {e}");
                         return Ok(2);

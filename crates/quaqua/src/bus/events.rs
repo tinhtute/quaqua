@@ -705,7 +705,14 @@ impl FarmBus {
         let conn = self.conn.lock().unwrap();
         let now = crate::bus::now_ms() as i64;
         crate::engine::sqlite::retry_while_busy(|| {
-            query_digest_rows(&conn, from_id, &self.farm, consumer, now)
+            query_digest_rows(
+                &conn,
+                from_id,
+                &self.farm,
+                consumer,
+                now,
+                self.path().parent().unwrap_or(Path::new(".")),
+            )
         })
     }
 
@@ -728,8 +735,9 @@ impl FarmBus {
                 .optional()?
                 .unwrap_or(0) as u64;
 
-            let rows = query_digest_rows(&tx, prev_cursor, &self.farm, consumer, now)?;
-            let render = render_digest(&rows);
+            let runs_dir = self.path().parent().unwrap_or(Path::new("."));
+            let rows = query_digest_rows(&tx, prev_cursor, &self.farm, consumer, now, runs_dir)?;
+            let render = render_digest(&rows, consumer);
 
             if advance {
                 // One render is one batch (spec §6): the cursor moves past every row the
@@ -776,8 +784,14 @@ pub const DIGEST_MAX_LINES: usize = 20;
 const DIGEST_BODY_LINES: usize = DIGEST_MAX_LINES - 1;
 
 const DIGEST_ROWS_SQL: &str = r#"
-    SELECT t.id, t.kind, t.actor, t.thread_id, t.summary, t.ref
+    SELECT t.id, t.ts_ms, t.kind, t.actor, t.thread_id, t.summary, t.ref,
+           t.to_name, t.dedupe_key, t.payload_json, th.owner,
+           IFNULL((t.to_name = ?3
+                   OR EXISTS (SELECT 1 FROM subscriptions s
+                              WHERE s.thread_id = t.thread_id AND s.consumer = ?3
+                                AND s.until_ms >= ?4)), 0)
     FROM triggers t
+    LEFT JOIN threads th ON t.thread_id = th.id
     WHERE t.id > ?1
       AND (t.farm = ?2 OR t.farm IS NULL)
       AND (t.to_name IS NULL
@@ -787,30 +801,113 @@ const DIGEST_ROWS_SQL: &str = r#"
     ORDER BY t.id ASC
 "#;
 
+/// A candidate row plus the columns the consumer filters need.
+struct DigestCandidate {
+    row: DigestRow,
+    ts_ms: u64,
+    to_name: Option<String>,
+    dedupe_key: Option<String>,
+    payload_json: String,
+    thread_owner: Option<String>,
+    /// Addressed to the consumer, or on a thread it is subscribed to.
+    addressed: bool,
+}
+
+impl DigestCandidate {
+    fn as_event_record(&self) -> FarmEventRecord {
+        let thread_id = &self.row.thread_id;
+        let subject = thread_id
+            .strip_prefix("agent:")
+            .unwrap_or(thread_id)
+            .to_string();
+        let (owner, project) = match serde_json::from_str::<serde_json::Value>(&self.payload_json) {
+            Ok(v) => (
+                v.get("owner")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    .or_else(|| self.thread_owner.clone()),
+                v.get("project").and_then(|x| x.as_str()).map(String::from),
+            ),
+            Err(_) => (self.thread_owner.clone(), None),
+        };
+        FarmEventRecord {
+            seq: self.row.id,
+            ts_ms: self.ts_ms,
+            event_type: self.row.kind.clone(),
+            actor: Some(self.row.actor.clone()),
+            subject: Some(subject),
+            owner,
+            project,
+            incident_key: self.dedupe_key.clone(),
+            payload_json: self.payload_json.clone(),
+            farm: None,
+        }
+    }
+}
+
 fn query_digest_rows(
     conn: &rusqlite::Connection,
     from_id: u64,
     farm: &str,
     consumer: &str,
     now: i64,
+    runs_dir: &Path,
 ) -> rusqlite::Result<Vec<DigestRow>> {
     let mut stmt = conn.prepare_cached(DIGEST_ROWS_SQL)?;
     let rows = stmt.query_map(
         rusqlite::params![from_id as i64, farm, consumer, now],
         |row| {
-            Ok(DigestRow {
-                id: row.get::<_, i64>(0)? as u64,
-                kind: row.get(1)?,
-                actor: row.get(2)?,
-                thread_id: row.get(3)?,
-                summary: row.get(4)?,
-                ref_val: row.get(5)?,
+            Ok(DigestCandidate {
+                row: DigestRow {
+                    id: row.get::<_, i64>(0)? as u64,
+                    kind: row.get(2)?,
+                    actor: row.get(3)?,
+                    thread_id: row.get(4)?,
+                    summary: row.get(5)?,
+                    ref_val: row.get(6)?,
+                },
+                ts_ms: row.get::<_, i64>(1)? as u64,
+                to_name: row.get(7)?,
+                dedupe_key: row.get(8)?,
+                payload_json: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| "{}".to_string()),
+                thread_owner: row.get(10)?,
+                addressed: row.get::<_, i64>(11)? != 0,
             })
         },
     )?;
-    let mut out = Vec::new();
+    let mut candidates = Vec::new();
     for r in rows {
-        out.push(r?);
+        candidates.push(r?);
+    }
+
+    // Incidents carry no recipient, so they are admitted the same way the pre-digest
+    // `inbox_digest` admitted them: own-pane noise dropped, everything else scoped to
+    // the consumer's group. The own pane is resolved only when an incident is present.
+    let own_pane = if candidates
+        .iter()
+        .any(|c| c.to_name.is_none() && !c.addressed)
+    {
+        resolve_consumer_pane(consumer)
+    } else {
+        None
+    };
+
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if candidate.to_name.is_none() && !candidate.addressed {
+            if candidate.dedupe_key.is_none() {
+                continue;
+            }
+            let rec = candidate.as_event_record();
+            if is_consumer_own_pane_blocked_noise(&rec, own_pane.as_deref())
+                || !is_incident_in_consumer_group(&rec, consumer, runs_dir)
+            {
+                continue;
+            }
+        }
+        out.push(candidate.row);
     }
     Ok(out)
 }
@@ -821,17 +918,17 @@ fn query_digest_rows(
 ///
 /// Returns "" for an empty batch; that empty string is what the CoS hook treats as
 /// "nothing new".
-pub fn render_digest(rows: &[DigestRow]) -> String {
-    render_digest_lines(rows, Some(DIGEST_BODY_LINES))
+pub fn render_digest(rows: &[DigestRow], consumer: &str) -> String {
+    render_digest_lines(rows, Some(DIGEST_BODY_LINES), consumer)
 }
 
 /// Renders every row without the line cap: `mail inbox --all` is the spill line's
 /// escape hatch, so it must be able to show the rows the digest elided.
-pub fn render_digest_all(rows: &[DigestRow]) -> String {
-    render_digest_lines(rows, None)
+pub fn render_digest_all(rows: &[DigestRow], consumer: &str) -> String {
+    render_digest_lines(rows, None, consumer)
 }
 
-fn render_digest_lines(rows: &[DigestRow], cap: Option<usize>) -> String {
+fn render_digest_lines(rows: &[DigestRow], cap: Option<usize>, consumer: &str) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -909,7 +1006,7 @@ fn render_digest_lines(rows: &[DigestRow], cap: Option<usize>) -> String {
     if spilled > 0 {
         let dropped_rows: usize = lines[kept..].iter().map(|(_, ids)| ids.len()).sum();
         text.push_str(&format!(
-            "… +{dropped_rows} more: quaqua mail inbox --all\n"
+            "… +{dropped_rows} more: quaqua mail inbox --for {consumer} --all\n"
         ));
     }
 

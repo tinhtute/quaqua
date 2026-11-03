@@ -1251,12 +1251,12 @@ fn test_render_digest_golden() {
 #1..#4 handoff ×2 mu-lead cos second handoff → project:mu
 #2..#3 blocked ×2 w2 mu-lead waiting on CI
 ";
-    assert_eq!(render_digest(&rows), expected);
+    assert_eq!(render_digest(&rows, "cos"), expected);
 }
 
 #[test]
 fn test_render_digest_empty_is_blank() {
-    assert_eq!(render_digest(&[]), "", "empty batch renders nothing");
+    assert_eq!(render_digest(&[], "cos"), "", "empty batch renders nothing");
 }
 
 #[test]
@@ -1274,11 +1274,11 @@ fn test_render_digest_caps_20_lines() {
         })
         .collect();
 
-    let text = render_digest(&rows);
+    let text = render_digest(&rows, "cos");
     assert_eq!(text.lines().count(), 20, "digest is capped at 20 lines");
     assert_eq!(
         text.lines().last(),
-        Some("… +6 more: quaqua mail inbox --all")
+        Some("… +6 more: quaqua mail inbox --for cos --all")
     );
     assert!(
         text.starts_with("#25 handoff mu-lead t25 s25\n"),
@@ -1694,7 +1694,7 @@ fn test_inbox_spill_drains_instead_of_repeating() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout.lines().count(), 20, "capped at 20 lines: {stdout}");
     assert!(
-        stdout.contains("… +6 more: quaqua mail inbox --all"),
+        stdout.contains("… +6 more: quaqua mail inbox --for cos --all"),
         "the elided tail is advertised: {stdout}"
     );
 
@@ -1765,5 +1765,114 @@ fn test_inbox_db_error_exits_2() {
         String::from_utf8_lossy(&out.stderr).contains("cannot open database"),
         "the failure is reported on stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_mail_inbox_drops_consumer_own_pane_incident() {
+    let runs_dir = hermetic_temp_dir("digest-own-pane");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    let own_pane = "w1:p9";
+    // A `blocked` incident about the CoS's own pane: the old digest dropped it.
+    bus.record(
+        &quaqua::bus::FarmEvent::new(
+            "blocked",
+            Some("herdr"),
+            Some(own_pane),
+            Some("cos"),
+            Some("p1"),
+        )
+        .with_incident_key("blocked:cos:1"),
+    )
+    .expect("record own-pane incident");
+    let kept = bus
+        .record(
+            &quaqua::bus::FarmEvent::new(
+                "blocked",
+                Some("herdr"),
+                Some("w-worker"),
+                Some("cos"),
+                Some("p1"),
+            )
+            .with_incident_key("blocked:w-worker:1"),
+        )
+        .expect("record worker incident");
+    assert!(kept);
+    drop(bus);
+
+    let out = run_quaqua(
+        &["mail", "inbox", "--for", "cos"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("cos")),
+            ("HERDR_PANE_ID", Some(own_pane)),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(own_pane),
+        "the consumer's own blocked pane is noise: {stdout}"
+    );
+    assert!(
+        stdout.contains("w-worker"),
+        "a real incident still reaches the digest: {stdout}"
+    );
+}
+
+#[test]
+fn test_mail_inbox_scopes_incidents_to_the_consumer_group() {
+    let runs_dir = hermetic_temp_dir("digest-group");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    // An incident owned by another Lead's worker.
+    bus.record(
+        &quaqua::bus::FarmEvent::new(
+            "blocked",
+            Some("herdr"),
+            Some("w-mu"),
+            Some("mu-lead"),
+            Some("mu"),
+        )
+        .with_incident_key("blocked:w-mu:1"),
+    )
+    .expect("record foreign incident");
+    drop(bus);
+
+    let arch = run_quaqua(
+        &["mail", "inbox", "--for", "arch-lead"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("arch-lead")),
+            ("HERDR_PANE_ID", None),
+        ],
+    );
+    assert_eq!(arch.status.code(), Some(0));
+    assert!(
+        !String::from_utf8_lossy(&arch.stdout).contains("w-mu"),
+        "another Lead's worker incident is not arch-lead's: {}",
+        String::from_utf8_lossy(&arch.stdout)
+    );
+
+    let cos = run_quaqua(
+        &["mail", "inbox", "--for", "cos"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("cos")),
+            ("HERDR_PANE_ID", None),
+        ],
+    );
+    assert_eq!(cos.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&cos.stdout).contains("w-mu"),
+        "a Lead's incident still reaches the CoS: {}",
+        String::from_utf8_lossy(&cos.stdout)
     );
 }
