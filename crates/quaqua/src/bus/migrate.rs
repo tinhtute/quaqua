@@ -194,19 +194,7 @@ pub fn migrate_bus<H: HerdrOps>(
             .map(|c| c > 0)
             .unwrap_or(false);
         if has_c {
-            let mut stmt = conn
-                .prepare("PRAGMA table_info(cursors)")
-                .map_err(|e| e.to_string())?;
-            let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-            let mut found = false;
-            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                let col: String = row.get(1).map_err(|e| e.to_string())?;
-                if col == "seq" {
-                    found = true;
-                    break;
-                }
-            }
-            found
+            table_has_column(&conn, "cursors", "seq")
         } else {
             false
         }
@@ -214,9 +202,13 @@ pub fn migrate_bus<H: HerdrOps>(
 
     // Read legacy farm_events
     let farm_events: Vec<LegacyFarmEvent> = if has_farm_events {
-        let mut stmt = conn
-            .prepare("SELECT seq, ts_ms, type, actor, subject, owner, incident_key, payload_json, farm FROM farm_events ORDER BY ts_ms ASC, seq ASC")
-            .map_err(|e| e.to_string())?;
+        let has_farm_col = table_has_column(&conn, "farm_events", "farm");
+        let query = if has_farm_col {
+            "SELECT seq, ts_ms, type, actor, subject, owner, incident_key, payload_json, farm FROM farm_events ORDER BY ts_ms ASC, seq ASC"
+        } else {
+            "SELECT seq, ts_ms, type, actor, subject, owner, incident_key, payload_json, NULL AS farm FROM farm_events ORDER BY ts_ms ASC, seq ASC"
+        };
+        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(LegacyFarmEvent {
@@ -245,9 +237,13 @@ pub fn migrate_bus<H: HerdrOps>(
 
     // Read legacy mail
     let mails: Vec<LegacyMail> = if has_mail {
-        let mut stmt = conn
-            .prepare("SELECT id, ts_ms, from_name, to_name, kind, body, farm FROM mail ORDER BY ts_ms ASC, id ASC")
-            .map_err(|e| e.to_string())?;
+        let has_farm_col = table_has_column(&conn, "mail", "farm");
+        let query = if has_farm_col {
+            "SELECT id, ts_ms, from_name, to_name, kind, body, farm FROM mail ORDER BY ts_ms ASC, id ASC"
+        } else {
+            "SELECT id, ts_ms, from_name, to_name, kind, body, NULL AS farm FROM mail ORDER BY ts_ms ASC, id ASC"
+        };
+        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(LegacyMail {
@@ -272,9 +268,13 @@ pub fn migrate_bus<H: HerdrOps>(
 
     // Read legacy cursors
     let cursors: Vec<LegacyCursor> = if has_legacy_cursors {
-        let mut stmt = conn
-            .prepare("SELECT consumer, seq, mail_id FROM cursors")
-            .map_err(|e| e.to_string())?;
+        let has_mail_id_col = table_has_column(&conn, "cursors", "mail_id");
+        let query = if has_mail_id_col {
+            "SELECT consumer, seq, mail_id FROM cursors"
+        } else {
+            "SELECT consumer, seq, 0 AS mail_id FROM cursors"
+        };
+        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(LegacyCursor {
@@ -640,4 +640,20 @@ pub fn run_migrate(dry_run: bool) -> Result<i32, String> {
         println!("bus migration: already migrated to superagent-v1; no-op");
     }
     Ok(0)
+}
+
+fn table_has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let pragma = format!("PRAGMA table_info({table})");
+    if let Ok(mut stmt) = conn.prepare(&pragma) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(col_name) = row.get::<_, String>(1) {
+                    if col_name == column {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }

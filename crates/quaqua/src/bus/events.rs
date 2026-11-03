@@ -421,77 +421,71 @@ impl FarmBus {
     ) -> rusqlite::Result<Vec<FarmEventRecord>> {
         let conn = self.conn_for_test();
         crate::engine::sqlite::retry_while_busy(|| {
-            if consumer == "cos" {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    SELECT seq, ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-                    FROM farm_events
-                    WHERE seq > ?1 AND incident_key IS NOT NULL
-                      AND (farm = ?2 OR (farm IS NULL AND seq <= ?3))
-                    ORDER BY seq ASC
-                    "#,
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![since_seq as i64, &self.farm, self.events_watermark as i64],
-                    |row| {
-                        Ok(FarmEventRecord {
-                            seq: row.get::<_, i64>(0)? as u64,
-                            ts_ms: row.get::<_, i64>(1)? as u64,
-                            event_type: row.get(2)?,
-                            actor: row.get(3)?,
-                            subject: row.get(4)?,
-                            owner: row.get(5)?,
-                            project: row.get(6)?,
-                            incident_key: row.get(7)?,
-                            payload_json: row.get(8)?,
-                            farm: row.get(9)?,
-                        })
-                    },
-                )?;
-                let mut res = Vec::new();
-                for r in rows {
-                    res.push(r?);
+            let mut stmt = conn.prepare_cached(
+                r#"
+                SELECT t.id, t.ts_ms, t.kind, t.actor, t.to_name, t.thread_id, t.dedupe_key, t.payload_json, t.farm, th.owner
+                FROM triggers t
+                LEFT JOIN threads th ON t.thread_id = th.id
+                WHERE t.source != 'mail' AND t.id > ?1 AND t.dedupe_key IS NOT NULL
+                  AND (t.farm = ?2 OR (t.farm IS NULL AND t.id <= ?3))
+                ORDER BY t.id ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since_seq as i64, &self.farm, self.events_watermark as i64],
+                |row| {
+                    let thread_id: String = row.get(5)?;
+                    let subject = thread_id
+                        .strip_prefix("agent:")
+                        .unwrap_or(&thread_id)
+                        .to_string();
+                    let payload_str: String = row
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "{}".to_string());
+                    let thread_owner: Option<String> = row.get(9)?;
+
+                    let (owner, project) =
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                            let o = v
+                                .get("owner")
+                                .and_then(|x| x.as_str())
+                                .map(String::from)
+                                .or(thread_owner);
+                            let p = v.get("project").and_then(|x| x.as_str()).map(String::from);
+                            (o, p)
+                        } else {
+                            (thread_owner, None)
+                        };
+
+                    Ok(FarmEventRecord {
+                        seq: row.get::<_, i64>(0)? as u64,
+                        ts_ms: row.get::<_, i64>(1)? as u64,
+                        event_type: row.get(2)?,
+                        actor: Some(row.get(3)?),
+                        subject: Some(subject),
+                        owner,
+                        project,
+                        incident_key: row.get(6)?,
+                        payload_json: payload_str,
+                        farm: row.get(8)?,
+                    })
+                },
+            )?;
+            let mut res = Vec::new();
+            for r in rows {
+                let rec = r?;
+                if consumer == "cos" {
+                    res.push(rec);
+                } else {
+                    let matches_consumer = rec.owner.as_deref() == Some(consumer)
+                        || rec.owner.is_none()
+                        || rec.subject.as_deref() == Some(consumer);
+                    if matches_consumer {
+                        res.push(rec);
+                    }
                 }
-                Ok(res)
-            } else {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                    SELECT seq, ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm
-                    FROM farm_events
-                    WHERE seq > ?1 AND incident_key IS NOT NULL
-                      AND (farm = ?2 OR (farm IS NULL AND seq <= ?3))
-                      AND owner = ?4
-                    ORDER BY seq ASC
-                    "#,
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![
-                        since_seq as i64,
-                        &self.farm,
-                        self.events_watermark as i64,
-                        consumer
-                    ],
-                    |row| {
-                        Ok(FarmEventRecord {
-                            seq: row.get::<_, i64>(0)? as u64,
-                            ts_ms: row.get::<_, i64>(1)? as u64,
-                            event_type: row.get(2)?,
-                            actor: row.get(3)?,
-                            subject: row.get(4)?,
-                            owner: row.get(5)?,
-                            project: row.get(6)?,
-                            incident_key: row.get(7)?,
-                            payload_json: row.get(8)?,
-                            farm: row.get(9)?,
-                        })
-                    },
-                )?;
-                let mut res = Vec::new();
-                for r in rows {
-                    res.push(r?);
-                }
-                Ok(res)
             }
+            Ok(res)
         })
     }
 
@@ -571,10 +565,11 @@ impl FarmBus {
     /// Queries the latest event type and incident key recorded for `subject`.
     pub fn latest_event_for_subject(&self, subject: &str) -> Option<(String, Option<String>)> {
         let conn = self.conn_for_test();
+        let thread_id = format!("agent:{subject}");
         crate::engine::sqlite::retry_while_busy(|| {
             conn.query_row(
-                "SELECT type, incident_key FROM farm_events WHERE subject = ?1 ORDER BY seq DESC LIMIT 1",
-                rusqlite::params![subject],
+                "SELECT kind, dedupe_key FROM triggers WHERE thread_id = ?1 OR actor = ?2 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![&thread_id, subject],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
         })
@@ -607,12 +602,13 @@ impl FarmBus {
             let mut stmt = conn
                 .prepare_cached(
                     r#"
-                    SELECT id, msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to,
-                           body, deliveries, last_delivered_ms, acked_ms, acked_by
-                    FROM mail
-                    WHERE to_name = ?1 AND acked_ms IS NULL AND id > ?2
-                      AND (farm = ?3 OR farm IS NULL)
-                    ORDER BY id ASC
+                    SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.farm
+                    FROM triggers t
+                    LEFT JOIN cursors c ON c.consumer = t.to_name
+                    WHERE t.source = 'mail' AND t.to_name = ?1 AND t.id > ?2
+                      AND (c.trigger_id IS NULL OR t.id > c.trigger_id)
+                      AND (t.farm = ?3 OR t.farm IS NULL)
+                    ORDER BY t.id ASC
                     "#,
                 )
                 .map_err(|e| e.to_string())?;
@@ -621,21 +617,34 @@ impl FarmBus {
                 .query_map(
                     rusqlite::params![consumer, *last_seen_mail_id as i64, &self.farm],
                     |row| {
+                        let id = row.get::<_, i64>(0)? as u64;
+                        let dedupe_key: Option<String> = row.get(1)?;
+                        let msg_key = dedupe_key
+                            .as_deref()
+                            .and_then(|k| k.strip_prefix("mail:"))
+                            .unwrap_or("")
+                            .to_string();
+                        let ts_ms = row.get::<_, i64>(2)? as u64;
+                        let from_name: String = row.get(3)?;
+                        let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+                        let kind: String = row.get(5)?;
+                        let body: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+
                         Ok(MailMessage {
-                            id: row.get::<_, i64>(0)? as u64,
-                            msg_key: row.get(1)?,
-                            ts_ms: row.get::<_, i64>(2)? as u64,
-                            from_name: row.get(3)?,
-                            from_role: row.get(4)?,
-                            to_name: row.get(5)?,
-                            kind: row.get(6)?,
-                            project: row.get(7)?,
-                            reply_to: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                            body: row.get(9)?,
-                            deliveries: row.get::<_, i64>(10)? as u64,
-                            last_delivered_ms: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-                            acked_ms: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                            acked_by: row.get(13)?,
+                            id,
+                            msg_key,
+                            ts_ms,
+                            from_name,
+                            from_role: "lead".to_string(),
+                            to_name,
+                            kind,
+                            project: None,
+                            reply_to: None,
+                            body,
+                            deliveries: 1,
+                            last_delivered_ms: Some(ts_ms),
+                            acked_ms: None,
+                            acked_by: None,
                         })
                     },
                 )

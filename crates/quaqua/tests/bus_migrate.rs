@@ -252,6 +252,9 @@ fn test_legacy_db_open_refused_without_dropping() {
         )
         .unwrap();
     }
+    // Compute file hash before open attempts
+    let bytes_before = std::fs::read(&db_path).expect("read db bytes before");
+    let hash_before = quaqua::bus::mail::sha256_hex(&bytes_before);
 
     // Attempt FarmBus::open
     let open_res = FarmBus::open(&db_path);
@@ -272,6 +275,21 @@ fn test_legacy_db_open_refused_without_dropping() {
         "open_bus must return Err on legacy DB"
     );
 
+    // Assert write-free refusal (S9): exact hash match, no -wal or -shm sidecars
+    let bytes_after = std::fs::read(&db_path).expect("read db bytes after");
+    let hash_after = quaqua::bus::mail::sha256_hex(&bytes_after);
+    assert_eq!(
+        hash_before, hash_after,
+        "refusal must write 0 bytes to legacy db"
+    );
+    assert!(
+        !tmp.join("quaqua.db-wal").exists(),
+        "no -wal file should be created on refusal"
+    );
+    assert!(
+        !tmp.join("quaqua.db-shm").exists(),
+        "no -shm file should be created on refusal"
+    );
     // Verify legacy tables and rows are completely untouched
     let conn = Connection::open(&db_path).unwrap();
     let fe_count: i64 = conn
@@ -790,4 +808,215 @@ fn test_legacy_db_cli_refusal_exits_code_2() {
         Some(2),
         "quaqua mail inbox on legacy DB must exit with code 2"
     );
+
+    // Case 4: `quaqua mail send` on legacy DB must exit 2 (S4 residual)
+    let out_send = std::process::Command::new(bin)
+        .args([
+            "mail", "send", "--to", "cos", "--kind", "handoff", "--body", "test",
+        ])
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "bus-lead")
+        .env_remove("HERDR_PANE_ID")
+        .output()
+        .expect("run quaqua mail send");
+    assert_eq!(
+        out_send.status.code(),
+        Some(2),
+        "quaqua mail send on legacy DB must exit with code 2"
+    );
+}
+
+#[test]
+fn test_migrate_dry_run_on_wal_db_leaves_db_untouched() {
+    let tmp = hermetic_temp_dir("dry-run-wal");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    // Switch to WAL mode and insert data
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'wal test body')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let bytes_before = std::fs::read(&db_path).expect("read db bytes before dry run");
+    let hash_before = quaqua::bus::mail::sha256_hex(&bytes_before);
+
+    let herdr = MockHerdr::with_raw("[]");
+    let summary =
+        migrate_bus(&db_path, None, true, &herdr).expect("dry run on WAL db must succeed");
+
+    assert!(summary.dry_run);
+    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.mail_count, 1);
+    assert_eq!(summary.triggers_count, 2);
+
+    let bytes_after = std::fs::read(&db_path).expect("read db bytes after dry run");
+    let hash_after = quaqua::bus::mail::sha256_hex(&bytes_after);
+    assert_eq!(
+        hash_before, hash_after,
+        "dry run on WAL db must leave DB file unchanged"
+    );
+}
+
+#[test]
+fn test_bus_migrate_cli_subcommand() {
+    let tmp = hermetic_temp_dir("cli-migrate");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'test body')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let bin = env!("CARGO_BIN_EXE_quaqua");
+    // Create fake herdr script in test bin dir returning 0 active workers
+    let bin_dir = tmp.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let fake_herdr = bin_dir.join("herdr");
+    std::fs::write(
+        &fake_herdr,
+        r#"#!/bin/sh
+echo '{"id":"cli:agent:list","result":{"agents":[]}}'
+exit 0
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let custom_path = format!("{}:{}", bin_dir.display(), orig_path);
+
+    // 1. Run `quaqua bus migrate --dry-run`
+    let out_dry = std::process::Command::new(bin)
+        .args(["bus", "migrate", "--dry-run"])
+        .env("PATH", &custom_path)
+        .env("HERDR_BIN_PATH", fake_herdr.to_str().unwrap())
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .output()
+        .expect("run quaqua bus migrate --dry-run");
+    assert_eq!(out_dry.status.code(), Some(0));
+    let stdout_dry = String::from_utf8_lossy(&out_dry.stdout);
+    assert!(
+        stdout_dry.contains("--dry-run"),
+        "stdout must mention --dry-run: {stdout_dry}"
+    );
+
+    // 2. Run real `quaqua bus migrate`
+    let out_real = std::process::Command::new(bin)
+        .args(["bus", "migrate"])
+        .env("PATH", &custom_path)
+        .env("HERDR_BIN_PATH", fake_herdr.to_str().unwrap())
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .output()
+        .expect("run quaqua bus migrate");
+    assert_eq!(
+        out_real.status.code(),
+        Some(0),
+        "real migrate failed: stderr={}, stdout={}",
+        String::from_utf8_lossy(&out_real.stderr),
+        String::from_utf8_lossy(&out_real.stdout)
+    );
+    // 3. Verify FarmBus::open succeeds on the migrated database
+    let bus = FarmBus::open(&db_path).expect("FarmBus::open must succeed after CLI migration");
+    assert_eq!(bus.path(), db_path);
+}
+
+#[test]
+fn test_migrate_pre_farm_legacy_columns() {
+    let tmp = hermetic_temp_dir("pre-farm-legacy");
+    let db_path = tmp.join("quaqua.db");
+
+    // Create legacy DB without farm columns and without mail_id in cursors
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE farm_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                actor TEXT,
+                subject TEXT,
+                owner TEXT,
+                project TEXT,
+                incident_key TEXT UNIQUE,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE mail (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_key     TEXT NOT NULL UNIQUE,
+                ts_ms       INTEGER NOT NULL,
+                from_name   TEXT NOT NULL,
+                from_role   TEXT NOT NULL,
+                to_name     TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                project     TEXT,
+                reply_to    INTEGER REFERENCES mail(id),
+                body        TEXT NOT NULL,
+                deliveries  INTEGER NOT NULL DEFAULT 0,
+                last_delivered_ms INTEGER,
+                acked_ms    INTEGER,
+                acked_by    TEXT
+            );
+            CREATE TABLE cursors (
+                consumer TEXT PRIMARY KEY,
+                seq INTEGER NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'old schema body')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq) VALUES ('cos', 1000)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::with_raw(r#"{"result":{"agents":[]}}"#);
+    let summary = migrate_bus(&db_path, None, false, &herdr)
+        .expect("migrate on pre-farm legacy schema must succeed");
+
+    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.mail_count, 1);
+    assert_eq!(summary.legacy_cursors_count, 1);
+    assert_eq!(summary.triggers_count, 2);
+
+    let bus = FarmBus::open(&db_path).expect("FarmBus::open must succeed on migrated db");
+    let events = bus.load_events(0).unwrap();
+    assert_eq!(events.len(), 2);
 }

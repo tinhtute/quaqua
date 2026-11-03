@@ -131,6 +131,49 @@ impl FarmBus {
         let runs_dir = path.parent().unwrap_or(path);
         let local_farm = crate::workspace::farm_of_runs_dir(runs_dir);
 
+        if path.exists() {
+            let has_legacy_probe: bool = (|| -> rusqlite::Result<bool> {
+                let ro_conn = rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                let legacy_table_count: i64 = ro_conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if legacy_table_count > 0 {
+                    return Ok(true);
+                }
+                let has_cursors: bool = ro_conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'cursors'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map(|c| c > 0)
+                    .unwrap_or(false);
+                if has_cursors {
+                    let mut stmt = ro_conn.prepare("PRAGMA table_info(cursors)")?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        let col_name: String = row.get(1)?;
+                        if col_name == "seq" {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            })()
+            .unwrap_or(false);
+
+            if has_legacy_probe {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(LEGACY_DB_ERROR_MSG),
+                )));
+            }
+        }
+
         let conn = crate::engine::sqlite::open_conn(path)?;
         let has_legacy: bool = crate::engine::sqlite::retry_while_busy(|| {
             let legacy_table_count: i64 = conn.query_row(
@@ -161,7 +204,6 @@ impl FarmBus {
             }
             Ok(false)
         })?;
-
         if has_legacy {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                 std::io::Error::other(LEGACY_DB_ERROR_MSG),
@@ -287,9 +329,10 @@ impl FarmBus {
                 .or(event.owner.as_deref())
                 .unwrap_or("unknown");
             let thread_id = format!("agent:{thread_name}");
+            let thread_owner = event.owner.as_deref().unwrap_or(thread_name);
             tx.execute(
                 "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
-                rusqlite::params![&thread_id, thread_name, event.ts_ms as i64],
+                rusqlite::params![&thread_id, thread_owner, event.ts_ms as i64],
             )?;
             tx.execute(
                 "UPDATE threads SET last_trigger_ms = MAX(last_trigger_ms, ?1) WHERE id = ?2",
@@ -315,6 +358,19 @@ impl FarmBus {
             } else {
                 "worker"
             };
+            let payload_final = if event.owner.is_some() || event.project.is_some() {
+                let mut v: serde_json::Value = serde_json::from_str(&event.payload_json)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": event.payload_json }));
+                if let Some(o) = &event.owner {
+                    v["owner"] = serde_json::Value::String(o.clone());
+                }
+                if let Some(p) = &event.project {
+                    v["project"] = serde_json::Value::String(p.clone());
+                }
+                v.to_string()
+            } else {
+                event.payload_json.clone()
+            };
             let rows = tx.execute(
                 r#"
                 INSERT OR IGNORE INTO triggers (
@@ -328,7 +384,7 @@ impl FarmBus {
                     actor_str,
                     thread_id,
                     summary_final,
-                    event.payload_json,
+                    payload_final,
                     event.incident_key,
                     farm_str,
                 ],
@@ -344,10 +400,11 @@ impl FarmBus {
         crate::engine::sqlite::retry_while_busy(|| {
             let mut stmt = conn.prepare_cached(
                 r#"
-                SELECT id, ts_ms, kind, actor, thread_id, dedupe_key, payload_json, farm
-                FROM triggers
-                WHERE id > ?1
-                ORDER BY id ASC
+                SELECT t.id, t.ts_ms, t.kind, t.actor, t.thread_id, t.dedupe_key, t.payload_json, t.farm, th.owner
+                FROM triggers t
+                LEFT JOIN threads th ON t.thread_id = th.id
+                WHERE t.id > ?1
+                ORDER BY t.id ASC
                 "#,
             )?;
             let rows = stmt.query_map(rusqlite::params![since_seq as i64], |row| {
@@ -356,18 +413,34 @@ impl FarmBus {
                     .strip_prefix("agent:")
                     .unwrap_or(&thread_id)
                     .to_string();
+                let payload_str: String = row
+                    .get::<_, Option<String>>(6)?
+                    .unwrap_or_else(|| "{}".to_string());
+                let thread_owner: Option<String> = row.get(8)?;
+
+                let (owner, project) =
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                        let o = v
+                            .get("owner")
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                            .or(thread_owner);
+                        let p = v.get("project").and_then(|x| x.as_str()).map(String::from);
+                        (o, p)
+                    } else {
+                        (thread_owner, None)
+                    };
+
                 Ok(FarmEventRecord {
                     seq: row.get::<_, i64>(0)? as u64,
                     ts_ms: row.get::<_, i64>(1)? as u64,
                     event_type: row.get(2)?,
                     actor: Some(row.get(3)?),
                     subject: Some(subject),
-                    owner: None,
-                    project: None,
+                    owner,
+                    project,
                     incident_key: row.get(5)?,
-                    payload_json: row
-                        .get::<_, Option<String>>(6)?
-                        .unwrap_or_else(|| "{}".to_string()),
+                    payload_json: payload_str,
                     farm: row.get(7)?,
                 })
             })?;
