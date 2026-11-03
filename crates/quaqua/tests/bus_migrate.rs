@@ -24,13 +24,25 @@ fn hermetic_temp_dir(prefix: &str) -> PathBuf {
 }
 
 struct MockHerdr {
-    agent_list_json: String,
+    agent_list_result: std::io::Result<String>,
 }
 
 impl MockHerdr {
     fn with_agents(agents_json: &str) -> Self {
         Self {
-            agent_list_json: format!(r#"{{"result":{{"agents":{agents_json}}}}}"#),
+            agent_list_result: Ok(format!(r#"{{"result":{{"agents":{agents_json}}}}}"#)),
+        }
+    }
+
+    fn with_raw(raw: &str) -> Self {
+        Self {
+            agent_list_result: Ok(raw.to_string()),
+        }
+    }
+
+    fn with_err(err: std::io::Error) -> Self {
+        Self {
+            agent_list_result: Err(err),
         }
     }
 
@@ -44,7 +56,10 @@ impl HerdrOps for MockHerdr {
         unimplemented!()
     }
     fn agent_list(&self) -> std::io::Result<String> {
-        Ok(self.agent_list_json.clone())
+        self.agent_list_result
+            .as_ref()
+            .map(|s| s.clone())
+            .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
     fn agent_get(&self, _name: &str) -> std::io::Result<(bool, String)> {
         unimplemented!()
@@ -297,6 +312,63 @@ fn test_migrate_live_worker_refused() {
         .unwrap();
     assert!(has_fe, "legacy tables must remain untouched");
 }
+#[test]
+fn test_migrate_live_worker_herdr_error_fails_closed() {
+    let tmp = hermetic_temp_dir("live-worker-err-closed");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let herdr_err = MockHerdr::with_err(std::io::Error::other("herdr daemon down"));
+    let res = migrate_bus(&db_path, None, false, &herdr_err);
+    assert!(res.is_err(), "must fail closed when herdr errors");
+    let err_msg = res.err().unwrap();
+    assert!(
+        err_msg.contains("cannot verify live workers: herdr agent list failed: herdr daemon down"),
+        "unexpected error message: {err_msg}"
+    );
+}
+
+#[test]
+fn test_migrate_live_worker_malformed_json_fails_closed() {
+    let tmp = hermetic_temp_dir("live-worker-malformed-json");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let herdr_bad = MockHerdr::with_raw("not valid json");
+    let res = migrate_bus(&db_path, None, false, &herdr_bad);
+    assert!(res.is_err(), "must fail closed on unparseable herdr response");
+    let err_msg = res.err().unwrap();
+    assert!(
+        err_msg.contains("cannot verify live workers: invalid herdr agent list JSON"),
+        "unexpected error message: {err_msg}"
+    );
+}
+
+#[test]
+fn test_migrate_dry_run_allowed_with_live_workers() {
+    let tmp = hermetic_temp_dir("dry-run-live-worker");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject) VALUES (100, 'spawned', 'cos', 'w1')",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Active worker present
+    let herdr_active =
+        MockHerdr::with_agents(r#"[{"name":"worker-running","agent_status":"working"}]"#);
+    // dry-run must succeed and report counts
+    let summary = migrate_bus(&db_path, None, true, &herdr_active)
+        .expect("dry-run must be allowed even when live workers exist");
+    assert!(summary.dry_run);
+    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.triggers_count, 1);
+}
 
 #[test]
 fn test_migrate_backup_vacuum_into() {
@@ -475,11 +547,19 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
     );
 
     // Verify threads
+    // Verify threads: exactly agent:w1 and agent:cos (no phantom agent:unknown)
     let thread_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
         .unwrap();
-    // agent:unknown, agent:w1, agent:cos
-    assert!(thread_count >= 2);
+    assert_eq!(thread_count, 2, "threads must only contain agent:w1 and agent:cos");
+    let thread_ids: Vec<String> = conn
+        .prepare("SELECT id FROM threads ORDER BY id ASC")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(thread_ids, vec!["agent:cos", "agent:w1"]);
 }
 
 #[test]

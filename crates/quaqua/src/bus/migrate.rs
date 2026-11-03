@@ -89,32 +89,38 @@ pub fn migrate_bus<H: HerdrOps>(
         return Err(format!("database not found at {}", db_path.display()));
     }
 
-    // 1. Live worker check
-    if let Ok(raw) = herdr.agent_list() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(agents) = val
-                .get("result")
-                .and_then(|r| r.get("agents"))
-                .and_then(|a| a.as_array())
-            {
-                let mut active_workers = Vec::new();
-                for a in agents {
-                    let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let status = a
-                        .get("agent_status")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    if status != "dead" && !name.is_empty() && name != "cos" {
-                        active_workers.push(format!("{name} ({status})"));
-                    }
-                }
-                if !active_workers.is_empty() {
-                    return Err(format!(
-                        "cannot migrate: active workers running: {}",
-                        active_workers.join(", ")
-                    ));
-                }
+    // 1. Live worker check (fail-closed, skipped on dry-run)
+    if !dry_run {
+        let raw = herdr
+            .agent_list()
+            .map_err(|e| format!("cannot verify live workers: herdr agent list failed: {e}"))?;
+        let val: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            format!("cannot verify live workers: invalid herdr agent list JSON: {e}")
+        })?;
+        let agents = val
+            .pointer("/result/agents")
+            .and_then(|a| a.as_array())
+            .ok_or_else(|| {
+                "cannot verify live workers: missing /result/agents array in herdr response"
+                    .to_string()
+            })?;
+
+        let mut active_workers = Vec::new();
+        for a in agents {
+            let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let status = a
+                .get("agent_status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if status != "dead" && !name.is_empty() && name != "cos" {
+                active_workers.push(format!("{name} ({status})"));
             }
+        }
+        if !active_workers.is_empty() {
+            return Err(format!(
+                "cannot migrate: active workers running: {}",
+                active_workers.join(", ")
+            ));
         }
     }
 
@@ -295,7 +301,6 @@ pub fn migrate_bus<H: HerdrOps>(
 
     // Build threads and candidate triggers
     let mut threads_map: BTreeMap<String, (String, u64)> = BTreeMap::new();
-    threads_map.insert("agent:unknown".to_string(), ("unknown".to_string(), 0));
 
     let mut candidates = Vec::with_capacity(farm_events.len() + mails.len());
 
