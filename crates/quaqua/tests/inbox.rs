@@ -1876,3 +1876,108 @@ fn test_mail_inbox_scopes_incidents_to_the_consumer_group() {
         String::from_utf8_lossy(&cos.stdout)
     );
 }
+
+#[test]
+fn test_mail_inbox_cursor_advances_past_filtered_incidents() {
+    let runs_dir = hermetic_temp_dir("digest-cursor-filtered");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    let own_pane = "w2:p4";
+    // Admitted for cos.
+    bus.record(
+        &quaqua::bus::FarmEvent::new(
+            "blocked",
+            Some("herdr"),
+            Some("w-kept"),
+            Some("cos"),
+            Some("p1"),
+        )
+        .with_incident_key("blocked:w-kept:1"),
+    )
+    .expect("record kept incident");
+    // Trailing own-pane noise: filtered out, but the cursor must still clear it.
+    bus.record(
+        &quaqua::bus::FarmEvent::new(
+            "blocked",
+            Some("herdr"),
+            Some(own_pane),
+            Some("cos"),
+            Some("p1"),
+        )
+        .with_incident_key("blocked:cos:1"),
+    )
+    .expect("record own-pane incident");
+    let max_id: u64 = bus
+        .conn_for_test()
+        .query_row("SELECT max(id) FROM triggers", [], |r| r.get::<_, i64>(0))
+        .expect("max trigger id") as u64;
+    drop(bus);
+
+    let out = run_quaqua(
+        &["mail", "inbox", "--for", "cos"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("cos")),
+            ("HERDR_PANE_ID", Some(own_pane)),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("w-kept"),
+        "the real incident renders: {stdout}"
+    );
+    assert!(
+        !stdout.contains(own_pane),
+        "own-pane noise stays out: {stdout}"
+    );
+
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("reopen bus");
+    assert_eq!(
+        bus.get_cursor("cos").expect("cursor"),
+        Some(max_id),
+        "the cursor clears the filtered row too, or it is re-filtered on every read"
+    );
+
+    // Every row is foreign for arch-lead: nothing renders, and the cursor still advances.
+    let arch = run_quaqua(
+        &["mail", "inbox", "--for", "arch-lead"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("arch-lead")),
+            ("HERDR_PANE_ID", None),
+        ],
+    );
+    assert_eq!(arch.status.code(), Some(0));
+    assert!(
+        arch.stdout.is_empty(),
+        "a foreign Lead sees none of it: {}",
+        String::from_utf8_lossy(&arch.stdout)
+    );
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("reopen bus");
+    assert_eq!(
+        bus.get_cursor("arch-lead").expect("cursor"),
+        Some(max_id),
+        "a filtered-only batch still advances the cursor"
+    );
+
+    // Nothing is re-evaluated on the next read.
+    let again = run_quaqua(
+        &["mail", "inbox", "--for", "cos"],
+        &runs_dir,
+        &[
+            ("QUAQUA_TEST", Some("1")),
+            ("QUAQUA_OWNER", Some("cos")),
+            ("HERDR_PANE_ID", Some(own_pane)),
+        ],
+    );
+    assert!(again.stdout.is_empty(), "a repeat finds nothing left");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("reopen bus");
+    assert_eq!(bus.get_cursor("cos").expect("cursor"), Some(max_id));
+}

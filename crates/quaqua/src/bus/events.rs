@@ -713,6 +713,7 @@ impl FarmBus {
                 now,
                 self.path().parent().unwrap_or(Path::new(".")),
             )
+            .map(|batch| batch.rows)
         })
     }
 
@@ -736,20 +737,16 @@ impl FarmBus {
                 .unwrap_or(0) as u64;
 
             let runs_dir = self.path().parent().unwrap_or(Path::new("."));
-            let rows = query_digest_rows(&tx, prev_cursor, &self.farm, consumer, now, runs_dir)?;
-            let render = render_digest(&rows, consumer);
+            let batch = query_digest_rows(&tx, prev_cursor, &self.farm, consumer, now, runs_dir)?;
+            let render = render_digest(&batch.rows, consumer);
 
             if advance {
                 // One render is one batch (spec §6): the cursor moves past every row the
-                // batch covered, so a repeat finds nothing left. Rows elided by the 20-line
-                // cap stay reachable through `--all`, which reads the whole history
-                // uncapped and never advances.
-                let target = rows
-                    .iter()
-                    .map(|r| r.id)
-                    .max()
-                    .unwrap_or(prev_cursor)
-                    .max(prev_cursor);
+                // batch evaluated — including the ones the consumer filters dropped, or they
+                // would be re-filtered on every read — so a repeat finds nothing left. Rows
+                // elided by the 20-line cap stay reachable through `--all`, which reads the
+                // whole history uncapped and never advances.
+                let target = batch.max_evaluated_id.max(prev_cursor);
                 if target > prev_cursor {
                     tx.execute(
                         r#"
@@ -845,6 +842,12 @@ impl DigestCandidate {
     }
 }
 
+/// The rows a digest batch renders, plus the highest id it evaluated.
+struct DigestBatch {
+    rows: Vec<DigestRow>,
+    max_evaluated_id: u64,
+}
+
 fn query_digest_rows(
     conn: &rusqlite::Connection,
     from_id: u64,
@@ -852,7 +855,7 @@ fn query_digest_rows(
     consumer: &str,
     now: i64,
     runs_dir: &Path,
-) -> rusqlite::Result<Vec<DigestRow>> {
+) -> rusqlite::Result<DigestBatch> {
     let mut stmt = conn.prepare_cached(DIGEST_ROWS_SQL)?;
     let rows = stmt.query_map(
         rusqlite::params![from_id as i64, farm, consumer, now],
@@ -881,6 +884,9 @@ fn query_digest_rows(
     for r in rows {
         candidates.push(r?);
     }
+    // The cursor must clear every row the batch evaluated, admitted or not: a filtered
+    // row left above the cursor is re-filtered on every read and can resurface as new.
+    let max_evaluated_id = candidates.iter().map(|c| c.row.id).max().unwrap_or(0);
 
     // Incidents carry no recipient, so they are admitted the same way the pre-digest
     // `inbox_digest` admitted them: own-pane noise dropped, everything else scoped to
@@ -909,7 +915,10 @@ fn query_digest_rows(
         }
         out.push(candidate.row);
     }
-    Ok(out)
+    Ok(DigestBatch {
+        rows: out,
+        max_evaluated_id,
+    })
 }
 
 /// Renders a digest batch: `#<id> <kind> <actor> <thread> <summary>[ → <ref>]`, grouped by
