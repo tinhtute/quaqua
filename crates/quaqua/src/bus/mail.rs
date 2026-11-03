@@ -1329,6 +1329,17 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
         crate::workspace::workspace_root().join("runs")
     };
 
+    // The bus is the precondition of every mail verb. Refuse a legacy database here,
+    // before argument parsing or caller/sender identity resolution, so those errors
+    // cannot mask the migration instruction the operator needs.
+    let db_path = runs_dir.join("quaqua.db");
+    if crate::bus::migrate::is_legacy_db_probe(&db_path).unwrap_or(false) {
+        return Err(format!(
+            "cannot open database: {}",
+            crate::bus::LEGACY_DB_ERROR_MSG
+        ));
+    }
+
     let verb = args[0].as_str();
     let subargs = &args[1..];
 
