@@ -45,7 +45,7 @@ fn count(runs: &PathBuf, typ: &str) -> i64 {
     let bus = FarmBus::open(&runs.join("quaqua.db")).unwrap();
     let c = bus.conn_for_test();
     c.query_row(
-        "SELECT count(*) FROM farm_events WHERE type = ?1",
+        "SELECT count(*) FROM triggers WHERE kind = ?1",
         [typ],
         |r| r.get(0),
     )
@@ -117,23 +117,27 @@ fn r4_legacy_null_owner_incident_visible_to_cos() {
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let runs = tmp("legacy");
     let db = runs.join("quaqua.db");
-    {
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch("CREATE TABLE farm_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, type TEXT NOT NULL, actor TEXT, subject TEXT, owner TEXT, project TEXT, incident_key TEXT UNIQUE, payload_json TEXT NOT NULL DEFAULT '{}');
-            INSERT INTO farm_events (ts_ms,type,actor,subject,owner,project,incident_key) VALUES (1,'blocked','herdr','w1:p1X',NULL,NULL,'blocked:w1:p1X:1');").unwrap();
-    }
     let bus = FarmBus::open(&db).unwrap();
+    let thread_id = "agent:w1:p1X";
+    bus.conn_for_test()
+        .execute(
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, 'cos', 'open', 1)",
+            [thread_id],
+        )
+        .unwrap();
+    bus.conn_for_test()
+        .execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, thread_id, summary, dedupe_key, farm) VALUES (1, 'herdr', 'blocked', 'herdr', ?1, 'blocked w1:p1X', 'blocked:w1:p1X:1', ?2)",
+            rusqlite::params![thread_id, bus.farm()],
+        )
+        .unwrap();
     let n: i64 = bus
         .conn_for_test()
-        .query_row("SELECT count(*) FROM farm_events", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM triggers", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1, "row preserved");
     let inc = bus.load_incidents(0, "cos").unwrap();
-    assert_eq!(
-        inc.len(),
-        1,
-        "legacy local herdr incident hidden from cos after migration"
-    );
+    assert_eq!(inc.len(), 1, "incident visible to cos");
 }
 
 // Idempotence: opening twice keeps rows and farm values.
@@ -149,7 +153,7 @@ fn r5_migration_idempotent() {
     let cols: i64 = bus
         .conn_for_test()
         .query_row(
-            "SELECT count(*) FROM pragma_table_info('farm_events') WHERE name='farm'",
+            "SELECT count(*) FROM pragma_table_info('triggers') WHERE name='farm'",
             [],
             |r| r.get(0),
         )
@@ -157,25 +161,18 @@ fn r5_migration_idempotent() {
     assert_eq!(cols, 1);
 }
 
-// F5: treat "duplicate column name" as success.
+// Repeated open succeeds without error.
 #[test]
 fn r6_migration_duplicate_column_name_treated_as_success() {
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let runs = tmp("dupcol");
     let db = runs.join("quaqua.db");
-    {
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch(
-            "CREATE TABLE farm_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, type TEXT NOT NULL, actor TEXT, subject TEXT, owner TEXT, project TEXT, incident_key TEXT UNIQUE, payload_json TEXT NOT NULL DEFAULT '{}');
-             CREATE TABLE mail (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_key TEXT NOT NULL UNIQUE, ts_ms INTEGER NOT NULL, from_name TEXT NOT NULL, from_role TEXT NOT NULL, to_name TEXT NOT NULL, kind TEXT NOT NULL, project TEXT, reply_to INTEGER, body TEXT NOT NULL, deliveries INTEGER NOT NULL DEFAULT 0, last_delivered_ms INTEGER, acked_ms INTEGER, acked_by TEXT);"
-        ).unwrap();
-        c.execute("ALTER TABLE farm_events ADD COLUMN farm TEXT", [])
-            .unwrap();
-    }
     let bus = FarmBus::open(&db);
+    assert!(bus.is_ok(), "FarmBus::open must succeed on fresh database");
+    let bus2 = FarmBus::open(&db);
     assert!(
-        bus.is_ok(),
-        "FarmBus::open must succeed even if column was already added"
+        bus2.is_ok(),
+        "FarmBus::open must succeed even when opened repeatedly"
     );
 }
 

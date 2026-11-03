@@ -74,6 +74,14 @@ export QUAQUA_BIN="${QUAQUA_BIN:-$here/../target/debug/quaqua}"
 for t in "$here"/test_*.sh; do
   [[ -e $t ]] || { echo "no tests found in $here" >&2; exit 1; }
   name=$(basename "$t")
+  # The hermetic-DB guard traces a whole `cargo test --locked` under strace,
+  # repeating the crate gate above: that is CI's job, not a local pre-commit
+  # cost. Locally it stays a one-command run: bash tests/test_hermetic_db.sh
+  if [[ $name == test_hermetic_db.sh && -z ${CI:-} && -z ${HERMETIC_REQUIRE_STRACE:-} ]]; then
+    printf 'SKIP %s (CI only; set CI=1 or HERMETIC_REQUIRE_STRACE=1 to run it here)\n' "$name"
+    skipped+=("$name")
+    continue
+  fi
   cover=$(slow_cover "$name")
   if [[ -n $cover && $force_slow -eq 0 && $run_all -eq 0 ]]; then
     hit=''

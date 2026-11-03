@@ -500,6 +500,19 @@ pub fn spawn_lead<G: GitOps, H: HerdrOps>(
     // so subsequent prompt/index steps do not strip the marker from a live Lead.
     role_guard.success = true;
 
+    // Open integ thread quaqua/<slug>-integ and subscribe <slug>-lead and cos for 14 days (R6)
+    let integ_thread = format!("quaqua/{slug}-integ");
+    let now = crate::bus::now_ms();
+    let until_ms = now + 14 * 86_400 * 1000;
+    crate::bus::open_thread_and_subscribe_safely_in_runs(
+        &runs_dir,
+        &integ_thread,
+        &name,
+        &name,
+        until_ms,
+    );
+    crate::bus::subscribe_safely_in_runs(&runs_dir, &integ_thread, "cos", until_ms);
+
     // Update projects/INDEX.md with mkdir lock
     update_project_index_owner(&root, &slug, &name)?;
 

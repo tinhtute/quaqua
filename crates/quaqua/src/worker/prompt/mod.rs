@@ -1195,16 +1195,34 @@ fn prompt_worker_once<G: GitOps>(
             .file_name()
             .and_then(|n| n.to_str())
             .map(String::from);
-        let mut ev =
-            crate::bus::FarmEvent::new(event_type, Some("watchdog"), Some(name), owner, project);
-        if let Some(key) = incident_key {
-            ev = ev.with_incident_key(key);
+        let thread_id = format!("quaqua/{name}");
+        let mut pl = match payload {
+            serde_json::Value::Object(m) => m,
+            other => {
+                let mut m = serde_json::Map::new();
+                if other != serde_json::Value::Null {
+                    m.insert("data".to_string(), other);
+                }
+                m
+            }
+        };
+        if let Some(o) = &owner {
+            pl.insert("owner".to_string(), serde_json::Value::String(o.clone()));
         }
-        let payload_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-        if !payload_str.is_empty() && payload_str != "{}" {
-            ev = ev.with_payload_json(payload_str);
+        if let Some(p) = project {
+            pl.insert("project".to_string(), serde_json::Value::String(p));
         }
-        crate::bus::record_event_safely_in_runs(&runs_dir, &ev);
+        let summary = format!("{event_type} {name}");
+        let mut trigger =
+            crate::bus::NewTrigger::new("watchdog", event_type, "watchdog", &thread_id, summary)
+                .with_payload_json(serde_json::Value::Object(pl).to_string());
+        if let Some(o) = owner {
+            trigger = trigger.with_to_name(o);
+        }
+        if let Some(k) = incident_key {
+            trigger = trigger.with_dedupe_key(k);
+        }
+        crate::bus::record_trigger_safely_in_runs(&runs_dir, &trigger);
     };
 
     let single_output = match outcome {
@@ -1511,12 +1529,12 @@ esac
             );
         }
         let bus = crate::bus::FarmBus::open(&db_path).expect("open bus");
-        let farm_events = bus.load_events(0).expect("load farm events");
+        let events = bus.load_events(0).expect("load events");
         assert!(
-            farm_events
+            events
                 .iter()
                 .any(|e| e.event_type == "report_written" && e.subject.as_deref() == Some(name)),
-            "exit 0 must record report_written event in farm_events"
+            "exit 0 must record report_written event in triggers"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -1559,12 +1577,12 @@ esac
             "a fresh blocked state file must end the wait as blocked"
         );
         let bus = crate::bus::FarmBus::open(&tmp.join("quaqua.db")).expect("open bus");
-        let farm_events = bus.load_events(0).expect("load farm events");
+        let events = bus.load_events(0).expect("load events");
         assert!(
-            farm_events
+            events
                 .iter()
                 .any(|e| e.event_type == "blocked" && e.subject.as_deref() == Some("sude-hook")),
-            "exit 5 must record a blocked event in farm_events"
+            "exit 5 must record a blocked event in triggers"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -1828,12 +1846,12 @@ esac
             "a missing `## Playbook` block must reject the report"
         );
         let bus = crate::bus::FarmBus::open(&tmp.join("quaqua.db")).expect("open bus");
-        let farm_events = bus.load_events(0).expect("load farm events");
+        let events = bus.load_events(0).expect("load events");
         assert!(
-            farm_events
+            events
                 .iter()
                 .any(|e| e.event_type == "malformed" && e.subject.as_deref() == Some("sude-gap")),
-            "exit 6 must record malformed event in farm_events"
+            "exit 6 must record malformed event in triggers"
         );
 
         assert!(

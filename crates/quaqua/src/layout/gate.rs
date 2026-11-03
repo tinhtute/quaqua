@@ -934,7 +934,7 @@ pub fn gate<H: HerdrOps>(
 /// Shadow mode evaluation of layout rules at a choke point.
 ///
 /// Evaluates the decision, prints one `would_deny` stderr line and writes a
-/// `farm_events` row if denied. Never blocks, never changes exit codes.
+/// `triggers` row if denied. Never blocks, never changes exit codes.
 pub fn shadow<H: HerdrOps>(
     caller: Option<&Caller>,
     herdr: Option<&H>,
@@ -984,10 +984,21 @@ fn gate_inner<H: HerdrOps>(
             caller_resolved = match herdr {
                 Some(h) => {
                     let mut c = crate::identity::resolve_caller(h, runs_dir);
+                    // `QUAQUA_OWNER` is the shell's claim about the caller. An
+                    // unset variable is no claim — the old `!= Ok("")` let `Err`
+                    // through and named the caller after `owner` — but a lib
+                    // unit test has no shell to export it, and `cfg!(test)` is
+                    // never true in a production build, so that is the seam a
+                    // unit test gets: no pane, no claim, caller `cos`.
+                    let env_owner = std::env::var("QUAQUA_OWNER")
+                        .ok()
+                        .map(|o| o.trim().to_string())
+                        .filter(|o| !o.is_empty())
+                        .or_else(|| cfg!(test).then(|| "cos".to_string()));
                     if c.role == crate::identity::Role::Unknown
                         && (std::env::var("QUAQUA_TEST").as_deref() == Ok("1") || cfg!(test))
                         && crate::identity::caller_pane_tokens(h).is_none()
-                        && std::env::var("QUAQUA_OWNER").as_deref() != Ok("")
+                        && env_owner.is_some()
                     {
                         c = crate::identity::Caller {
                             name: owner.unwrap_or("cos").to_string(),
@@ -1021,6 +1032,10 @@ fn gate_inner<H: HerdrOps>(
 
     if effective_caller.role == crate::identity::Role::Unknown {
         if let Some(h) = herdr {
+            // `Some` here means herdr can see the caller pane, not that the pane
+            // carries tokens: a restart restores panes without them (herdr omits
+            // the `tokens` field). Keying the heal on the tokens object skipped
+            // it in exactly the case it exists for.
             if crate::identity::caller_pane_tokens(h).is_some() {
                 let _ = crate::identity::heal_with_runs_dir(h, runs_dir, None, false);
                 caller_healed = crate::identity::resolve_caller(h, runs_dir);
@@ -1157,32 +1172,52 @@ fn gate_inner<H: HerdrOps>(
                 decision.rule_id, layer, layout.name
             );
 
-            let event = crate::bus::FarmEvent::new(
-                "would_deny",
-                Some(effective_caller.name.clone()),
-                subj,
-                owner.map(String::from),
-                project.map(String::from),
-            )
-            .with_payload_json(payload.to_string());
-
+            let subj_str = subj.as_deref().unwrap_or("unknown");
+            let thread_id = format!("agent:{subj_str}");
+            let mut pl = payload.clone();
+            if let Some(o) = owner {
+                pl["owner"] = serde_json::Value::String(o.to_string());
+            }
+            if let Some(p) = project {
+                pl["project"] = serde_json::Value::String(p.to_string());
+            }
             let _ = std::fs::create_dir_all(runs_dir);
-            crate::bus::record_event_safely_in_runs(runs_dir, &event);
+            crate::bus::record_trigger_safely_in_runs(
+                runs_dir,
+                &crate::bus::NewTrigger::new(
+                    "worker",
+                    "would_deny",
+                    &effective_caller.name,
+                    &thread_id,
+                    format!("would_deny {subj_str}"),
+                )
+                .with_payload_json(pl.to_string()),
+            );
             return Ok(decision);
         }
 
         // Enforce mode
-        let event = crate::bus::FarmEvent::new(
-            "denied",
-            Some(effective_caller.name.clone()),
-            subj,
-            owner.map(String::from),
-            project.map(String::from),
-        )
-        .with_payload_json(payload.to_string());
-
+        let subj_str = subj.as_deref().unwrap_or("unknown");
+        let thread_id = format!("agent:{subj_str}");
+        let mut pl = payload.clone();
+        if let Some(o) = owner {
+            pl["owner"] = serde_json::Value::String(o.to_string());
+        }
+        if let Some(p) = project {
+            pl["project"] = serde_json::Value::String(p.to_string());
+        }
         let _ = std::fs::create_dir_all(runs_dir);
-        crate::bus::record_event_safely_in_runs(runs_dir, &event);
+        crate::bus::record_trigger_safely_in_runs(
+            runs_dir,
+            &crate::bus::NewTrigger::new(
+                "worker",
+                "denied",
+                &effective_caller.name,
+                &thread_id,
+                format!("denied {subj_str}"),
+            )
+            .with_payload_json(pl.to_string()),
+        );
 
         let mut err_msg = if let Some(tname) = target_name {
             if verb == Verb::Spawn {

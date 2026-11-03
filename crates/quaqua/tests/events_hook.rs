@@ -353,15 +353,22 @@ exit 0
     let bus = quaqua::bus::FarmBus::open(&db_path).expect("open bus");
     let now = quaqua::bus::now_ms();
     let past = now.saturating_sub(40 * 60 * 1000);
+    let thread_id = "agent:cos";
+    bus.conn_for_test()
+        .execute(
+            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, 'cos', 'open', ?2)",
+            rusqlite::params![thread_id, past as i64],
+        )
+        .expect("insert thread");
     bus.conn_for_test()
         .execute(
             r#"
-        INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, project, body)
-        VALUES ('k1', ?1, 'mu-lead', 'lead', 'cos', 'escalate', 'mu', 'help needed')
-        "#,
-            rusqlite::params![past as i64],
+            INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm)
+            VALUES (?1, 'mail', 'escalate', 'mu-lead', 'cos', ?2, 'help needed', 'project:mu', 'help needed', 'mail:k1', ?3)
+            "#,
+            rusqlite::params![past as i64, thread_id, bus.farm()],
         )
-        .expect("insert mail");
+        .expect("insert trigger");
 
     // Run inbox digest which triggers unacked check
     let _ = bus.inbox_digest(&runs_dir, "cos").expect("digest");
@@ -512,7 +519,7 @@ exit 0
         let events = bus.load_events(0).unwrap_or_default();
         assert!(
             events.is_empty(),
-            "foreign pane must not record any row in farm_events"
+            "foreign pane must not record any row in triggers"
         );
     }
 
