@@ -984,10 +984,21 @@ fn gate_inner<H: HerdrOps>(
             caller_resolved = match herdr {
                 Some(h) => {
                     let mut c = crate::identity::resolve_caller(h, runs_dir);
+                    // `QUAQUA_OWNER` is the shell's claim about the caller. An
+                    // unset variable is no claim — the old `!= Ok("")` let `Err`
+                    // through and named the caller after `owner` — but a lib
+                    // unit test has no shell to export it, and `cfg!(test)` is
+                    // never true in a production build, so that is the seam a
+                    // unit test gets: no pane, no claim, caller `cos`.
+                    let env_owner = std::env::var("QUAQUA_OWNER")
+                        .ok()
+                        .map(|o| o.trim().to_string())
+                        .filter(|o| !o.is_empty())
+                        .or_else(|| cfg!(test).then(|| "cos".to_string()));
                     if c.role == crate::identity::Role::Unknown
                         && (std::env::var("QUAQUA_TEST").as_deref() == Ok("1") || cfg!(test))
                         && crate::identity::caller_pane_tokens(h).is_none()
-                        && std::env::var("QUAQUA_OWNER").as_deref() != Ok("")
+                        && env_owner.is_some()
                     {
                         c = crate::identity::Caller {
                             name: owner.unwrap_or("cos").to_string(),
@@ -1021,6 +1032,10 @@ fn gate_inner<H: HerdrOps>(
 
     if effective_caller.role == crate::identity::Role::Unknown {
         if let Some(h) = herdr {
+            // `Some` here means herdr can see the caller pane, not that the pane
+            // carries tokens: a restart restores panes without them (herdr omits
+            // the `tokens` field). Keying the heal on the tokens object skipped
+            // it in exactly the case it exists for.
             if crate::identity::caller_pane_tokens(h).is_some() {
                 let _ = crate::identity::heal_with_runs_dir(h, runs_dir, None, false);
                 caller_healed = crate::identity::resolve_caller(h, runs_dir);
