@@ -724,8 +724,18 @@ fn test_repair_arranges_all_groups_using_tab_as_default() {
 fn test_hook_shadow_mode_file_precedence_and_empty_snapshot() {
     // Finding 8: shadow file precedence and empty snapshot
     use quaqua::grid::hook::{is_shadow_mode, reconcile_step};
-    let tmp_state = std::env::temp_dir().join("test_shadow_mode_dir");
-    let _ = fs::create_dir_all(&tmp_state);
+    // Unique per run: a fixed name shared with a concurrent run, or with
+    // whatever an earlier run left behind (a read-only `shadow` file makes
+    // every later `fs::write` fail).
+    let tmp_state = std::env::temp_dir().join(format!(
+        "quaqua-shadow-mode-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&tmp_state).unwrap();
 
     std::env::set_var("HERDR_GRID_SHADOW", "1");
     fs::write(tmp_state.join("shadow"), "0\n").unwrap();
