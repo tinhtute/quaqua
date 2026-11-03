@@ -42,7 +42,7 @@ lane: high-risk
 - constraints: workers do all edits; one writer per file area per wave; no push/merge without anh iu; committed paths use `~/` or repo-relative; gates `cargo test --locked`, `cargo clippy --locked -p quaqua`, `cargo fmt --check`, `cargo build --locked -p quaqua`; the local clippy + `--test doctor` gate is green on main `5b7bd1e` (PR #205), and `bash tests/test_hermetic_db.sh` skips locally on macOS by design — CI enforces it.
 - recovery: each phase lands on its own `quaqua/<phase>` branch off `quaqua/superagent-integ`; the Lead merges it into integ after `suhuynh`'s review; a failed phase is reverted by dropping its branch; the DB is restored from the `raw/` backup taken in P1.
 - phase_slug: `pre`
-  status: planned
+  status: in_progress (0a done, 0b open)
   - goal: a green local gate before any phase runs (0a, done) and #163 fixed so the caller identity survives a herdr restart (0b, gates P3) | depends_on: none
   - surfaces: `pipeline/mod.rs`, `tests/doctor.rs` (0a); `identity.rs`, `layout/gate.rs` (0b) | avoided: `bus/`
   - escalate_when: #163's root cause is in herdr rather than quaqua
@@ -52,16 +52,16 @@ lane: high-risk
   - review: `suhuynh` diff review → Lead accepts into integ → anh iu approves the integ→main PR → install binary (0b only; 0a is already on main)
   - phase check: `cargo test --locked --test doctor`; 0b is P3's gate
 - phase_slug: `hermetic`
-  status: planned
+  status: done (main `313b9d4`, PR #203)
   - goal: R0 | depends_on: none
   - surfaces: `crates/quaqua/src/workspace.rs`, test harness (`crates/quaqua/tests/common/`, existing `tests/live_db_guard.rs`), `engine/sqlite.rs`, `engine/activities.rs`, `worker/prompt/cost.rs`, `lead/prompt.rs` (QUAQUA_OWNER leak), `tests/test_hermetic_db.sh`, `.github/workflows/test.yml` | avoided: `bus/`, schema
   - escalate_when: a test needs the live DB by design
   - wave 1: landed as `5e5e8cd` (merged into integ as `da7a053`; CI run 41458802512 green, 0 hits)
     - T1 done: `tests/test_hermetic_db.sh` traces `openat` of the live DB under `cargo test --locked`, plus the `.github/workflows/test.yml` step that installs strace on ubuntu and sets `HERMETIC_REQUIRE_STRACE=1`; without strace the script prints `skipped: strace unavailable` and exits 0, so local runs on macOS skip and CI is the enforcement point (owner: tieude)
-  - wave 2:
-    - T2 close the 4 opens the trace found, at the root: `engine/sqlite.rs:60`, `engine/activities.rs:688`, `worker/prompt/cost.rs:588`, `:856`; fixture `QUAQUA_HOME`/`QUAQUA_RUNS_DIR`, no passwd-home fallback under test, QUAQUA_OWNER leak (owner: tieude worker, writes `engine/`, `workspace.rs`, `tests/common/`, `lead/prompt.rs` + failing tests only) — output: commit + list of fixed paths — check: CI job green with 0 hits — stop_if: a fix needs a schema change
-    - T3 CI decoy: on a throwaway draft-PR branch, plant the test from the script header (`crates/quaqua/tests/zz_planted_live_db.rs`), assert the CI job fails listing the planted `openat`, then delete it and assert green (owner: tieude, draft PR only) — output: two CI runs — check: red with the planted open listed, green after removal
-  - review: `suhuynh` diff review → Lead accepts into integ → anh iu approves the integ→main PR → install binary
+  - wave 2: landed as `d482885` + `ad0a933` (integ `50144f6`; CI run 41467771856 green, decoy planted, 0 hits)
+    - T2 done (`d482885`: the 4 opens guarded at the root, `--test live_db_guard` 8/8; fixture env/QUAQUA_OWNER items not in this diff, carried to P1): close the 4 opens the trace found, at the root: `engine/sqlite.rs:60`, `engine/activities.rs:688`, `worker/prompt/cost.rs:588`, `:856`; fixture `QUAQUA_HOME`/`QUAQUA_RUNS_DIR`, no passwd-home fallback under test, QUAQUA_OWNER leak (owner: tieude worker, writes `engine/`, `workspace.rs`, `tests/common/`, `lead/prompt.rs` + failing tests only) — output: commit + list of fixed paths — check: CI job green with 0 hits — stop_if: a fix needs a schema change
+    - T3 done as a decoy instead (`ad0a933`: CI plants a decoy file at the live path so an existence-gated open still shows up; no planted-test red→green pair was run): CI decoy: on a throwaway draft-PR branch, plant the test from the script header (`crates/quaqua/tests/zz_planted_live_db.rs`), assert the CI job fails listing the planted `openat`, then delete it and assert green (owner: tieude, draft PR only) — output: two CI runs — check: red with the planted open listed, green after removal
+  - review: done — `suhuynh-p0rev` MERGE, minor follow-ups only (cost.rs:864 guard untested; `test_hermetic_db.sh` not gated to CI under `tests/run.sh`); PR #203 merged → main `313b9d4`; binary installed
   - phase check: CI job green; locally `cargo test --locked` only (the strace step skips on macOS)
 - phase_slug: `model`
   status: planned
@@ -129,12 +129,13 @@ lane: high-risk
 - 2026-11-02 — plan — to-plan verify (advisor) fixed before any phase ran: P1/R2 rg gates exclude `bus/migrate.rs`; checks use `--test <file>` so 0 matched tests fail; R0 check is strace-based (live DB has concurrent writers); cursor migration rule made concrete; `open_bus` never drops legacy tables; integ thread from `lead spawn`; CI fires only on PRs to main; legacy inbox.md trash step (needs approval); CoS pane never nudged
 - 2026-11-02 — plan — CoS review vs #163: `mail inbox` consumer + cursor-advance rules added to spec §5 and R4 (`--for` cannot advance another consumer's cursor; `--peek`; Unknown caller exits 1; CoS hook keeps `--for cos`). Evidence: CoS env `HERDR_BIN_PATH` pointing at a missing binary resolves the caller to Unknown, same failure shape as #163
 - 2026-11-02 — plan — PR #203 review, corrections 1–9 applied and accepted by anh iu: `pre` phase added (0a already done on main `5b7bd1e` via PR #205; 0b = #163); R0 is CI-only with a local skip on macOS; every phase ends `suhuynh` review → Lead into `quaqua/superagent-integ` → anh iu's integ→main PR → install from merged main; Lead `superagent-lead` named; P1 owners moved to sude and T2 split T2a/T2b; the integ-unmerged risk removed (`0af6002` on main via #201); P3 depends on #163 and the watchdog anchor is `worker/prompt/mod.rs:1358` (the review's 1352 does not match the code at `bdb4af1`); P5 timer covers launchd + systemd; P2·T3 runs `quaqua init --update`; live `bus migrate` only after P1 is merged and installed, 0 live workers, time anh iu picks
+- 2026-11-02 — hermetic — done: T0 docs `7cffb0d` + wave 1 `5e5e8cd` + wave 2 `d482885`/`ad0a933` on integ `50144f6`; suhuynh review MERGE; CI 41467771856 green (decoy, `HERMETIC_REQUIRE_STRACE=1`, 0 opens); PR #203 merged → main `313b9d4`. `tests/grid.rs:731` fails locally on main too: a leftover `$TMPDIR/test_shadow_mode_dir/shadow` with no write bit, not this phase
 
 ## Validation
 
 ## Current State and Next Action
 - active_phase: none
-- lifecycle_status: planned
+- lifecycle_status: in_progress
 - blockers: none
 - open_items: anh iu confirms new seams `quaqua bus migrate` (before P1), `quaqua recall` (before P4), `quaqua source github-ci poll` + timer cadence default 5 min (before P5); approvals for live migration (P1 T4, after the P1 PR is merged and installed) and inbox.md trash (P2 T3)
-- exact_next_action: work phase hermetic wave 2 (the 4 open sites + the CI decoy); `pre` 0b (#163) runs in parallel and only gates P3
+- exact_next_action: phase model wave 1 T1 (sude, integ reset to main `313b9d4`); `pre` 0b (#163) runs in parallel and only gates P3
