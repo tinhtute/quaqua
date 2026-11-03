@@ -195,7 +195,21 @@ pub fn depth_walk(runs_dir: &Path, start: &str) -> Result<u32, DepthError> {
     }
 }
 
-/// Query the current pane tokens once via herdr `pane get $HERDR_PANE_ID`.
+/// Query the caller pane once via herdr `pane get $HERDR_PANE_ID` and return its
+/// token set.
+///
+/// `Some` means herdr can see the caller pane, and an empty map is a real
+/// answer: the pane exists and carries no tokens. That distinction is what the
+/// callers depend on. A herdr server restart restores panes from `session.json`
+/// (cwd, label, agent name, agent session — never tokens) and then *omits* the
+/// `tokens` field from `pane get` instead of sending an empty object, so
+/// "no tokens key" must not read as "no pane": it did, and skipped both the
+/// identity heal and the env guard in every caller (`HERDR_PANE_ID` stays set in
+/// the shell across the restart).
+///
+/// `None` means there is no caller pane: `HERDR_PANE_ID` unset or empty, `pane
+/// get` failed, or herdr answered with an error body (`pane get` exits 0 for a
+/// dead pane, so the body decides).
 pub fn caller_pane_tokens<H: HerdrOps>(herdr: &H) -> Option<HashMap<String, String>> {
     let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
     if pane_id.trim().is_empty() {
@@ -206,11 +220,13 @@ pub fn caller_pane_tokens<H: HerdrOps>(herdr: &H) -> Option<HashMap<String, Stri
         return None;
     }
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let tokens_val = v.pointer("/result/pane/tokens")?.as_object()?;
+    let pane = v.pointer("/result/pane")?;
     let mut tokens = HashMap::new();
-    for (k, val) in tokens_val {
-        if let Some(s) = val.as_str() {
-            tokens.insert(k.clone(), s.to_string());
+    if let Some(tokens_val) = pane.get("tokens").and_then(|t| t.as_object()) {
+        for (k, val) in tokens_val {
+            if let Some(s) = val.as_str() {
+                tokens.insert(k.clone(), s.to_string());
+            }
         }
     }
     Some(tokens)
@@ -310,8 +326,10 @@ pub fn resolve_caller_from_tokens(
 }
 
 /// Resolves the caller identity from herdr pane tokens, environment fallback, and owner chains.
-/// If caller role is unknown but a caller pane is present (tokens lost after herdr restart),
-/// attempts self-healing via `heal_with_runs_dir` to recover pane tokens from persisted identity.
+/// If caller role is unknown but herdr can see the caller pane, attempts
+/// self-healing via `heal_with_runs_dir` to recover pane tokens from persisted
+/// identity. The pane must be the trigger, not its tokens object: after a
+/// restart herdr omits `tokens` entirely (see `caller_pane_tokens`).
 pub fn resolve_caller<H: HerdrOps>(herdr: &H, runs_dir: &Path) -> Caller {
     let tokens = caller_pane_tokens(herdr);
     let caller = resolve_caller_from_tokens(tokens.as_ref(), runs_dir);
