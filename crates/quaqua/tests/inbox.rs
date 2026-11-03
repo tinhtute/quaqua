@@ -962,3 +962,102 @@ fn test_finding_f5_follow_tick_preserves_project_and_reply_to() {
         "F5: reply_to must be decoded from ref"
     );
 }
+
+#[test]
+fn test_finding_m1_mail_ack_never_drops_unread_incidents_or_unacked_lower_mail() {
+    let runs_dir = hermetic_temp_dir("m1-mail-ack");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "mu-lead");
+    guard.remove("HERDR_PANE_ID");
+
+    // 1. Initial event to establish cos cursor at 1
+    let ev0 = quaqua::bus::FarmEvent::new(
+        "spawned",
+        Some("cos"),
+        Some("w0"),
+        Some("cos"),
+        Some("p1"),
+    )
+    .with_incident_key("k0");
+    bus.record(&ev0).unwrap();
+    let d0 = bus.inbox_digest(&runs_dir, "cos").unwrap();
+    assert_eq!(d0.new_cursor, 1);
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
+
+    // 2. Trigger 2: lower mail to cos
+    let opts1 = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "directive".to_string(),
+        body: "lower mail 1".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    let res_mail1 = mail::send_mail(&runs_dir, &opts1, &herdr).unwrap();
+    assert_eq!(res_mail1.id, 2);
+
+    // 3. Trigger 3: non-mail incident
+    let ev_inc = quaqua::bus::FarmEvent::new(
+        "blocked",
+        Some("herdr"),
+        Some("w1"),
+        Some("cos"),
+        Some("p1"),
+    )
+    .with_incident_key("k_blocked");
+    bus.record(&ev_inc).unwrap();
+
+    // 4. Trigger 4: higher mail to cos
+    let opts2 = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "directive".to_string(),
+        body: "higher mail 2".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    let res_mail2 = mail::send_mail(&runs_dir, &opts2, &herdr).unwrap();
+    assert_eq!(res_mail2.id, 4);
+
+    // 5. cos acks ONLY higher mail 4
+    let acked = mail::ack_mail(&runs_dir, "cos", &[res_mail2.id]).expect("ack mail 4");
+    assert_eq!(acked, vec![res_mail2.id]);
+
+    // Part A: Lower mail 2 must NOT disappear from mail inbox
+    let inbox_after = mail::render_inbox(&runs_dir, "cos").expect("render inbox");
+    assert!(
+        inbox_after.contains(&format!("#{}", res_mail1.id)),
+        "lower mail 2 must NOT disappear from mail inbox; got:\n{inbox_after}"
+    );
+
+    let mail_list = mail::list_mail(&runs_dir, false, None, None, None).expect("list mail");
+    assert!(
+        mail_list.contains("#2    mu-lead      -> cos          directive  [unacked]"),
+        "lower mail 2 must remain unacked in mail ls; got:\n{mail_list}"
+    );
+    assert!(
+        mail_list.contains("#4    mu-lead      -> cos          directive  [acked]"),
+        "higher mail 4 must be acked in mail ls; got:\n{mail_list}"
+    );
+
+    // Part B: Incident trigger 3 must NOT be skipped by inbox_digest
+    let digest = bus.inbox_digest(&runs_dir, "cos").expect("inbox digest");
+    assert_eq!(
+        digest.incidents.len(),
+        1,
+        "incident trigger 3 must NOT be lost after mail ack; incidents found: {:?}",
+        digest.incidents
+    );
+    assert_eq!(digest.incidents[0].event_type, "blocked");
+    assert_eq!(digest.incidents[0].seq, 3);
+}
