@@ -874,7 +874,28 @@ fn test_legacy_db_cli_refusal_exits_code_2() {
     assert_eq!(
         out_send.status.code(),
         Some(2),
-        "quaqua mail send on legacy DB must exit with code 2"
+        "quaqua mail send on legacy DB must exit code 2"
+    );
+
+    // Case 5: `quaqua mail ack` on legacy DB must exit 2 (no identity in env, so the
+    // legacy refusal has to win over the identity error)
+    let out_ack = std::process::Command::new(bin)
+        .args(["mail", "ack", "1"])
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("QUAQUA_TEST")
+        .env_remove("QUAQUA_OWNER")
+        .output()
+        .expect("run quaqua mail ack");
+    assert_eq!(
+        out_ack.status.code(),
+        Some(2),
+        "quaqua mail ack on legacy DB must exit with code 2"
+    );
+    let ack_stderr = String::from_utf8_lossy(&out_ack.stderr);
+    assert!(
+        ack_stderr.contains("legacy database detected; run quaqua bus migrate"),
+        "stderr must mention running quaqua bus migrate: {ack_stderr}"
     );
 }
 
