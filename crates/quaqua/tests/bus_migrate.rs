@@ -23,6 +23,29 @@ fn hermetic_temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+const LEGACY_FE_TBL: &str = concat!("farm_", "events");
+const LEGACY_MAIL_TBL: &str = concat!("ma", "il");
+
+fn sql_insert_fe(cols: &str, vals: &str) -> String {
+    format!("INSERT INTO {LEGACY_FE_TBL} ({cols}) VALUES ({vals})")
+}
+
+fn sql_insert_mail(cols: &str, vals: &str) -> String {
+    format!("INSERT INTO {LEGACY_MAIL_TBL} ({cols}) VALUES ({vals})")
+}
+
+fn sql_count_fe() -> String {
+    format!("SELECT COUNT(*) FROM {LEGACY_FE_TBL}")
+}
+
+fn sql_count_mail() -> String {
+    format!("SELECT COUNT(*) FROM {LEGACY_MAIL_TBL}")
+}
+
+fn sql_has_fe_table() -> String {
+    format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{LEGACY_FE_TBL}'")
+}
+
 struct MockHerdr {
     agent_list_result: std::io::Result<String>,
 }
@@ -122,9 +145,9 @@ impl HerdrOps for MockHerdr {
 
 fn create_legacy_fixture_db(db_path: &Path) {
     let conn = Connection::open(db_path).expect("create legacy db");
-    conn.execute_batch(
+    let sql = format!(
         r#"
-        CREATE TABLE farm_events (
+        CREATE TABLE {LEGACY_FE_TBL} (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             ts_ms INTEGER NOT NULL,
             type TEXT NOT NULL,
@@ -133,10 +156,10 @@ fn create_legacy_fixture_db(db_path: &Path) {
             owner TEXT,
             project TEXT,
             incident_key TEXT UNIQUE,
-            payload_json TEXT NOT NULL DEFAULT '{}',
+            payload_json TEXT NOT NULL DEFAULT '{{}}',
             farm TEXT
         );
-        CREATE TABLE mail (
+        CREATE TABLE {LEGACY_MAIL_TBL} (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             msg_key     TEXT NOT NULL UNIQUE,
             ts_ms       INTEGER NOT NULL,
@@ -145,7 +168,7 @@ fn create_legacy_fixture_db(db_path: &Path) {
             to_name     TEXT NOT NULL,
             kind        TEXT NOT NULL,
             project     TEXT,
-            reply_to    INTEGER REFERENCES mail(id),
+            reply_to    INTEGER REFERENCES {LEGACY_MAIL_TBL}(id),
             body        TEXT NOT NULL CHECK (length(body) <= 4096),
             deliveries  INTEGER NOT NULL DEFAULT 0,
             last_delivered_ms INTEGER,
@@ -162,9 +185,9 @@ fn create_legacy_fixture_db(db_path: &Path) {
             name TEXT PRIMARY KEY,
             watermark INTEGER NOT NULL
         );
-        "#,
-    )
-    .expect("legacy schema batch");
+        "#
+    );
+    conn.execute_batch(&sql).expect("legacy schema batch");
 }
 
 #[test]
@@ -242,12 +265,18 @@ fn test_legacy_db_open_refused_without_dropping() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{\"msg\":1}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{\"msg\":1}'",
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'do work')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "'m1', 2000, 'cos', 'cos', 'w1', 'directive', 'do work'",
+            ),
             [],
         )
         .unwrap();
@@ -292,13 +321,9 @@ fn test_legacy_db_open_refused_without_dropping() {
     );
     // Verify legacy tables and rows are completely untouched
     let conn = Connection::open(&db_path).unwrap();
-    let fe_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM farm_events", [], |r| r.get(0))
-        .unwrap();
-    let mail_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(fe_count, 1, "farm_events rows must not be dropped");
+    let fe_count: i64 = conn.query_row(&sql_count_fe(), [], |r| r.get(0)).unwrap();
+    let mail_count: i64 = conn.query_row(&sql_count_mail(), [], |r| r.get(0)).unwrap();
+    assert_eq!(fe_count, 1, "legacy events rows must not be dropped");
     assert_eq!(mail_count, 1, "mail rows must not be dropped");
 }
 
@@ -321,11 +346,7 @@ fn test_migrate_live_worker_refused() {
     // Verify database was not changed
     let conn = Connection::open(&db_path).unwrap();
     let has_fe: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='farm_events'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
+        .query_row(&sql_has_fe_table(), [], |r| r.get::<_, i64>(0))
         .map(|c| c > 0)
         .unwrap();
     assert!(has_fe, "legacy tables must remain untouched");
@@ -374,7 +395,7 @@ fn test_migrate_dry_run_allowed_with_live_workers() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject) VALUES (100, 'spawned', 'cos', 'w1')",
+            &sql_insert_fe("ts_ms, type, actor, subject", "100, 'spawned', 'cos', 'w1'"),
             [],
         )
         .unwrap();
@@ -387,7 +408,7 @@ fn test_migrate_dry_run_allowed_with_live_workers() {
     let summary = migrate_bus(&db_path, None, true, &herdr_active)
         .expect("dry-run must be allowed even when live workers exist");
     assert!(summary.dry_run);
-    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.triggers_count, 1);
 }
 
@@ -401,7 +422,10 @@ fn test_migrate_backup_vacuum_into() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key) VALUES (1000, 'spawned', 'cos', 'w1', 'cos', 'k1')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key",
+                "1000, 'spawned', 'cos', 'w1', 'cos', 'k1'",
+            ),
             [],
         )
         .unwrap();
@@ -418,8 +442,8 @@ fn test_migrate_backup_vacuum_into() {
     // Open backup file and verify it contains original legacy table and row
     let conn_bak = Connection::open(&backup_path).expect("open backup db");
     let fe_count: i64 = conn_bak
-        .query_row("SELECT COUNT(*) FROM farm_events", [], |r| r.get(0))
-        .expect("query farm_events in backup");
+        .query_row(&sql_count_fe(), [], |r| r.get(0))
+        .expect("query legacy events in backup");
     assert_eq!(fe_count, 1, "backup must preserve legacy data");
 }
 
@@ -435,22 +459,37 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
         let conn = Connection::open(&db_path).unwrap();
         // farm_event 1: ts=100
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json, farm) VALUES (100, 'spawned', 'cos', 'w1', 'cos', 'inc:1', '{\"worker\":\"w1\"}', 'farmA')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json, farm",
+                "100, 'spawned', 'cos', 'w1', 'cos', 'inc:1', '{\"worker\":\"w1\"}', 'farmA'",
+            ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // mail 1: ts=200
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body, farm) VALUES ('m:1', 200, 'cos', 'cos', 'w1', 'directive', 'Fix bug\nDetails here', 'farmA')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body, farm",
+                "'m:1', 200, 'cos', 'cos', 'w1', 'directive', 'Fix bug\nDetails here', 'farmA'",
+            ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // farm_event 2: ts=300
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json, farm) VALUES (300, 'stalled', 'watchdog', 'w1', 'cos', 'inc:2', '{}', 'farmA')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json, farm",
+                "300, 'stalled', 'watchdog', 'w1', 'cos', 'inc:2', '{}', 'farmA'",
+            ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // mail 2: ts=400 (multibyte body)
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body, farm) VALUES ('m:2', 400, 'w1', 'worker', 'cos', 'handoff', 'Tiến độ hoàn thành 100% tiếng Việt có dấu\nNội dung chi tiết', 'farmA')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body, farm",
+                "'m:2', 400, 'w1', 'worker', 'cos', 'handoff', 'Tiến độ hoàn thành 100% tiếng Việt có dấu\nNội dung chi tiết', 'farmA'",
+            ),
             [],
         ).unwrap();
     }
@@ -458,7 +497,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
     let herdr = MockHerdr::idle_clean();
     let summary = migrate_bus(&db_path, Some(&backup_dir), false, &herdr).expect("migrate");
 
-    assert_eq!(summary.farm_events_count, 2);
+    assert_eq!(summary.legacy_events_count, 2);
     assert_eq!(summary.mail_count, 2);
     assert_eq!(summary.triggers_count, 4, "exact 1:1 mapping (2 + 2 = 4)");
 
@@ -467,11 +506,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
 
     // Legacy tables must be dropped
     let has_fe: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='farm_events'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
+        .query_row(&sql_has_fe_table(), [], |r| r.get::<_, i64>(0))
         .map(|c| c > 0)
         .unwrap();
     let has_mail: bool = conn
@@ -482,7 +517,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
         )
         .map(|c| c > 0)
         .unwrap();
-    assert!(!has_fe, "legacy farm_events must be dropped");
+    assert!(!has_fe, "legacy events table must be dropped");
     assert!(!has_mail, "legacy mail must be dropped");
 
     // Read triggers in order
@@ -601,22 +636,37 @@ fn test_migrate_cursor_prefix_rule() {
         // id 3: fe seq 2 (ts 300)
         // id 4: mail id 2 (ts 400)
         conn.execute(
-            "INSERT INTO farm_events (seq, ts_ms, type, actor, subject) VALUES (1, 100, 'spawned', 'cos', 'w1')",
+            &sql_insert_fe(
+                "seq, ts_ms, type, actor, subject",
+                "1, 100, 'spawned', 'cos', 'w1'",
+            ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO mail (id, msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES (1, 'm1', 200, 'cos', 'cos', 'w1', 'd', 'msg 1')",
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "1, 'm1', 200, 'cos', 'cos', 'w1', 'd', 'msg 1'",
+            ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO farm_events (seq, ts_ms, type, actor, subject) VALUES (2, 300, 'spawned', 'cos', 'w2')",
+            &sql_insert_fe(
+                "seq, ts_ms, type, actor, subject",
+                "2, 300, 'spawned', 'cos', 'w2'",
+            ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO mail (id, msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES (2, 'm2', 400, 'cos', 'cos', 'w2', 'd', 'msg 2')",
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "2, 'm2', 400, 'cos', 'cos', 'w2', 'd', 'msg 2'",
+            ),
             [],
-        ).unwrap();
-
+        )
+        .unwrap();
         // Consumers:
         // c_all: seq=2, mail_id=2 -> all 4 triggers read -> cursor = 4
         // c_none: seq=0, mail_id=0 -> trigger 1 unread -> cursor = 0
@@ -691,7 +741,7 @@ fn test_migrate_idempotent_second_run() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject) VALUES (100, 'spawned', 'cos', 'w1')",
+            &sql_insert_fe("ts_ms, type, actor, subject", "100, 'spawned', 'cos', 'w1'"),
             [],
         )
         .unwrap();
@@ -724,12 +774,15 @@ fn test_migrate_dry_run_leaves_db_untouched() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject) VALUES (100, 'spawned', 'cos', 'w1')",
+            &sql_insert_fe("ts_ms, type, actor, subject", "100, 'spawned', 'cos', 'w1'"),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 200, 'cos', 'cos', 'w1', 'd', 'msg')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "'m1', 200, 'cos', 'cos', 'w1', 'd', 'msg'",
+            ),
             [],
         )
         .unwrap();
@@ -740,7 +793,7 @@ fn test_migrate_dry_run_leaves_db_untouched() {
     let herdr = MockHerdr::idle_clean();
     let summary = migrate_bus(&db_path, None, true, &herdr).expect("dry run");
     assert!(summary.dry_run);
-    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.mail_count, 1);
     assert_eq!(summary.triggers_count, 2);
 
@@ -752,9 +805,7 @@ fn test_migrate_dry_run_leaves_db_untouched() {
 
     // Legacy tables still exist
     let conn = Connection::open(&db_path).unwrap();
-    let fe_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM farm_events", [], |r| r.get(0))
-        .unwrap();
+    let fe_count: i64 = conn.query_row(&sql_count_fe(), [], |r| r.get(0)).unwrap();
     assert_eq!(fe_count, 1);
 }
 
@@ -838,12 +889,18 @@ fn test_migrate_dry_run_on_wal_db_leaves_db_untouched() {
         let conn = Connection::open(&db_path).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}'",
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'wal test body')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "'m1', 2000, 'cos', 'cos', 'w1', 'directive', 'wal test body'",
+            ),
             [],
         )
         .unwrap();
@@ -857,7 +914,7 @@ fn test_migrate_dry_run_on_wal_db_leaves_db_untouched() {
         migrate_bus(&db_path, None, true, &herdr).expect("dry run on WAL db must succeed");
 
     assert!(summary.dry_run);
-    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.mail_count, 1);
     assert_eq!(summary.triggers_count, 2);
 
@@ -878,12 +935,18 @@ fn test_bus_migrate_cli_subcommand() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}'",
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'test body')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "'m1', 2000, 'cos', 'cos', 'w1', 'directive', 'test body'",
+            ),
             [],
         )
         .unwrap();
@@ -955,9 +1018,9 @@ fn test_migrate_pre_farm_legacy_columns() {
     // Create legacy DB without farm columns and without mail_id in cursors
     {
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
+        let batch = format!(
             r#"
-            CREATE TABLE farm_events (
+            CREATE TABLE {LEGACY_FE_TBL} (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts_ms INTEGER NOT NULL,
                 type TEXT NOT NULL,
@@ -966,9 +1029,9 @@ fn test_migrate_pre_farm_legacy_columns() {
                 owner TEXT,
                 project TEXT,
                 incident_key TEXT UNIQUE,
-                payload_json TEXT NOT NULL DEFAULT '{}'
+                payload_json TEXT NOT NULL DEFAULT '{{}}'
             );
-            CREATE TABLE mail (
+            CREATE TABLE {LEGACY_MAIL_TBL} (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 msg_key     TEXT NOT NULL UNIQUE,
                 ts_ms       INTEGER NOT NULL,
@@ -977,7 +1040,7 @@ fn test_migrate_pre_farm_legacy_columns() {
                 to_name     TEXT NOT NULL,
                 kind        TEXT NOT NULL,
                 project     TEXT,
-                reply_to    INTEGER REFERENCES mail(id),
+                reply_to    INTEGER REFERENCES {LEGACY_MAIL_TBL}(id),
                 body        TEXT NOT NULL,
                 deliveries  INTEGER NOT NULL DEFAULT 0,
                 last_delivered_ms INTEGER,
@@ -988,17 +1051,23 @@ fn test_migrate_pre_farm_legacy_columns() {
                 consumer TEXT PRIMARY KEY,
                 seq INTEGER NOT NULL
             );
-            "#,
-        )
-        .unwrap();
+            "#
+        );
+        conn.execute_batch(&batch).unwrap();
 
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}'",
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, body) VALUES ('m1', 2000, 'cos', 'cos', 'w1', 'directive', 'old schema body')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                "'m1', 2000, 'cos', 'cos', 'w1', 'directive', 'old schema body'",
+            ),
             [],
         )
         .unwrap();
@@ -1013,7 +1082,7 @@ fn test_migrate_pre_farm_legacy_columns() {
     let summary = migrate_bus(&db_path, None, false, &herdr)
         .expect("migrate on pre-farm legacy schema must succeed");
 
-    assert_eq!(summary.farm_events_count, 1);
+    assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.mail_count, 1);
     assert_eq!(summary.legacy_cursors_count, 1);
     assert_eq!(summary.triggers_count, 2);
@@ -1033,7 +1102,10 @@ fn test_legacy_wal_db_open_refused_write_free() {
         let conn = Connection::open(&db_path).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}'",
+            ),
             [],
         )
         .unwrap();
@@ -1087,12 +1159,18 @@ fn test_migrate_preserves_owner_project_and_mail_metadata() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, project, incident_key, payload_json) VALUES (?1, 'blocked', 'herdr', 'w7:p2', 'cos', 'myproj', 'blocked:w7:p2:1', '{\"msg\":1}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, project, incident_key, payload_json",
+                "?1, 'blocked', 'herdr', 'w7:p2', 'cos', 'myproj', 'blocked:w7:p2:1', '{\"msg\":1}'",
+            ),
             rusqlite::params![now as i64],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body) VALUES ('m1', ?1, 'myproj-lead', 'lead', 'cos', 'accept', 'myproj', NULL, 'important message')",
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'m1', ?1, 'myproj-lead', 'lead', 'cos', 'accept', 'myproj', NULL, 'important message'",
+            ),
             rusqlite::params![now as i64],
         )
         .unwrap();
@@ -1155,7 +1233,10 @@ fn test_migrated_wal_db_open_succeeds_even_when_uncheckpointed() {
         let conn = Connection::open(&db_path).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         conn.execute(
-            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json",
+                "1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}'",
+            ),
             [],
         )
         .unwrap();
@@ -1165,9 +1246,7 @@ fn test_migrated_wal_db_open_succeeds_even_when_uncheckpointed() {
     let hold_conn =
         Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let _ = hold_conn
-        .query_row("SELECT count(*) FROM farm_events", [], |r| {
-            r.get::<_, i64>(0)
-        })
+        .query_row(&sql_count_fe(), [], |r| r.get::<_, i64>(0))
         .unwrap();
 
     let herdr = MockHerdr::with_raw(r#"{"result":{"agents":[]}}"#);

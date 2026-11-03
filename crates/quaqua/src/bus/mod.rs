@@ -105,6 +105,76 @@ pub struct FarmEventRecord {
     pub farm: Option<String>,
 }
 
+/// A trigger to be recorded in the `triggers` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTrigger {
+    pub ts_ms: u64,
+    pub source: String,
+    pub kind: String,
+    pub actor: String,
+    pub to_name: Option<String>,
+    pub thread_id: String,
+    pub summary: String,
+    pub ref_val: Option<String>,
+    pub payload_json: String,
+    pub dedupe_key: Option<String>,
+    pub farm: Option<String>,
+}
+
+impl NewTrigger {
+    pub fn new(
+        source: impl Into<String>,
+        kind: impl Into<String>,
+        actor: impl Into<String>,
+        thread_id: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts_ms: now_ms(),
+            source: source.into(),
+            kind: kind.into(),
+            actor: actor.into(),
+            to_name: None,
+            thread_id: thread_id.into(),
+            summary: summary.into(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: None,
+        }
+    }
+
+    pub fn with_ts_ms(mut self, ts_ms: u64) -> Self {
+        self.ts_ms = ts_ms;
+        self
+    }
+
+    pub fn with_to_name(mut self, to_name: impl Into<String>) -> Self {
+        self.to_name = Some(to_name.into());
+        self
+    }
+
+    pub fn with_ref(mut self, ref_val: impl Into<String>) -> Self {
+        self.ref_val = Some(ref_val.into());
+        self
+    }
+
+    pub fn with_payload_json(mut self, payload: impl Into<String>) -> Self {
+        self.payload_json = payload.into();
+        self
+    }
+
+    pub fn with_dedupe_key(mut self, key: impl Into<String>) -> Self {
+        self.dedupe_key = Some(key.into());
+        self
+    }
+
+    pub fn with_farm(mut self, farm: impl Into<String>) -> Self {
+        self.farm = Some(farm.into());
+        self
+    }
+}
+
 /// SQLite-backed event bus.
 pub struct FarmBus {
     conn: Mutex<rusqlite::Connection>,
@@ -132,57 +202,7 @@ impl FarmBus {
         let local_farm = crate::workspace::farm_of_runs_dir(runs_dir);
 
         if path.exists() {
-            let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-            let is_legacy = if !wal_path.exists() {
-                let uri = format!("file:{}?immutable=1", path.display());
-                (|| -> rusqlite::Result<bool> {
-                    let imm_conn = rusqlite::Connection::open_with_flags(
-                        &uri,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                    )?;
-                    let legacy_count: i64 = imm_conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
-                    let triggers_count: i64 = imm_conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'triggers'",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
-                    Ok(legacy_count > 0 && triggers_count == 0)
-                })()
-                .unwrap_or(false)
-            } else {
-                (|| -> rusqlite::Result<bool> {
-                    let ro_conn = rusqlite::Connection::open_with_flags(
-                        path,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )?;
-                    let legacy_count: i64 = ro_conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
-                    let triggers_count: i64 = ro_conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'triggers'",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
-                    Ok(legacy_count > 0 && triggers_count == 0)
-                })()
-                .unwrap_or(false)
-            };
-
+            let is_legacy = crate::bus::migrate::is_legacy_db_probe(path).unwrap_or(false);
             if is_legacy {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                     std::io::Error::other(LEGACY_DB_ERROR_MSG),
@@ -192,33 +212,7 @@ impl FarmBus {
 
         let conn = crate::engine::sqlite::open_conn(path)?;
         let has_legacy: bool = crate::engine::sqlite::retry_while_busy(|| {
-            let legacy_table_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
-                [],
-                |r| r.get(0),
-            )?;
-            if legacy_table_count > 0 {
-                return Ok(true);
-            }
-            let has_cursors: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'cursors'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-            if has_cursors {
-                let mut stmt = conn.prepare("PRAGMA table_info(cursors)")?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let col_name: String = row.get(1)?;
-                    if col_name == "seq" {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
+            crate::bus::migrate::is_legacy_db_conn(&conn)
         })?;
         if has_legacy {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -278,13 +272,7 @@ impl FarmBus {
             Ok(())
         })?;
 
-        let events_watermark: u64 = conn
-            .query_row(
-                "SELECT watermark FROM bus_migration WHERE name = 'farm_events_seq'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as u64;
+        let events_watermark: u64 = crate::bus::migrate::legacy_events_watermark(&conn);
 
         let mail_watermark: u64 = conn
             .query_row(
@@ -421,7 +409,8 @@ impl FarmBus {
             let rows = stmt.query_map(rusqlite::params![since_seq as i64], |row| {
                 let thread_id: String = row.get(4)?;
                 let subject = thread_id
-                    .strip_prefix("agent:")
+                    .strip_prefix("quaqua/")
+                    .or_else(|| thread_id.strip_prefix("agent:"))
                     .unwrap_or(&thread_id)
                     .to_string();
                 let payload_str: String = row
@@ -499,9 +488,157 @@ impl FarmBus {
         self.get_cursor(consumer)
     }
 
-    /// Sets or updates the mail cursor for `consumer`, delegating to `set_cursor` on superagent schema.
-    pub fn set_mail_cursor(&self, consumer: &str, mail_id: u64) -> rusqlite::Result<()> {
-        self.set_cursor(consumer, mail_id)
+    /// Opens or updates a thread with owner and marks it open.
+    pub fn open_thread(&self, thread_id: &str, owner: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_ms() as i64;
+        crate::engine::sqlite::retry_while_busy(|| {
+            conn.execute(
+                r#"
+                INSERT INTO threads (id, owner, state, last_trigger_ms)
+                VALUES (?1, ?2, 'open', ?3)
+                ON CONFLICT(id) DO UPDATE SET
+                    owner = excluded.owner,
+                    state = 'open',
+                    last_trigger_ms = MAX(threads.last_trigger_ms, excluded.last_trigger_ms)
+                "#,
+                rusqlite::params![thread_id, owner, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Subscribes a consumer to a thread until `until_ms`.
+    pub fn subscribe(
+        &self,
+        thread_id: &str,
+        consumer: &str,
+        until_ms: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        crate::engine::sqlite::retry_while_busy(|| {
+            conn.execute(
+                r#"
+                INSERT INTO subscriptions (thread_id, consumer, until_ms)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(thread_id, consumer) DO UPDATE SET
+                    until_ms = MAX(subscriptions.until_ms, excluded.until_ms)
+                "#,
+                rusqlite::params![thread_id, consumer, until_ms as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Atomically opens a thread and subscribes a consumer until `until_ms`.
+    pub fn open_thread_and_subscribe(
+        &self,
+        thread_id: &str,
+        owner: &str,
+        consumer: &str,
+        until_ms: u64,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let now = now_ms() as i64;
+        crate::engine::sqlite::retry_while_busy(|| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                r#"
+                INSERT INTO threads (id, owner, state, last_trigger_ms)
+                VALUES (?1, ?2, 'open', ?3)
+                ON CONFLICT(id) DO UPDATE SET
+                    owner = excluded.owner,
+                    state = 'open',
+                    last_trigger_ms = MAX(threads.last_trigger_ms, excluded.last_trigger_ms)
+                "#,
+                rusqlite::params![thread_id, owner, now],
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO subscriptions (thread_id, consumer, until_ms)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(thread_id, consumer) DO UPDATE SET
+                    until_ms = MAX(subscriptions.until_ms, excluded.until_ms)
+                "#,
+                rusqlite::params![thread_id, consumer, until_ms as i64],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Returns all (consumer, until_ms) subscriptions for a thread.
+    pub fn get_subscriptions(&self, thread_id: &str) -> rusqlite::Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        crate::engine::sqlite::retry_while_busy(|| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT consumer, until_ms FROM subscriptions WHERE thread_id = ?1 ORDER BY consumer ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![thread_id], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            let mut res = Vec::new();
+            for r in rows {
+                res.push(r?);
+            }
+            Ok(res)
+        })
+    }
+
+    /// Records a new trigger into `triggers`, updating the thread's `last_trigger_ms`
+    /// and extending active subscriptions by 14 days.
+    pub fn record_trigger(&self, trigger: &NewTrigger) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let farm_str = trigger.farm.as_deref().unwrap_or(&self.farm);
+        let now = trigger.ts_ms as i64;
+        crate::engine::sqlite::retry_while_busy(|| {
+            let tx = conn.transaction()?;
+            let summary_trunc: String = trigger.summary.trim().chars().take(80).collect();
+            let summary_final = if summary_trunc.is_empty() {
+                trigger.kind.chars().take(80).collect()
+            } else {
+                summary_trunc
+            };
+
+            tx.execute(
+                "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
+                rusqlite::params![&trigger.thread_id, &trigger.actor, now],
+            )?;
+            tx.execute(
+                "UPDATE threads SET last_trigger_ms = MAX(last_trigger_ms, ?1) WHERE id = ?2",
+                rusqlite::params![now, &trigger.thread_id],
+            )?;
+
+            // Extend active subscriptions on this thread: now + 14 days (R6)
+            let ext_until = (trigger.ts_ms + 14 * 86_400 * 1000) as i64;
+            tx.execute(
+                "UPDATE subscriptions SET until_ms = MAX(until_ms, ?1) WHERE thread_id = ?2 AND until_ms >= ?3",
+                rusqlite::params![ext_until, &trigger.thread_id, now],
+            )?;
+
+            let rows = tx.execute(
+                r#"
+                INSERT OR IGNORE INTO triggers (
+                    ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                rusqlite::params![
+                    now,
+                    trigger.source,
+                    trigger.kind,
+                    trigger.actor,
+                    trigger.to_name,
+                    trigger.thread_id,
+                    summary_final,
+                    trigger.ref_val,
+                    trigger.payload_json,
+                    trigger.dedupe_key,
+                    farm_str,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(rows > 0)
+        })
     }
 }
 
@@ -536,6 +673,55 @@ pub fn record_event_safely(db_path: &Path, event: &FarmEvent) -> bool {
 /// Safely records a farm event into `<runs_dir>/quaqua.db`.
 pub fn record_event_safely_in_runs(runs_dir: &Path, event: &FarmEvent) -> bool {
     record_event_safely(&runs_dir.join("quaqua.db"), event)
+}
+
+/// Safely opens a thread and subscribes a consumer until `until_ms` into `<runs_dir>/quaqua.db`.
+pub fn open_thread_and_subscribe_safely_in_runs(
+    runs_dir: &Path,
+    thread_id: &str,
+    owner: &str,
+    consumer: &str,
+    until_ms: u64,
+) -> bool {
+    let db_path = runs_dir.join("quaqua.db");
+    if crate::workspace::live_db_open_refused(&db_path) {
+        return false;
+    }
+    match FarmBus::open(&db_path) {
+        Ok(bus) => bus
+            .open_thread_and_subscribe(thread_id, owner, consumer, until_ms)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Safely subscribes a consumer until `until_ms` into `<runs_dir>/quaqua.db`.
+pub fn subscribe_safely_in_runs(
+    runs_dir: &Path,
+    thread_id: &str,
+    consumer: &str,
+    until_ms: u64,
+) -> bool {
+    let db_path = runs_dir.join("quaqua.db");
+    if crate::workspace::live_db_open_refused(&db_path) {
+        return false;
+    }
+    match FarmBus::open(&db_path) {
+        Ok(bus) => bus.subscribe(thread_id, consumer, until_ms).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Safely records a trigger into `<runs_dir>/quaqua.db`.
+pub fn record_trigger_safely_in_runs(runs_dir: &Path, trigger: &NewTrigger) -> bool {
+    let db_path = runs_dir.join("quaqua.db");
+    if crate::workspace::live_db_open_refused(&db_path) {
+        return false;
+    }
+    match FarmBus::open(&db_path) {
+        Ok(bus) => bus.record_trigger(trigger).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -742,7 +928,7 @@ mod tests {
 
         assert_eq!(
             status_before, status_after,
-            "quaqua status output must be byte-unchanged when farm_events/cursors tables and rows exist"
+            "quaqua status output must be byte-unchanged when legacy tables and rows exist"
         );
     }
 
@@ -754,49 +940,14 @@ mod tests {
         // 1. Manually initialize a database with legacy schema
         {
             let conn = rusqlite::Connection::open(&db_path).expect("open legacy db");
-            conn.execute_batch(
-                r#"
-                CREATE TABLE farm_events (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts_ms INTEGER NOT NULL,
-                    type TEXT NOT NULL,
-                    actor TEXT,
-                    subject TEXT,
-                    owner TEXT,
-                    project TEXT,
-                    incident_key TEXT UNIQUE,
-                    payload_json TEXT NOT NULL DEFAULT '{}'
-                );
-                CREATE TABLE mail (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    msg_key     TEXT NOT NULL UNIQUE,
-                    ts_ms       INTEGER NOT NULL,
-                    from_name   TEXT NOT NULL,
-                    from_role   TEXT NOT NULL,
-                    to_name     TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    project     TEXT,
-                    reply_to    INTEGER REFERENCES mail(id),
-                    body        TEXT NOT NULL CHECK (length(body) <= 4096),
-                    deliveries  INTEGER NOT NULL DEFAULT 0,
-                    last_delivered_ms INTEGER,
-                    acked_ms    INTEGER,
-                    acked_by    TEXT
-                );
-                INSERT INTO farm_events (ts_ms, type, actor, subject, owner, project, incident_key)
-                VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'projA', 'k1');
-                INSERT INTO farm_events (ts_ms, type, actor, subject, owner, project, incident_key)
-                VALUES (2000, 'blocked', 'herdr', 'w7:p2', NULL, NULL, 'k2');
-                "#,
-            )
-            .expect("create legacy schema");
+            crate::bus::migrate::create_legacy_fixture_tables_for_test(&conn)
+                .expect("create legacy schema");
         }
 
         // Count rows before open
-        let count_before: i64 = {
+        let count_before = {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.query_row("SELECT count(*) FROM farm_events", [], |r| r.get(0))
-                .unwrap()
+            crate::bus::migrate::count_legacy_events_for_test(&conn).unwrap()
         };
         assert_eq!(count_before, 2);
 
@@ -814,9 +965,7 @@ mod tests {
 
         // Invariant: no row deleted or dropped
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let count_after: i64 = conn
-            .query_row("SELECT count(*) FROM farm_events", [], |r| r.get(0))
-            .unwrap();
+        let count_after = crate::bus::migrate::count_legacy_events_for_test(&conn).unwrap();
         assert_eq!(count_after, count_before, "refusal must not delete any row");
     }
 

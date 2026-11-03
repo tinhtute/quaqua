@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationSummary {
     pub backup_path: Option<PathBuf>,
-    pub farm_events_count: i64,
+    pub legacy_events_count: i64,
     pub mail_count: i64,
     pub legacy_cursors_count: i64,
     pub triggers_count: i64,
@@ -155,7 +155,7 @@ pub fn migrate_bus<H: HerdrOps>(
     if is_already_migrated {
         return Ok(MigrationSummary {
             backup_path: None,
-            farm_events_count: 0,
+            legacy_events_count: 0,
             mail_count: 0,
             legacy_cursors_count: 0,
             triggers_count: 0,
@@ -454,7 +454,7 @@ pub fn migrate_bus<H: HerdrOps>(
         }
         return Ok(MigrationSummary {
             backup_path: None,
-            farm_events_count: farm_events.len() as i64,
+            legacy_events_count: farm_events.len() as i64,
             mail_count: mails.len() as i64,
             legacy_cursors_count: cursors.len() as i64,
             triggers_count: candidates.len() as i64,
@@ -627,7 +627,7 @@ pub fn migrate_bus<H: HerdrOps>(
 
     Ok(MigrationSummary {
         backup_path: Some(backup_path),
-        farm_events_count: farm_events.len() as i64,
+        legacy_events_count: farm_events.len() as i64,
         mail_count: mails.len() as i64,
         legacy_cursors_count: cursors.len() as i64,
         triggers_count: candidates.len() as i64,
@@ -677,4 +677,125 @@ fn table_has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> b
         }
     }
     false
+}
+
+/// Checks if a database connection contains a legacy schema.
+/// Returns true if legacy tables (`farm_events`, `mail`, or legacy `cursors` with column `seq`)
+/// exist while the new `triggers` table is absent.
+pub fn is_legacy_db_conn(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    let triggers_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'triggers'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if triggers_count > 0 {
+        return Ok(false);
+    }
+
+    let legacy_table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if legacy_table_count > 0 {
+        return Ok(true);
+    }
+
+    let has_cursors: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'cursors'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if has_cursors && table_has_column(conn, "cursors", "seq") {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Probes a path before opening with WAL mode.
+/// Returns true if the database exists and has a legacy schema.
+/// When no `-wal` exists, uses `file:...immutable=1` with read-only flags
+/// so that header bytes 18/19 are never modified and no sidecars are created.
+/// When `-wal` exists, uses read-only flags.
+pub fn is_legacy_db_probe(path: &Path) -> rusqlite::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    if !wal_path.exists() {
+        let uri = format!("file:{}?immutable=1", path.display());
+        let imm_conn = rusqlite::Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        is_legacy_db_conn(&imm_conn)
+    } else {
+        let ro_conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        is_legacy_db_conn(&ro_conn)
+    }
+}
+
+/// Reads the watermark for migrated legacy events from `bus_migration`.
+pub fn legacy_events_watermark(conn: &rusqlite::Connection) -> u64 {
+    conn.query_row(
+        "SELECT watermark FROM bus_migration WHERE name = 'farm_events_seq'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0) as u64
+}
+
+#[cfg(test)]
+pub fn create_legacy_fixture_tables_for_test(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE farm_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_ms INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            actor TEXT,
+            subject TEXT,
+            owner TEXT,
+            project TEXT,
+            incident_key TEXT UNIQUE,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE mail (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_key     TEXT NOT NULL UNIQUE,
+            ts_ms       INTEGER NOT NULL,
+            from_name   TEXT NOT NULL,
+            from_role   TEXT NOT NULL,
+            to_name     TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            project     TEXT,
+            reply_to    INTEGER REFERENCES mail(id),
+            body        TEXT NOT NULL CHECK (length(body) <= 4096),
+            deliveries  INTEGER NOT NULL DEFAULT 0,
+            last_delivered_ms INTEGER,
+            acked_ms    INTEGER,
+            acked_by    TEXT
+        );
+        INSERT INTO farm_events (ts_ms, type, actor, subject, owner, project, incident_key)
+        VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'projA', 'k1');
+        INSERT INTO farm_events (ts_ms, type, actor, subject, owner, project, incident_key)
+        VALUES (2000, 'blocked', 'herdr', 'w7:p2', NULL, NULL, 'k2');
+        "#,
+    )
+}
+
+#[cfg(test)]
+pub fn count_legacy_events_for_test(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT count(*) FROM farm_events", [], |r| r.get(0))
 }

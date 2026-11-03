@@ -416,7 +416,6 @@ pub(crate) fn warn_if_omp_hook_missing(hook_path: &str) -> bool {
     }
 }
 
-
 pub fn spawn_worker<G: GitOps, H: HerdrOps>(
     opts: SpawnOptions,
     cfg: &Config,
@@ -436,35 +435,66 @@ pub fn spawn_worker<G: GitOps, H: HerdrOps>(
 
     match &res {
         Ok((caller, owner)) => {
-            crate::bus::record_event_safely_in_runs(
+            let thread_id = format!("quaqua/{name}");
+            let now = crate::bus::now_ms();
+            let until_ms = now + 14 * 86_400 * 1000;
+            crate::bus::open_thread_and_subscribe_safely_in_runs(
+                &runs_dir, &thread_id, owner, owner, until_ms,
+            );
+            let mut payload = serde_json::Map::new();
+            payload.insert(
+                "owner".to_string(),
+                serde_json::Value::String(owner.clone()),
+            );
+            if let Some(r) = &repo_name {
+                payload.insert("project".to_string(), serde_json::Value::String(r.clone()));
+            }
+            crate::bus::record_trigger_safely_in_runs(
                 &runs_dir,
-                &crate::bus::FarmEvent::new(
+                &crate::bus::NewTrigger::new(
+                    "worker",
                     "spawned",
-                    Some(caller.clone()),
-                    Some(name),
-                    Some(owner.clone()),
-                    repo_name,
-                ),
+                    caller,
+                    &thread_id,
+                    format!("spawned {name}"),
+                )
+                .with_to_name(owner)
+                .with_payload_json(serde_json::Value::Object(payload).to_string()),
             );
             Ok(())
         }
         Err((code, msg)) => {
-            let payload = if msg.trim().is_empty() {
-                "{}".to_string()
+            let thread_id = if name.is_empty() {
+                "quaqua/unknown".to_string()
             } else {
-                serde_json::to_string(&serde_json::json!({ "error": msg.trim() }))
-                    .unwrap_or_else(|_| "{}".to_string())
+                format!("quaqua/{name}")
             };
-            crate::bus::record_event_safely_in_runs(
+            let mut payload = if msg.trim().is_empty() {
+                serde_json::Map::new()
+            } else {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "error".to_string(),
+                    serde_json::Value::String(msg.trim().to_string()),
+                );
+                m
+            };
+            if let Some(r) = &repo_name {
+                payload.insert("project".to_string(), serde_json::Value::String(r.clone()));
+            }
+            crate::bus::record_trigger_safely_in_runs(
                 &runs_dir,
-                &crate::bus::FarmEvent::new(
+                &crate::bus::NewTrigger::new(
+                    "worker",
                     "spawn_failed",
-                    None::<String>,
-                    if name.is_empty() { None } else { Some(name) },
-                    None::<String>,
-                    repo_name,
+                    "worker",
+                    &thread_id,
+                    format!(
+                        "spawn_failed {}",
+                        if name.is_empty() { "unknown" } else { &name }
+                    ),
                 )
-                .with_payload_json(payload),
+                .with_payload_json(serde_json::Value::Object(payload).to_string()),
             );
             Err((*code, msg.clone()))
         }

@@ -934,7 +934,7 @@ pub fn gate<H: HerdrOps>(
 /// Shadow mode evaluation of layout rules at a choke point.
 ///
 /// Evaluates the decision, prints one `would_deny` stderr line and writes a
-/// `farm_events` row if denied. Never blocks, never changes exit codes.
+/// `triggers` row if denied. Never blocks, never changes exit codes.
 pub fn shadow<H: HerdrOps>(
     caller: Option<&Caller>,
     herdr: Option<&H>,
@@ -1157,32 +1157,52 @@ fn gate_inner<H: HerdrOps>(
                 decision.rule_id, layer, layout.name
             );
 
-            let event = crate::bus::FarmEvent::new(
-                "would_deny",
-                Some(effective_caller.name.clone()),
-                subj,
-                owner.map(String::from),
-                project.map(String::from),
-            )
-            .with_payload_json(payload.to_string());
-
+            let subj_str = subj.as_deref().unwrap_or("unknown");
+            let thread_id = format!("agent:{subj_str}");
+            let mut pl = payload.clone();
+            if let Some(o) = owner {
+                pl["owner"] = serde_json::Value::String(o.to_string());
+            }
+            if let Some(p) = project {
+                pl["project"] = serde_json::Value::String(p.to_string());
+            }
             let _ = std::fs::create_dir_all(runs_dir);
-            crate::bus::record_event_safely_in_runs(runs_dir, &event);
+            crate::bus::record_trigger_safely_in_runs(
+                runs_dir,
+                &crate::bus::NewTrigger::new(
+                    "worker",
+                    "would_deny",
+                    &effective_caller.name,
+                    &thread_id,
+                    format!("would_deny {subj_str}"),
+                )
+                .with_payload_json(pl.to_string()),
+            );
             return Ok(decision);
         }
 
         // Enforce mode
-        let event = crate::bus::FarmEvent::new(
-            "denied",
-            Some(effective_caller.name.clone()),
-            subj,
-            owner.map(String::from),
-            project.map(String::from),
-        )
-        .with_payload_json(payload.to_string());
-
+        let subj_str = subj.as_deref().unwrap_or("unknown");
+        let thread_id = format!("agent:{subj_str}");
+        let mut pl = payload.clone();
+        if let Some(o) = owner {
+            pl["owner"] = serde_json::Value::String(o.to_string());
+        }
+        if let Some(p) = project {
+            pl["project"] = serde_json::Value::String(p.to_string());
+        }
         let _ = std::fs::create_dir_all(runs_dir);
-        crate::bus::record_event_safely_in_runs(runs_dir, &event);
+        crate::bus::record_trigger_safely_in_runs(
+            runs_dir,
+            &crate::bus::NewTrigger::new(
+                "worker",
+                "denied",
+                &effective_caller.name,
+                &thread_id,
+                format!("denied {subj_str}"),
+            )
+            .with_payload_json(pl.to_string()),
+        );
 
         let mut err_msg = if let Some(tname) = target_name {
             if verb == Verb::Spawn {

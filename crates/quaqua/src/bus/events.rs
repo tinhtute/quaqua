@@ -590,7 +590,7 @@ impl FarmBus {
             let mut stmt = conn
                 .prepare_cached(
                     r#"
-                    SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.farm
+                    SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm
                     FROM triggers t
                     LEFT JOIN cursors c ON c.consumer = t.to_name
                     WHERE t.source = 'mail' AND t.to_name = ?1 AND t.id > ?2

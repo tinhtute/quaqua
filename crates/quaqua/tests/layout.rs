@@ -1904,7 +1904,7 @@ fn test_layout_enforce_peer_spawn_denied_exit_1_no_worktree_or_pane() {
     let bus = quaqua::bus::FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
     let events = bus.load_events(0).expect("load events");
     let denies: Vec<_> = events.iter().filter(|e| e.event_type == "denied").collect();
-    assert_eq!(denies.len(), 1, "expected 1 denied event in farm_events");
+    assert_eq!(denies.len(), 1, "expected 1 denied event in triggers");
     assert!(denies[0].payload_json.contains("edge.none"));
 }
 

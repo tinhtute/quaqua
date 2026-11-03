@@ -806,7 +806,7 @@ fn test_finding8_mail_unacked_check_on_every_verb() {
 
     // Call mail::list_mail to trigger lazy check
     let _ = mail::list_mail(&runs, true, None, None, None).expect("list mail");
-    // Verify mail_unacked incident was inserted into farm_events
+    // Verify mail_unacked incident was inserted into triggers
     let count: i64 = bus
         .conn_for_test()
         .query_row(

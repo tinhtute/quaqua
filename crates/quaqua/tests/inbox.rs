@@ -914,3 +914,51 @@ fn test_inbox_digest_interleaved_mail_incident_no_redelivery() {
     assert_eq!(digest2.new_cursor, 3);
     assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
 }
+
+#[test]
+fn test_finding_f5_follow_tick_preserves_project_and_reply_to() {
+    let runs_dir = hermetic_temp_dir("f5-follow-ref");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "alpha-lead");
+    guard.remove("HERDR_PANE_ID");
+
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "accept".to_string(),
+        body: "finished unit".to_string(),
+        project: Some("my-proj".to_string()),
+        reply_to: Some(42),
+        client_id: None,
+    };
+    let send_res = mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    assert!(send_res.id > 0);
+
+    let mut last_seen_mail = 0;
+    let digest = bus
+        .follow_tick(&runs_dir, "cos", &mut last_seen_mail)
+        .expect("follow tick");
+
+    assert_eq!(digest.unacked_mail.len(), 1);
+    let msg = &digest.unacked_mail[0];
+
+    assert_eq!(
+        msg.project.as_deref(),
+        Some("my-proj"),
+        "F5: project must be decoded from ref"
+    );
+    assert_eq!(
+        msg.reply_to,
+        Some(42),
+        "F5: reply_to must be decoded from ref"
+    );
+}
