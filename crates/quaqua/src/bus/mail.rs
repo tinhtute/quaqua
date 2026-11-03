@@ -978,31 +978,30 @@ pub fn ack_mail(runs_dir: &Path, caller_name: &str, mail_ids: &[u64]) -> Result<
             drop(rows);
             drop(query);
 
-            let current_cursor: Option<u64> = {
-                let mut c_stmt = conn
-                    .prepare_cached("SELECT trigger_id FROM cursors WHERE consumer = ?1")
+            let is_already_acked: bool = {
+                let mut a_stmt = conn
+                    .prepare_cached("SELECT 1 FROM trigger_acks WHERE trigger_id = ?1")
                     .map_err(|e| e.to_string())?;
-                let mut c_rows = c_stmt
-                    .query(rusqlite::params![caller_name])
+                let mut a_rows = a_stmt
+                    .query(rusqlite::params![id as i64])
                     .map_err(|e| e.to_string())?;
-                if let Some(c_row) = c_rows.next().map_err(|e| e.to_string())? {
-                    Some(c_row.get::<_, i64>(0).map_err(|e| e.to_string())? as u64)
-                } else {
-                    None
-                }
+                a_rows.next().map_err(|e| e.to_string())?.is_some()
             };
 
-            let new_cursor = current_cursor.map(|c| c.max(id)).unwrap_or(id);
+            if is_already_acked {
+                return Err(format!("mail #{id} is already acked"));
+            }
+
             let mut set_stmt = conn
                 .prepare_cached(
                     r#"
-                    INSERT INTO cursors (consumer, trigger_id) VALUES (?1, ?2)
-                    ON CONFLICT(consumer) DO UPDATE SET trigger_id = MAX(trigger_id, excluded.trigger_id)
+                    INSERT INTO trigger_acks (trigger_id, acked_ms, acked_by) VALUES (?1, ?2, ?3)
+                    ON CONFLICT(trigger_id) DO NOTHING
                     "#,
                 )
                 .map_err(|e| e.to_string())?;
             set_stmt
-                .execute(rusqlite::params![caller_name, new_cursor as i64])
+                .execute(rusqlite::params![id as i64, _now as i64, caller_name])
                 .map_err(|e| e.to_string())?;
 
             acked_ids.push(id);

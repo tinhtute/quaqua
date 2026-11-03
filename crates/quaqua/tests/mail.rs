@@ -135,7 +135,16 @@ fn test_ack_by_non_recipient_refused() {
     assert_eq!(acked_ids, vec![res.id]);
 
     let cursor_after = bus.get_cursor("cos").expect("get cursor");
-    assert_eq!(cursor_after, Some(res.id));
+    assert!(
+        cursor_after.is_none(),
+        "M1: mail ack must not move consumer cursor"
+    );
+
+    let inbox_view = mail::render_inbox(&runs, "cos").expect("render inbox");
+    assert!(
+        inbox_view.contains("no unacked mail for 'cos'"),
+        "acked mail must not appear in inbox: {inbox_view}"
+    );
 }
 
 #[test]
