@@ -836,16 +836,17 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
-/// Last write time of an opencode session store row.
+/// Database files that can hold a session's `session_message` rows, in probe
+/// order. `env_db` is `QUAQUA_COST_DB_PATH`.
 ///
-/// Uses `session_message.time_updated` for the session id (the shared db-wal
-/// mtime is not a per-session signal).
-fn opencode_session_mtime(session_id: &str) -> Option<u64> {
+/// The live workspace DB is never among them: [`crate::workspace::live_db_open_refused`]
+/// drops it here, before the first open, so a test whose `QUAQUA_COST_DB_PATH`
+/// names `$HOME/quaqua/runs/quaqua.db` reads nothing instead of the owner's
+/// journal.
+fn opencode_session_db_candidates_from(env_db: Option<PathBuf>) -> Vec<PathBuf> {
     let mut db_candidates = Vec::new();
-    if let Ok(env_db) = std::env::var("QUAQUA_COST_DB_PATH") {
-        if !env_db.is_empty() {
-            db_candidates.push(std::path::PathBuf::from(env_db));
-        }
+    if let Some(db) = env_db {
+        db_candidates.push(db);
     }
     let state_dir = default_runs_dir().join(".opencode-state");
     if let Ok(entries) = std::fs::read_dir(&state_dir) {
@@ -857,13 +858,28 @@ fn opencode_session_mtime(session_id: &str) -> Option<u64> {
         }
     }
     if let Ok(home) = std::env::var("HOME") {
-        db_candidates
-            .push(std::path::PathBuf::from(home).join(".local/share/opencode/opencode.db"));
+        db_candidates.push(PathBuf::from(home).join(".local/share/opencode/opencode.db"));
     }
-    for db_path in db_candidates {
-        if crate::workspace::live_db_open_refused(&db_path) {
-            continue;
-        }
+    db_candidates.retain(|p| !crate::workspace::live_db_open_refused(p));
+    db_candidates
+}
+
+/// [`opencode_session_db_candidates_from`] with `QUAQUA_COST_DB_PATH` as the
+/// env-provided candidate.
+fn opencode_session_db_candidates() -> Vec<PathBuf> {
+    let env_db = std::env::var("QUAQUA_COST_DB_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    opencode_session_db_candidates_from(env_db)
+}
+
+/// Last write time of an opencode session store row.
+///
+/// Uses `session_message.time_updated` for the session id (the shared db-wal
+/// mtime is not a per-session signal).
+fn opencode_session_mtime(session_id: &str) -> Option<u64> {
+    for db_path in opencode_session_db_candidates() {
         if !db_path.is_file() {
             continue;
         }
@@ -1272,6 +1288,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The live workspace DB must never reach the session-mtime opener: under
+    /// test the candidate list drops it, so `QUAQUA_COST_DB_PATH` naming it
+    /// reads nothing instead of the owner's journal.
+    #[test]
+    fn test_session_db_candidates_refuse_the_live_workspace_db() {
+        let live = crate::workspace::live_workspace_db().expect("system user home");
+        let refused = opencode_session_db_candidates_from(Some(live.clone()));
+        assert!(
+            !refused.contains(&live),
+            "the live workspace DB {live:?} must never be a session-mtime candidate, got {refused:?}"
+        );
+
+        // Control: a candidate outside the live workspace survives the filter,
+        // so the assertion above cannot pass just because the list is empty.
+        let other = std::env::temp_dir().join("quaqua-session-candidates/opencode.db");
+        let kept = opencode_session_db_candidates_from(Some(other.clone()));
+        assert!(
+            kept.contains(&other),
+            "a non-live candidate must still be probed, got {kept:?}"
+        );
     }
 
     #[test]

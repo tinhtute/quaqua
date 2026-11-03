@@ -189,6 +189,10 @@ impl Harness {
             ("QUAQUA_PRINCIPLES_DIR", pr_dir.display().to_string()),
             ("GRID_SKIP", "1".to_string()),
             ("QUAQUA_TEST", "1".to_string()),
+            // Identity seam: with no pane (`HERDR_PANE_ID` unset, as on CI) the
+            // caller comes from `QUAQUA_OWNER` under `QUAQUA_TEST=1`. Pin it so
+            // the test never inherits an ambient owner.
+            ("QUAQUA_OWNER", "cos".to_string()),
             ("CALLS", calls.display().to_string()),
             ("STUB_RUNS", runs.display().to_string()),
             ("STUB_CWD", sandbox.0.display().to_string()),
