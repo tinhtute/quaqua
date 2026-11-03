@@ -67,6 +67,8 @@ struct LegacyMail {
     farm: Option<String>,
     acked_ms: Option<u64>,
     acked_by: Option<String>,
+    msg_key: Option<String>,
+    project: Option<String>,
 }
 
 struct LegacyCursor {
@@ -245,13 +247,33 @@ pub fn migrate_bus<H: HerdrOps>(
         let has_farm_col = table_has_column(&conn, "mail", "farm");
         let has_acked_ms_col = table_has_column(&conn, "mail", "acked_ms");
         let has_acked_by_col = table_has_column(&conn, "mail", "acked_by");
+        let has_msg_key_col = table_has_column(&conn, "mail", "msg_key");
+        let has_project_col = table_has_column(&conn, "mail", "project");
 
         let farm_expr = if has_farm_col { "farm" } else { "NULL AS farm" };
-        let acked_ms_expr = if has_acked_ms_col { "acked_ms" } else { "NULL AS acked_ms" };
-        let acked_by_expr = if has_acked_by_col { "acked_by" } else { "NULL AS acked_by" };
+        let acked_ms_expr = if has_acked_ms_col {
+            "acked_ms"
+        } else {
+            "NULL AS acked_ms"
+        };
+        let acked_by_expr = if has_acked_by_col {
+            "acked_by"
+        } else {
+            "NULL AS acked_by"
+        };
+        let msg_key_expr = if has_msg_key_col {
+            "msg_key"
+        } else {
+            "NULL AS msg_key"
+        };
+        let project_expr = if has_project_col {
+            "project"
+        } else {
+            "NULL AS project"
+        };
 
         let query = format!(
-            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, {farm_expr}, {acked_ms_expr}, {acked_by_expr} FROM mail ORDER BY ts_ms ASC, id ASC"
+            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, {farm_expr}, {acked_ms_expr}, {acked_by_expr}, {msg_key_expr}, {project_expr} FROM mail ORDER BY ts_ms ASC, id ASC"
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -267,6 +289,8 @@ pub fn migrate_bus<H: HerdrOps>(
                     farm: row.get(7)?,
                     acked_ms: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
                     acked_by: row.get(9)?,
+                    msg_key: row.get(10)?,
+                    project: row.get(11)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -401,6 +425,27 @@ pub fn migrate_bus<H: HerdrOps>(
 
         let farm_final = m.farm.clone().unwrap_or_else(|| local_farm.clone());
 
+        // Identity + metadata must survive exactly as mail::send_mail writes them, or the
+        // readers (decode_mail_fields, dedupe on `mail:<msg_key>`) lose both.
+        let mut ref_parts = Vec::new();
+        if let Some(r) = m.reply_to {
+            ref_parts.push(format!("mail:{r}"));
+        }
+        if let Some(p) = &m.project {
+            ref_parts.push(format!("project:{p}"));
+        }
+        let ref_val = if ref_parts.is_empty() {
+            None
+        } else {
+            Some(ref_parts.join(";"))
+        };
+        let dedupe_key = m
+            .msg_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("mail:{k}"));
+
         candidates.push(CandidateTrigger {
             legacy_ref: LegacyRef::Mail(m.id),
             ts_ms: m.ts_ms,
@@ -410,9 +455,9 @@ pub fn migrate_bus<H: HerdrOps>(
             to_name: Some(m.to_name.clone()),
             thread_id,
             summary: summary_final,
-            ref_val: m.reply_to.map(|id| format!("mail:{id}")),
+            ref_val,
             payload_json: Some(m.body.clone()),
-            dedupe_key: None,
+            dedupe_key,
             farm: farm_final,
         });
     }

@@ -578,7 +578,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
     assert_eq!(trigs[1].to_name.as_deref(), Some("w1"));
     assert_eq!(trigs[1].thread_id, "agent:w1");
     assert_eq!(trigs[1].summary, "Fix bug");
-    assert_eq!(trigs[1].dedupe_key, None);
+    assert_eq!(trigs[1].dedupe_key.as_deref(), Some("mail:m:1"));
     assert_eq!(trigs[1].farm, "farmA");
 
     // Verify trigger 3: farm_event (ts=300)
@@ -601,6 +601,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
         trigs[3].summary,
         "Tiến độ hoàn thành 100% tiếng Việt có dấu"
     );
+    assert_eq!(trigs[3].dedupe_key.as_deref(), Some("mail:m:2"));
 
     // Verify threads
     // Verify threads: exactly agent:w1 and agent:cos (no phantom agent:unknown)
@@ -1239,6 +1240,7 @@ fn test_migrate_preserves_owner_project_and_mail_metadata() {
     assert_eq!(digest.unacked_mail.len(), 1);
     let mail_msg = &digest.unacked_mail[0];
     assert_eq!(mail_msg.from_role, "lead");
+    assert_eq!(mail_msg.msg_key, "m1");
     assert_eq!(mail_msg.project.as_deref(), Some("myproj"));
     assert_eq!(mail_msg.reply_to, None);
     assert_eq!(mail_msg.body, "important message");
@@ -1287,7 +1289,9 @@ fn test_migrate_mail_preserves_dedupe_key_and_project() {
 
     let read_mail_triggers = |conn: &Connection| -> Vec<(String, Option<String>, Option<String>)> {
         let mut stmt = conn
-            .prepare("SELECT actor, dedupe_key, ref FROM triggers WHERE source = 'mail' ORDER BY id ASC")
+            .prepare(
+                "SELECT actor, dedupe_key, ref FROM triggers WHERE source = 'mail' ORDER BY id ASC",
+            )
             .unwrap();
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -1316,7 +1320,7 @@ fn test_migrate_mail_preserves_dedupe_key_and_project() {
         );
         assert_eq!(
             rows[1].2.as_deref(),
-            Some("mail:2;project:projY"),
+            Some("mail:1;project:projY"),
             "ref syntax must match send_mail: reply first, project second, ';' separated"
         );
     }
@@ -1343,7 +1347,7 @@ fn test_migrate_mail_preserves_dedupe_key_and_project() {
             expected.push((
                 "cos".to_string(),
                 Some("mail:cos-m2".to_string()),
-                Some("mail:2;project:projY".to_string()),
+                Some("mail:1;project:projY".to_string()),
             ));
             expected
         });
