@@ -1580,3 +1580,92 @@ fn test_mail_send_fails_open_when_pane_get_is_unreadable() {
         .expect("an unreadable pane answer must not block mail");
     assert!(res.id > 0);
 }
+
+#[test]
+fn test_reack_mail_is_idempotent_noop() {
+    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID"]);
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "bus-lead");
+    let runs = hermetic_temp_dir("reack-idempotent");
+    let herdr = Herdr::new();
+
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "directive".to_string(),
+        body: "directive payload".to_string(),
+        project: Some("bus".to_string()),
+        reply_to: None,
+        client_id: None,
+    };
+    let res = mail::send_mail(&runs, &opts, &herdr).expect("send mail");
+
+    // First ack succeeds
+    let acked1 = mail::ack_mail(&runs, "cos", &[res.id]).expect("first ack succeeds");
+    assert_eq!(acked1, vec![res.id]);
+
+    // Re-ack must be an idempotent no-op (succeeds with Ok, exit 0)
+    let acked2 = mail::ack_mail(&runs, "cos", &[res.id]).expect("re-ack must succeed as no-op");
+    assert_eq!(acked2, vec![res.id]);
+}
+
+#[test]
+fn test_multi_id_ack_is_all_or_nothing_in_single_tx() {
+    let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID"]);
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "bus-lead");
+    let runs = hermetic_temp_dir("multi-ack-atomic");
+    let herdr = Herdr::new();
+
+    let opts1 = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "directive".to_string(),
+        body: "mail for cos".to_string(),
+        project: Some("bus".to_string()),
+        reply_to: None,
+        client_id: None,
+    };
+    let res1 = mail::send_mail(&runs, &opts1, &herdr).expect("send mail 1");
+
+    let opts2 = SendMailOpts {
+        to: "other-agent".to_string(),
+        kind: "directive".to_string(),
+        body: "mail for other".to_string(),
+        project: Some("bus".to_string()),
+        reply_to: None,
+        client_id: None,
+    };
+    let res2 = mail::send_mail(&runs, &opts2, &herdr).expect("send mail 2");
+
+    // Attempt multi-id ack where cos is recipient of mail 1, but NOT mail 2
+    let err = mail::ack_mail(&runs, "cos", &[res1.id, res2.id])
+        .expect_err("multi-id ack with unauthorized id must fail");
+    assert!(
+        err.contains("refused") || err.contains("recipient"),
+        "expected recipient refusal error, got: {err}"
+    );
+
+    // Atomicity check: mail 1 must NOT be acked because the tx rolled back
+    let inbox = mail::read_inbox(&runs, "cos").expect("read inbox");
+    assert_eq!(
+        inbox.len(),
+        1,
+        "mail 1 must remain unacked in inbox after aborted multi-ack"
+    );
+    assert_eq!(inbox[0].id, res1.id);
+
+    let bus = FarmBus::open(&runs.join("quaqua.db")).expect("open bus");
+    let conn = bus.conn_for_test();
+    let ack_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM trigger_acks WHERE trigger_id = ?1",
+            rusqlite::params![res1.id as i64],
+            |r| r.get(0),
+        )
+        .expect("query trigger_acks");
+    assert_eq!(
+        ack_count, 0,
+        "trigger_acks must NOT contain mail 1 when multi-id ack fails"
+    );
+}

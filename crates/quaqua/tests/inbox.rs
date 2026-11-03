@@ -1061,3 +1061,74 @@ fn test_finding_m1_mail_ack_never_drops_unread_incidents_or_unacked_lower_mail()
     assert_eq!(digest.incidents[0].event_type, "blocked");
     assert_eq!(digest.incidents[0].seq, 3);
 }
+
+#[test]
+fn test_finding_r2_follow_tick_never_redelivers_acked_mail() {
+    let runs_dir = hermetic_temp_dir("r2-follow-ack");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "mu-lead");
+    guard.remove("HERDR_PANE_ID");
+
+    // 1. Initial event establishes cos cursor at 1
+    let ev0 = quaqua::bus::FarmEvent::new(
+        "spawned",
+        Some("cos"),
+        Some("w0"),
+        Some("cos"),
+        Some("p1"),
+    )
+    .with_incident_key("k0");
+    bus.record(&ev0).unwrap();
+    let d0 = bus.inbox_digest(&runs_dir, "cos").unwrap();
+    assert_eq!(d0.new_cursor, 1);
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
+
+    // 2. Trigger 2: send mail to cos
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "directive".to_string(),
+        body: "directive body".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    let send_res = mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    assert_eq!(send_res.id, 2);
+
+    // 3. cos acks mail #2
+    let acked = mail::ack_mail(&runs_dir, "cos", &[send_res.id]).expect("ack mail");
+    assert_eq!(acked, vec![2]);
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
+
+    // 4. Simulate inbox --follow --for cos
+    let initial_digest = bus.inbox_digest(&runs_dir, "cos").expect("initial digest");
+    assert_eq!(initial_digest.unacked_mail.len(), 0);
+    let mut last_seen_mail = initial_digest
+        .unacked_mail
+        .iter()
+        .map(|m| m.id)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(last_seen_mail, 0);
+
+    // First tick must NOT redeliver acked mail #2
+    let tick = bus
+        .follow_tick(&runs_dir, "cos", &mut last_seen_mail)
+        .expect("follow tick");
+    assert_eq!(
+        tick.unacked_mail.len(),
+        0,
+        "acked mail #2 must NOT be redelivered in follow_tick; got: {:?}",
+        tick.unacked_mail
+    );
+}
