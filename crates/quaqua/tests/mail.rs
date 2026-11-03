@@ -354,7 +354,7 @@ fn test_mail_send_preserves_project_and_reply_to() {
     let guard = EnvGuard::new(&["QUAQUA_TEST", "QUAQUA_OWNER", "HERDR_PANE_ID"]);
     guard.remove("HERDR_PANE_ID");
     guard.set("QUAQUA_TEST", "1");
-    guard.set("QUAQUA_OWNER", "superproj-lead");
+    guard.set("QUAQUA_OWNER", "alpha-lead");
     let runs = hermetic_temp_dir("mail-metadata");
     let herdr = Herdr::new();
 
@@ -362,7 +362,7 @@ fn test_mail_send_preserves_project_and_reply_to() {
         to: "cos".to_string(),
         kind: "handoff".to_string(),
         body: "testing project and reply-to".to_string(),
-        project: Some("superproj".to_string()),
+        project: Some("explicit-custom-project".to_string()),
         reply_to: Some(99),
         client_id: None,
     };
@@ -373,7 +373,7 @@ fn test_mail_send_preserves_project_and_reply_to() {
     let msgs = mail::read_inbox(&runs, "cos").expect("read inbox");
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].from_role, "lead");
-    assert_eq!(msgs[0].project.as_deref(), Some("superproj"));
+    assert_eq!(msgs[0].project.as_deref(), Some("explicit-custom-project"));
     assert_eq!(msgs[0].reply_to, Some(99));
     assert_eq!(msgs[0].body, "testing project and reply-to");
 }

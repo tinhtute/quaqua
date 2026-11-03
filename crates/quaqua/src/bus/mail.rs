@@ -705,7 +705,18 @@ pub fn send_mail<H: HerdrOps>(
         };
 
         let dedupe_key = format!("mail:{msg_key}");
-        let ref_val = opts.reply_to.map(|id| format!("mail:{id}"));
+        let mut ref_parts = Vec::new();
+        if let Some(r) = opts.reply_to {
+            ref_parts.push(format!("mail:{r}"));
+        }
+        if let Some(ref p) = opts.project {
+            ref_parts.push(format!("project:{p}"));
+        }
+        let ref_val = if ref_parts.is_empty() {
+            None
+        } else {
+            Some(ref_parts.join(";"))
+        };
         let rows = tx.execute(
             r#"
             INSERT OR IGNORE INTO triggers (
@@ -1575,9 +1586,6 @@ mod tests {
         assert_eq!(ts, parsed);
     }
 }
-
-/// Decodes structured mail fields from trigger `payload_json`.
-/// Falls back to treating `payload_json` as plain body if not a structured JSON object.
 /// Decodes mail body and metadata (from_role, project, reply_to) from trigger fields.
 pub fn decode_mail_fields(
     payload_str: Option<&str>,
@@ -1594,15 +1602,26 @@ pub fn decode_mail_fields(
     }
     .to_string();
 
-    let project = if actor.ends_with("-lead") {
-        actor.strip_suffix("-lead").map(String::from)
-    } else {
-        None
-    };
+    let mut reply_to = None;
+    let mut project = None;
 
-    let reply_to = ref_str
-        .and_then(|r| r.strip_prefix("mail:"))
-        .and_then(|s| s.parse::<u64>().ok());
+    if let Some(r) = ref_str {
+        for part in r.split(';') {
+            if let Some(m) = part.strip_prefix("mail:") {
+                reply_to = m.parse::<u64>().ok();
+            } else if let Some(p) = part.strip_prefix("project:") {
+                project = Some(p.to_string());
+            }
+        }
+    }
+
+    if project.is_none() {
+        project = if actor.ends_with("-lead") {
+            actor.strip_suffix("-lead").map(String::from)
+        } else {
+            None
+        };
+    }
 
     (body, from_role, project, reply_to)
 }

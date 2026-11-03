@@ -133,17 +133,14 @@ impl FarmBus {
 
         if path.exists() {
             let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-            let shm_path = PathBuf::from(format!("{}-shm", path.display()));
-            let wal_existed = wal_path.exists();
-            let shm_existed = shm_path.exists();
-
-            let has_legacy_probe: bool = (|| -> rusqlite::Result<bool> {
+            let is_legacy = if !wal_path.exists() {
                 let uri = format!("file:{}?immutable=1", path.display());
-                if let Ok(imm_conn) = rusqlite::Connection::open_with_flags(
-                    &uri,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                ) {
+                (|| -> rusqlite::Result<bool> {
+                    let imm_conn = rusqlite::Connection::open_with_flags(
+                        &uri,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    )?;
                     let legacy_count: i64 = imm_conn
                         .query_row(
                             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
@@ -151,73 +148,42 @@ impl FarmBus {
                             |r| r.get(0),
                         )
                         .unwrap_or(0);
-                    if legacy_count > 0 {
-                        return Ok(true);
-                    }
-                    let has_cursors: bool = imm_conn
+                    let triggers_count: i64 = imm_conn
                         .query_row(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'cursors'",
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'triggers'",
                             [],
-                            |r| r.get::<_, i64>(0),
+                            |r| r.get(0),
                         )
-                        .map(|c| c > 0)
-                        .unwrap_or(false);
-                    if has_cursors {
-                        if let Ok(mut stmt) = imm_conn.prepare("PRAGMA table_info(cursors)") {
-                            if let Ok(mut rows) = stmt.query([]) {
-                                while let Ok(Some(row)) = rows.next() {
-                                    if let Ok(col_name) = row.get::<_, String>(1) {
-                                        if col_name == "seq" {
-                                            return Ok(true);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                        .unwrap_or(0);
+                    Ok(legacy_count > 0 && triggers_count == 0)
+                })()
+                .unwrap_or(false)
+            } else {
+                (|| -> rusqlite::Result<bool> {
+                    let ro_conn = rusqlite::Connection::open_with_flags(
+                        path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?;
+                    let legacy_count: i64 = ro_conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    let triggers_count: i64 = ro_conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'triggers'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    Ok(legacy_count > 0 && triggers_count == 0)
+                })()
+                .unwrap_or(false)
+            };
 
-                let ro_conn = rusqlite::Connection::open_with_flags(
-                    path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                let legacy_table_count: i64 = ro_conn.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if legacy_table_count > 0 {
-                    return Ok(true);
-                }
-                let has_cursors: bool = ro_conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'cursors'",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map(|c| c > 0)
-                    .unwrap_or(false);
-                if has_cursors {
-                    let mut stmt = ro_conn.prepare("PRAGMA table_info(cursors)")?;
-                    let mut rows = stmt.query([])?;
-                    while let Some(row) = rows.next()? {
-                        let col_name: String = row.get(1)?;
-                        if col_name == "seq" {
-                            return Ok(true);
-                        }
-                    }
-                }
-                Ok(false)
-            })()
-            .unwrap_or(false);
-
-            if has_legacy_probe {
-                if !wal_existed && wal_path.exists() {
-                    let _ = std::fs::remove_file(&wal_path);
-                }
-                if !shm_existed && shm_path.exists() {
-                    let _ = std::fs::remove_file(&shm_path);
-                }
+            if is_legacy {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                     std::io::Error::other(LEGACY_DB_ERROR_MSG),
                 )));

@@ -60,10 +60,8 @@ struct LegacyMail {
     id: u64,
     ts_ms: u64,
     from_name: String,
-    from_role: String,
     to_name: String,
     kind: String,
-    project: Option<String>,
     reply_to: Option<u64>,
     body: String,
     farm: Option<String>,
@@ -244,9 +242,9 @@ pub fn migrate_bus<H: HerdrOps>(
     let mails: Vec<LegacyMail> = if has_mail {
         let has_farm_col = table_has_column(&conn, "mail", "farm");
         let query = if has_farm_col {
-            "SELECT id, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, farm FROM mail ORDER BY ts_ms ASC, id ASC"
+            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, farm FROM mail ORDER BY ts_ms ASC, id ASC"
         } else {
-            "SELECT id, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, NULL AS farm FROM mail ORDER BY ts_ms ASC, id ASC"
+            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, NULL AS farm FROM mail ORDER BY ts_ms ASC, id ASC"
         };
         let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -255,13 +253,11 @@ pub fn migrate_bus<H: HerdrOps>(
                     id: row.get::<_, i64>(0)? as u64,
                     ts_ms: row.get::<_, i64>(1)? as u64,
                     from_name: row.get(2)?,
-                    from_role: row.get(3)?,
-                    to_name: row.get(4)?,
-                    kind: row.get(5)?,
-                    project: row.get(6)?,
-                    reply_to: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                    body: row.get(8)?,
-                    farm: row.get(9)?,
+                    to_name: row.get(3)?,
+                    kind: row.get(4)?,
+                    reply_to: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    body: row.get(6)?,
+                    farm: row.get(7)?,
                 })
             })
             .map_err(|e| e.to_string())?;

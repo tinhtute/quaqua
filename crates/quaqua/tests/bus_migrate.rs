@@ -1144,3 +1144,50 @@ fn test_migrate_preserves_owner_project_and_mail_metadata() {
     assert_eq!(mail_msg.reply_to, None);
     assert_eq!(mail_msg.body, "important message");
 }
+
+#[test]
+fn test_migrated_wal_db_open_succeeds_even_when_uncheckpointed() {
+    let tmp = hermetic_temp_dir("migrated-uncheckpointed");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Open a reader connection that holds a shared lock to prevent checkpoint truncate
+    let hold_conn =
+        Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let _ = hold_conn
+        .query_row("SELECT count(*) FROM farm_events", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+
+    let herdr = MockHerdr::with_raw(r#"{"result":{"agents":[]}}"#);
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.triggers_count, 1);
+
+    let wal_path = tmp.join("quaqua.db-wal");
+    assert!(
+        wal_path.exists(),
+        "WAL file should exist while hold_conn is active"
+    );
+
+    // F4: FarmBus::open must NOT misclassify the migrated DB as legacy even while schema is in WAL
+    let bus = FarmBus::open(&db_path)
+        .expect("FarmBus::open must succeed on migrated uncheckpointed WAL DB");
+    let digest = bus
+        .inbox_digest(&tmp, "cos")
+        .expect("inbox digest must succeed");
+    assert_eq!(digest.incidents.len(), 1);
+
+    drop(hold_conn);
+}
