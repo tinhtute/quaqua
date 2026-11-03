@@ -65,6 +65,8 @@ struct LegacyMail {
     reply_to: Option<u64>,
     body: String,
     farm: Option<String>,
+    acked_ms: Option<u64>,
+    acked_by: Option<String>,
 }
 
 struct LegacyCursor {
@@ -241,12 +243,17 @@ pub fn migrate_bus<H: HerdrOps>(
     // Read legacy mail
     let mails: Vec<LegacyMail> = if has_mail {
         let has_farm_col = table_has_column(&conn, "mail", "farm");
-        let query = if has_farm_col {
-            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, farm FROM mail ORDER BY ts_ms ASC, id ASC"
-        } else {
-            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, NULL AS farm FROM mail ORDER BY ts_ms ASC, id ASC"
-        };
-        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+        let has_acked_ms_col = table_has_column(&conn, "mail", "acked_ms");
+        let has_acked_by_col = table_has_column(&conn, "mail", "acked_by");
+
+        let farm_expr = if has_farm_col { "farm" } else { "NULL AS farm" };
+        let acked_ms_expr = if has_acked_ms_col { "acked_ms" } else { "NULL AS acked_ms" };
+        let acked_by_expr = if has_acked_by_col { "acked_by" } else { "NULL AS acked_by" };
+
+        let query = format!(
+            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, {farm_expr}, {acked_ms_expr}, {acked_by_expr} FROM mail ORDER BY ts_ms ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(LegacyMail {
@@ -258,6 +265,8 @@ pub fn migrate_bus<H: HerdrOps>(
                     reply_to: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                     body: row.get(6)?,
                     farm: row.get(7)?,
+                    acked_ms: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                    acked_by: row.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -540,6 +549,12 @@ pub fn migrate_bus<H: HerdrOps>(
                 trigger_id INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS trigger_acks (
+                trigger_id INTEGER PRIMARY KEY REFERENCES triggers(id),
+                acked_ms   INTEGER NOT NULL,
+                acked_by   TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS source_state (
                 source TEXT PRIMARY KEY,
                 value  TEXT NOT NULL
@@ -562,7 +577,7 @@ pub fn migrate_bus<H: HerdrOps>(
             }
         }
 
-        // Populate triggers
+        // Populate triggers and trigger_acks
         {
             let mut trig_stmt = tx.prepare_cached(
                 r#"
@@ -571,7 +586,11 @@ pub fn migrate_bus<H: HerdrOps>(
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 "#,
             )?;
-            for cand in &candidates {
+            let mut ack_stmt = tx.prepare_cached(
+                "INSERT INTO trigger_acks (trigger_id, acked_ms, acked_by) VALUES (?1, ?2, ?3)",
+            )?;
+            for (idx, cand) in candidates.iter().enumerate() {
+                let new_trigger_id = (idx + 1) as u64;
                 trig_stmt.execute(rusqlite::params![
                     cand.ts_ms as i64,
                     cand.source,
@@ -585,9 +604,20 @@ pub fn migrate_bus<H: HerdrOps>(
                     cand.dedupe_key,
                     cand.farm,
                 ])?;
+
+                if let LegacyRef::Mail(mail_id) = cand.legacy_ref {
+                    if let Some(m) = mails.iter().find(|m| m.id == mail_id) {
+                        if let Some(acked_ms) = m.acked_ms {
+                            ack_stmt.execute(rusqlite::params![
+                                new_trigger_id as i64,
+                                acked_ms as i64,
+                                m.acked_by.as_deref(),
+                            ])?;
+                        }
+                    }
+                }
             }
         }
-
         // Populate cursors_new
         {
             let mut cur_stmt = tx.prepare_cached(

@@ -523,10 +523,10 @@ pub fn check_unacked_incidents(
         r#"
         SELECT t.id, t.ts_ms, t.actor, t.to_name, t.kind, t.farm
         FROM triggers t
-        LEFT JOIN cursors c ON c.consumer = t.to_name
+        LEFT JOIN trigger_acks a ON a.trigger_id = t.id
         WHERE t.source = 'mail'
           AND t.ts_ms <= ?1
-          AND (c.trigger_id IS NULL OR c.trigger_id < t.id)
+          AND a.trigger_id IS NULL
           AND (t.farm = ?2 OR t.farm IS NULL)
         "#,
     )?;
@@ -828,29 +828,16 @@ pub fn read_unacked_mail_since(
     let timeout_ms = get_mail_ack_timeout_ms();
     let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
     let now = crate::bus::now_ms();
-    let min_id = if since_id > 0 {
-        since_id
-    } else {
-        let mut c_stmt = conn
-            .prepare_cached("SELECT trigger_id FROM cursors WHERE consumer = ?1")
-            .map_err(|e| e.to_string())?;
-        let mut c_rows = c_stmt
-            .query(rusqlite::params![to_name])
-            .map_err(|e| e.to_string())?;
-        if let Some(c_row) = c_rows.next().map_err(|e| e.to_string())? {
-            c_row.get::<_, i64>(0).map_err(|e| e.to_string())? as u64
-        } else {
-            0
-        }
-    };
+    let min_id = since_id;
 
     let mut stmt = conn
         .prepare_cached(
             r#"
-            SELECT id, dedupe_key, ts_ms, actor, to_name, kind, payload_json, ref, farm
-            FROM triggers
-            WHERE source = 'mail' AND to_name = ?1 AND id > ?2 AND (farm = ?3 OR farm IS NULL)
-            ORDER BY id ASC
+            SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm
+            FROM triggers t
+            LEFT JOIN trigger_acks a ON a.trigger_id = t.id
+            WHERE t.source = 'mail' AND t.to_name = ?1 AND a.trigger_id IS NULL AND t.id > ?2 AND (t.farm = ?3 OR t.farm IS NULL)
+            ORDER BY t.id ASC
             "#,
         )
         .map_err(|e| e.to_string())?;
@@ -1224,9 +1211,9 @@ pub fn list_mail(
 
     let mut query = String::from(
         r#"
-        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm, c.trigger_id
+        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm, a.acked_ms, a.acked_by
         FROM triggers t
-        LEFT JOIN cursors c ON c.consumer = t.to_name
+        LEFT JOIN trigger_acks a ON a.trigger_id = t.id
         WHERE t.source = 'mail' AND (t.farm = ? OR t.farm IS NULL)
         "#,
     );
@@ -1263,12 +1250,9 @@ pub fn list_mail(
             let raw_payload: Option<String> = row.get(6)?;
             let ref_val: Option<String> = row.get(7)?;
             let _farm: Option<String> = row.get(8)?;
-            let cursor_id: Option<i64> = row.get(9)?;
-            let acked_ms = if cursor_id.map(|cid| cid >= id as i64).unwrap_or(false) {
-                Some(ts_ms)
-            } else {
-                None
-            };
+            let acked_ms: Option<i64> = row.get(9)?;
+            let acked_by: Option<String> = row.get(10)?;
+            let acked_ms = acked_ms.map(|v| v as u64);
             let (body, from_role, project, reply_to) =
                 decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
 
@@ -1286,7 +1270,7 @@ pub fn list_mail(
                 deliveries: 1,
                 last_delivered_ms: Some(ts_ms),
                 acked_ms,
-                acked_by: None,
+                acked_by,
             })
         })
         .map_err(|e| e.to_string())?;
