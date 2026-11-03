@@ -695,6 +695,331 @@ impl FarmBus {
             new_mail_cursor: *last_seen_mail_id,
         })
     }
+
+    /// Selects the triggers a digest for `consumer` renders, from `from_id` (exclusive).
+    ///
+    /// Farm-scoped, and limited to what is addressed to `consumer`: rows with no
+    /// recipient (incidents), rows addressed to it, and rows on a thread it is
+    /// currently subscribed to. `mail inbox --all` reads the whole history this way.
+    pub fn digest_rows(&self, consumer: &str, from_id: u64) -> rusqlite::Result<Vec<DigestRow>> {
+        let conn = self.conn.lock().unwrap();
+        let now = crate::bus::now_ms() as i64;
+        crate::engine::sqlite::retry_while_busy(|| {
+            query_digest_rows(
+                &conn,
+                from_id,
+                &self.farm,
+                consumer,
+                now,
+                self.path().parent().unwrap_or(Path::new(".")),
+            )
+            .map(|batch| batch.rows)
+        })
+    }
+
+    /// Renders one digest batch for `consumer` from its cursor and, when `advance` is
+    /// set, moves the cursor past the batch — all in one transaction. Returns "" when
+    /// nothing is new. A repeated call with `advance` and no new rows leaves the cursor
+    /// where it is, so re-running converges.
+    pub fn inbox_batch(&self, consumer: &str, advance: bool) -> Result<String, String> {
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn.lock().unwrap();
+        let now = crate::bus::now_ms() as i64;
+        let res: rusqlite::Result<String> = crate::engine::sqlite::retry_while_busy(|| {
+            let tx = conn.transaction()?;
+            let prev_cursor: u64 = tx
+                .query_row(
+                    "SELECT trigger_id FROM cursors WHERE consumer = ?1",
+                    rusqlite::params![consumer],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0) as u64;
+
+            let runs_dir = self.path().parent().unwrap_or(Path::new("."));
+            let batch = query_digest_rows(&tx, prev_cursor, &self.farm, consumer, now, runs_dir)?;
+            let render = render_digest(&batch.rows, consumer);
+
+            if advance {
+                // One render is one batch (spec §6): the cursor moves past every row the
+                // batch evaluated — including the ones the consumer filters dropped, or they
+                // would be re-filtered on every read — so a repeat finds nothing left. Rows
+                // elided by the 20-line cap stay reachable through `--all`, which reads the
+                // whole history uncapped and never advances.
+                let target = batch.max_evaluated_id.max(prev_cursor);
+                if target > prev_cursor {
+                    tx.execute(
+                        r#"
+                        INSERT INTO cursors (consumer, trigger_id) VALUES (?1, ?2)
+                        ON CONFLICT(consumer) DO UPDATE SET trigger_id = excluded.trigger_id
+                        "#,
+                        rusqlite::params![consumer, target as i64],
+                    )?;
+                }
+            }
+
+            tx.commit()?;
+            Ok(render)
+        });
+        res.map_err(|e| format!("cannot read digest: {e}"))
+    }
+}
+
+/// A trigger row as rendered in a digest line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestRow {
+    pub id: u64,
+    pub kind: String,
+    pub actor: String,
+    pub thread_id: String,
+    pub summary: String,
+    pub ref_val: Option<String>,
+}
+
+/// Digest body lines before the spill line (`… +N more`), so a full render is ≤20 lines.
+pub const DIGEST_MAX_LINES: usize = 20;
+const DIGEST_BODY_LINES: usize = DIGEST_MAX_LINES - 1;
+
+const DIGEST_ROWS_SQL: &str = r#"
+    SELECT t.id, t.ts_ms, t.kind, t.actor, t.thread_id, t.summary, t.ref,
+           t.to_name, t.dedupe_key, t.payload_json, th.owner,
+           IFNULL((t.to_name = ?3
+                   OR EXISTS (SELECT 1 FROM subscriptions s
+                              WHERE s.thread_id = t.thread_id AND s.consumer = ?3
+                                AND s.until_ms >= ?4)), 0)
+    FROM triggers t
+    LEFT JOIN threads th ON t.thread_id = th.id
+    WHERE t.id > ?1
+      AND (t.farm = ?2 OR t.farm IS NULL)
+      AND (t.to_name IS NULL
+           OR t.to_name = ?3
+           OR EXISTS (SELECT 1 FROM subscriptions s
+                      WHERE s.thread_id = t.thread_id AND s.consumer = ?3 AND s.until_ms >= ?4))
+    ORDER BY t.id ASC
+"#;
+
+/// A candidate row plus the columns the consumer filters need.
+struct DigestCandidate {
+    row: DigestRow,
+    ts_ms: u64,
+    to_name: Option<String>,
+    dedupe_key: Option<String>,
+    payload_json: String,
+    thread_owner: Option<String>,
+    /// Addressed to the consumer, or on a thread it is subscribed to.
+    addressed: bool,
+}
+
+impl DigestCandidate {
+    fn as_event_record(&self) -> FarmEventRecord {
+        let thread_id = &self.row.thread_id;
+        let subject = thread_id
+            .strip_prefix("agent:")
+            .unwrap_or(thread_id)
+            .to_string();
+        let (owner, project) = match serde_json::from_str::<serde_json::Value>(&self.payload_json) {
+            Ok(v) => (
+                v.get("owner")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    .or_else(|| self.thread_owner.clone()),
+                v.get("project").and_then(|x| x.as_str()).map(String::from),
+            ),
+            Err(_) => (self.thread_owner.clone(), None),
+        };
+        FarmEventRecord {
+            seq: self.row.id,
+            ts_ms: self.ts_ms,
+            event_type: self.row.kind.clone(),
+            actor: Some(self.row.actor.clone()),
+            subject: Some(subject),
+            owner,
+            project,
+            incident_key: self.dedupe_key.clone(),
+            payload_json: self.payload_json.clone(),
+            farm: None,
+        }
+    }
+}
+
+/// The rows a digest batch renders, plus the highest id it evaluated.
+struct DigestBatch {
+    rows: Vec<DigestRow>,
+    max_evaluated_id: u64,
+}
+
+fn query_digest_rows(
+    conn: &rusqlite::Connection,
+    from_id: u64,
+    farm: &str,
+    consumer: &str,
+    now: i64,
+    runs_dir: &Path,
+) -> rusqlite::Result<DigestBatch> {
+    let mut stmt = conn.prepare_cached(DIGEST_ROWS_SQL)?;
+    let rows = stmt.query_map(
+        rusqlite::params![from_id as i64, farm, consumer, now],
+        |row| {
+            Ok(DigestCandidate {
+                row: DigestRow {
+                    id: row.get::<_, i64>(0)? as u64,
+                    kind: row.get(2)?,
+                    actor: row.get(3)?,
+                    thread_id: row.get(4)?,
+                    summary: row.get(5)?,
+                    ref_val: row.get(6)?,
+                },
+                ts_ms: row.get::<_, i64>(1)? as u64,
+                to_name: row.get(7)?,
+                dedupe_key: row.get(8)?,
+                payload_json: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| "{}".to_string()),
+                thread_owner: row.get(10)?,
+                addressed: row.get::<_, i64>(11)? != 0,
+            })
+        },
+    )?;
+    let mut candidates = Vec::new();
+    for r in rows {
+        candidates.push(r?);
+    }
+    // The cursor must clear every row the batch evaluated, admitted or not: a filtered
+    // row left above the cursor is re-filtered on every read and can resurface as new.
+    let max_evaluated_id = candidates.iter().map(|c| c.row.id).max().unwrap_or(0);
+
+    // Incidents carry no recipient, so they are admitted the same way the pre-digest
+    // `inbox_digest` admitted them: own-pane noise dropped, everything else scoped to
+    // the consumer's group. The own pane is resolved only when an incident is present.
+    let own_pane = if candidates
+        .iter()
+        .any(|c| c.to_name.is_none() && !c.addressed)
+    {
+        resolve_consumer_pane(consumer)
+    } else {
+        None
+    };
+
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if candidate.to_name.is_none() && !candidate.addressed {
+            if candidate.dedupe_key.is_none() {
+                continue;
+            }
+            let rec = candidate.as_event_record();
+            if is_consumer_own_pane_blocked_noise(&rec, own_pane.as_deref())
+                || !is_incident_in_consumer_group(&rec, consumer, runs_dir)
+            {
+                continue;
+            }
+        }
+        out.push(candidate.row);
+    }
+    Ok(DigestBatch {
+        rows: out,
+        max_evaluated_id,
+    })
+}
+
+/// Renders a digest batch: `#<id> <kind> <actor> <thread> <summary>[ → <ref>]`, grouped by
+/// thread (newest thread first), consecutive same-kind rows in a thread collapsed to
+/// `#<first>..#<last> <kind> ×N …`, capped at [`DIGEST_MAX_LINES`] lines.
+///
+/// Returns "" for an empty batch; that empty string is what the CoS hook treats as
+/// "nothing new".
+pub fn render_digest(rows: &[DigestRow], consumer: &str) -> String {
+    render_digest_lines(rows, Some(DIGEST_BODY_LINES), consumer)
+}
+
+/// Renders every row without the line cap: `mail inbox --all` is the spill line's
+/// escape hatch, so it must be able to show the rows the digest elided.
+pub fn render_digest_all(rows: &[DigestRow], consumer: &str) -> String {
+    render_digest_lines(rows, None, consumer)
+}
+
+fn render_digest_lines(rows: &[DigestRow], cap: Option<usize>, consumer: &str) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut sorted: Vec<&DigestRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.id);
+
+    // Group by thread, keeping each group's rows in id order.
+    let mut groups: Vec<(String, Vec<&DigestRow>)> = Vec::new();
+    for row in sorted {
+        match groups
+            .iter_mut()
+            .find(|(thread, _)| *thread == row.thread_id)
+        {
+            Some((_, group)) => group.push(row),
+            None => groups.push((row.thread_id.clone(), vec![row])),
+        }
+    }
+    // Thread with the newest trigger first.
+    groups
+        .sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|r| r.id).max().unwrap_or(0)));
+
+    // One line per run of consecutive same-kind rows inside a thread.
+    let mut lines: Vec<(String, Vec<u64>)> = Vec::new();
+    for (_, group) in &groups {
+        let mut i = 0;
+        while i < group.len() {
+            let kind = &group[i].kind;
+            let mut j = i + 1;
+            while j < group.len() && &group[j].kind == kind {
+                j += 1;
+            }
+            let run = &group[i..j];
+            let ids: Vec<u64> = run.iter().map(|r| r.id).collect();
+            let last = run[run.len() - 1];
+            let thread = last
+                .thread_id
+                .strip_prefix("agent:")
+                .unwrap_or(&last.thread_id);
+            let mut line = if run.len() > 1 {
+                format!(
+                    "#{}..#{} {} ×{} {} {} {}",
+                    ids[0],
+                    last.id,
+                    last.kind,
+                    run.len(),
+                    last.actor,
+                    thread,
+                    last.summary
+                )
+            } else {
+                format!(
+                    "#{} {} {} {} {}",
+                    last.id, last.kind, last.actor, thread, last.summary
+                )
+            };
+            if let Some(r) = &last.ref_val {
+                line.push_str(" → ");
+                line.push_str(r);
+            }
+            lines.push((line, ids));
+            i = j;
+        }
+    }
+
+    let cap = cap.unwrap_or(lines.len());
+    let spilled = lines.len().saturating_sub(cap);
+    let kept = lines.len().min(cap);
+    let mut text = String::new();
+    for (line, _) in &lines[..kept] {
+        text.push_str(line);
+        text.push('\n');
+    }
+
+    if spilled > 0 {
+        let dropped_rows: usize = lines[kept..].iter().map(|(_, ids)| ids.len()).sum();
+        text.push_str(&format!(
+            "… +{dropped_rows} more: quaqua mail inbox --for {consumer} --all\n"
+        ));
+    }
+
+    text
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

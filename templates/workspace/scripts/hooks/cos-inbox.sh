@@ -1,6 +1,6 @@
 #!/bin/sh
 # cos-inbox.sh — Claude Code hook for CoS lead mail notification.
-# Runs `quaqua inbox --for cos` for new unacked mail and injects a <=10-line digest.
+# Runs `quaqua mail inbox --for cos` and injects the batched digest (<=20 lines).
 # On UserPromptSubmit: injects additionalContext.
 # On Stop: blocks once with the digest so the CoS reports it.
 # Must be fast (<300 ms), silent when nothing new, and never fail the turn on error.
@@ -44,20 +44,15 @@ if [ -z "$QUAQUA" ] || (! command -v "$QUAQUA" >/dev/null 2>&1 && [ ! -x "$QUAQU
   exit 0
 fi
 
-# Run `quaqua inbox --for cos`
-RAW_OUT=$("$QUAQUA" inbox --for cos 2>/dev/null || true)
+# Run the one digest renderer; --for cos advances only when the caller is cos.
+RAW_OUT=$("$QUAQUA" mail inbox --for cos 2>/dev/null || true)
 
 if [ -z "$RAW_OUT" ]; then
   exit 0
 fi
 
-# Check if there is no unacked mail or incidents
-if echo "$RAW_OUT" | grep -q "no unacked mail or new incidents"; then
-  exit 0
-fi
-
-# Cap digest to <= 10 lines
-DIGEST=$(printf '%s\n' "$RAW_OUT" | head -n 10)
+# The renderer already caps at 20 lines; keep the cap if a caller ever widens it.
+DIGEST=$(printf '%s\n' "$RAW_OUT" | head -n 20)
 
 # Check if digest is empty after stripping whitespace
 if [ -z "$(printf '%s' "$DIGEST" | tr -d '[:space:]')" ]; then

@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 /// Maximum body length allowed by SQLite schema CHECK (length(body) <= 4096).
 pub const MAX_BODY_LEN: usize = 4096;
 
+/// Maximum digest summary length; matches the `triggers.summary` CHECK.
+pub const MAX_SUMMARY_LEN: usize = 80;
+
 /// Default mail ack timeout: 30 minutes in milliseconds.
 pub const DEFAULT_MAIL_ACK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
@@ -608,6 +611,22 @@ pub fn send_mail<H: HerdrOps>(
             "error: mail body exceeds {} characters (length: {})",
             MAX_BODY_LEN,
             opts.body.chars().count()
+        ));
+    }
+
+    // The digest renders the summary, so an over-long first line is rejected here
+    // instead of being silently truncated into the triggers row.
+    let first_line_len = opts
+        .body
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .count();
+    if first_line_len > MAX_SUMMARY_LEN {
+        return Err(format!(
+            "error: mail summary exceeds {MAX_SUMMARY_LEN} characters (length: {first_line_len}); keep the first line of the body to {MAX_SUMMARY_LEN} characters or fewer"
         ));
     }
 
@@ -1419,34 +1438,102 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
             Ok(0)
         }
         "inbox" => {
-            let mut for_user = None;
+            let mut for_user: Option<String> = None;
+            let mut peek = false;
+            let mut all = false;
             let mut i = 0;
             while i < subargs.len() {
-                if subargs[i] == "--for" {
-                    i += 1;
-                    if i < subargs.len() {
+                match subargs[i].as_str() {
+                    "--for" => {
+                        i += 1;
+                        if i >= subargs.len() {
+                            return Err("missing value for --for <name>".to_string());
+                        }
                         for_user = Some(subargs[i].clone());
                     }
+                    "--peek" => peek = true,
+                    "--all" => all = true,
+                    other => return Err(format!("unknown option for mail inbox: {other}")),
                 }
                 i += 1;
             }
 
-            let recipient = if let Some(u) = for_user {
-                u
-            } else {
-                let caller = crate::identity::resolve_caller(herdr, &runs_dir);
-                if caller.role != crate::identity::Role::Unknown {
-                    caller.name
-                } else {
-                    return Err(
-                        "cannot determine recipient identity from harness (unresolved caller)"
-                            .to_string(),
-                    );
+            // Identity is resolved before the bus is opened, so an unresolved caller
+            // cannot move any consumer's cursor.
+            let caller = crate::identity::resolve_caller(herdr, &runs_dir);
+            let known = caller.role != crate::identity::Role::Unknown;
+
+            let (consumer, advance) = match for_user {
+                Some(name) => {
+                    if peek {
+                        (name, false)
+                    } else if known && caller.name == name {
+                        (name, true)
+                    } else {
+                        // Reading for someone else must not consume their mail.
+                        eprintln!(
+                            "warning: caller '{}' cannot advance the cursor for '{name}'; rendering without advancing (peek)",
+                            caller.name
+                        );
+                        (name, false)
+                    }
+                }
+                None => {
+                    if !known {
+                        return Err(
+                            "cannot determine recipient identity from harness (unresolved caller)"
+                                .to_string(),
+                        );
+                    }
+                    (caller.name.clone(), !peek)
                 }
             };
 
-            let output = render_inbox(&runs_dir, &recipient)?;
-            print!("{output}");
+            // A DB failure is exit 2 (spec §5), so it is reported here rather than as a
+            // generic error the caller would map to exit 1.
+            let db_path = runs_dir.join("quaqua.db");
+            let bus = match FarmBus::open(&db_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    if crate::bus::is_legacy_db_error(&e) {
+                        eprintln!(
+                            "error: cannot open database: {}",
+                            crate::bus::LEGACY_DB_ERROR_MSG
+                        );
+                    } else {
+                        eprintln!("error: cannot open database: {e}");
+                    }
+                    return Ok(2);
+                }
+            };
+
+            let digest = if all {
+                // `--all` is the spill line's escape hatch: read the whole history and
+                // never cap it, so rows the 20-line digest elided are still shown.
+                match bus.digest_rows(&consumer, 0) {
+                    Ok(rows) => crate::bus::events::render_digest_all(&rows, &consumer),
+                    Err(e) => {
+                        eprintln!("error: cannot read digest: {e}");
+                        return Ok(2);
+                    }
+                }
+            } else {
+                match bus.inbox_batch(&consumer, advance) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(2);
+                    }
+                }
+            };
+
+            // stdout is the digest batch only, so a caller (the CoS hook) can treat
+            // empty output as "nothing new"; diagnostics go to stderr.
+            if digest.is_empty() {
+                eprintln!("no new triggers for '{consumer}'");
+            } else {
+                print!("{digest}");
+            }
             Ok(0)
         }
         "ack" => {
