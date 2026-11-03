@@ -733,3 +733,55 @@ fn test_migrate_dry_run_leaves_db_untouched() {
         .unwrap();
     assert_eq!(fe_count, 1);
 }
+
+#[test]
+fn test_legacy_db_cli_refusal_exits_code_2() {
+    let tmp = hermetic_temp_dir("cli-exit-2");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let bin = env!("CARGO_BIN_EXE_quaqua");
+
+    // Case 1: `quaqua inbox` on legacy DB
+    let out = std::process::Command::new(bin)
+        .arg("inbox")
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .output()
+        .expect("run quaqua inbox");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "quaqua inbox on legacy DB must exit with code 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("legacy database detected; run quaqua bus migrate"),
+        "stderr must mention running quaqua bus migrate: {stderr}"
+    );
+
+    // Case 2: `quaqua inbox --all` on legacy DB
+    let out_all = std::process::Command::new(bin)
+        .arg("inbox")
+        .arg("--all")
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .output()
+        .expect("run quaqua inbox --all");
+    assert_eq!(
+        out_all.status.code(),
+        Some(2),
+        "quaqua inbox --all on legacy DB must exit with code 2"
+    );
+
+    // Case 3: `quaqua mail inbox` on legacy DB
+    let out_mail = std::process::Command::new(bin)
+        .arg("mail")
+        .arg("inbox")
+        .env("QUAQUA_RUNS_DIR", &tmp)
+        .output()
+        .expect("run quaqua mail inbox");
+    assert_eq!(
+        out_mail.status.code(),
+        Some(2),
+        "quaqua mail inbox on legacy DB must exit with code 2"
+    );
+}

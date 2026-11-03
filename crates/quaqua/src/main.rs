@@ -918,7 +918,11 @@ fn main() {
                     if !e.is_empty() {
                         eprintln!("{e}");
                     }
-                    1
+                    if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
+                        2
+                    } else {
+                        1
+                    }
                 }
             }
         }
@@ -937,7 +941,11 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
-                        1
+                        if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
+                            2
+                        } else {
+                            1
+                        }
                     }
                 }
             } else {
@@ -986,7 +994,7 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("error opening bus at {}: {e}", db_path.display());
-                        if e.to_string().contains("run quaqua bus migrate") {
+                        if quaqua::bus::is_legacy_db_error(&e) {
                             2
                         } else {
                             1
