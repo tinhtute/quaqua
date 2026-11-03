@@ -695,6 +695,232 @@ impl FarmBus {
             new_mail_cursor: *last_seen_mail_id,
         })
     }
+
+    /// Selects the triggers a digest for `consumer` renders, from `from_id` (exclusive).
+    ///
+    /// Farm-scoped, and limited to what is addressed to `consumer`: rows with no
+    /// recipient (incidents), rows addressed to it, and rows on a thread it is
+    /// currently subscribed to.
+    pub fn digest_rows(&self, consumer: &str, from_id: u64) -> rusqlite::Result<Vec<DigestRow>> {
+        let conn = self.conn.lock().unwrap();
+        let now = crate::bus::now_ms() as i64;
+        crate::engine::sqlite::retry_while_busy(|| {
+            let mut stmt = conn.prepare_cached(DIGEST_ROWS_SQL)?;
+            let rows = stmt.query_map(
+                rusqlite::params![from_id as i64, &self.farm, consumer, now],
+                |row| {
+                    Ok(DigestRow {
+                        id: row.get::<_, i64>(0)? as u64,
+                        kind: row.get(1)?,
+                        actor: row.get(2)?,
+                        thread_id: row.get(3)?,
+                        summary: row.get(4)?,
+                        ref_val: row.get(5)?,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Renders one digest batch for `consumer` and, when `advance` is set, moves its
+    /// cursor past the batch — all in one transaction. Returns "" when nothing is new.
+    ///
+    /// `from_id` overrides the cursor start (`Some(0)` for `--all`); the cursor is
+    /// still only moved when `advance` is set. A repeated call with `advance` and no
+    /// new rows leaves the cursor where it is, so re-running converges.
+    pub fn inbox_batch(
+        &self,
+        consumer: &str,
+        from_id: Option<u64>,
+        advance: bool,
+    ) -> Result<String, String> {
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn.lock().unwrap();
+        let now = crate::bus::now_ms() as i64;
+        let res: rusqlite::Result<String> = crate::engine::sqlite::retry_while_busy(|| {
+            let tx = conn.transaction()?;
+            let prev_cursor: u64 = tx
+                .query_row(
+                    "SELECT trigger_id FROM cursors WHERE consumer = ?1",
+                    rusqlite::params![consumer],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0) as u64;
+            let start = from_id.unwrap_or(prev_cursor);
+
+            let rows: Vec<DigestRow> = {
+                let mut stmt = tx.prepare_cached(DIGEST_ROWS_SQL)?;
+                let mapped = stmt.query_map(
+                    rusqlite::params![start as i64, &self.farm, consumer, now],
+                    |row| {
+                        Ok(DigestRow {
+                            id: row.get::<_, i64>(0)? as u64,
+                            kind: row.get(1)?,
+                            actor: row.get(2)?,
+                            thread_id: row.get(3)?,
+                            summary: row.get(4)?,
+                            ref_val: row.get(5)?,
+                        })
+                    },
+                )?;
+                let mut out = Vec::new();
+                for r in mapped {
+                    out.push(r?);
+                }
+                out
+            };
+
+            let render = render_digest(&rows);
+
+            if advance {
+                // One render is one batch (spec §6): the cursor moves past every row the
+                // batch covered, so a repeat finds nothing left. Rows elided by the 20-line
+                // cap stay reachable through `--all`, which never advances.
+                let target = rows
+                    .iter()
+                    .map(|r| r.id)
+                    .max()
+                    .unwrap_or(start)
+                    .max(prev_cursor);
+                if target > prev_cursor {
+                    tx.execute(
+                        r#"
+                        INSERT INTO cursors (consumer, trigger_id) VALUES (?1, ?2)
+                        ON CONFLICT(consumer) DO UPDATE SET trigger_id = excluded.trigger_id
+                        "#,
+                        rusqlite::params![consumer, target as i64],
+                    )?;
+                }
+            }
+
+            tx.commit()?;
+            Ok(render)
+        });
+        res.map_err(|e| format!("cannot read digest: {e}"))
+    }
+}
+
+/// A trigger row as rendered in a digest line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestRow {
+    pub id: u64,
+    pub kind: String,
+    pub actor: String,
+    pub thread_id: String,
+    pub summary: String,
+    pub ref_val: Option<String>,
+}
+
+/// Digest body lines before the spill line (`… +N more`), so a full render is ≤20 lines.
+pub const DIGEST_MAX_LINES: usize = 20;
+const DIGEST_BODY_LINES: usize = DIGEST_MAX_LINES - 1;
+
+const DIGEST_ROWS_SQL: &str = r#"
+    SELECT t.id, t.kind, t.actor, t.thread_id, t.summary, t.ref
+    FROM triggers t
+    WHERE t.id > ?1
+      AND (t.farm = ?2 OR t.farm IS NULL)
+      AND (t.to_name IS NULL
+           OR t.to_name = ?3
+           OR EXISTS (SELECT 1 FROM subscriptions s
+                      WHERE s.thread_id = t.thread_id AND s.consumer = ?3 AND s.until_ms >= ?4))
+    ORDER BY t.id ASC
+"#;
+
+/// Renders a digest batch: `#<id> <kind> <actor> <thread> <summary>[ → <ref>]`, grouped by
+/// thread (newest thread first), consecutive same-kind rows in a thread collapsed to
+/// `#<first>..#<last> <kind> ×N …`, capped at [`DIGEST_MAX_LINES`] lines.
+///
+/// Returns "" for an empty batch; that empty string is what the CoS hook treats as
+/// "nothing new".
+pub fn render_digest(rows: &[DigestRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut sorted: Vec<&DigestRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.id);
+
+    // Group by thread, keeping each group's rows in id order.
+    let mut groups: Vec<(String, Vec<&DigestRow>)> = Vec::new();
+    for row in sorted {
+        match groups
+            .iter_mut()
+            .find(|(thread, _)| *thread == row.thread_id)
+        {
+            Some((_, group)) => group.push(row),
+            None => groups.push((row.thread_id.clone(), vec![row])),
+        }
+    }
+    // Thread with the newest trigger first.
+    groups
+        .sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|r| r.id).max().unwrap_or(0)));
+
+    // One line per run of consecutive same-kind rows inside a thread.
+    let mut lines: Vec<(String, Vec<u64>)> = Vec::new();
+    for (_, group) in &groups {
+        let mut i = 0;
+        while i < group.len() {
+            let kind = &group[i].kind;
+            let mut j = i + 1;
+            while j < group.len() && &group[j].kind == kind {
+                j += 1;
+            }
+            let run = &group[i..j];
+            let ids: Vec<u64> = run.iter().map(|r| r.id).collect();
+            let last = run[run.len() - 1];
+            let thread = last
+                .thread_id
+                .strip_prefix("agent:")
+                .unwrap_or(&last.thread_id);
+            let mut line = if run.len() > 1 {
+                format!(
+                    "#{}..#{} {} ×{} {} {} {}",
+                    ids[0],
+                    last.id,
+                    last.kind,
+                    run.len(),
+                    last.actor,
+                    thread,
+                    last.summary
+                )
+            } else {
+                format!(
+                    "#{} {} {} {} {}",
+                    last.id, last.kind, last.actor, thread, last.summary
+                )
+            };
+            if let Some(r) = &last.ref_val {
+                line.push_str(" → ");
+                line.push_str(r);
+            }
+            lines.push((line, ids));
+            i = j;
+        }
+    }
+
+    let spilled = lines.len().saturating_sub(DIGEST_BODY_LINES);
+    let kept = lines.len().min(DIGEST_BODY_LINES);
+    let mut text = String::new();
+    for (line, _) in &lines[..kept] {
+        text.push_str(line);
+        text.push('\n');
+    }
+
+    if spilled > 0 {
+        let dropped_rows: usize = lines[kept..].iter().map(|(_, ids)| ids.len()).sum();
+        text.push_str(&format!(
+            "… +{dropped_rows} more: quaqua mail inbox --all\n"
+        ));
+    }
+
+    text
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
