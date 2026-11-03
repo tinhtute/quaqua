@@ -50,6 +50,7 @@ struct LegacyFarmEvent {
     actor: Option<String>,
     subject: Option<String>,
     owner: Option<String>,
+    project: Option<String>,
     incident_key: Option<String>,
     payload_json: String,
     farm: Option<String>,
@@ -59,8 +60,11 @@ struct LegacyMail {
     id: u64,
     ts_ms: u64,
     from_name: String,
+    from_role: String,
     to_name: String,
     kind: String,
+    project: Option<String>,
+    reply_to: Option<u64>,
     body: String,
     farm: Option<String>,
 }
@@ -204,9 +208,9 @@ pub fn migrate_bus<H: HerdrOps>(
     let farm_events: Vec<LegacyFarmEvent> = if has_farm_events {
         let has_farm_col = table_has_column(&conn, "farm_events", "farm");
         let query = if has_farm_col {
-            "SELECT seq, ts_ms, type, actor, subject, owner, incident_key, payload_json, farm FROM farm_events ORDER BY ts_ms ASC, seq ASC"
+            "SELECT seq, ts_ms, type, actor, subject, owner, project, incident_key, payload_json, farm FROM farm_events ORDER BY ts_ms ASC, seq ASC"
         } else {
-            "SELECT seq, ts_ms, type, actor, subject, owner, incident_key, payload_json, NULL AS farm FROM farm_events ORDER BY ts_ms ASC, seq ASC"
+            "SELECT seq, ts_ms, type, actor, subject, owner, project, incident_key, payload_json, NULL AS farm FROM farm_events ORDER BY ts_ms ASC, seq ASC"
         };
         let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -218,11 +222,12 @@ pub fn migrate_bus<H: HerdrOps>(
                     actor: row.get(3)?,
                     subject: row.get(4)?,
                     owner: row.get(5)?,
-                    incident_key: row.get(6)?,
+                    project: row.get(6)?,
+                    incident_key: row.get(7)?,
                     payload_json: row
-                        .get::<_, Option<String>>(7)?
+                        .get::<_, Option<String>>(8)?
                         .unwrap_or_else(|| "{}".to_string()),
-                    farm: row.get(8)?,
+                    farm: row.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -239,9 +244,9 @@ pub fn migrate_bus<H: HerdrOps>(
     let mails: Vec<LegacyMail> = if has_mail {
         let has_farm_col = table_has_column(&conn, "mail", "farm");
         let query = if has_farm_col {
-            "SELECT id, ts_ms, from_name, to_name, kind, body, farm FROM mail ORDER BY ts_ms ASC, id ASC"
+            "SELECT id, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, farm FROM mail ORDER BY ts_ms ASC, id ASC"
         } else {
-            "SELECT id, ts_ms, from_name, to_name, kind, body, NULL AS farm FROM mail ORDER BY ts_ms ASC, id ASC"
+            "SELECT id, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, NULL AS farm FROM mail ORDER BY ts_ms ASC, id ASC"
         };
         let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -250,10 +255,13 @@ pub fn migrate_bus<H: HerdrOps>(
                     id: row.get::<_, i64>(0)? as u64,
                     ts_ms: row.get::<_, i64>(1)? as u64,
                     from_name: row.get(2)?,
-                    to_name: row.get(3)?,
-                    kind: row.get(4)?,
-                    body: row.get(5)?,
-                    farm: row.get(6)?,
+                    from_role: row.get(3)?,
+                    to_name: row.get(4)?,
+                    kind: row.get(5)?,
+                    project: row.get(6)?,
+                    reply_to: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                    body: row.get(8)?,
+                    farm: row.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -305,9 +313,10 @@ pub fn migrate_bus<H: HerdrOps>(
             .or(fe.owner.as_deref())
             .unwrap_or("unknown");
         let thread_id = format!("agent:{thread_name}");
+        let thread_owner = fe.owner.as_deref().unwrap_or(thread_name);
         let entry = threads_map
             .entry(thread_id.clone())
-            .or_insert_with(|| (thread_name.to_string(), 0));
+            .or_insert_with(|| (thread_owner.to_string(), 0));
         if fe.ts_ms > entry.1 {
             entry.1 = fe.ts_ms;
         }
@@ -347,10 +356,20 @@ pub fn migrate_bus<H: HerdrOps>(
             thread_id,
             summary: summary_final,
             ref_val: None,
-            payload_json: if fe.payload_json.is_empty() {
-                None
-            } else {
-                Some(fe.payload_json.clone())
+            payload_json: {
+                let mut v: serde_json::Value = if fe.payload_json.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&fe.payload_json)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": &fe.payload_json }))
+                };
+                if let Some(ref o) = fe.owner {
+                    v["owner"] = serde_json::Value::String(o.clone());
+                }
+                if let Some(ref p) = fe.project {
+                    v["project"] = serde_json::Value::String(p.clone());
+                }
+                Some(v.to_string())
             },
             dedupe_key: fe.incident_key.clone(),
             farm: farm_final,
@@ -386,7 +405,7 @@ pub fn migrate_bus<H: HerdrOps>(
             to_name: Some(m.to_name.clone()),
             thread_id,
             summary: summary_final,
-            ref_val: None,
+            ref_val: m.reply_to.map(|id| format!("mail:{id}")),
             payload_json: Some(m.body.clone()),
             dedupe_key: None,
             farm: farm_final,
@@ -632,7 +651,13 @@ pub fn run_migrate(dry_run: bool) -> Result<i32, String> {
         crate::workspace::workspace_root().join("runs")
     };
     let db_path = runs_dir.join("quaqua.db");
-    let raw_dir = crate::workspace::workspace_root().join("raw");
+    let raw_dir = if let Ok(dir) = std::env::var("QUAQUA_RAW_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(parent) = runs_dir.parent() {
+        parent.join("raw")
+    } else {
+        crate::workspace::workspace_root().join("raw")
+    };
     let herdr = crate::herdr::Herdr::new();
 
     let summary = migrate_bus(&db_path, Some(&raw_dir), dry_run, &herdr)?;

@@ -501,12 +501,6 @@ impl FarmBus {
             .get_cursor(consumer)
             .map_err(|e| format!("cannot get cursor: {e}"))?
             .unwrap_or(0);
-
-        let prev_mail_cursor = self
-            .get_mail_cursor(consumer)
-            .map_err(|e| format!("cannot get mail cursor: {e}"))?
-            .unwrap_or(0);
-
         // Check for any unacked mail incidents lazily
         {
             let conn = self.conn_for_test();
@@ -515,16 +509,22 @@ impl FarmBus {
         }
 
         let unacked_mail =
-            crate::bus::mail::read_unacked_mail_since(runs_dir, consumer, prev_mail_cursor)?;
+            crate::bus::mail::read_unacked_mail_since(runs_dir, consumer, prev_cursor)?;
         let raw_incidents = self
             .load_incidents(prev_cursor, consumer)
             .map_err(|e| format!("cannot load incidents: {e}"))?;
 
-        let max_evaluated_seq = raw_incidents
+        let max_mail_seq = unacked_mail
+            .iter()
+            .map(|m| m.id)
+            .max()
+            .unwrap_or(prev_cursor);
+        let max_incident_seq = raw_incidents
             .iter()
             .map(|e| e.seq)
             .max()
             .unwrap_or(prev_cursor);
+        let max_evaluated_seq = max_mail_seq.max(max_incident_seq);
 
         let own_pane = resolve_consumer_pane(consumer);
         let incidents: Vec<_> = raw_incidents
@@ -541,25 +541,13 @@ impl FarmBus {
             prev_cursor
         };
 
-        let new_mail_cursor = if let Some(max_mail_id) = unacked_mail.iter().map(|m| m.id).max() {
-            if max_mail_id > prev_mail_cursor {
-                self.set_mail_cursor(consumer, max_mail_id)
-                    .map_err(|e| format!("cannot set mail cursor: {e}"))?;
-                max_mail_id
-            } else {
-                prev_mail_cursor
-            }
-        } else {
-            prev_mail_cursor
-        };
-
         Ok(InboxDigest {
             unacked_mail,
             incidents,
             prev_cursor,
             new_cursor,
-            prev_mail_cursor,
-            new_mail_cursor,
+            prev_mail_cursor: prev_cursor,
+            new_mail_cursor: new_cursor,
         })
     }
     /// Queries the latest event type and incident key recorded for `subject`.
@@ -568,8 +556,8 @@ impl FarmBus {
         let thread_id = format!("agent:{subject}");
         crate::engine::sqlite::retry_while_busy(|| {
             conn.query_row(
-                "SELECT kind, dedupe_key FROM triggers WHERE thread_id = ?1 OR actor = ?2 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![&thread_id, subject],
+                "SELECT kind, dedupe_key FROM triggers WHERE source != 'mail' AND thread_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![&thread_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
         })
@@ -628,18 +616,25 @@ impl FarmBus {
                         let from_name: String = row.get(3)?;
                         let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
                         let kind: String = row.get(5)?;
-                        let body: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+                        let raw_payload: Option<String> = row.get(6)?;
+                        let ref_val: Option<String> = row.get(7)?;
+                        let (body, from_role, project, reply_to) =
+                            crate::bus::mail::decode_mail_fields(
+                                raw_payload.as_deref(),
+                                &from_name,
+                                ref_val.as_deref(),
+                            );
 
                         Ok(MailMessage {
                             id,
                             msg_key,
                             ts_ms,
                             from_name,
-                            from_role: "lead".to_string(),
+                            from_role,
                             to_name,
                             kind,
-                            project: None,
-                            reply_to: None,
+                            project,
+                            reply_to,
                             body,
                             deliveries: 1,
                             last_delivered_ms: Some(ts_ms),
@@ -657,20 +652,25 @@ impl FarmBus {
             msgs
         };
 
-        if let Some(max_mail_id) = new_mail.iter().map(|m| m.id).max() {
-            *last_seen_mail_id = max_mail_id;
-        }
+        let max_mail_seq = new_mail
+            .iter()
+            .map(|m| m.id)
+            .max()
+            .unwrap_or(*last_seen_mail_id);
+        *last_seen_mail_id = max_mail_seq;
 
         let own_pane = resolve_consumer_pane(consumer);
         let raw_incidents = self
             .load_incidents(prev_cursor, consumer)
             .map_err(|e| format!("cannot load incidents: {e}"))?;
 
-        let max_evaluated_seq = raw_incidents
+        let max_incident_seq = raw_incidents
             .iter()
             .map(|e| e.seq)
             .max()
             .unwrap_or(prev_cursor);
+        let max_evaluated_seq = max_mail_seq.max(max_incident_seq);
+
         let incidents: Vec<_> = raw_incidents
             .into_iter()
             .filter(|r| !is_consumer_own_pane_blocked_noise(r, own_pane.as_deref()))
@@ -684,6 +684,7 @@ impl FarmBus {
         } else {
             prev_cursor
         };
+        *last_seen_mail_id = (*last_seen_mail_id).max(new_cursor);
 
         Ok(InboxDigest {
             unacked_mail: new_mail,

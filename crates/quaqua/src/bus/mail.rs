@@ -1,6 +1,6 @@
 //! Inter-team and worker mail: storage, verbs, dual-write, and fallback.
 //!
-//! Stores messages in the `mail` table in `runs/quaqua.db`.
+//! Stores messages in the `triggers` table in `runs/quaqua.db`.
 //! Verbs:
 //! - `send`: inserts row + `mail_sent` farm event in one transaction; dual-writes to markdown for leads;
 //!   falls back to markdown append on missing/corrupt database.
@@ -511,7 +511,7 @@ pub fn get_mail_ack_timeout_ms() -> u64 {
     DEFAULT_MAIL_ACK_TIMEOUT_MS
 }
 
-/// Lazily inserts `mail_unacked:<id>` incident into `farm_events` for rows unacked past `ack_timeout_ms`.
+/// Lazily inserts `mail_unacked:<id>` incident into `triggers` for rows unacked past `ack_timeout_ms`.
 pub fn check_unacked_incidents(
     conn: &rusqlite::Connection,
     ack_timeout_ms: u64,
@@ -705,11 +705,12 @@ pub fn send_mail<H: HerdrOps>(
         };
 
         let dedupe_key = format!("mail:{msg_key}");
+        let ref_val = opts.reply_to.map(|id| format!("mail:{id}"));
         let rows = tx.execute(
             r#"
             INSERT OR IGNORE INTO triggers (
                 ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
-            ) VALUES (?1, 'mail', ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)
+            ) VALUES (?1, 'mail', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             rusqlite::params![
                 now as i64,
@@ -718,6 +719,7 @@ pub fn send_mail<H: HerdrOps>(
                 opts.to,
                 thread_id,
                 summary_final,
+                ref_val,
                 opts.body,
                 dedupe_key,
                 bus.farm(),
@@ -834,7 +836,7 @@ pub fn read_unacked_mail_since(
     let mut stmt = conn
         .prepare_cached(
             r#"
-            SELECT id, dedupe_key, ts_ms, actor, to_name, kind, payload_json, farm
+            SELECT id, dedupe_key, ts_ms, actor, to_name, kind, payload_json, ref, farm
             FROM triggers
             WHERE source = 'mail' AND to_name = ?1 AND id > ?2 AND (farm = ?3 OR farm IS NULL)
             ORDER BY id ASC
@@ -857,19 +859,22 @@ pub fn read_unacked_mail_since(
                 let from_name: String = row.get(3)?;
                 let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
                 let kind: String = row.get(5)?;
-                let body: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
-                let _farm: Option<String> = row.get(7)?;
+                let raw_payload: Option<String> = row.get(6)?;
+                let ref_val: Option<String> = row.get(7)?;
+                let _farm: Option<String> = row.get(8)?;
+                let (body, from_role, project, reply_to) =
+                    decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
 
                 Ok(MailMessage {
                     id,
                     msg_key,
                     ts_ms,
                     from_name,
-                    from_role: "lead".to_string(),
+                    from_role,
                     to_name,
                     kind,
-                    project: None,
-                    reply_to: None,
+                    project,
+                    reply_to,
                     body,
                     deliveries: 1,
                     last_delivered_ms: Some(ts_ms),
@@ -1191,7 +1196,7 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
     Ok(result)
 }
 
-/// Lists messages from `mail` table, optionally formatted as markdown inbox view (`--md`).
+/// Lists messages from `triggers` table, optionally formatted as markdown inbox view (`--md`).
 pub fn list_mail(
     runs_dir: &Path,
     md_format: bool,
@@ -1208,7 +1213,7 @@ pub fn list_mail(
 
     let mut query = String::from(
         r#"
-        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.farm, c.trigger_id
+        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm, c.trigger_id
         FROM triggers t
         LEFT JOIN cursors c ON c.consumer = t.to_name
         WHERE t.source = 'mail' AND (t.farm = ? OR t.farm IS NULL)
@@ -1244,25 +1249,28 @@ pub fn list_mail(
             let from_name: String = row.get(3)?;
             let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
             let kind: String = row.get(5)?;
-            let body: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
-            let _farm: Option<String> = row.get(7)?;
-            let cursor_id: Option<i64> = row.get(8)?;
+            let raw_payload: Option<String> = row.get(6)?;
+            let ref_val: Option<String> = row.get(7)?;
+            let _farm: Option<String> = row.get(8)?;
+            let cursor_id: Option<i64> = row.get(9)?;
             let acked_ms = if cursor_id.map(|cid| cid >= id as i64).unwrap_or(false) {
                 Some(ts_ms)
             } else {
                 None
             };
+            let (body, from_role, project, reply_to) =
+                decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
 
             Ok(MailMessage {
                 id,
                 msg_key,
                 ts_ms,
                 from_name,
-                from_role: "lead".to_string(),
+                from_role,
                 to_name,
                 kind,
-                project: None,
-                reply_to: None,
+                project,
+                reply_to,
                 body,
                 deliveries: 1,
                 last_delivered_ms: Some(ts_ms),
@@ -1566,4 +1574,35 @@ mod tests {
         let parsed = parse_iso_timestamp(&formatted).expect("parse iso");
         assert_eq!(ts, parsed);
     }
+}
+
+/// Decodes structured mail fields from trigger `payload_json`.
+/// Falls back to treating `payload_json` as plain body if not a structured JSON object.
+/// Decodes mail body and metadata (from_role, project, reply_to) from trigger fields.
+pub fn decode_mail_fields(
+    payload_str: Option<&str>,
+    actor: &str,
+    ref_str: Option<&str>,
+) -> (String, String, Option<String>, Option<u64>) {
+    let body = payload_str.unwrap_or_default().to_string();
+    let from_role = if actor == "cos" {
+        "cos"
+    } else if actor.ends_with("-lead") {
+        "lead"
+    } else {
+        "peer"
+    }
+    .to_string();
+
+    let project = if actor.ends_with("-lead") {
+        actor.strip_suffix("-lead").map(String::from)
+    } else {
+        None
+    };
+
+    let reply_to = ref_str
+        .and_then(|r| r.strip_prefix("mail:"))
+        .and_then(|s| s.parse::<u64>().ok());
+
+    (body, from_role, project, reply_to)
 }

@@ -1,6 +1,6 @@
 //! Farm bus: SQLite event bus for farm coordination and monitoring.
 //!
-//! Stores `farm_events` and `cursors` in `runs/quaqua.db`.
+//! Stores triggers, threads, subscriptions, and cursors in `runs/quaqua.db`.
 //! Uses shared SQLite connection opener with WAL mode, busy timeout, and retry_while_busy.
 
 pub mod events;
@@ -39,7 +39,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// An event to be recorded in the `farm_events` table.
+/// An event to be recorded in the `triggers` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FarmEvent {
     pub ts_ms: u64,
@@ -132,7 +132,51 @@ impl FarmBus {
         let local_farm = crate::workspace::farm_of_runs_dir(runs_dir);
 
         if path.exists() {
+            let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+            let shm_path = PathBuf::from(format!("{}-shm", path.display()));
+            let wal_existed = wal_path.exists();
+            let shm_existed = shm_path.exists();
+
             let has_legacy_probe: bool = (|| -> rusqlite::Result<bool> {
+                let uri = format!("file:{}?immutable=1", path.display());
+                if let Ok(imm_conn) = rusqlite::Connection::open_with_flags(
+                    &uri,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                ) {
+                    let legacy_count: i64 = imm_conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('farm_events', 'mail')",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if legacy_count > 0 {
+                        return Ok(true);
+                    }
+                    let has_cursors: bool = imm_conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'cursors'",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map(|c| c > 0)
+                        .unwrap_or(false);
+                    if has_cursors {
+                        if let Ok(mut stmt) = imm_conn.prepare("PRAGMA table_info(cursors)") {
+                            if let Ok(mut rows) = stmt.query([]) {
+                                while let Ok(Some(row)) = rows.next() {
+                                    if let Ok(col_name) = row.get::<_, String>(1) {
+                                        if col_name == "seq" {
+                                            return Ok(true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let ro_conn = rusqlite::Connection::open_with_flags(
                     path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -168,6 +212,12 @@ impl FarmBus {
             .unwrap_or(false);
 
             if has_legacy_probe {
+                if !wal_existed && wal_path.exists() {
+                    let _ = std::fs::remove_file(&wal_path);
+                }
+                if !shm_existed && shm_path.exists() {
+                    let _ = std::fs::remove_file(&shm_path);
+                }
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                     std::io::Error::other(LEGACY_DB_ERROR_MSG),
                 )));
@@ -306,11 +356,6 @@ impl FarmBus {
         self.conn.lock().unwrap()
     }
 
-    /// Records an event in `farm_events`.
-    ///
-    /// If `event.incident_key` is set and a row with that key already exists,
-    /// the insert is ignored and this method returns `Ok(false)`.
-    /// Otherwise, the event is inserted and this method returns `Ok(true)`.
     /// Records an event in `triggers` and updates the thread's `last_trigger_ms`
     /// in a single transaction.
     ///
@@ -702,7 +747,7 @@ mod tests {
         let status_before =
             render_status(&db_path, runs_dir, &mock_herdr).expect("render status before");
 
-        // Now open FarmBus on the same database, creating farm_events and cursors tables,
+        // Now open FarmBus on the same database, creating superagent tables,
         // and insert several farm events.
         {
             let bus = FarmBus::open(&db_path).expect("open bus");

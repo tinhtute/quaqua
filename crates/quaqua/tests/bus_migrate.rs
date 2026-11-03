@@ -916,6 +916,7 @@ exit 0
         .env("PATH", &custom_path)
         .env("HERDR_BIN_PATH", fake_herdr.to_str().unwrap())
         .env("QUAQUA_RUNS_DIR", &tmp)
+        .env("QUAQUA_RAW_DIR", tmp.join("raw").to_str().unwrap())
         .output()
         .expect("run quaqua bus migrate --dry-run");
     assert_eq!(out_dry.status.code(), Some(0));
@@ -931,6 +932,7 @@ exit 0
         .env("PATH", &custom_path)
         .env("HERDR_BIN_PATH", fake_herdr.to_str().unwrap())
         .env("QUAQUA_RUNS_DIR", &tmp)
+        .env("QUAQUA_RAW_DIR", tmp.join("raw").to_str().unwrap())
         .output()
         .expect("run quaqua bus migrate");
     assert_eq!(
@@ -1019,4 +1021,126 @@ fn test_migrate_pre_farm_legacy_columns() {
     let bus = FarmBus::open(&db_path).expect("FarmBus::open must succeed on migrated db");
     let events = bus.load_events(0).unwrap();
     assert_eq!(events.len(), 2);
+}
+
+#[test]
+fn test_legacy_wal_db_open_refused_write_free() {
+    let tmp = hermetic_temp_dir("legacy-wal-refused");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, incident_key, payload_json) VALUES (1000, 'blocked', 'herdr', 'w1:p1', 'cos', 'k1', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+
+    let wal_path = tmp.join("quaqua.db-wal");
+    let shm_path = tmp.join("quaqua.db-shm");
+    if wal_path.exists() {
+        let _ = std::fs::remove_file(&wal_path);
+    }
+    if shm_path.exists() {
+        let _ = std::fs::remove_file(&shm_path);
+    }
+
+    let bytes_before = std::fs::read(&db_path).expect("read db bytes before");
+    let hash_before = quaqua::bus::mail::sha256_hex(&bytes_before);
+
+    let open_res = FarmBus::open(&db_path);
+    assert!(open_res.is_err(), "must refuse legacy WAL db");
+    assert!(open_res
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("legacy database detected"));
+
+    let bytes_after = std::fs::read(&db_path).expect("read db bytes after");
+    let hash_after = quaqua::bus::mail::sha256_hex(&bytes_after);
+    assert_eq!(
+        hash_before, hash_after,
+        "refusal on WAL db must be strictly write-free on DB file"
+    );
+    assert!(
+        !wal_path.exists(),
+        "no -wal sidecar may be left behind on refusal"
+    );
+    assert!(
+        !shm_path.exists(),
+        "no -shm sidecar may be left behind on refusal"
+    );
+}
+
+#[test]
+fn test_migrate_preserves_owner_project_and_mail_metadata() {
+    let tmp = hermetic_temp_dir("migrate-metadata");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO farm_events (ts_ms, type, actor, subject, owner, project, incident_key, payload_json) VALUES (?1, 'blocked', 'herdr', 'w7:p2', 'cos', 'myproj', 'blocked:w7:p2:1', '{\"msg\":1}')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mail (msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body) VALUES ('m1', ?1, 'myproj-lead', 'lead', 'cos', 'accept', 'myproj', NULL, 'important message')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::with_raw(r#"{"result":{"agents":[]}}"#);
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.triggers_count, 2);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+
+    // 1. Assert threads table preserved thread owner as "cos", not "w7:p2"
+    let thread_owner: String = bus
+        .conn_for_test()
+        .query_row(
+            "SELECT owner FROM threads WHERE id = 'agent:w7:p2'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query thread owner");
+    assert_eq!(
+        thread_owner, "cos",
+        "threads.owner must be preserved as cos"
+    );
+
+    // 2. Assert load_events preserves owner and project
+    let events = bus.load_events(0).expect("load events");
+    assert_eq!(events.len(), 2);
+    let fe_record = &events[0];
+    assert_eq!(fe_record.owner.as_deref(), Some("cos"));
+    assert_eq!(fe_record.project.as_deref(), Some("myproj"));
+
+    // 3. Assert CoS inbox digest sees the incident (F2: CoS must not lose migrated incident)
+    let digest = bus.inbox_digest(&tmp, "cos").expect("cos inbox digest");
+    assert_eq!(
+        digest.incidents.len(),
+        1,
+        "CoS digest must see the migrated incident"
+    );
+    assert_eq!(digest.incidents[0].owner.as_deref(), Some("cos"));
+    assert_eq!(digest.incidents[0].project.as_deref(), Some("myproj"));
+
+    // 4. Assert mail metadata (from_role, project, reply_to) is preserved
+    assert_eq!(digest.unacked_mail.len(), 1);
+    let mail_msg = &digest.unacked_mail[0];
+    assert_eq!(mail_msg.from_role, "lead");
+    assert_eq!(mail_msg.project.as_deref(), Some("myproj"));
+    assert_eq!(mail_msg.reply_to, None);
+    assert_eq!(mail_msg.body, "important message");
 }

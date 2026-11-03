@@ -848,3 +848,69 @@ fn test_inbox_foreign_farm_rows_never_reach_cos_or_lead() {
         "foreign rows with owner=NULL or foreign farm must not reach mu-lead inbox digest"
     );
 }
+
+#[test]
+fn test_inbox_digest_interleaved_mail_incident_no_redelivery() {
+    let runs_dir = hermetic_temp_dir("interleaved-cursor");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "mu-lead");
+    guard.remove("HERDR_PANE_ID");
+
+    // Trigger 1: incident
+    let ev1 = quaqua::bus::FarmEvent::new(
+        "blocked",
+        Some("herdr"),
+        Some("w1"),
+        Some("cos"),
+        Some("p1"),
+    )
+    .with_incident_key("k1");
+    bus.record(&ev1).unwrap();
+
+    // Trigger 2: mail
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "directive".to_string(),
+        body: "do work".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    let send_res = mail::send_mail(&runs_dir, &opts, &herdr).unwrap();
+    assert_eq!(send_res.id, 2);
+
+    // Trigger 3: incident after mail
+    let ev2 = quaqua::bus::FarmEvent::new(
+        "stalled",
+        Some("watchdog"),
+        Some("w2"),
+        Some("cos"),
+        Some("p1"),
+    )
+    .with_incident_key("k2");
+    bus.record(&ev2).unwrap();
+
+    // First read: must see both incidents and mail, advancing cursor to 3
+    let digest1 = bus.inbox_digest(&runs_dir, "cos").unwrap();
+    assert_eq!(digest1.unacked_mail.len(), 1);
+    assert_eq!(digest1.incidents.len(), 2);
+    assert_eq!(digest1.new_cursor, 3);
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
+
+    // Second read: must be completely empty (F1: no redelivery of trigger 3)
+    let digest2 = bus.inbox_digest(&runs_dir, "cos").unwrap();
+    assert_eq!(digest2.unacked_mail.len(), 0);
+    assert_eq!(digest2.incidents.len(), 0);
+    assert_eq!(digest2.new_cursor, 3);
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
+}
