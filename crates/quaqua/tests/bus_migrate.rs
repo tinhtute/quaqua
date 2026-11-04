@@ -1109,9 +1109,46 @@ fn test_migrate_pre_farm_legacy_columns() {
         .unwrap();
     }
 
+    let live_raw = quaqua::workspace::system_user_home()
+        .map(|h| h.join("quaqua/raw"))
+        .expect("system user home");
+    let count_before = std::fs::read_dir(&live_raw)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains("pre-superagent"))
+                .count()
+        })
+        .unwrap_or(0);
+
     let herdr = MockHerdr::with_raw(r#"{"result":{"agents":[]}}"#);
     let summary = migrate_bus(&db_path, None, false, &herdr)
         .expect("migrate on pre-farm legacy schema must succeed");
+    let count_after = std::fs::read_dir(&live_raw)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains("pre-superagent"))
+                .count()
+        })
+        .unwrap_or(0);
+    let backup_path = summary
+        .backup_path
+        .as_ref()
+        .expect("backup path must be present");
+    let leaked = backup_path.starts_with(&live_raw);
+    if leaked && backup_path.exists() {
+        let _ = std::fs::remove_file(backup_path);
+    }
+    assert_eq!(
+        count_before, count_after,
+        "hermetic leak: live raw/ changed after migrate_bus(&db_path, None, ...)"
+    );
+    assert!(
+        !leaked,
+        "hermetic leak: migrate_bus(&db_path, None, ...) wrote backup to live raw: {}",
+        backup_path.display()
+    );
 
     assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.mail_count, 1);
