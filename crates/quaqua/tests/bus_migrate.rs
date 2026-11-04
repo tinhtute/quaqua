@@ -847,17 +847,27 @@ fn test_legacy_db_cli_refusal_exits_code_2() {
         "quaqua inbox --all on legacy DB must exit with code 2"
     );
 
-    // Case 3: `quaqua mail inbox` on legacy DB
+    // Case 3: `quaqua mail inbox` without `--for` on legacy DB must exit 2: the legacy
+    // refusal has to win over the recipient-identity lookup, whose failure would
+    // otherwise surface first as a plain exit 1.
     let out_mail = std::process::Command::new(bin)
         .arg("mail")
         .arg("inbox")
         .env("QUAQUA_RUNS_DIR", &tmp)
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("QUAQUA_TEST")
+        .env_remove("QUAQUA_OWNER")
         .output()
         .expect("run quaqua mail inbox");
     assert_eq!(
         out_mail.status.code(),
         Some(2),
         "quaqua mail inbox on legacy DB must exit with code 2"
+    );
+    let mail_stderr = String::from_utf8_lossy(&out_mail.stderr);
+    assert!(
+        mail_stderr.contains("legacy database detected; run quaqua bus migrate"),
+        "stderr must mention running quaqua bus migrate: {mail_stderr}"
     );
 
     // Case 4: `quaqua mail send` on legacy DB must exit 2 (S4 residual)
