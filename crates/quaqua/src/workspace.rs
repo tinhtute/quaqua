@@ -149,6 +149,47 @@ pub fn is_live_workspace_runs(path: &Path) -> bool {
     is_live_workspace_db(&db)
 }
 
+/// Returns the live workspace raw directory at `<system_user_home>/quaqua/raw`.
+pub fn live_workspace_raw() -> Option<PathBuf> {
+    system_user_home().map(|h| h.join("quaqua/raw"))
+}
+
+/// Returns true if `path` points to the live workspace raw directory at `$HOME/quaqua/raw`.
+pub fn is_live_workspace_raw(path: &Path) -> bool {
+    let tmp = std::env::temp_dir();
+    if path.starts_with(&tmp) {
+        return false;
+    }
+    if let (Ok(p_canon), Ok(tmp_canon)) = (path.canonicalize(), tmp.canonicalize()) {
+        if p_canon.starts_with(&tmp_canon) {
+            return false;
+        }
+    }
+    if path.starts_with("/tmp")
+        || path.starts_with("/private/tmp")
+        || path.starts_with("/private/var")
+    {
+        return false;
+    }
+
+    if let Some(live) = live_workspace_raw() {
+        if path == live {
+            return true;
+        }
+        if let (Ok(p1), Ok(p2)) = (path.canonicalize(), live.canonicalize()) {
+            if p1 == p2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when a test must not write to `path`: it is the owner's live workspace raw directory.
+pub fn live_raw_refused(path: &Path) -> bool {
+    is_test_environment() && is_live_workspace_raw(path)
+}
+
 /// True when a test must not touch `path` at all: it is the owner's live workspace DB.
 ///
 /// Every SQLite opener calls this before its first filesystem access, so a test

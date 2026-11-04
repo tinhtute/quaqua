@@ -1149,6 +1149,11 @@ fn test_migrate_pre_farm_legacy_columns() {
         "hermetic leak: migrate_bus(&db_path, None, ...) wrote backup to live raw: {}",
         backup_path.display()
     );
+    assert!(
+        backup_path.starts_with(&tmp),
+        "backup path must be hermetic inside tmp: {}",
+        backup_path.display()
+    );
 
     assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.mail_count, 1);
@@ -1158,6 +1163,26 @@ fn test_migrate_pre_farm_legacy_columns() {
     let bus = FarmBus::open(&db_path).expect("FarmBus::open must succeed on migrated db");
     let events = bus.load_events(0).unwrap();
     assert_eq!(events.len(), 2);
+}
+
+#[test]
+fn test_migrate_bus_refuses_live_raw_under_test() {
+    let live_raw = quaqua::workspace::live_workspace_raw().expect("system user home");
+    let tmp = hermetic_temp_dir("refuse-live-raw");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let herdr = MockHerdr::idle_clean();
+    let res = migrate_bus(&db_path, Some(&live_raw), false, &herdr);
+    assert!(
+        res.is_err(),
+        "migrate_bus must refuse live raw directory under test"
+    );
+    let err = res.err().unwrap();
+    assert!(
+        err.contains("refused live workspace raw directory under test"),
+        "error was: {err}"
+    );
 }
 
 #[test]

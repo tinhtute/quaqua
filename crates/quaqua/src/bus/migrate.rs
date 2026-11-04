@@ -476,9 +476,22 @@ pub fn migrate_bus<H: HerdrOps>(
     }
 
     // 4. Real migration: Backup via VACUUM INTO
-    let backup_dir_path = backup_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::workspace::workspace_root().join("raw"));
+    let backup_dir_path = backup_dir.map(PathBuf::from).unwrap_or_else(|| {
+        if crate::workspace::is_test_environment() {
+            if let Some(parent) = db_path.parent() {
+                return parent.join("raw");
+            }
+            return crate::workspace::test_default_runs_dir().join("raw");
+        }
+        crate::workspace::workspace_root().join("raw")
+    });
+
+    if crate::workspace::live_raw_refused(&backup_dir_path) {
+        return Err(format!(
+            "refused live workspace raw directory under test: {}",
+            backup_dir_path.display()
+        ));
+    }
     std::fs::create_dir_all(&backup_dir_path).map_err(|e| {
         format!(
             "cannot create backup directory {}: {e}",

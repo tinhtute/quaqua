@@ -177,3 +177,14 @@ fn test_opencode_spend_refused_for_live_db() {
     );
     assert!(spend.usd.is_none(), "a refused live DB yields no spend");
 }
+
+#[test]
+fn test_live_raw_refused_under_test() {
+    let _guard = EnvGuard::new(&[]);
+    let live_raw = quaqua::workspace::live_workspace_raw().expect("system user home");
+
+    assert!(
+        quaqua::workspace::live_raw_refused(&live_raw),
+        "live_raw_refused must return true for live workspace raw directory under test"
+    );
+}
