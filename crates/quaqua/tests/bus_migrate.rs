@@ -847,17 +847,27 @@ fn test_legacy_db_cli_refusal_exits_code_2() {
         "quaqua inbox --all on legacy DB must exit with code 2"
     );
 
-    // Case 3: `quaqua mail inbox` on legacy DB
+    // Case 3: `quaqua mail inbox` without `--for` on legacy DB must exit 2: the legacy
+    // refusal has to win over the recipient-identity lookup, whose failure would
+    // otherwise surface first as a plain exit 1.
     let out_mail = std::process::Command::new(bin)
         .arg("mail")
         .arg("inbox")
         .env("QUAQUA_RUNS_DIR", &tmp)
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("QUAQUA_TEST")
+        .env_remove("QUAQUA_OWNER")
         .output()
         .expect("run quaqua mail inbox");
     assert_eq!(
         out_mail.status.code(),
         Some(2),
         "quaqua mail inbox on legacy DB must exit with code 2"
+    );
+    let mail_stderr = String::from_utf8_lossy(&out_mail.stderr);
+    assert!(
+        mail_stderr.contains("legacy database detected; run quaqua bus migrate"),
+        "stderr must mention running quaqua bus migrate: {mail_stderr}"
     );
 
     // Case 4: `quaqua mail send` on legacy DB must exit 2 (S4 residual)
@@ -1099,9 +1109,51 @@ fn test_migrate_pre_farm_legacy_columns() {
         .unwrap();
     }
 
+    let live_raw = quaqua::workspace::system_user_home()
+        .map(|h| h.join("quaqua/raw"))
+        .expect("system user home");
+    let count_before = std::fs::read_dir(&live_raw)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains("pre-superagent"))
+                .count()
+        })
+        .unwrap_or(0);
+
     let herdr = MockHerdr::with_raw(r#"{"result":{"agents":[]}}"#);
     let summary = migrate_bus(&db_path, None, false, &herdr)
         .expect("migrate on pre-farm legacy schema must succeed");
+    let count_after = std::fs::read_dir(&live_raw)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains("pre-superagent"))
+                .count()
+        })
+        .unwrap_or(0);
+    let backup_path = summary
+        .backup_path
+        .as_ref()
+        .expect("backup path must be present");
+    let leaked = backup_path.starts_with(&live_raw);
+    if leaked && backup_path.exists() {
+        let _ = std::fs::remove_file(backup_path);
+    }
+    assert_eq!(
+        count_before, count_after,
+        "hermetic leak: live raw/ changed after migrate_bus(&db_path, None, ...)"
+    );
+    assert!(
+        !leaked,
+        "hermetic leak: migrate_bus(&db_path, None, ...) wrote backup to live raw: {}",
+        backup_path.display()
+    );
+    assert!(
+        backup_path.starts_with(&tmp),
+        "backup path must be hermetic inside tmp: {}",
+        backup_path.display()
+    );
 
     assert_eq!(summary.legacy_events_count, 1);
     assert_eq!(summary.mail_count, 1);
@@ -1111,6 +1163,26 @@ fn test_migrate_pre_farm_legacy_columns() {
     let bus = FarmBus::open(&db_path).expect("FarmBus::open must succeed on migrated db");
     let events = bus.load_events(0).unwrap();
     assert_eq!(events.len(), 2);
+}
+
+#[test]
+fn test_migrate_bus_refuses_live_raw_under_test() {
+    let live_raw = quaqua::workspace::live_workspace_raw().expect("system user home");
+    let tmp = hermetic_temp_dir("refuse-live-raw");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let herdr = MockHerdr::idle_clean();
+    let res = migrate_bus(&db_path, Some(&live_raw), false, &herdr);
+    assert!(
+        res.is_err(),
+        "migrate_bus must refuse live raw directory under test"
+    );
+    let err = res.err().unwrap();
+    assert!(
+        err.contains("refused live workspace raw directory under test"),
+        "error was: {err}"
+    );
 }
 
 #[test]

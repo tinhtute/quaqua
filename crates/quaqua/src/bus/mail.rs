@@ -438,6 +438,7 @@ pub fn has_msg_key_at_marker_position(content: &str, target_key: &str) -> bool {
 }
 
 /// Appends an entry to `<runs_dir>/<target_inbox>.inbox.md`, ensuring idempotence via msg_key.
+#[allow(clippy::too_many_arguments)]
 pub fn append_to_markdown_inbox(
     runs_dir: &Path,
     target_inbox: &str,
