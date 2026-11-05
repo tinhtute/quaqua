@@ -7,6 +7,8 @@ created: 2026-11-05
 
 # Quaqua Herdr GUI
 
+> **Intent:** this is a backlog record, not work in progress. Nothing here is being built now. Each requirement has its own issue (label `gui:herdr`); pick one up later, starting with R1 (#214).
+
 ## Goal
 
 - **outcome:** The Principal sees and steers every Quaqua pipeline from the Herdr app window: what needs them, what is in review, what is working, and what finished. They can act on it (jump, ack, stop, approve merge) without typing a `quaqua` command.
@@ -55,6 +57,23 @@ created: 2026-11-05
   - acceptance: changing `strategy.default_kind` from the UI changes the line in `team.toml` and nothing else (a golden-file diff); an invalid value (e.g. `builder_reviewer_differ="x"`) shows the validate error and leaves the file as it was; a project override shows the "Project" badge and resets to Everywhere.
 - **R10 · Farm layout panel.** (#224) A view of the effective topology from `quaqua layout show --json`: roles (cos/lead/peer/taskforce), `can_spawn`, `can_prompt`, `reports_to`, `max_children`, depth, and naming. A project picker switches between the workspace and each `[projects.<slug>]`. It has a "Why?" tool that takes a caller, verb and target and runs `quaqua layout why`. Actions: "Refreeze" (`quaqua layout refreeze <slug>`, with a confirm) and "Reconcile grid" (`quaqua grid reconcile`). Its grid settings (`[grid]`: `workers_tab`, `deferred_statuses`) are edited through R9's `config set`.
   - acceptance: the fixture layout renders the same as `layout show` text; the Why tool prints the same verdict as the CLI; refreeze is disabled while the live `team.toml` matches the frozen snapshot; a reconcile failure shows the stderr in a toast.
+
+## References
+
+Shepherdr is pinned at commit `2b1b41b` so these links don't move.
+
+| Req | Look at |
+|---|---|
+| R1 | Herdr mod contract: `~/.config/herdr-app/AGENTS.md` (`exec`, `watchFolder`, layouts, clone rules) |
+| R2 | [mods/tasks/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/tasks/main.js), pie dots [mods/tasks/pie/](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/tasks/pie) |
+| R3 | [mods/toasts/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/toasts/main.js), [mods/accept-card/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/accept-card/main.js), [core/needs.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/core/needs.js) |
+| R4 | [mods/spaces-chat/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/spaces-chat/main.js), [mods/spaces-chat/sections.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/spaces-chat/sections.js) |
+| R5 | [mods/confirm-chat/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/confirm-chat/main.js), [core/confirm.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/core/confirm.js) |
+| R6 | [mods/accept-card/core/accept.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/accept-card/core/accept.js), [mods/task-pr/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/task-pr/main.js) |
+| R7 | [layouts/shepherdr.json](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/layouts/shepherdr.json), [mods/workspace-status-chat/main.js](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/workspace-status-chat/main.js) |
+| R8 | [install.sh](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/install.sh), [docs/upgrading.md](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/docs/upgrading.md) |
+| R9 | [mods/shepherdr-settings/](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/mods/shepherdr-settings), [docs/settings.md](https://github.com/eliasstravik/shepherdr/blob/2b1b41b7fa05e4e4925eac998c4371804e0c19de/docs/settings.md) (Everywhere vs space levels) |
+| R10 | Quaqua `docs/research/plans/farm-layouts/roadmap.md`; `quaqua layout show --json`, `quaqua layout why`, `quaqua grid reconcile` |
 
 ## Non-goals
 
