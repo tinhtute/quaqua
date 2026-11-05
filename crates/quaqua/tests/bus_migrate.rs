@@ -1308,12 +1308,14 @@ fn test_migrate_preserves_owner_project_and_mail_metadata() {
     assert_eq!(digest.incidents[0].project.as_deref(), Some("myproj"));
 
     // 4. Assert mail metadata (from_role, project, reply_to) is preserved
-    assert_eq!(digest.unacked_mail.len(), 1);
-    let mail_msg = &digest.unacked_mail[0];
-    assert_eq!(mail_msg.from_role, "lead");
-    assert_eq!(mail_msg.project.as_deref(), Some("myproj"));
-    assert_eq!(mail_msg.reply_to, None);
-    assert_eq!(mail_msg.body, "important message");
+    let mail_trig = digest
+        .triggers
+        .iter()
+        .find(|t| t.source == "mail")
+        .expect("mail trigger in triggers");
+    assert_eq!(mail_trig.actor, "myproj-lead");
+    assert_eq!(mail_trig.to_name.as_deref(), Some("cos"));
+    assert_eq!(mail_trig.summary, "important message");
 }
 
 #[test]
@@ -1394,7 +1396,10 @@ fn test_finding_m2_legacy_migration_preserves_per_mail_ack_state() {
         conn.execute(
             &sql_insert_fe(
                 "ts_ms, type, actor, subject, owner, project, incident_key",
-                &format!("{}, 'stalled', 'watchdog', 'w2', 'cos', 'p', 'k2'", old + 20),
+                &format!(
+                    "{}, 'stalled', 'watchdog', 'w2', 'cos', 'p', 'k2'",
+                    old + 20
+                ),
             ),
             [],
         )
@@ -1404,7 +1409,11 @@ fn test_finding_m2_legacy_migration_preserves_per_mail_ack_state() {
         conn.execute(
             &sql_insert_mail(
                 "msg_key, ts_ms, from_name, from_role, to_name, kind, body, acked_ms, acked_by",
-                &format!("'m1', {}, 'w1', 'peer', 'cos', 'report', 'hello', {}, 'cos'", old + 5, old + 6),
+                &format!(
+                    "'m1', {}, 'w1', 'peer', 'cos', 'report', 'hello', {}, 'cos'",
+                    old + 5,
+                    old + 6
+                ),
             ),
             [],
         )
@@ -1414,7 +1423,10 @@ fn test_finding_m2_legacy_migration_preserves_per_mail_ack_state() {
         conn.execute(
             &sql_insert_mail(
                 "msg_key, ts_ms, from_name, from_role, to_name, kind, body, acked_ms, acked_by",
-                &format!("'m2', {}, 'mu-lead', 'lead', 'cos', 'escalate', 'urgent', NULL, NULL", old + 15),
+                &format!(
+                    "'m2', {}, 'mu-lead', 'lead', 'cos', 'escalate', 'urgent', NULL, NULL",
+                    old + 15
+                ),
             ),
             [],
         )
@@ -1424,59 +1436,66 @@ fn test_finding_m2_legacy_migration_preserves_per_mail_ack_state() {
         conn.execute(
             &sql_insert_mail(
                 "msg_key, ts_ms, from_name, from_role, to_name, kind, body, acked_ms, acked_by",
-                &format!("'m3', {}, 'cos', 'cos', 'w9', 'task', 'acked by w9', {}, 'w9'", old + 25, old + 30),
+                &format!(
+                    "'m3', {}, 'cos', 'cos', 'w9', 'task', 'acked by w9', {}, 'w9'",
+                    old + 25,
+                    old + 30
+                ),
             ),
             [],
         )
         .unwrap();
 
         // Legacy cursors: only cos has a cursor
-        conn.execute("INSERT INTO cursors VALUES ('cos', 1, 1)", []).unwrap();
+        conn.execute("INSERT INTO cursors VALUES ('cos', 1, 1)", [])
+            .unwrap();
     }
 
     let herdr = MockHerdr::idle_clean();
-    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
-        .expect("migrate must succeed");
+    let summary =
+        migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr).expect("migrate must succeed");
     assert_eq!(summary.triggers_count, 6);
 
-    // 1. mail::list_mail must show m3 as [acked] and m1 as [acked], m2 as [unacked]
-    let mail_list = quaqua::bus::mail::list_mail(&tmp, false, None, None, None)
-        .expect("list_mail must succeed");
-
-    assert!(
-        mail_list.contains("cos          -> w9           task       [acked]"),
-        "mail to w9 (m3) was acked in legacy DB and must remain acked after migrate; got:\n{mail_list}"
-    );
-    assert!(
-        mail_list.contains("w1           -> cos          report     [acked]"),
-        "mail to cos (m1) was acked in legacy DB and must remain acked; got:\n{mail_list}"
-    );
-    assert!(
-        mail_list.contains("mu-lead      -> cos          escalate   [unacked]"),
-        "mail to cos (m2) was unacked in legacy DB and must remain unacked; got:\n{mail_list}"
-    );
-
-    // 2. w9 has no unacked mail in inbox
-    let w9_inbox = quaqua::bus::mail::read_inbox(&tmp, "w9").expect("read w9 inbox");
-    assert_eq!(
-        w9_inbox.len(),
-        0,
-        "w9 must have 0 unacked mails, but got {}",
-        w9_inbox.len()
-    );
-
-    // 3. check_unacked_incidents must NOT create mail_unacked trigger for w9
     let bus = FarmBus::open(&db_path).expect("open bus");
     let conn = bus.conn_for_test();
-    let unacked_w9_count: i64 = conn
+    let ack_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM trigger_acks", [], |r| r.get(0))
+        .expect("count trigger_acks");
+    assert_eq!(
+        ack_count, 2,
+        "m1 and m3 were acked, so trigger_acks must have exactly 2 rows"
+    );
+
+    // m1 was acked by cos
+    let m1_acked_by: String = conn
         .query_row(
-            "SELECT COUNT(*) FROM triggers WHERE kind = 'mail_unacked' AND to_name = 'w9'",
+            "SELECT a.acked_by FROM trigger_acks a JOIN triggers t ON a.trigger_id = t.id WHERE t.actor = 'w1'",
             [],
             |r| r.get(0),
         )
-        .expect("query mail_unacked for w9");
+        .expect("query m1 acked_by");
+    assert_eq!(m1_acked_by, "cos");
+
+    // m3 was acked by w9
+    let m3_acked_by: String = conn
+        .query_row(
+            "SELECT a.acked_by FROM trigger_acks a JOIN triggers t ON a.trigger_id = t.id WHERE t.actor = 'cos' AND t.to_name = 'w9'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query m3 acked_by");
+    assert_eq!(m3_acked_by, "w9");
+
+    // m2 was unacked, so no trigger_acks row exists
+    let m2_ack_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM trigger_acks a JOIN triggers t ON a.trigger_id = t.id WHERE t.actor = 'mu-lead'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query m2 ack count");
     assert_eq!(
-        unacked_w9_count, 0,
-        "must NOT insert mail_unacked trigger for acked mail to w9"
+        m2_ack_count, 0,
+        "m2 must remain unacked with no trigger_acks row"
     );
 }

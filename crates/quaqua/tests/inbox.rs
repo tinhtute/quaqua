@@ -185,8 +185,10 @@ fn test_inbox_digest_with_mail_and_incidents() {
 
     // Read inbox digest
     let digest = bus.inbox_digest(&runs_dir, "cos").expect("digest");
-    assert_eq!(digest.unacked_mail.len(), 1, "must have 1 unacked mail");
-    assert_eq!(digest.unacked_mail[0].id, send_res.id);
+    assert!(
+        digest.triggers.iter().any(|t| t.id == send_res.id),
+        "must have 1 mail trigger"
+    );
     assert_eq!(digest.incidents.len(), 1, "must have 1 incident");
 
     let rendered = digest.render("cos");
@@ -394,12 +396,8 @@ fn test_inbox_high_water_mark_mail_cursor_advances_and_deduplicates() {
 
     // First inbox read: sees Mail 1
     let digest1 = bus.inbox_digest(&runs_dir, "cos").expect("digest 1");
-    assert_eq!(
-        digest1.unacked_mail.len(),
-        1,
-        "first digest must see mail 1"
-    );
-    assert_eq!(digest1.unacked_mail[0].id, res1.id);
+    assert_eq!(digest1.triggers.len(), 1, "first digest must see mail 1");
+    assert_eq!(digest1.triggers[0].id, res1.id);
     assert_eq!(
         bus.get_mail_cursor("cos").expect("get cursor"),
         Some(res1.id)
@@ -408,7 +406,7 @@ fn test_inbox_high_water_mark_mail_cursor_advances_and_deduplicates() {
     // Second inbox read: returns 0 mail (high-water mark prevents re-delivering)
     let digest2 = bus.inbox_digest(&runs_dir, "cos").expect("digest 2");
     assert_eq!(
-        digest2.unacked_mail.len(),
+        digest2.triggers.len(),
         0,
         "repeated digest must not re-yield already seen mail"
     );
@@ -432,11 +430,11 @@ fn test_inbox_high_water_mark_mail_cursor_advances_and_deduplicates() {
     // Third inbox read: sees ONLY Mail 2
     let digest3 = bus.inbox_digest(&runs_dir, "cos").expect("digest 3");
     assert_eq!(
-        digest3.unacked_mail.len(),
+        digest3.triggers.len(),
         1,
         "third digest must see only new mail"
     );
-    assert_eq!(digest3.unacked_mail[0].id, res2.id);
+    assert_eq!(digest3.triggers[0].id, res2.id);
     assert_eq!(
         bus.get_mail_cursor("cos").expect("get cursor"),
         Some(res2.id)
@@ -444,7 +442,7 @@ fn test_inbox_high_water_mark_mail_cursor_advances_and_deduplicates() {
 }
 
 #[test]
-fn test_e2e_smoke_mail_send_dual_write_hook_digest_idempotent_resend_ack() {
+fn test_e2e_smoke_mail_send_hook_digest_idempotent_resend() {
     let guard = EnvGuard::new(&[
         "QUAQUA_TEST",
         "QUAQUA_OWNER",
@@ -489,19 +487,6 @@ fn test_e2e_smoke_mail_send_dual_write_hook_digest_idempotent_resend_ack() {
         )
         .expect("query trigger row");
     assert_eq!(row_count, 1, "DB row must exist");
-
-    let inbox_md = runs_dir.join("mu-lead.inbox.md");
-    assert!(
-        inbox_md.is_file(),
-        "markdown dual-write file mu-lead.inbox.md must exist"
-    );
-    let md_content = std::fs::read_to_string(&inbox_md).expect("read inbox md");
-    assert!(md_content.contains("## "), "markdown must contain header");
-    assert!(
-        md_content.contains("mu-lead handoff"),
-        "markdown must contain sender and kind"
-    );
-    assert!(md_content.contains(body_text), "markdown must contain body");
 
     // Step 3: hook digest shows it
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -584,13 +569,6 @@ fn test_e2e_smoke_mail_send_dual_write_hook_digest_idempotent_resend_ack() {
         "DB triggers table must still have exactly 1 row"
     );
 
-    let md_content2 = std::fs::read_to_string(&inbox_md).expect("read inbox md again");
-    let header_count = md_content2.matches("mu-lead handoff").count();
-    assert_eq!(
-        header_count, 1,
-        "markdown inbox dual-write must not duplicate entries"
-    );
-
     // Hook run after idempotent resend: must be SILENT (0 new mail since high-water mark advanced)
     let out_hook2 = std::process::Command::new("sh")
         .arg(&hook_script)
@@ -605,27 +583,6 @@ fn test_e2e_smoke_mail_send_dual_write_hook_digest_idempotent_resend_ack() {
         out_hook2.stdout.is_empty(),
         "hook must be silent on idempotent resend (nothing new)"
     );
-
-    // Step 5: ack hides it
-    let acked = mail::ack_mail(&runs_dir, "cos", &[res1.id]).expect("ack mail");
-    assert_eq!(acked, vec![res1.id]);
-
-    let cursor: Option<u64> = bus.get_cursor("cos").expect("query cursor");
-    assert!(cursor.is_some(), "cursor must be set in DB");
-
-    // Render inbox (which shows all unacked mail) must now hide it
-    let inbox_view = mail::render_inbox(&runs_dir, "cos").expect("render inbox");
-    assert!(
-        inbox_view.contains("no unacked mail for 'cos'"),
-        "ack hides it from inbox: {inbox_view}"
-    );
-    assert!(!inbox_view.contains(&format!("#{}", res1.id)));
-
-    // Inbox digest also hides it
-    let digest_after_ack = bus
-        .inbox_digest(&runs_dir, "cos")
-        .expect("digest after ack");
-    assert_eq!(digest_after_ack.unacked_mail.len(), 0);
 }
 
 #[test]
@@ -910,14 +867,14 @@ fn test_inbox_digest_interleaved_mail_incident_no_redelivery() {
 
     // First read: must see both incidents and mail, advancing cursor to 3
     let digest1 = bus.inbox_digest(&runs_dir, "cos").unwrap();
-    assert_eq!(digest1.unacked_mail.len(), 1);
+    assert!(digest1.triggers.iter().any(|t| t.id == send_res.id));
     assert_eq!(digest1.incidents.len(), 2);
     assert_eq!(digest1.new_cursor, 3);
     assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
 
     // Second read: must be completely empty (F1: no redelivery of trigger 3)
     let digest2 = bus.inbox_digest(&runs_dir, "cos").unwrap();
-    assert_eq!(digest2.unacked_mail.len(), 0);
+    assert_eq!(digest2.triggers.len(), 0);
     assert_eq!(digest2.incidents.len(), 0);
     assert_eq!(digest2.new_cursor, 3);
     assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
@@ -968,166 +925,6 @@ fn test_finding_f5_follow_tick_preserves_project_and_reply_to() {
         msg.reply_to,
         Some(42),
         "F5: reply_to must be decoded from ref"
-    );
-}
-
-#[test]
-fn test_finding_m1_mail_ack_never_drops_unread_incidents_or_unacked_lower_mail() {
-    let runs_dir = hermetic_temp_dir("m1-mail-ack");
-    let db_path = runs_dir.join("quaqua.db");
-    let bus = FarmBus::open(&db_path).expect("open bus");
-    let herdr = Herdr::new();
-
-    let guard = EnvGuard::new(&[
-        "QUAQUA_TEST",
-        "QUAQUA_OWNER",
-        "HERDR_PANE_ID",
-        "QUAQUA_RUNS_DIR",
-    ]);
-    guard.set("QUAQUA_TEST", "1");
-    guard.set("QUAQUA_OWNER", "mu-lead");
-    guard.remove("HERDR_PANE_ID");
-
-    // 1. Initial event to establish cos cursor at 1
-    let ev0 =
-        quaqua::bus::FarmEvent::new("spawned", Some("cos"), Some("w0"), Some("cos"), Some("p1"))
-            .with_incident_key("k0");
-    bus.record(&ev0).unwrap();
-    let d0 = bus.inbox_digest(&runs_dir, "cos").unwrap();
-    assert_eq!(d0.new_cursor, 1);
-    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
-
-    // 2. Trigger 2: lower mail to cos
-    let opts1 = SendMailOpts {
-        to: "cos".to_string(),
-        kind: "directive".to_string(),
-        body: "lower mail 1".to_string(),
-        project: None,
-        reply_to: None,
-        client_id: None,
-    };
-    let res_mail1 = mail::send_mail(&runs_dir, &opts1, &herdr).unwrap();
-    assert_eq!(res_mail1.id, 2);
-
-    // 3. Trigger 3: non-mail incident
-    let ev_inc = quaqua::bus::FarmEvent::new(
-        "blocked",
-        Some("herdr"),
-        Some("w1"),
-        Some("cos"),
-        Some("p1"),
-    )
-    .with_incident_key("k_blocked");
-    bus.record(&ev_inc).unwrap();
-
-    // 4. Trigger 4: higher mail to cos
-    let opts2 = SendMailOpts {
-        to: "cos".to_string(),
-        kind: "directive".to_string(),
-        body: "higher mail 2".to_string(),
-        project: None,
-        reply_to: None,
-        client_id: None,
-    };
-    let res_mail2 = mail::send_mail(&runs_dir, &opts2, &herdr).unwrap();
-    assert_eq!(res_mail2.id, 4);
-
-    // 5. cos acks ONLY higher mail 4
-    let acked = mail::ack_mail(&runs_dir, "cos", &[res_mail2.id]).expect("ack mail 4");
-    assert_eq!(acked, vec![res_mail2.id]);
-
-    // Part A: Lower mail 2 must NOT disappear from mail inbox
-    let inbox_after = mail::render_inbox(&runs_dir, "cos").expect("render inbox");
-    assert!(
-        inbox_after.contains(&format!("#{}", res_mail1.id)),
-        "lower mail 2 must NOT disappear from mail inbox; got:\n{inbox_after}"
-    );
-
-    let mail_list = mail::list_mail(&runs_dir, false, None, None, None).expect("list mail");
-    assert!(
-        mail_list.contains("#2    mu-lead      -> cos          directive  [unacked]"),
-        "lower mail 2 must remain unacked in mail ls; got:\n{mail_list}"
-    );
-    assert!(
-        mail_list.contains("#4    mu-lead      -> cos          directive  [acked]"),
-        "higher mail 4 must be acked in mail ls; got:\n{mail_list}"
-    );
-
-    // Part B: Incident trigger 3 must NOT be skipped by inbox_digest
-    let digest = bus.inbox_digest(&runs_dir, "cos").expect("inbox digest");
-    assert_eq!(
-        digest.incidents.len(),
-        1,
-        "incident trigger 3 must NOT be lost after mail ack; incidents found: {:?}",
-        digest.incidents
-    );
-    assert_eq!(digest.incidents[0].event_type, "blocked");
-    assert_eq!(digest.incidents[0].seq, 3);
-}
-
-#[test]
-fn test_finding_r2_follow_tick_never_redelivers_acked_mail() {
-    let runs_dir = hermetic_temp_dir("r2-follow-ack");
-    let db_path = runs_dir.join("quaqua.db");
-    let bus = FarmBus::open(&db_path).expect("open bus");
-    let herdr = Herdr::new();
-
-    let guard = EnvGuard::new(&[
-        "QUAQUA_TEST",
-        "QUAQUA_OWNER",
-        "HERDR_PANE_ID",
-        "QUAQUA_RUNS_DIR",
-    ]);
-    guard.set("QUAQUA_TEST", "1");
-    guard.set("QUAQUA_OWNER", "mu-lead");
-    guard.remove("HERDR_PANE_ID");
-
-    // 1. Initial event establishes cos cursor at 1
-    let ev0 =
-        quaqua::bus::FarmEvent::new("spawned", Some("cos"), Some("w0"), Some("cos"), Some("p1"))
-            .with_incident_key("k0");
-    bus.record(&ev0).unwrap();
-    let d0 = bus.inbox_digest(&runs_dir, "cos").unwrap();
-    assert_eq!(d0.new_cursor, 1);
-    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
-
-    // 2. Trigger 2: send mail to cos
-    let opts = SendMailOpts {
-        to: "cos".to_string(),
-        kind: "directive".to_string(),
-        body: "directive body".to_string(),
-        project: None,
-        reply_to: None,
-        client_id: None,
-    };
-    let send_res = mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
-    assert_eq!(send_res.id, 2);
-
-    // 3. cos acks mail #2
-    let acked = mail::ack_mail(&runs_dir, "cos", &[send_res.id]).expect("ack mail");
-    assert_eq!(acked, vec![2]);
-    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
-
-    // 4. Simulate inbox --follow --for cos
-    let initial_digest = bus.inbox_digest(&runs_dir, "cos").expect("initial digest");
-    assert_eq!(initial_digest.unacked_mail.len(), 0);
-    let mut last_seen_mail = initial_digest
-        .unacked_mail
-        .iter()
-        .map(|m| m.id)
-        .max()
-        .unwrap_or(0);
-    assert_eq!(last_seen_mail, 0);
-
-    // First tick must NOT redeliver acked mail #2
-    let tick = bus
-        .follow_tick(&runs_dir, "cos", &mut last_seen_mail)
-        .expect("follow tick");
-    assert_eq!(
-        tick.unacked_mail.len(),
-        0,
-        "acked mail #2 must NOT be redelivered in follow_tick; got: {:?}",
-        tick.unacked_mail
     );
 }
 

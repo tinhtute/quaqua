@@ -257,12 +257,6 @@ impl FarmBus {
                     trigger_id INTEGER NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS trigger_acks (
-                    trigger_id INTEGER PRIMARY KEY REFERENCES triggers(id),
-                    acked_ms   INTEGER NOT NULL,
-                    acked_by   TEXT
-                );
-
                 CREATE TABLE IF NOT EXISTS source_state (
                     source TEXT PRIMARY KEY,
                     value  TEXT NOT NULL

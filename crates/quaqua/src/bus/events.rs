@@ -689,15 +689,7 @@ impl FarmBus {
             .get_cursor(consumer)
             .map_err(|e| format!("cannot get cursor: {e}"))?
             .unwrap_or(0);
-        // Check for any unacked mail incidents lazily
-        {
-            let conn = self.conn_for_test();
-            let timeout = crate::bus::mail::get_mail_ack_timeout_ms();
-            let _ = crate::bus::mail::check_unacked_incidents(&conn, timeout, &self.farm);
-        }
-
-        let unacked_mail =
-            crate::bus::mail::read_unacked_mail_since(runs_dir, consumer, prev_cursor)?;
+        let unacked_mail: Vec<MailMessage> = Vec::new();
         let raw_incidents = self
             .load_incidents(prev_cursor, consumer)
             .map_err(|e| format!("cannot load incidents: {e}"))?;
@@ -772,12 +764,6 @@ impl FarmBus {
             .map_err(|e| format!("cannot get cursor: {e}"))?
             .unwrap_or(0);
 
-        {
-            let conn = self.conn_for_test();
-            let timeout = crate::bus::mail::get_mail_ack_timeout_ms();
-            let _ = crate::bus::mail::check_unacked_incidents(&conn, timeout, &self.farm);
-        }
-
         let new_mail = {
             let conn = self.conn_for_test();
             let mut stmt = conn
@@ -785,9 +771,7 @@ impl FarmBus {
                     r#"
                     SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm
                     FROM triggers t
-                    LEFT JOIN trigger_acks a ON a.trigger_id = t.id
                     WHERE t.source = 'mail' AND t.to_name = ?1 AND t.id > ?2
-                      AND a.trigger_id IS NULL
                       AND (t.farm = ?3 OR t.farm IS NULL)
                     ORDER BY t.id ASC
                     "#,
@@ -831,8 +815,6 @@ impl FarmBus {
                             body,
                             deliveries: 1,
                             last_delivered_ms: Some(ts_ms),
-                            acked_ms: None,
-                            acked_by: None,
                         })
                     },
                 )
