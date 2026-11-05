@@ -29,7 +29,8 @@ created: 2026-11-05
 | Data source | Read `runs/quaqua.db` directly with `exec("sqlite3", ["-readonly", "-json", db, sql])`, refresh on `watchFolder(runs/)` with a 5 s timer fallback | **adr candidate:** this ties the mods to the internal schema; mitigated by R1 |
 | Writes | Only through the `quaqua` CLI (`mail ack`, `worker stop/cleanup`, `merge …`) | The mods never write to the DB |
 | v1 actions | Jump to pane, ack mail, stop/cleanup a worker, approve a merge | Stop and approve always show a confirm dialog |
-| v1 scope | board, inbox, lead sidebar, layout + status bar | One issue each, plus R1 |
+| v1 scope | board, inbox, lead sidebar, layout + status bar, settings, farm layout | One issue each, plus R1 |
+| Config writes | New `quaqua config set` (keeps comments; validates before writing) | Keeps the "writes only through the CLI" rule; **adr candidate** |
 
 ## Requirements
 
@@ -49,6 +50,11 @@ created: 2026-11-05
   - acceptance: `herdr-app check mods/<each>` passes, `layout.switch {"name":"quaqua"}` returns ok, and `ctrl-shift-l` returns to `main`.
 - **R8 · Installer.** (#221) `quaqua init --herdr` copies the layout and mods into `~/.config/herdr-app`. It never overwrites; a name clash gets a suffix, as AGENTS.md says.
   - acceptance: running it twice is a no-op, and an existing `quaqua` mod folder is left as it is.
+
+- **R9 · `quaqua-settings` panel (team config).** (#223) A settings dialog in the style of Shepherdr's `shepherdr-settings`, with one page per `team.toml` section: Team (`[kinds.*]` roster: harness, model, effort), Routing (`[strategy]`, `[purposes]`, `[opencode_models]`), Limits & timers (`[limits]`, `[timers]`), Merge (`[merge]`), Taskforce (`[taskforce.*]`), Projects (`[projects.*]`). Each value has two levels, *Everywhere* (workspace) and *Project* (`[projects.<slug>]` override), and the page shows which level a value comes from. Reads go through `quaqua config get --json`. Writes go through a new `quaqua config set <key> <value> [--project <slug>]`, which edits `team.toml` keeping comments and order, runs `config validate`, and refuses the change when validation fails.
+  - acceptance: changing `strategy.default_kind` from the UI changes the line in `team.toml` and nothing else (a golden-file diff); an invalid value (e.g. `builder_reviewer_differ="x"`) shows the validate error and leaves the file as it was; a project override shows the "Project" badge and resets to Everywhere.
+- **R10 · Farm layout panel.** (#224) A view of the effective topology from `quaqua layout show --json`: roles (cos/lead/peer/taskforce), `can_spawn`, `can_prompt`, `reports_to`, `max_children`, depth, and naming. A project picker switches between the workspace and each `[projects.<slug>]`. It has a "Why?" tool that takes a caller, verb and target and runs `quaqua layout why`. Actions: "Refreeze" (`quaqua layout refreeze <slug>`, with a confirm) and "Reconcile grid" (`quaqua grid reconcile`). Its grid settings (`[grid]`: `workers_tab`, `deferred_statuses`) are edited through R9's `config set`.
+  - acceptance: the fixture layout renders the same as `layout show` text; the Why tool prints the same verdict as the CLI; refreeze is disabled while the live `team.toml` matches the frozen snapshot; a reconcile failure shows the stderr in a toast.
 
 ## Non-goals
 
