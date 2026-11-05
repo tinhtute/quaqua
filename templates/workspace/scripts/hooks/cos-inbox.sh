@@ -52,7 +52,7 @@ if [ -z "$RAW_OUT" ]; then
 fi
 
 # Check if there is no unacked mail or incidents
-if echo "$RAW_OUT" | grep -q "no unacked mail or new incidents"; then
+if echo "$RAW_OUT" | grep -q -E "(no unacked mail or new incidents|no unread triggers)"; then
   exit 0
 fi
 

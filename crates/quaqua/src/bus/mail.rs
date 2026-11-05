@@ -1421,32 +1421,68 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
         }
         "inbox" => {
             let mut for_user = None;
+            let mut peek = false;
+            let mut all = false;
             let mut i = 0;
             while i < subargs.len() {
-                if subargs[i] == "--for" {
-                    i += 1;
-                    if i < subargs.len() {
-                        for_user = Some(subargs[i].clone());
+                match subargs[i].as_str() {
+                    "--for" => {
+                        i += 1;
+                        if i < subargs.len() {
+                            for_user = Some(subargs[i].clone());
+                        }
                     }
+                    "--peek" => {
+                        peek = true;
+                    }
+                    "--all" => {
+                        all = true;
+                    }
+                    _ => {}
                 }
                 i += 1;
             }
 
-            let recipient = if let Some(u) = for_user {
-                u
-            } else {
-                let caller = crate::identity::resolve_caller(herdr, &runs_dir);
-                if caller.role != crate::identity::Role::Unknown {
-                    caller.name
-                } else {
-                    return Err(
-                        "cannot determine recipient identity from harness (unresolved caller)"
-                            .to_string(),
-                    );
+            let caller = crate::identity::resolve_caller(herdr, &runs_dir);
+
+            let (consumer, should_advance) = match for_user {
+                None => {
+                    if caller.role == crate::identity::Role::Unknown {
+                        return Err(
+                            "cannot determine recipient identity from harness (unresolved caller)"
+                                .to_string(),
+                        );
+                    }
+                    (caller.name, !peek)
+                }
+                Some(target) => {
+                    if caller.role == crate::identity::Role::Unknown {
+                        eprintln!(
+                            "warning: cannot determine caller identity from harness (unresolved caller); rendering in peek mode without advancing cursor"
+                        );
+                        (target, false)
+                    } else if caller.name != target {
+                        eprintln!(
+                            "warning: caller '{}' does not match recipient '{}'; rendering in peek mode without advancing cursor",
+                            caller.name, target
+                        );
+                        (target, false)
+                    } else {
+                        (target, !peek)
+                    }
                 }
             };
 
-            let output = render_inbox(&runs_dir, &recipient)?;
+            if !is_safe_inbox_name(&consumer) {
+                return Err(format!(
+                    "invalid recipient name '{consumer}': cannot escape runs/"
+                ));
+            }
+
+            let db_path = runs_dir.join("quaqua.db");
+            let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
+
+            let (output, _max_id) = bus.render_trigger_digest(&consumer, !should_advance, all)?;
             print!("{output}");
             Ok(0)
         }

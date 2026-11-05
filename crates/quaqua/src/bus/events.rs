@@ -7,6 +7,23 @@ use super::{FarmBus, FarmEvent, FarmEventRecord};
 use crate::bus::mail::MailMessage;
 use crate::herdr::HerdrOps;
 
+/// A trigger record from the `triggers` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerRecord {
+    pub id: u64,
+    pub ts_ms: u64,
+    pub source: String,
+    pub kind: String,
+    pub actor: String,
+    pub to_name: Option<String>,
+    pub thread_id: String,
+    pub summary: String,
+    pub ref_val: Option<String>,
+    pub payload_json: String,
+    pub dedupe_key: Option<String>,
+    pub farm: String,
+}
+
 /// Digest of unacked mail and incidents for a consumer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxDigest {
@@ -18,11 +35,16 @@ pub struct InboxDigest {
     pub prev_mail_cursor: u64,
     #[serde(default)]
     pub new_mail_cursor: u64,
+    #[serde(default)]
+    pub triggers: Vec<TriggerRecord>,
 }
 
 impl InboxDigest {
     /// Renders the inbox digest into a human- and agent-readable string.
-    pub fn render(&self, consumer: &str) -> String {
+    pub fn render(&self, _consumer: &str) -> String {
+        if !self.triggers.is_empty() {
+            return render_triggers(&self.triggers, false);
+        }
         let mut out = String::new();
         if !self.unacked_mail.is_empty() {
             for msg in &self.unacked_mail {
@@ -52,12 +74,91 @@ impl InboxDigest {
                 ));
             }
         }
-        if out.is_empty() {
-            format!("no unacked mail or new incidents for '{consumer}'\n")
-        } else {
-            out
+        out
+    }
+}
+
+/// Renders triggers into the superagent digest format per spec §5-§6.
+pub fn render_triggers(triggers: &[TriggerRecord], all: bool) -> String {
+    if triggers.is_empty() {
+        return String::new();
+    }
+
+    // Group triggers by thread_id
+    let mut thread_map: std::collections::BTreeMap<&str, Vec<&TriggerRecord>> =
+        std::collections::BTreeMap::new();
+    for t in triggers {
+        thread_map.entry(&t.thread_id).or_default().push(t);
+    }
+
+    // Sort threads newest-trigger-first (by max trigger id in this batch)
+    let mut threads: Vec<(&str, Vec<&TriggerRecord>)> = thread_map.into_iter().collect();
+    threads.sort_by(|a, b| {
+        let max_a = a.1.iter().map(|t| t.id).max().unwrap_or(0);
+        let max_b = b.1.iter().map(|t| t.id).max().unwrap_or(0);
+        max_b.cmp(&max_a)
+    });
+
+    let mut lines = Vec::new();
+
+    for (_thread_id, mut thread_triggers) in threads {
+        // Ensure triggers are in ascending order by id within the thread
+        thread_triggers.sort_by_key(|t| t.id);
+
+        // Group consecutive triggers of the same kind
+        let mut groups: Vec<Vec<&TriggerRecord>> = Vec::new();
+        for t in thread_triggers {
+            if let Some(last_group) = groups.last_mut() {
+                if last_group[0].kind == t.kind {
+                    last_group.push(t);
+                    continue;
+                }
+            }
+            groups.push(vec![t]);
+        }
+
+        for group in groups {
+            let first = group[0];
+            let last = *group.last().unwrap();
+            let summary_clean: String = last.summary.replace(['\n', '\r'], " ");
+            let summary_clean = summary_clean.trim();
+            let summary_80: String = summary_clean.chars().take(80).collect();
+
+            let ref_suffix = match &last.ref_val {
+                Some(r) if !r.trim().is_empty() => format!(" → {}", r.trim()),
+                _ => String::new(),
+            };
+
+            let line = if group.len() == 1 {
+                format!(
+                    "#{} {} {} {} {}{}\n",
+                    first.id, first.kind, first.actor, first.thread_id, summary_80, ref_suffix
+                )
+            } else {
+                format!(
+                    "#{}..#{} {} ×{} {} {} {}{}\n",
+                    first.id,
+                    last.id,
+                    first.kind,
+                    group.len(),
+                    last.actor,
+                    last.thread_id,
+                    summary_80,
+                    ref_suffix
+                )
+            };
+            lines.push(line);
         }
     }
+
+    if !all && lines.len() > 20 {
+        let total_lines = lines.len();
+        lines.truncate(19);
+        let overflow = total_lines - 19;
+        lines.push(format!("… +{} more: quaqua mail inbox --all\n", overflow));
+    }
+
+    lines.concat()
 }
 
 /// Resolves the consumer's own pane ID if known (e.g. from HERDR_PANE_ID or herdr query).
@@ -489,10 +590,97 @@ impl FarmBus {
         })
     }
 
+    /// Loads unread triggers for `consumer` with id > `since_cursor`:
+    /// Where `to_name = consumer` OR `consumer` is subscribed to `thread_id` with `until_ms >= now`.
+    pub fn load_unread_triggers(
+        &self,
+        consumer: &str,
+        since_cursor: u64,
+    ) -> rusqlite::Result<Vec<TriggerRecord>> {
+        let conn = self.conn_for_test();
+        let now = crate::bus::now_ms() as i64;
+        crate::engine::sqlite::retry_while_busy(|| {
+            let mut stmt = conn.prepare_cached(
+                r#"
+                SELECT t.id, t.ts_ms, t.source, t.kind, t.actor, t.to_name, t.thread_id, t.summary, t.ref, t.payload_json, t.dedupe_key, t.farm
+                FROM triggers t
+                LEFT JOIN subscriptions s ON s.thread_id = t.thread_id AND s.consumer = ?1 AND s.until_ms >= ?2
+                WHERE t.id > ?3
+                  AND (t.farm = ?4 OR t.farm IS NULL)
+                  AND (t.to_name = ?1 OR s.consumer IS NOT NULL)
+                ORDER BY t.id ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![consumer, now, since_cursor as i64, &self.farm],
+                |row| {
+                    Ok(TriggerRecord {
+                        id: row.get::<_, i64>(0)? as u64,
+                        ts_ms: row.get::<_, i64>(1)? as u64,
+                        source: row.get(2)?,
+                        kind: row.get(3)?,
+                        actor: row.get(4)?,
+                        to_name: row.get(5)?,
+                        thread_id: row.get(6)?,
+                        summary: row.get(7)?,
+                        ref_val: row.get(8)?,
+                        payload_json: row
+                            .get::<_, Option<String>>(9)?
+                            .unwrap_or_else(|| "{}".to_string()),
+                        dedupe_key: row.get(10)?,
+                        farm: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                    })
+                },
+            )?;
+            let mut res = Vec::new();
+            for r in rows {
+                res.push(r?);
+            }
+            Ok(res)
+        })
+    }
+
+    /// Renders the superagent trigger digest for `consumer`.
+    /// If `all` is false, output is capped at 20 lines; overflow ends with:
+    /// `… +N more: quaqua mail inbox --all`.
+    ///
+    /// If `peek` is false, advances `consumer`'s cursor in `cursors` table to the max trigger id.
+    /// Returns the rendered digest string and the new cursor (or max trigger id).
+    pub fn render_trigger_digest(
+        &self,
+        consumer: &str,
+        peek: bool,
+        all: bool,
+    ) -> Result<(String, u64), String> {
+        let prev_cursor = self
+            .get_cursor(consumer)
+            .map_err(|e| format!("cannot get cursor: {e}"))?
+            .unwrap_or(0);
+
+        let triggers = self
+            .load_unread_triggers(consumer, prev_cursor)
+            .map_err(|e| format!("cannot load triggers: {e}"))?;
+
+        if triggers.is_empty() {
+            return Ok((String::new(), prev_cursor));
+        }
+
+        let max_id = triggers.iter().map(|t| t.id).max().unwrap_or(prev_cursor);
+        let rendered = render_triggers(&triggers, all);
+
+        if !peek && max_id > prev_cursor {
+            self.set_cursor(consumer, max_id)
+                .map_err(|e| format!("cannot set cursor: {e}"))?;
+        }
+
+        Ok((rendered, max_id))
+    }
+
     /// Reads the inbox digest for `consumer`:
     /// - Checks lazy unacked mail incidents.
     /// - Reads unacked mail addressed to `consumer`.
     /// - Reads incidents since the consumer's cursor.
+    /// - Reads unread triggers since the consumer's cursor.
     /// - Advances the cursor to the latest event sequence.
     ///
     /// A repeated read with no new events is idempotent: the cursor remains unchanged.
@@ -513,6 +701,9 @@ impl FarmBus {
         let raw_incidents = self
             .load_incidents(prev_cursor, consumer)
             .map_err(|e| format!("cannot load incidents: {e}"))?;
+        let triggers = self
+            .load_unread_triggers(consumer, prev_cursor)
+            .unwrap_or_default();
 
         let max_mail_seq = unacked_mail
             .iter()
@@ -524,7 +715,8 @@ impl FarmBus {
             .map(|e| e.seq)
             .max()
             .unwrap_or(prev_cursor);
-        let max_evaluated_seq = max_mail_seq.max(max_incident_seq);
+        let max_trigger_seq = triggers.iter().map(|t| t.id).max().unwrap_or(prev_cursor);
+        let max_evaluated_seq = max_mail_seq.max(max_incident_seq).max(max_trigger_seq);
 
         let own_pane = resolve_consumer_pane(consumer);
         let incidents: Vec<_> = raw_incidents
@@ -548,6 +740,7 @@ impl FarmBus {
             new_cursor,
             prev_mail_cursor: prev_cursor,
             new_mail_cursor: new_cursor,
+            triggers,
         })
     }
     /// Queries the latest event type and incident key recorded for `subject`.
@@ -693,6 +886,7 @@ impl FarmBus {
             new_cursor,
             prev_mail_cursor: *last_seen_mail_id,
             new_mail_cursor: *last_seen_mail_id,
+            triggers: Vec::new(),
         })
     }
 }

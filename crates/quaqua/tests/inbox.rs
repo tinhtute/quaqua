@@ -1,7 +1,8 @@
 //! Tests for `quaqua inbox` consumer digest and per-reader cursor idempotence.
 
+use quaqua::bus::events::{render_triggers, TriggerRecord};
 use quaqua::bus::mail::{self, SendMailOpts};
-use quaqua::bus::FarmBus;
+use quaqua::bus::{FarmBus, NewTrigger};
 use quaqua::herdr::Herdr;
 use std::path::PathBuf;
 
@@ -173,6 +174,13 @@ fn test_inbox_digest_with_mail_and_incidents() {
         Some("mu"),
     )
     .with_incident_key("stall:sude-worker:5000");
+    bus.open_thread_and_subscribe(
+        "agent:sude-worker",
+        "cos",
+        "cos",
+        quaqua::bus::now_ms() + 86_400_000,
+    )
+    .expect("open thread and subscribe");
     bus.record(&ev).expect("record incident");
 
     // Read inbox digest
@@ -183,12 +191,12 @@ fn test_inbox_digest_with_mail_and_incidents() {
 
     let rendered = digest.render("cos");
     assert!(
-        rendered.contains(&format!("#{} mu-lead accept", send_res.id)),
+        rendered.contains(&format!("#{} accept mu-lead", send_res.id)),
         "rendered mail header"
     );
     assert!(
-        rendered.contains("stall:sude-worker:5000"),
-        "rendered incident"
+        rendered.contains("stalled watchdog agent:sude-worker"),
+        "rendered incident: {rendered}"
     );
 }
 
@@ -237,7 +245,7 @@ fn test_finding_3_inbox_follow_no_duplicate_deliveries_and_only_new_items() {
     // Finding 3: `--follow` must print only new items and NOT re-print the existing mail,
     // nor bump `deliveries` repeatedly on each tick.
     let occurrences = stdout
-        .matches(&format!("#{} mu-lead accept", send_res.id))
+        .matches(&format!("#{} accept mu-lead", send_res.id))
         .count();
     assert_eq!(
         occurrences, 1,
@@ -523,12 +531,12 @@ fn test_e2e_smoke_mail_send_dual_write_hook_digest_idempotent_resend_ack() {
         "hook JSON must have additionalContext"
     );
     assert!(
-        hook_stdout.contains(&format!("#{} mu-lead handoff", res1.id)),
+        hook_stdout.contains(&format!("#{} handoff mu-lead", res1.id)),
         "hook digest must show the new mail"
     );
     assert!(
         hook_stdout.contains(body_text),
-        "hook digest must include the mail body"
+        "hook digest must include the mail summary"
     );
 
     // Verify digest length is <= 10 lines
@@ -681,7 +689,7 @@ fn test_cos_inbox_hook_stop_blocks_once_and_skips_when_stop_hook_active() {
         "must block on stop: {stdout}"
     );
     assert!(
-        stdout.contains("arch-lead escalate"),
+        stdout.contains("escalate arch-lead"),
         "must mention new mail: {stdout}"
     );
 
@@ -981,14 +989,9 @@ fn test_finding_m1_mail_ack_never_drops_unread_incidents_or_unacked_lower_mail()
     guard.remove("HERDR_PANE_ID");
 
     // 1. Initial event to establish cos cursor at 1
-    let ev0 = quaqua::bus::FarmEvent::new(
-        "spawned",
-        Some("cos"),
-        Some("w0"),
-        Some("cos"),
-        Some("p1"),
-    )
-    .with_incident_key("k0");
+    let ev0 =
+        quaqua::bus::FarmEvent::new("spawned", Some("cos"), Some("w0"), Some("cos"), Some("p1"))
+            .with_incident_key("k0");
     bus.record(&ev0).unwrap();
     let d0 = bus.inbox_digest(&runs_dir, "cos").unwrap();
     assert_eq!(d0.new_cursor, 1);
@@ -1080,14 +1083,9 @@ fn test_finding_r2_follow_tick_never_redelivers_acked_mail() {
     guard.remove("HERDR_PANE_ID");
 
     // 1. Initial event establishes cos cursor at 1
-    let ev0 = quaqua::bus::FarmEvent::new(
-        "spawned",
-        Some("cos"),
-        Some("w0"),
-        Some("cos"),
-        Some("p1"),
-    )
-    .with_incident_key("k0");
+    let ev0 =
+        quaqua::bus::FarmEvent::new("spawned", Some("cos"), Some("w0"), Some("cos"), Some("p1"))
+            .with_incident_key("k0");
     bus.record(&ev0).unwrap();
     let d0 = bus.inbox_digest(&runs_dir, "cos").unwrap();
     assert_eq!(d0.new_cursor, 1);
@@ -1131,4 +1129,424 @@ fn test_finding_r2_follow_tick_never_redelivers_acked_mail() {
         "acked mail #2 must NOT be redelivered in follow_tick; got: {:?}",
         tick.unacked_mail
     );
+}
+
+#[test]
+fn test_superagent_trigger_digest_golden_format_and_ref_omission() {
+    let triggers = vec![
+        TriggerRecord {
+            id: 1,
+            ts_ms: 100,
+            source: "mail".to_string(),
+            kind: "handoff".to_string(),
+            actor: "mu-lead".to_string(),
+            to_name: Some("cos".to_string()),
+            thread_id: "quaqua/mu-lead".to_string(),
+            summary: "Task completed successfully".to_string(),
+            ref_val: Some("runs/mu-lead.md".to_string()),
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 2,
+            ts_ms: 200,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: "mu-lead".to_string(),
+            to_name: None,
+            thread_id: "quaqua/mu-lead".to_string(),
+            summary: "running targeted tests".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 3,
+            ts_ms: 300,
+            source: "watchdog".to_string(),
+            kind: "notice".to_string(),
+            actor: "watchdog".to_string(),
+            to_name: Some("cos".to_string()),
+            thread_id: "quaqua/other".to_string(),
+            summary: "budget check ok".to_string(),
+            ref_val: Some("   ".to_string()),
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+    ];
+
+    let out = render_triggers(&triggers, false);
+
+    // Thread "quaqua/other" has max trigger #3, so it appears first
+    // Thread "quaqua/mu-lead" has max trigger #2, so it appears second
+    let expected = "\
+#3 notice watchdog quaqua/other budget check ok
+#1 handoff mu-lead quaqua/mu-lead Task completed successfully → runs/mu-lead.md
+#2 progress mu-lead quaqua/mu-lead running targeted tests
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn test_superagent_trigger_digest_thread_grouping_newest_first() {
+    let triggers = vec![
+        TriggerRecord {
+            id: 10,
+            ts_ms: 100,
+            source: "worker".to_string(),
+            kind: "k1".to_string(),
+            actor: "a1".to_string(),
+            to_name: None,
+            thread_id: "thread-alpha".to_string(),
+            summary: "alpha first".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 20,
+            ts_ms: 200,
+            source: "worker".to_string(),
+            kind: "k2".to_string(),
+            actor: "a1".to_string(),
+            to_name: None,
+            thread_id: "thread-alpha".to_string(),
+            summary: "alpha second".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 5,
+            ts_ms: 150,
+            source: "worker".to_string(),
+            kind: "k1".to_string(),
+            actor: "b1".to_string(),
+            to_name: None,
+            thread_id: "thread-beta".to_string(),
+            summary: "beta first".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 50,
+            ts_ms: 500,
+            source: "worker".to_string(),
+            kind: "k2".to_string(),
+            actor: "b1".to_string(),
+            to_name: None,
+            thread_id: "thread-beta".to_string(),
+            summary: "beta second".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 30,
+            ts_ms: 300,
+            source: "worker".to_string(),
+            kind: "k1".to_string(),
+            actor: "c1".to_string(),
+            to_name: None,
+            thread_id: "thread-gamma".to_string(),
+            summary: "gamma only".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+    ];
+
+    let out = render_triggers(&triggers, false);
+
+    // Order: thread-beta (max 50), then thread-gamma (max 30), then thread-alpha (max 20)
+    let expected = "\
+#5 k1 b1 thread-beta beta first
+#50 k2 b1 thread-beta beta second
+#30 k1 c1 thread-gamma gamma only
+#10 k1 a1 thread-alpha alpha first
+#20 k2 a1 thread-alpha alpha second
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn test_superagent_trigger_digest_same_kind_collapsing() {
+    let triggers = vec![
+        TriggerRecord {
+            id: 1,
+            ts_ms: 10,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: "worker-1".to_string(),
+            to_name: None,
+            thread_id: "quaqua/worker-1".to_string(),
+            summary: "step 1".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 2,
+            ts_ms: 20,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: "worker-1".to_string(),
+            to_name: None,
+            thread_id: "quaqua/worker-1".to_string(),
+            summary: "step 2".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 3,
+            ts_ms: 30,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: "worker-1".to_string(),
+            to_name: None,
+            thread_id: "quaqua/worker-1".to_string(),
+            summary: "step 3".to_string(),
+            ref_val: Some("pr/1".to_string()),
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 4,
+            ts_ms: 40,
+            source: "reviewer".to_string(),
+            kind: "review".to_string(),
+            actor: "reviewer-1".to_string(),
+            to_name: None,
+            thread_id: "quaqua/worker-1".to_string(),
+            summary: "review clean".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 5,
+            ts_ms: 50,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: "worker-1".to_string(),
+            to_name: None,
+            thread_id: "quaqua/worker-1".to_string(),
+            summary: "step 4".to_string(),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+        TriggerRecord {
+            id: 6,
+            ts_ms: 60,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: "worker-1".to_string(),
+            to_name: None,
+            thread_id: "quaqua/worker-1".to_string(),
+            summary: "step 5".to_string(),
+            ref_val: Some("pr/2".to_string()),
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        },
+    ];
+
+    let out = render_triggers(&triggers, false);
+    let expected = "\
+#1..#3 progress ×3 worker-1 quaqua/worker-1 step 3 → pr/1
+#4 review reviewer-1 quaqua/worker-1 review clean
+#5..#6 progress ×2 worker-1 quaqua/worker-1 step 5 → pr/2
+";
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn test_superagent_trigger_digest_overflow_truncation_and_all() {
+    let mut triggers = Vec::new();
+    for i in 1..=25 {
+        triggers.push(TriggerRecord {
+            id: i,
+            ts_ms: i * 10,
+            source: "worker".to_string(),
+            kind: "progress".to_string(),
+            actor: format!("worker-{i}"),
+            to_name: None,
+            thread_id: format!("thread-{i}"),
+            summary: format!("summary {i}"),
+            ref_val: None,
+            payload_json: "{}".to_string(),
+            dedupe_key: None,
+            farm: "local".to_string(),
+        });
+    }
+
+    // 1. Without --all: capped at 20 lines, ends with overflow note
+    let out_capped = render_triggers(&triggers, false);
+    let lines_capped: Vec<&str> = out_capped.lines().collect();
+    assert_eq!(lines_capped.len(), 20, "capped output must have 20 lines");
+    assert_eq!(
+        lines_capped[19], "… +6 more: quaqua mail inbox --all",
+        "20th line must be overflow line with +6 more"
+    );
+
+    // 2. With --all: all 25 lines printed without overflow truncation
+    let out_all = render_triggers(&triggers, true);
+    let lines_all: Vec<&str> = out_all.lines().collect();
+    assert_eq!(lines_all.len(), 25, "--all must show all 25 lines");
+    assert!(
+        !out_all.contains("more: quaqua mail inbox --all"),
+        "--all must not contain overflow note"
+    );
+}
+
+#[test]
+fn test_mail_inbox_cli_caller_resolution_no_for_unknown_exits_1() {
+    let guard = EnvGuard::new(&["QUAQUA_OWNER", "HERDR_PANE_ID", "QUAQUA_RUNS_DIR"]);
+    guard.remove("QUAQUA_OWNER");
+    guard.remove("HERDR_PANE_ID");
+
+    let runs_dir = hermetic_temp_dir("caller-unknown");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+
+    let tr =
+        NewTrigger::new("mail", "handoff", "lead", "thread-1", "test summary").with_to_name("cos");
+    bus.record_trigger(&tr).expect("record trigger");
+
+    let herdr = Herdr::new();
+    let res = mail::handle_mail(&["inbox".to_string()], &herdr);
+    assert!(
+        res.is_err(),
+        "inbox without --for must error when caller identity is unknown"
+    );
+    let err = res.err().unwrap();
+    assert!(
+        err.contains("unresolved caller"),
+        "error must mention unresolved caller: {err}"
+    );
+
+    // Ensure cursor was NOT created or advanced
+    assert_eq!(bus.get_cursor("cos").unwrap(), None);
+}
+
+#[test]
+fn test_mail_inbox_cli_for_other_peeks_with_warning() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "mu-lead");
+    guard.remove("HERDR_PANE_ID");
+    let runs_dir = hermetic_temp_dir("for-other-peek");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+
+    let tr =
+        NewTrigger::new("mail", "handoff", "lead", "thread-1", "test summary").with_to_name("cos");
+    bus.record_trigger(&tr).expect("record trigger");
+
+    let herdr = Herdr::new();
+    let res = mail::handle_mail(
+        &["inbox".to_string(), "--for".to_string(), "cos".to_string()],
+        &herdr,
+    );
+    assert_eq!(res.expect("inbox for other succeeds with peek"), 0);
+
+    // Recipient 'cos' cursor must NOT be advanced because caller is mu-lead
+    assert_eq!(
+        bus.get_cursor("cos").unwrap(),
+        None,
+        "cos cursor must not advance when inspected by another caller"
+    );
+}
+
+#[test]
+fn test_mail_inbox_cli_peek_leaves_cursor_unchanged() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    let runs_dir = hermetic_temp_dir("peek-no-advance");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+
+    let tr =
+        NewTrigger::new("mail", "handoff", "lead", "thread-1", "test summary").with_to_name("cos");
+    bus.record_trigger(&tr).expect("record trigger");
+
+    let herdr = Herdr::new();
+    let res = mail::handle_mail(&["inbox".to_string(), "--peek".to_string()], &herdr);
+    assert_eq!(res.expect("inbox --peek succeeds"), 0);
+
+    // cos cursor must remain None
+    assert_eq!(
+        bus.get_cursor("cos").unwrap(),
+        None,
+        "--peek must not advance cursor"
+    );
+}
+
+#[test]
+fn test_mail_inbox_cli_matching_caller_advances_cursor() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "mu-lead");
+    guard.remove("HERDR_PANE_ID");
+    let runs_dir = hermetic_temp_dir("matching-advances");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+
+    let tr1 =
+        NewTrigger::new("mail", "handoff", "cos", "thread-1", "summary 1").with_to_name("mu-lead");
+    let tr2 =
+        NewTrigger::new("mail", "handoff", "cos", "thread-1", "summary 2").with_to_name("mu-lead");
+    bus.record_trigger(&tr1).expect("record trigger 1");
+    bus.record_trigger(&tr2).expect("record trigger 2");
+
+    let herdr = Herdr::new();
+
+    // First run: matching caller mu-lead advances cursor
+    let res = mail::handle_mail(&["inbox".to_string()], &herdr);
+    assert_eq!(res.expect("matching caller inbox succeeds"), 0);
+
+    let cursor_after = bus.get_cursor("mu-lead").unwrap();
+    assert_eq!(
+        cursor_after,
+        Some(2),
+        "cursor must advance to max trigger id 2"
+    );
+
+    // Second run: no unread triggers, cursor remains 2
+    let res2 = mail::handle_mail(&["inbox".to_string()], &herdr);
+    assert_eq!(res2.expect("second run succeeds"), 0);
+    assert_eq!(bus.get_cursor("mu-lead").unwrap(), Some(2));
 }
