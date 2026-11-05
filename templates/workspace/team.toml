@@ -23,7 +23,7 @@ can_prompt = ["lead", "peer"]
 
 [roles.lead]
 can_spawn = ["peer", "taskforce"]
-can_prompt = ["peer"]
+can_prompt = ["lead", "peer"]
 reports_to = "cos"
 max_peers = 4
 

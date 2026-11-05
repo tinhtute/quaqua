@@ -2622,3 +2622,76 @@ fn test_worker_spawn_from_tokenless_worker_pane_with_env_cos_is_denied() {
         "no pane_split on deny"
     );
 }
+
+#[test]
+fn test_lead_to_lead_prompt_allowed_and_peer_denied() {
+    let lead_caller = Caller {
+        name: "alpha-lead".to_string(),
+        role: Role::Lead,
+        depth: CallerDepth::Resolved(1),
+        source: IdentitySource::PaneTokens,
+    };
+    let peer_caller = Caller {
+        name: "worker-peer".to_string(),
+        role: Role::Peer,
+        depth: CallerDepth::Resolved(2),
+        source: IdentitySource::PaneTokens,
+    };
+
+    // 1. Built-in SLP layout
+    let slp = builtin::get("slp").expect("slp layout");
+    let dec_lead_lead = check(&slp, &lead_caller, Verb::Prompt, "lead");
+    assert!(
+        dec_lead_lead.allow,
+        "lead must be allowed to prompt lead under slp layout"
+    );
+    assert_eq!(dec_lead_lead.rule_id, "slp.lead.can_prompt.lead");
+
+    let dec_lead_peer = check(&slp, &lead_caller, Verb::Prompt, "peer");
+    assert!(
+        dec_lead_peer.allow,
+        "lead must be allowed to prompt peer under slp layout"
+    );
+    assert_eq!(dec_lead_peer.rule_id, "slp.lead.can_prompt.peer");
+
+    let dec_peer_lead = check(&slp, &peer_caller, Verb::Prompt, "lead");
+    assert!(
+        !dec_peer_lead.allow,
+        "peer must not be allowed to prompt lead under slp layout"
+    );
+    assert_eq!(dec_peer_lead.rule_id, "edge.none");
+
+    // 2. Built-in lead-peer layout
+    let lp = builtin::get("lead-peer").expect("lead-peer layout");
+    let dec_lp_lead_lead = check(&lp, &lead_caller, Verb::Prompt, "lead");
+    assert!(
+        dec_lp_lead_lead.allow,
+        "lead must be allowed to prompt lead under lead-peer layout"
+    );
+    assert_eq!(dec_lp_lead_lead.rule_id, "lead-peer.lead.can_prompt.lead");
+
+    let dec_lp_peer_lead = check(&lp, &peer_caller, Verb::Prompt, "lead");
+    assert!(
+        !dec_lp_peer_lead.allow,
+        "peer must not be allowed to prompt lead under lead-peer layout"
+    );
+    assert_eq!(dec_lp_peer_lead.rule_id, "edge.none");
+
+    // 3. Workspace template team.toml
+    let template_toml = include_str!("../../../templates/workspace/team.toml");
+    let cfg: Config = toml::from_str(template_toml).expect("parse template team.toml");
+    let legacy = Layout::from_legacy(&cfg);
+    let dec_tmpl_lead_lead = check(&legacy, &lead_caller, Verb::Prompt, "lead");
+    assert!(
+        dec_tmpl_lead_lead.allow,
+        "lead must be allowed to prompt lead under workspace template"
+    );
+    assert_eq!(dec_tmpl_lead_lead.rule_id, "slp.lead.can_prompt.lead");
+
+    let dec_tmpl_peer_lead = check(&legacy, &peer_caller, Verb::Prompt, "lead");
+    assert!(
+        !dec_tmpl_peer_lead.allow,
+        "peer must not be allowed to prompt lead under workspace template"
+    );
+    assert_eq!(dec_tmpl_peer_lead.rule_id, "edge.none");
+}

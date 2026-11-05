@@ -10,7 +10,7 @@ max_children = 1
 [roles.lead]
 class = "lead"
 can_spawn = ["peer", "taskforce"]
-can_prompt = ["peer"]
+can_prompt = ["lead", "peer"]
 reports_to = "cos"
 max_children = 4
 naming = "slug-lead"

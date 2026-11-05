@@ -38,7 +38,7 @@ impl Layout {
                 Some(r) => r.can_prompt.clone(),
                 None => match *name {
                     "cos" => vec!["lead".to_string(), "peer".to_string()],
-                    "lead" => vec!["peer".to_string()],
+                    "lead" => vec!["lead".to_string(), "peer".to_string()],
                     _ => Vec::new(),
                 },
             };

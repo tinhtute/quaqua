@@ -180,8 +180,8 @@
       "caller_role": "lead",
       "verb": "prompt",
       "target_role": "lead",
-      "allowed": false,
-      "rule_id": "edge.none"
+      "allowed": true,
+      "rule_id": "slp.lead.can_prompt.lead"
     },
     {
       "caller_role": "lead",
@@ -320,8 +320,8 @@
       "caller_role": "lead",
       "verb": "mail",
       "target_role": "lead",
-      "allowed": false,
-      "rule_id": "edge.none"
+      "allowed": true,
+      "rule_id": "slp.lead.can_mail.lead"
     },
     {
       "caller_role": "lead",
