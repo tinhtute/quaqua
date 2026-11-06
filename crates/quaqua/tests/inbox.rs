@@ -1606,3 +1606,340 @@ fn test_regression_finding_4_inbox_cli_for_another_consumer_peeks_and_all_peeks(
         "inbox without --for when caller identity is unknown must exit 1"
     );
 }
+
+fn make_herdr_pane_stub(bin_dir: &std::path::Path, tokens_json: &str) -> PathBuf {
+    std::fs::create_dir_all(bin_dir).expect("bin dir");
+    let herdr_bin = bin_dir.join("herdr");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = "pane" ] && [ "$2" = "get" ]; then
+    echo '{{"result":{{"pane":{{"tokens":{tokens_json}}}}}}}'
+    exit 0
+fi
+exit 0
+"#
+    );
+    std::fs::write(&herdr_bin, script).expect("write stub herdr");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&herdr_bin)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&herdr_bin, perms).expect("chmod");
+    }
+    herdr_bin
+}
+
+#[test]
+fn test_regression_round2_finding_1_combined_digest_cap_and_cursor_stop() {
+    let runs_dir = hermetic_temp_dir("round2-finding-1-cap");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+
+    // 15 triggers to cos (IDs 1..15)
+    for i in 1..=15 {
+        let opts = SendMailOpts {
+            to: "cos".to_string(),
+            kind: format!("k{}", i),
+            body: format!("item {}", i),
+            project: None,
+            reply_to: None,
+            client_id: None,
+        };
+        mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    }
+
+    // 10 incidents on unsubscribed threads (IDs 16..25)
+    for i in 1..=10 {
+        let ev = quaqua::bus::FarmEvent::new(
+            "stalled",
+            Some("watchdog"),
+            Some(&format!("w{}", i)),
+            Some("cos"),
+            Some("mu"),
+        )
+        .with_incident_key(format!("stall:w{}:{}", i, i));
+        bus.record(&ev).expect("record incident");
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let hook_script = manifest_dir.join("../../templates/workspace/scripts/hooks/cos-inbox.sh");
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+
+    // First read via cos-inbox.sh
+    let out_hook = std::process::Command::new("sh")
+        .arg(&hook_script)
+        .arg("--user-prompt-submit")
+        .env("QUAQUA_BIN", quaqua_bin)
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .output()
+        .expect("execute cos-inbox.sh");
+
+    assert_eq!(out_hook.status.code(), Some(0));
+    let hook_stdout = String::from_utf8_lossy(&out_hook.stdout);
+    assert!(
+        hook_stdout.contains("… +6 more: quaqua mail inbox --all"),
+        "hook output must contain overflow line, got:\n{hook_stdout}"
+    );
+    // Cursor must NOT have advanced past unrendered items (cannot be 25)
+    let cursor_after = bus.get_cursor("cos").unwrap();
+    assert!(
+        cursor_after.unwrap_or(0) < 25,
+        "cursor must stop at last rendered item (< 25), but was {cursor_after:?}"
+    );
+
+    // Second read must NOT be empty: it must show remaining incidents (e.g. #21..#25)
+    let out_next = std::process::Command::new(quaqua_bin)
+        .args(["inbox", "--for", "cos"])
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("second inbox read");
+
+    assert_eq!(out_next.status.code(), Some(0));
+    let next_stdout = String::from_utf8_lossy(&out_next.stdout);
+    assert!(
+        next_stdout.contains("! #25") || next_stdout.contains("stall:w10"),
+        "second read must not be empty; unrendered incidents must be retained, got:\n{next_stdout}"
+    );
+}
+
+#[test]
+fn test_regression_round2_finding_2_mail_inbox_all_renders_incidents_without_skipping() {
+    let runs_dir = hermetic_temp_dir("round2-finding-2-all");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+
+    // 25 triggers to cos on 25 threads, with incidents interleaved (#6, #12, #18, #24, #30)
+    for i in 1..=25 {
+        let opts = SendMailOpts {
+            to: "cos".to_string(),
+            kind: format!("k{}", i),
+            body: format!("item {}", i),
+            project: None,
+            reply_to: None,
+            client_id: None,
+        };
+        mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+        if i % 5 == 0 {
+            let inc_num = i / 5;
+            let ev = quaqua::bus::FarmEvent::new(
+                "stalled",
+                Some("watchdog"),
+                Some(&format!("w{}", inc_num)),
+                Some("cos"),
+                Some("mu"),
+            )
+            .with_incident_key(format!("stall:w{}:{}", inc_num, inc_num));
+            bus.record(&ev).expect("record incident");
+        }
+    }
+
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+    let out_mail_all = std::process::Command::new(quaqua_bin)
+        .args(["mail", "inbox", "--all"])
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run mail inbox --all");
+
+    assert_eq!(out_mail_all.status.code(), Some(0));
+    let mail_stdout = String::from_utf8_lossy(&out_mail_all.stdout);
+    assert!(
+        mail_stdout.contains("! #6") || mail_stdout.contains("stall:w1:1"),
+        "CLI mail inbox --all must render interleaved incident #6, got:\n{mail_stdout}"
+    );
+    assert!(
+        mail_stdout.contains("! #12") || mail_stdout.contains("stall:w2:2"),
+        "CLI mail inbox --all must render interleaved incident #12, got:\n{mail_stdout}"
+    );
+    assert!(
+        mail_stdout.contains("! #18") || mail_stdout.contains("stall:w3:3"),
+        "CLI mail inbox --all must render interleaved incident #18, got:\n{mail_stdout}"
+    );
+    assert!(
+        mail_stdout.contains("! #24") || mail_stdout.contains("stall:w4:4"),
+        "CLI mail inbox --all must render interleaved incident #24, got:\n{mail_stdout}"
+    );
+    assert!(
+        mail_stdout.contains("! #30") || mail_stdout.contains("stall:w5:5"),
+        "CLI mail inbox --all must render interleaved incident #30, got:\n{mail_stdout}"
+    );
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(30));
+
+    // Subsequent read must be empty (all items consumed)
+    let out_next = std::process::Command::new(quaqua_bin)
+        .args(["mail", "inbox"])
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("subsequent mail inbox read");
+    assert_eq!(out_next.status.code(), Some(0));
+    let next_stdout = String::from_utf8_lossy(&out_next.stdout);
+    assert!(
+        next_stdout.trim().is_empty(),
+        "subsequent read must be empty, got:\n{next_stdout}"
+    );
+}
+
+#[test]
+fn test_regression_round2_finding_3_peer_cannot_advance_lead_or_cos_cursor() {
+    let runs_dir = hermetic_temp_dir("round2-finding-3-peer");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "HERDR_BIN_PATH",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+
+    // 1. Create a trigger for cos and a trigger for mu-lead
+    let opts1 = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "handoff".to_string(),
+        body: "task finished for cos".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    mail::send_mail(&runs_dir, &opts1, &herdr).expect("send mail to cos");
+
+    let opts2 = SendMailOpts {
+        to: "mu-lead".to_string(),
+        kind: "handoff".to_string(),
+        body: "task finished for mu-lead".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    mail::send_mail(&runs_dir, &opts2, &herdr).expect("send mail to mu-lead");
+
+    guard.remove("QUAQUA_OWNER");
+    guard.set("HERDR_PANE_ID", "w1:p1");
+    let bin_dir = runs_dir.join("bin");
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+
+    // Case A: Worker pane owned by cos: tokens {grid_role: worker, grid_owner: cos}
+    let stub_cos = make_herdr_pane_stub(
+        &bin_dir.join("cos_worker"),
+        r#"{"grid_role":"worker","grid_owner":"cos"}"#,
+    );
+    guard.set("HERDR_BIN_PATH", stub_cos.to_str().unwrap());
+
+    let out_cos = std::process::Command::new(quaqua_bin)
+        .args(["inbox", "--for", "cos"])
+        .env("QUAQUA_TEST", "1")
+        .env_remove("QUAQUA_OWNER")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_BIN_PATH", stub_cos.to_str().unwrap())
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run inbox --for cos as worker");
+    assert_eq!(out_cos.status.code(), Some(0));
+    assert_eq!(
+        bus.get_cursor("cos").unwrap(),
+        None,
+        "Peer worker owned by cos must NOT advance cos cursor"
+    );
+
+    // Case A2: Worker pane runs `quaqua mail inbox --for cos`
+    let out_cos_mail = std::process::Command::new(quaqua_bin)
+        .args(["mail", "inbox", "--for", "cos"])
+        .env("QUAQUA_TEST", "1")
+        .env_remove("QUAQUA_OWNER")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_BIN_PATH", stub_cos.to_str().unwrap())
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run mail inbox --for cos as worker");
+
+    assert_eq!(out_cos_mail.status.code(), Some(0));
+    assert_eq!(
+        bus.get_cursor("cos").unwrap(),
+        None,
+        "Peer worker owned by cos must NOT advance cos cursor via mail inbox"
+    );
+    // Case B: Worker pane owned by mu-lead: tokens {grid_role: worker, grid_owner: mu-lead}
+    let stub_lead = make_herdr_pane_stub(
+        &bin_dir.join("lead_worker"),
+        r#"{"grid_role":"worker","grid_owner":"mu-lead"}"#,
+    );
+    guard.set("HERDR_BIN_PATH", stub_lead.to_str().unwrap());
+
+    let out_lead = std::process::Command::new(quaqua_bin)
+        .args(["inbox", "--for", "mu-lead"])
+        .env("QUAQUA_TEST", "1")
+        .env_remove("QUAQUA_OWNER")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_BIN_PATH", stub_lead.to_str().unwrap())
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run inbox --for mu-lead as worker");
+    assert_eq!(out_lead.status.code(), Some(0));
+    assert_eq!(
+        bus.get_cursor("mu-lead").unwrap(),
+        None,
+        "Peer worker owned by mu-lead must NOT advance mu-lead cursor"
+    );
+
+    // Case B2: Worker pane runs `quaqua mail inbox --for mu-lead`
+    let out_lead_mail = std::process::Command::new(quaqua_bin)
+        .args(["mail", "inbox", "--for", "mu-lead"])
+        .env("QUAQUA_TEST", "1")
+        .env_remove("QUAQUA_OWNER")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_BIN_PATH", stub_lead.to_str().unwrap())
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run mail inbox --for mu-lead as worker");
+
+    assert_eq!(out_lead_mail.status.code(), Some(0));
+    assert_eq!(
+        bus.get_cursor("mu-lead").unwrap(),
+        None,
+        "Peer worker owned by mu-lead must NOT advance mu-lead cursor via mail inbox"
+    );
+}

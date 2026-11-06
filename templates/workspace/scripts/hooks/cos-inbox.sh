@@ -56,9 +56,8 @@ if echo "$RAW_OUT" | grep -q -E "(no unacked mail or new incidents|no unread tri
   exit 0
 fi
 
-# Cap digest to <= 20 lines (per R4)
-DIGEST=$(printf '%s\n' "$RAW_OUT" | head -n 20)
-
+# Digest is capped to <= 20 lines by the renderer (per R4)
+DIGEST="$RAW_OUT"
 # Check if digest is empty after stripping whitespace
 if [ -z "$(printf '%s' "$DIGEST" | tr -d '[:space:]')" ]; then
   exit 0

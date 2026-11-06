@@ -40,51 +40,23 @@ pub struct InboxDigest {
 }
 
 impl InboxDigest {
-    /// Renders the inbox digest into a human- and agent-readable string.
+    /// Renders the inbox digest into a human- and agent-readable string (capped at <=20 lines per R4).
     pub fn render(&self, _consumer: &str) -> String {
-        let mut out = String::new();
-        if !self.triggers.is_empty() {
-            out.push_str(&render_triggers(&self.triggers, false));
-        }
-        if !self.unacked_mail.is_empty() {
-            for msg in &self.unacked_mail {
-                let tag = if msg.deliveries > 1 {
-                    format!(" (redelivery #{})", msg.deliveries)
-                } else {
-                    String::new()
-                };
-                out.push_str(&format!(
-                    "#{} {} {}{}\n",
-                    msg.id, msg.from_name, msg.kind, tag
-                ));
-                if !msg.body.trim().is_empty() {
-                    out.push_str(&format!("{}\n", msg.body.trim_end()));
-                }
-                out.push('\n');
-            }
-        }
-        let rendered_trigger_ids: std::collections::HashSet<u64> =
-            self.triggers.iter().map(|t| t.id).collect();
-        if !self.incidents.is_empty() {
-            for ev in &self.incidents {
-                if !rendered_trigger_ids.contains(&ev.seq) {
-                    let key = ev.incident_key.as_deref().unwrap_or("none");
-                    let actor = ev.actor.as_deref().unwrap_or("-");
-                    let subj = ev.subject.as_deref().unwrap_or("-");
-                    out.push_str(&format!(
-                        "! #{} {} {} [{} -> {}]\n",
-                        ev.seq, ev.event_type, key, actor, subj
-                    ));
-                }
-            }
-        }
-        out
+        render_inbox_digest_internal(
+            &self.triggers,
+            &self.incidents,
+            &self.unacked_mail,
+            false,
+            self.prev_cursor,
+        )
+        .0
     }
 }
-/// Internal helper returning both the rendered trigger digest and the list of trigger IDs actually rendered.
-pub fn render_triggers_internal(triggers: &[TriggerRecord], all: bool) -> (String, Vec<u64>) {
+
+/// Helper returning line records for triggers: (line_string, trigger_ids_in_line)
+pub fn render_triggers_lines(triggers: &[TriggerRecord]) -> Vec<(String, Vec<u64>)> {
     if triggers.is_empty() {
-        return (String::new(), Vec::new());
+        return Vec::new();
     }
 
     // Group triggers by thread_id
@@ -154,6 +126,12 @@ pub fn render_triggers_internal(triggers: &[TriggerRecord], all: bool) -> (Strin
             line_records.push((line, group_ids));
         }
     }
+    line_records
+}
+
+/// Internal helper returning both the rendered trigger digest and the list of trigger IDs actually rendered.
+pub fn render_triggers_internal(triggers: &[TriggerRecord], all: bool) -> (String, Vec<u64>) {
+    let mut line_records = render_triggers_lines(triggers);
 
     let overflow = if !all && line_records.len() > 20 {
         let total_lines = line_records.len();
@@ -173,6 +151,75 @@ pub fn render_triggers_internal(triggers: &[TriggerRecord], all: bool) -> (Strin
     }
 
     (lines.concat(), rendered_ids)
+}
+
+/// Unified helper for inbox digest rendering across triggers, incidents, and unacked mail.
+/// Returns (rendered_string, rendered_ids, safe_cursor).
+pub fn render_inbox_digest_internal(
+    triggers: &[TriggerRecord],
+    incidents: &[FarmEventRecord],
+    unacked_mail: &[MailMessage],
+    all: bool,
+    prev_cursor: u64,
+) -> (String, Vec<u64>, u64) {
+    let mut line_records = render_triggers_lines(triggers);
+
+    for msg in unacked_mail {
+        let tag = if msg.deliveries > 1 {
+            format!(" (redelivery #{})", msg.deliveries)
+        } else {
+            String::new()
+        };
+        let mut s = format!("#{} {} {}{}\n", msg.id, msg.from_name, msg.kind, tag);
+        if !msg.body.trim().is_empty() {
+            s.push_str(&format!("{}\n", msg.body.trim_end()));
+        }
+        s.push('\n');
+        line_records.push((s, vec![msg.id]));
+    }
+
+    let rendered_trigger_ids: std::collections::HashSet<u64> =
+        triggers.iter().map(|t| t.id).collect();
+    for ev in incidents {
+        if !rendered_trigger_ids.contains(&ev.seq) {
+            let key = ev.incident_key.as_deref().unwrap_or("none");
+            let actor = ev.actor.as_deref().unwrap_or("-");
+            let subj = ev.subject.as_deref().unwrap_or("-");
+            let line = format!(
+                "! #{} {} {} [{} -> {}]\n",
+                ev.seq, ev.event_type, key, actor, subj
+            );
+            line_records.push((line, vec![ev.seq]));
+        }
+    }
+
+    let mut all_ids: Vec<u64> = line_records
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    all_ids.sort_unstable();
+    all_ids.dedup();
+
+    let total_lines = line_records.len();
+    let overflow = if !all && total_lines > 20 {
+        let total_lines = line_records.len();
+        line_records.truncate(19);
+        total_lines - 19
+    } else {
+        0
+    };
+
+    let rendered_ids: Vec<u64> = line_records
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    let mut lines: Vec<String> = line_records.into_iter().map(|(l, _)| l).collect();
+    if overflow > 0 {
+        lines.push(format!("… +{} more: quaqua mail inbox --all\n", overflow));
+    }
+
+    let safe_cursor = compute_safe_cursor(&all_ids, &rendered_ids, prev_cursor);
+    (lines.concat(), rendered_ids, safe_cursor)
 }
 
 /// Renders triggers into the superagent digest format per spec §5-§6.
@@ -700,17 +747,27 @@ impl FarmBus {
             .map_err(|e| format!("cannot get cursor: {e}"))?
             .unwrap_or(0);
 
+        let runs_dir = self.path.parent().unwrap_or(Path::new("."));
+        let raw_incidents = self
+            .load_incidents(prev_cursor, consumer)
+            .map_err(|e| format!("cannot load incidents: {e}"))?;
         let triggers = self
             .load_unread_triggers(consumer, prev_cursor)
             .map_err(|e| format!("cannot load triggers: {e}"))?;
 
-        if triggers.is_empty() {
+        let own_pane = resolve_consumer_pane(consumer);
+        let incidents: Vec<_> = raw_incidents
+            .into_iter()
+            .filter(|r| !is_consumer_own_pane_blocked_noise(r, own_pane.as_deref()))
+            .filter(|r| is_incident_in_consumer_group(r, consumer, runs_dir))
+            .collect();
+
+        if triggers.is_empty() && incidents.is_empty() {
             return Ok((String::new(), prev_cursor));
         }
 
-        let all_ids: Vec<u64> = triggers.iter().map(|t| t.id).collect();
-        let (rendered, rendered_ids) = render_triggers_internal(&triggers, all);
-        let safe_cursor = compute_safe_cursor(&all_ids, &rendered_ids, prev_cursor);
+        let (rendered, _rendered_ids, safe_cursor) =
+            render_inbox_digest_internal(&triggers, &incidents, &[], all, prev_cursor);
 
         if !peek && safe_cursor > prev_cursor {
             self.set_cursor(consumer, safe_cursor)
@@ -756,20 +813,7 @@ impl FarmBus {
             .map_err(|e| format!("cannot load incidents: {e}"))?;
         let triggers = self
             .load_unread_triggers(consumer, prev_cursor)
-            .unwrap_or_default();
-
-        let max_mail_seq = unacked_mail
-            .iter()
-            .map(|m| m.id)
-            .max()
-            .unwrap_or(prev_cursor);
-        let max_incident_seq = raw_incidents
-            .iter()
-            .map(|e| e.seq)
-            .max()
-            .unwrap_or(prev_cursor);
-        let max_trigger_seq = triggers.iter().map(|t| t.id).max().unwrap_or(prev_cursor);
-        let max_evaluated_seq = max_mail_seq.max(max_incident_seq).max(max_trigger_seq);
+            .map_err(|e| format!("cannot load triggers: {e}"))?;
 
         let own_pane = resolve_consumer_pane(consumer);
         let incidents: Vec<_> = raw_incidents
@@ -778,19 +822,8 @@ impl FarmBus {
             .filter(|r| is_incident_in_consumer_group(r, consumer, runs_dir))
             .collect();
 
-        let safe_cursor = if triggers.is_empty() {
-            max_evaluated_seq
-        } else {
-            let all_trigger_ids: Vec<u64> = triggers.iter().map(|t| t.id).collect();
-            let (_, rendered_trigger_ids) = render_triggers_internal(&triggers, false);
-            let safe_tr_cursor =
-                compute_safe_cursor(&all_trigger_ids, &rendered_trigger_ids, prev_cursor);
-            if safe_tr_cursor < max_trigger_seq {
-                safe_tr_cursor.max(prev_cursor)
-            } else {
-                max_evaluated_seq
-            }
-        };
+        let (_rendered_str, _rendered_ids, safe_cursor) =
+            render_inbox_digest_internal(&triggers, &incidents, &unacked_mail, false, prev_cursor);
 
         let new_cursor = if !peek && safe_cursor > prev_cursor {
             self.set_cursor(consumer, safe_cursor)

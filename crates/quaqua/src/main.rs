@@ -954,12 +954,27 @@ fn main() {
                                 );
                                 std::process::exit(1);
                             }
-                            (caller.name, !peek && !all)
+                            if caller.role == quaqua::identity::Role::Peer {
+                                eprintln!(
+                                    "warning: peer caller cannot advance lead/cos cursor; rendering in peek mode without advancing cursor"
+                                );
+                                (caller.name, false)
+                            } else {
+                                (caller.name, !peek && !all)
+                            }
                         }
                         Some(target) => {
                             if caller.role == quaqua::identity::Role::Unknown {
                                 eprintln!(
                                     "warning: cannot determine caller identity from harness (unresolved caller); rendering in peek mode without advancing cursor"
+                                );
+                                (target, false)
+                            } else if caller.role == quaqua::identity::Role::Peer
+                                && (target == "cos" || quaqua::cap::is_lead_owner(&target))
+                            {
+                                eprintln!(
+                                    "warning: peer caller '{}' cannot advance cursor for '{}'; rendering in peek mode without advancing cursor",
+                                    caller.name, target
                                 );
                                 (target, false)
                             } else if caller.name != target {

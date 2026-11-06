@@ -1021,12 +1021,27 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
                                 .to_string(),
                         );
                     }
-                    (caller.name, !peek)
+                    if caller.role == crate::identity::Role::Peer {
+                        eprintln!(
+                            "warning: peer caller cannot advance lead/cos cursor; rendering in peek mode without advancing cursor"
+                        );
+                        (caller.name, false)
+                    } else {
+                        (caller.name, !peek)
+                    }
                 }
                 Some(target) => {
                     if caller.role == crate::identity::Role::Unknown {
                         eprintln!(
                             "warning: cannot determine caller identity from harness (unresolved caller); rendering in peek mode without advancing cursor"
+                        );
+                        (target, false)
+                    } else if caller.role == crate::identity::Role::Peer
+                        && (target == "cos" || crate::cap::is_lead_owner(&target))
+                    {
+                        eprintln!(
+                            "warning: peer caller '{}' cannot advance cursor for '{}'; rendering in peek mode without advancing cursor",
+                            caller.name, target
                         );
                         (target, false)
                     } else if caller.name != target {
