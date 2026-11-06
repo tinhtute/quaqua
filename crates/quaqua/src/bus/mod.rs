@@ -257,12 +257,6 @@ impl FarmBus {
                     trigger_id INTEGER NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS trigger_acks (
-                    trigger_id INTEGER PRIMARY KEY REFERENCES triggers(id),
-                    acked_ms   INTEGER NOT NULL,
-                    acked_by   TEXT
-                );
-
                 CREATE TABLE IF NOT EXISTS source_state (
                     source TEXT PRIMARY KEY,
                     value  TEXT NOT NULL
@@ -475,7 +469,7 @@ impl FarmBus {
     }
 
     /// Sets or updates the cursor for `consumer`.
-    pub fn set_cursor(&self, consumer: &str, trigger_id: u64) -> rusqlite::Result<()> {
+    pub(crate) fn set_cursor(&self, consumer: &str, trigger_id: u64) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         crate::engine::sqlite::retry_while_busy(|| {
             let mut stmt = conn.prepare_cached(

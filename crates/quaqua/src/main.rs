@@ -133,22 +133,28 @@ enum Command {
         #[command(subcommand)]
         cmd: LayoutCmd,
     },
-    /// Inter-team and worker mail: send, inbox, ack, import, ls.
+    /// Inter-team and worker mail: send, inbox, import, ls.
     Mail {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Show unacked mail and incident digest for a consumer.
+    /// Show trigger and incident digest for a consumer.
     Inbox {
-        /// Recipient / consumer to read for (default: 'cos')
-        #[arg(long, default_value = "cos")]
-        r#for: String,
+        /// Recipient / consumer to read for (defaults to resolved caller if omitted)
+        #[arg(long)]
+        r#for: Option<String>,
+        /// Do not advance cursor (peek mode)
+        #[arg(long)]
+        peek: bool,
         /// Continuously follow and print new items every 2 seconds
         #[arg(long)]
         follow: bool,
-        /// Show all unacked mail ignoring high-water mark
+        /// Show all triggers ignoring high-water mark
         #[arg(long)]
         all: bool,
+        /// Output format: plain, hook-ups, or hook-stop
+        #[arg(long, default_value = "plain")]
+        format: String,
     },
     /// Event bus operations: hook.
     Events {
@@ -926,79 +932,107 @@ fn main() {
                 }
             }
         }
-        Some(Command::Inbox { r#for, follow, all }) => {
+        Some(Command::Inbox {
+            r#for,
+            peek,
+            follow,
+            all,
+            format,
+        }) => {
             let runs_dir = if let Ok(dir) = std::env::var("QUAQUA_RUNS_DIR") {
                 PathBuf::from(dir)
             } else {
                 quaqua::workspace::workspace_root().join("runs")
             };
             let db_path = runs_dir.join("quaqua.db");
-            if all {
-                match quaqua::bus::mail::render_inbox(&runs_dir, &r#for) {
-                    Ok(out) => {
-                        print!("{out}");
-                        0
+            match quaqua::bus::FarmBus::open(&db_path) {
+                Ok(bus) => {
+                    let herdr = quaqua::herdr::Herdr::new();
+                    let caller = quaqua::identity::resolve_caller(&herdr, &runs_dir);
+
+                    let (consumer, should_advance) = match r#for {
+                        None => {
+                            if caller.role == quaqua::identity::Role::Unknown {
+                                eprintln!(
+                                    "cannot determine recipient identity from harness (unresolved caller)"
+                                );
+                                std::process::exit(1);
+                            }
+                            if caller.role == quaqua::identity::Role::Peer {
+                                eprintln!(
+                                    "warning: peer caller cannot advance lead/cos cursor; rendering in peek mode without advancing cursor"
+                                );
+                                (caller.name, false)
+                            } else {
+                                (caller.name, !peek && !all)
+                            }
+                        }
+                        Some(target) => {
+                            if caller.role == quaqua::identity::Role::Unknown {
+                                eprintln!(
+                                    "warning: cannot determine caller identity from harness (unresolved caller); rendering in peek mode without advancing cursor"
+                                );
+                                (target, false)
+                            } else if caller.role == quaqua::identity::Role::Peer
+                                && (target == "cos" || quaqua::cap::is_lead_owner(&target))
+                            {
+                                eprintln!(
+                                    "warning: peer caller '{}' cannot advance cursor for '{}'; rendering in peek mode without advancing cursor",
+                                    caller.name, target
+                                );
+                                (target, false)
+                            } else if caller.name != target {
+                                eprintln!(
+                                    "warning: caller '{}' does not match recipient '{}'; rendering in peek mode without advancing cursor",
+                                    caller.name, target
+                                );
+                                (target, false)
+                            } else {
+                                (target, !peek && !all)
+                            }
+                        }
+                    };
+
+                    if !quaqua::bus::mail::is_safe_inbox_name(&consumer) {
+                        eprintln!("invalid recipient name '{consumer}': cannot escape runs/");
+                        std::process::exit(1);
                     }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
-                            2
-                        } else {
-                            1
+                    let deliver_format = match quaqua::bus::events::DeliverFormat::parse(&format) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let mode = quaqua::bus::events::DeliverMode::new(!should_advance, all);
+
+                    if follow {
+                        let mut stdout = std::io::stdout();
+                        loop {
+                            if let Err(e) =
+                                bus.deliver_page(&consumer, mode, deliver_format, &mut stdout)
+                            {
+                                eprintln!("inbox error: {e}");
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    } else {
+                        let mut stdout = std::io::stdout();
+                        match bus.deliver_page(&consumer, mode, deliver_format, &mut stdout) {
+                            Ok(_) => 0,
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                1
+                            }
                         }
                     }
                 }
-            } else {
-                match quaqua::bus::FarmBus::open(&db_path) {
-                    Ok(bus) => {
-                        if follow {
-                            let mut last_seen_mail = match bus.inbox_digest(&runs_dir, &r#for) {
-                                Ok(digest) => {
-                                    if !digest.unacked_mail.is_empty()
-                                        || !digest.incidents.is_empty()
-                                    {
-                                        print!("{}", digest.render(&r#for));
-                                    }
-                                    digest.unacked_mail.iter().map(|m| m.id).max().unwrap_or(0)
-                                }
-                                Err(e) => {
-                                    eprintln!("inbox error: {e}");
-                                    0
-                                }
-                            };
-                            loop {
-                                std::thread::sleep(std::time::Duration::from_secs(2));
-                                match bus.follow_tick(&runs_dir, &r#for, &mut last_seen_mail) {
-                                    Ok(digest) => {
-                                        if !digest.unacked_mail.is_empty()
-                                            || !digest.incidents.is_empty()
-                                        {
-                                            print!("{}", digest.render(&r#for));
-                                        }
-                                    }
-                                    Err(e) => eprintln!("inbox error: {e}"),
-                                }
-                            }
-                        } else {
-                            match bus.inbox_digest(&runs_dir, &r#for) {
-                                Ok(digest) => {
-                                    print!("{}", digest.render(&r#for));
-                                    0
-                                }
-                                Err(e) => {
-                                    eprintln!("error: {e}");
-                                    1
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error opening bus at {}: {e}", db_path.display());
-                        if quaqua::bus::is_legacy_db_error(&e) {
-                            2
-                        } else {
-                            1
-                        }
+                Err(e) => {
+                    eprintln!("error opening bus at {}: {e}", db_path.display());
+                    if quaqua::bus::is_legacy_db_error(&e) {
+                        2
+                    } else {
+                        1
                     }
                 }
             }

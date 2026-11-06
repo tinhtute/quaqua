@@ -1,14 +1,11 @@
-//! Inter-team and worker mail: storage, verbs, dual-write, and fallback.
+//! Inter-team and worker mail: storage, verbs, and delivery.
 //!
 //! Stores messages in the `triggers` table in `runs/quaqua.db`.
 //! Verbs:
-//! - `send`: inserts row + `mail_sent` farm event in one transaction; dual-writes to markdown for leads;
-//!   falls back to markdown append on missing/corrupt database.
-//! - `inbox`: reads unacked rows, bumps deliveries, marks redeliveries.
-//! - `ack`: acknowledges unacked mail; caller must be recipient.
-//! - `import`: idempotent import of lead markdown inboxes; msg_key = sha256(header_line).
-//! - `ls`: lists mail, with `--md` rendering the markdown inbox view.
-
+//! - `send`: inserts trigger row + sends desktop notification if urgent.
+//! - `inbox`: renders trigger digest for a consumer.
+//! - `import`: idempotent import of lead markdown files; msg_key = sha256(header_line).
+//! - `ls`: lists mail, with `--md` rendering the markdown view.
 use super::FarmBus;
 use crate::herdr::HerdrOps;
 use serde::{Deserialize, Serialize};
@@ -16,9 +13,6 @@ use std::path::{Path, PathBuf};
 
 /// Maximum body length allowed by SQLite schema CHECK (length(body) <= 4096).
 pub const MAX_BODY_LEN: usize = 4096;
-
-/// Default mail ack timeout: 30 minutes in milliseconds.
-pub const DEFAULT_MAIL_ACK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 /// Pure Rust SHA-256 implementation (FIPS 180-4) without external dependencies.
 #[allow(clippy::chunks_exact_to_as_chunks)]
@@ -226,8 +220,6 @@ pub struct MailMessage {
     pub body: String,
     pub deliveries: u64,
     pub last_delivered_ms: Option<u64>,
-    pub acked_ms: Option<u64>,
-    pub acked_by: Option<String>,
 }
 
 /// Options for sending mail.
@@ -437,168 +429,7 @@ pub fn has_msg_key_at_marker_position(content: &str, target_key: &str) -> bool {
     false
 }
 
-/// Appends an entry to `<runs_dir>/<target_inbox>.inbox.md`, ensuring idempotence via msg_key.
-#[allow(clippy::too_many_arguments)]
-pub fn append_to_markdown_inbox(
-    runs_dir: &Path,
-    target_inbox: &str,
-    from_name: &str,
-    to_name: &str,
-    iso_time: &str,
-    kind: &str,
-    body: &str,
-    msg_key: &str,
-) -> Result<(), String> {
-    if !is_safe_inbox_name(target_inbox) {
-        return Err(format!(
-            "invalid target inbox name '{target_inbox}': cannot escape runs/"
-        ));
-    }
-    if !is_safe_inbox_name(from_name) {
-        return Err(format!(
-            "invalid from_name '{from_name}': cannot escape runs/"
-        ));
-    }
-    if !is_safe_inbox_name(to_name) {
-        return Err(format!("invalid to_name '{to_name}': cannot escape runs/"));
-    }
-
-    let inbox_path = runs_dir.join(format!("{target_inbox}.inbox.md"));
-    let key_marker = format!("<!-- msg_key: {msg_key} -->");
-    let to_marker = format!("<!-- to: {to_name} -->");
-
-    if inbox_path.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&inbox_path) {
-            if has_msg_key_at_marker_position(&existing, msg_key) {
-                return Ok(());
-            }
-        }
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&inbox_path)
-        .map_err(|e| format!("cannot open {}: {e}", inbox_path.display()))?;
-
-    let header = if to_name == "cos" {
-        format!("## {iso_time} {from_name} {kind}")
-    } else {
-        format!("## {iso_time} {from_name} -> {to_name} {kind}")
-    };
-
-    use std::io::Write;
-    let entry = if body.trim().is_empty() {
-        format!("{header}\n{key_marker}\n{to_marker}\n\n")
-    } else {
-        let escaped = escape_body(body);
-        format!(
-            "{header}\n{key_marker}\n{to_marker}\n{}\n",
-            escaped.trim_end()
-        )
-    };
-    file.write_all(entry.as_bytes())
-        .map_err(|e| format!("cannot write to {}: {e}", inbox_path.display()))?;
-    Ok(())
-}
-
-/// Returns configured mail ack timeout in milliseconds, defaulting to 30 minutes.
-pub fn get_mail_ack_timeout_ms() -> u64 {
-    if let Ok(cfg) = crate::config::load_team_config() {
-        if let Ok(secs) = crate::config::parse_duration(&cfg.timers.mail_ack) {
-            return secs.saturating_mul(1000);
-        }
-    }
-    DEFAULT_MAIL_ACK_TIMEOUT_MS
-}
-
-/// Lazily inserts `mail_unacked:<id>` incident into `triggers` for rows unacked past `ack_timeout_ms`.
-pub fn check_unacked_incidents(
-    conn: &rusqlite::Connection,
-    ack_timeout_ms: u64,
-    farm: &str,
-) -> rusqlite::Result<usize> {
-    let now = crate::bus::now_ms();
-    let cutoff = now.saturating_sub(ack_timeout_ms);
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT t.id, t.ts_ms, t.actor, t.to_name, t.kind, t.farm
-        FROM triggers t
-        LEFT JOIN trigger_acks a ON a.trigger_id = t.id
-        WHERE t.source = 'mail'
-          AND t.ts_ms <= ?1
-          AND a.trigger_id IS NULL
-          AND (t.farm = ?2 OR t.farm IS NULL)
-        "#,
-    )?;
-    let rows = stmt.query_map(rusqlite::params![cutoff as i64, farm], |row| {
-        Ok((
-            row.get::<_, i64>(0)? as u64,
-            row.get::<_, i64>(1)? as u64,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
-
-    let mut incidents = Vec::new();
-    for r in rows {
-        incidents.push(r?);
-    }
-    drop(stmt);
-
-    let mut inserted_count = 0;
-    for (id, ts_ms, from_name, to_name, kind, row_farm) in incidents {
-        let incident_key = format!("mail_unacked:{id}");
-        let payload = serde_json::json!({
-            "mail_id": id,
-            "kind": kind,
-            "unacked_ms": now.saturating_sub(ts_ms),
-        })
-        .to_string();
-
-        let farm_to_insert = row_farm.as_deref().unwrap_or(farm);
-        let thread_id = format!("agent:{to_name}");
-        let summary = format!("mail_unacked #{id} to {to_name}");
-        let summary_trunc: String = summary.chars().take(80).collect();
-
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO threads (id, owner, state, last_trigger_ms) VALUES (?1, ?2, 'open', ?3)",
-            rusqlite::params![&thread_id, &to_name, now as i64],
-        );
-
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT OR IGNORE INTO triggers (
-                ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm
-            ) VALUES (?1, 'watchdog', 'mail_unacked', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)
-            "#,
-        )?;
-        let rows_affected = insert_stmt.execute(rusqlite::params![
-            now as i64,
-            &from_name,
-            &to_name,
-            &thread_id,
-            &summary_trunc,
-            &payload,
-            &incident_key,
-            farm_to_insert,
-        ])?;
-        if rows_affected > 0 {
-            inserted_count += 1;
-            let herdr = crate::herdr::Herdr::new();
-            let title = "quaqua mail: unacked";
-            let body =
-                format!("Mail #{id} from {from_name} to {to_name} ({kind}) is unacknowledged");
-            let _ = herdr.notification_show(title, &body, Some("request"));
-        }
-    }
-    Ok(inserted_count)
-}
-
-/// Sends mail: inserts mail row + `mail_sent` event in one transaction; dual-writes to markdown for leads;
-/// falls back to markdown append on missing/corrupt database with warning.
+/// Sends mail: inserts mail trigger row in one transaction; desktop notification if escalate/blocked.
 pub fn send_mail<H: HerdrOps>(
     runs_dir: &Path,
     opts: &SendMailOpts,
@@ -617,9 +448,8 @@ pub fn send_mail<H: HerdrOps>(
     // from *this* workspace (`default_runs_dir` is QUAQUA_HOME-aware, never pane-aware).
     refuse_foreign_caller_farm(herdr, runs_dir)?;
 
-    let (from_name, from_role) = resolve_sender(herdr, runs_dir)?;
+    let (from_name, _from_role) = resolve_sender(herdr, runs_dir)?;
     let now = crate::bus::now_ms();
-    let iso_time = format_iso_timestamp(now);
 
     let client_id = opts
         .client_id
@@ -636,14 +466,7 @@ pub fn send_mail<H: HerdrOps>(
     });
 
     let db_path = runs_dir.join("quaqua.db");
-    let fallback_target =
-        if opts.to == "cos" && (from_role == "lead" || from_name.ends_with("-lead")) {
-            from_name.clone()
-        } else {
-            opts.to.clone()
-        };
-
-    // Try opening database; fallback to markdown append on failure (unless locked)
+    // Open database
     let bus = match FarmBus::open(&db_path) {
         Ok(b) => b,
         Err(e) => {
@@ -657,34 +480,14 @@ pub fn send_mail<H: HerdrOps>(
             if crate::engine::sqlite::is_lock_error(&e) {
                 return Err(format!("database locked at {}: {e}", db_path.display()));
             }
-            eprintln!(
-                "warning: database unavailable at {}: {}; falling back to markdown append",
-                db_path.display(),
-                e
-            );
-            append_to_markdown_inbox(
-                runs_dir,
-                &fallback_target,
-                &from_name,
-                &opts.to,
-                &iso_time,
-                &opts.kind,
-                &opts.body,
-                &msg_key,
-            )?;
-            return Ok(SendMailResult {
-                id: 0,
-                already_sent: false,
-            });
+            return Err(format!(
+                "cannot open database at {}: {e}",
+                db_path.display()
+            ));
         }
     };
 
     let mut conn = bus.conn.lock().unwrap();
-
-    // Check unacked incidents on every mail verb (Finding 8)
-    let timeout_ms = get_mail_ack_timeout_ms();
-    let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
-
     let tx_res: rusqlite::Result<SendMailResult> = crate::engine::sqlite::retry_while_busy(|| {
         let tx = conn.transaction()?;
         let thread_id = format!("agent:{}", opts.to);
@@ -765,48 +568,12 @@ pub fn send_mail<H: HerdrOps>(
             if crate::engine::sqlite::is_lock_error(&e) {
                 return Err(format!("database locked at {}: {e}", db_path.display()));
             }
-            eprintln!(
-                "warning: database transaction failed at {}: {}; falling back to markdown append",
-                db_path.display(),
-                e
-            );
-            append_to_markdown_inbox(
-                runs_dir,
-                &fallback_target,
-                &from_name,
-                &opts.to,
-                &iso_time,
-                &opts.kind,
-                &opts.body,
-                &msg_key,
-            )?;
-            return Ok(SendMailResult {
-                id: 0,
-                already_sent: false,
-            });
+            return Err(format!(
+                "database transaction failed at {}: {e}",
+                db_path.display()
+            ));
         }
     };
-
-    // Dual-write to markdown for lead senders
-    if from_role == "lead" || from_name.ends_with("-lead") {
-        let dual_write_target = if opts.to == "cos" {
-            &from_name
-        } else {
-            &opts.to
-        };
-        if let Err(e) = append_to_markdown_inbox(
-            runs_dir,
-            dual_write_target,
-            &from_name,
-            &opts.to,
-            &iso_time,
-            &opts.kind,
-            &opts.body,
-            &msg_key,
-        ) {
-            eprintln!("warning: markdown dual-write failed: {e}");
-        }
-    }
     if !result.already_sent && (opts.kind == "escalate" || opts.kind == "blocked") {
         let title = format!("quaqua mail: {}", opts.kind);
         let body = format!("{} -> {}: {}", from_name, opts.to, opts.kind);
@@ -814,192 +581,6 @@ pub fn send_mail<H: HerdrOps>(
     }
 
     Ok(result)
-}
-
-/// Reads unacked mail addressed to `to_name` with id > `since_id`, bumps delivery counts, and updates last_delivered_ms.
-pub fn read_unacked_mail_since(
-    runs_dir: &Path,
-    to_name: &str,
-    since_id: u64,
-) -> Result<Vec<MailMessage>, String> {
-    let db_path = runs_dir.join("quaqua.db");
-    let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
-    let conn = bus.conn.lock().unwrap();
-
-    let timeout_ms = get_mail_ack_timeout_ms();
-    let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
-    let now = crate::bus::now_ms();
-    let min_id = since_id;
-
-    let mut stmt = conn
-        .prepare_cached(
-            r#"
-            SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm
-            FROM triggers t
-            LEFT JOIN trigger_acks a ON a.trigger_id = t.id
-            WHERE t.source = 'mail' AND t.to_name = ?1 AND a.trigger_id IS NULL AND t.id > ?2 AND (t.farm = ?3 OR t.farm IS NULL)
-            ORDER BY t.id ASC
-            "#,
-        )
-        .map_err(|e| e.to_string())?;
-
-    let rows = stmt
-        .query_map(
-            rusqlite::params![to_name, min_id as i64, bus.farm()],
-            |row| {
-                let id = row.get::<_, i64>(0)? as u64;
-                let dedupe_key: Option<String> = row.get(1)?;
-                let msg_key = dedupe_key
-                    .as_deref()
-                    .and_then(|k| k.strip_prefix("mail:"))
-                    .unwrap_or("")
-                    .to_string();
-                let ts_ms = row.get::<_, i64>(2)? as u64;
-                let from_name: String = row.get(3)?;
-                let to_name: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-                let kind: String = row.get(5)?;
-                let raw_payload: Option<String> = row.get(6)?;
-                let ref_val: Option<String> = row.get(7)?;
-                let _farm: Option<String> = row.get(8)?;
-                let (body, from_role, project, reply_to) =
-                    decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
-
-                Ok(MailMessage {
-                    id,
-                    msg_key,
-                    ts_ms,
-                    from_name,
-                    from_role,
-                    to_name,
-                    kind,
-                    project,
-                    reply_to,
-                    body,
-                    deliveries: 1,
-                    last_delivered_ms: Some(ts_ms),
-                    acked_ms: None,
-                    acked_by: None,
-                })
-            },
-        )
-        .map_err(|e| e.to_string())?;
-
-    let mut messages = Vec::new();
-    for r in rows {
-        messages.push(r.map_err(|e| e.to_string())?);
-    }
-    drop(stmt);
-
-    for msg in &mut messages {
-        let key = format!("mail_delivery:{}", msg.id);
-        let delivery_count: u64 = conn
-            .query_row(
-                "SELECT value FROM source_state WHERE source = ?1",
-                rusqlite::params![&key],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-            + 1;
-        let _ = conn.execute(
-            "INSERT INTO source_state (source, value) VALUES (?1, ?2) ON CONFLICT(source) DO UPDATE SET value = excluded.value",
-            rusqlite::params![&key, delivery_count.to_string()],
-        );
-        msg.deliveries = delivery_count;
-        msg.last_delivered_ms = Some(now);
-    }
-    Ok(messages)
-}
-
-/// Reads unacked mail addressed to `to_name`, bumps delivery counts, and updates last_delivered_ms.
-pub fn read_inbox(runs_dir: &Path, to_name: &str) -> Result<Vec<MailMessage>, String> {
-    read_unacked_mail_since(runs_dir, to_name, 0)
-}
-
-/// Renders unacked inbox messages for `to_name`.
-pub fn render_inbox(runs_dir: &Path, to_name: &str) -> Result<String, String> {
-    let msgs = read_inbox(runs_dir, to_name)?;
-    if msgs.is_empty() {
-        return Ok(format!("no unacked mail for '{to_name}'\n"));
-    }
-    let mut out = String::new();
-    for msg in msgs {
-        let tag = if msg.deliveries > 1 {
-            format!(" (redelivery #{})", msg.deliveries)
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "#{} {} {}{}\n",
-            msg.id, msg.from_name, msg.kind, tag
-        ));
-        if !msg.body.trim().is_empty() {
-            out.push_str(&format!("{}\n", msg.body.trim_end()));
-        }
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-/// Acknowledges unacked mail ids. Only the recipient may ack. Refuses non-recipient.
-pub fn ack_mail(runs_dir: &Path, caller_name: &str, mail_ids: &[u64]) -> Result<Vec<u64>, String> {
-    let db_path = runs_dir.join("quaqua.db");
-    let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
-    let mut conn = bus.conn.lock().unwrap();
-
-    let timeout_ms = get_mail_ack_timeout_ms();
-    let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
-
-    let now = crate::bus::now_ms();
-
-    let res: rusqlite::Result<Result<Vec<u64>, String>> =
-        crate::engine::sqlite::retry_while_busy(|| {
-            let tx = conn.transaction()?;
-            let mut acked_ids = Vec::new();
-
-            for &id in mail_ids {
-                let mut query = tx.prepare_cached(
-                    "SELECT to_name FROM triggers WHERE id = ?1 AND (farm = ?2 OR farm IS NULL)",
-                )?;
-
-                let mut rows = query.query(rusqlite::params![id as i64, bus.farm()])?;
-                if let Some(row) = rows.next()? {
-                    let to_name: String = row
-                        .get::<_, Option<String>>(0)?
-                        .unwrap_or_default();
-
-                    if caller_name != to_name {
-                        return Ok(Err(format!(
-                            "refused: caller '{caller_name}' is not the recipient of mail #{id} (addressed to '{to_name}')"
-                        )));
-                    }
-
-                    drop(rows);
-                    drop(query);
-
-                    let mut set_stmt = tx.prepare_cached(
-                        r#"
-                        INSERT INTO trigger_acks (trigger_id, acked_ms, acked_by) VALUES (?1, ?2, ?3)
-                        ON CONFLICT(trigger_id) DO NOTHING
-                        "#,
-                    )?;
-                    set_stmt.execute(rusqlite::params![id as i64, now as i64, caller_name])?;
-
-                    acked_ids.push(id);
-                } else {
-                    return Ok(Err(format!("mail #{id} not found")));
-                }
-            }
-
-            tx.commit()?;
-            Ok(Ok(acked_ids))
-        });
-
-    match res {
-        Ok(inner) => inner,
-        Err(e) => Err(e.to_string()),
-    }
 }
 
 /// Imports markdown inbox file. Idempotent: msg_key = sha256(header_line) or metadata msg_key.
@@ -1010,9 +591,6 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
     let db_path = runs_dir.join("quaqua.db");
     let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
     let conn = bus.conn.lock().unwrap();
-
-    let timeout_ms = get_mail_ack_timeout_ms();
-    let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
 
     let mut result = ImportResult::default();
 
@@ -1040,7 +618,11 @@ pub fn import_inbox_file(runs_dir: &Path, file_path: &Path) -> Result<ImportResu
     let file_stem = file_path
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(|s| s.strip_suffix(".inbox.md"))
+        .map(|s| {
+            s.strip_suffix(".md")
+                .map(|name| name.strip_suffix(".inbox").unwrap_or(name))
+                .unwrap_or(s)
+        })
         .unwrap_or("");
 
     for (header, raw_body) in entries {
@@ -1194,14 +776,10 @@ pub fn list_mail(
     let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
     let conn = bus.conn.lock().unwrap();
 
-    let timeout_ms = get_mail_ack_timeout_ms();
-    let _ = check_unacked_incidents(&conn, timeout_ms, bus.farm());
-
     let mut query = String::from(
         r#"
-        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm, a.acked_ms, a.acked_by
+        SELECT t.id, t.dedupe_key, t.ts_ms, t.actor, t.to_name, t.kind, t.payload_json, t.ref, t.farm
         FROM triggers t
-        LEFT JOIN trigger_acks a ON a.trigger_id = t.id
         WHERE t.source = 'mail' AND (t.farm = ? OR t.farm IS NULL)
         "#,
     );
@@ -1238,9 +816,6 @@ pub fn list_mail(
             let raw_payload: Option<String> = row.get(6)?;
             let ref_val: Option<String> = row.get(7)?;
             let _farm: Option<String> = row.get(8)?;
-            let acked_ms: Option<i64> = row.get(9)?;
-            let acked_by: Option<String> = row.get(10)?;
-            let acked_ms = acked_ms.map(|v| v as u64);
             let (body, from_role, project, reply_to) =
                 decode_mail_fields(raw_payload.as_deref(), &from_name, ref_val.as_deref());
 
@@ -1257,8 +832,6 @@ pub fn list_mail(
                 body,
                 deliveries: 1,
                 last_delivered_ms: Some(ts_ms),
-                acked_ms,
-                acked_by,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1274,14 +847,9 @@ pub fn list_mail(
             }
             out.push('\n');
         } else {
-            let ack_status = if msg.acked_ms.is_some() {
-                "acked"
-            } else {
-                "unacked"
-            };
             out.push_str(&format!(
-                "#{:<4} {:<12} -> {:<12} {:<10} [{}]\n",
-                msg.id, msg.from_name, msg.to_name, msg.kind, ack_status
+                "#{:<4} {:<12} -> {:<12} {:<10}\n",
+                msg.id, msg.from_name, msg.to_name, msg.kind
             ));
         }
     }
@@ -1291,7 +859,7 @@ pub fn list_mail(
 /// Dispatches CLI args for `quaqua mail`.
 pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, String> {
     if args.is_empty() {
-        eprintln!("Usage: quaqua mail <send|inbox|ack|import|ls> [options]");
+        eprintln!("Usage: quaqua mail <send|inbox|import|ls> [options]");
         return Ok(1);
     }
 
@@ -1421,70 +989,89 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
         }
         "inbox" => {
             let mut for_user = None;
+            let mut peek = false;
+            let mut all = false;
             let mut i = 0;
             while i < subargs.len() {
-                if subargs[i] == "--for" {
-                    i += 1;
-                    if i < subargs.len() {
-                        for_user = Some(subargs[i].clone());
+                match subargs[i].as_str() {
+                    "--for" => {
+                        i += 1;
+                        if i < subargs.len() {
+                            for_user = Some(subargs[i].clone());
+                        }
+                    }
+                    "--peek" => {
+                        peek = true;
+                    }
+                    "--all" => {
+                        all = true;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            let caller = crate::identity::resolve_caller(herdr, &runs_dir);
+
+            let (consumer, should_advance) = match for_user {
+                None => {
+                    if caller.role == crate::identity::Role::Unknown {
+                        return Err(
+                            "cannot determine recipient identity from harness (unresolved caller)"
+                                .to_string(),
+                        );
+                    }
+                    if caller.role == crate::identity::Role::Peer {
+                        eprintln!(
+                            "warning: peer caller cannot advance lead/cos cursor; rendering in peek mode without advancing cursor"
+                        );
+                        (caller.name, false)
+                    } else {
+                        (caller.name, !peek)
                     }
                 }
-                i += 1;
-            }
-
-            let recipient = if let Some(u) = for_user {
-                u
-            } else {
-                let caller = crate::identity::resolve_caller(herdr, &runs_dir);
-                if caller.role != crate::identity::Role::Unknown {
-                    caller.name
-                } else {
-                    return Err(
-                        "cannot determine recipient identity from harness (unresolved caller)"
-                            .to_string(),
-                    );
+                Some(target) => {
+                    if caller.role == crate::identity::Role::Unknown {
+                        eprintln!(
+                            "warning: cannot determine caller identity from harness (unresolved caller); rendering in peek mode without advancing cursor"
+                        );
+                        (target, false)
+                    } else if caller.role == crate::identity::Role::Peer
+                        && (target == "cos" || crate::cap::is_lead_owner(&target))
+                    {
+                        eprintln!(
+                            "warning: peer caller '{}' cannot advance cursor for '{}'; rendering in peek mode without advancing cursor",
+                            caller.name, target
+                        );
+                        (target, false)
+                    } else if caller.name != target {
+                        eprintln!(
+                            "warning: caller '{}' does not match recipient '{}'; rendering in peek mode without advancing cursor",
+                            caller.name, target
+                        );
+                        (target, false)
+                    } else {
+                        (target, !peek)
+                    }
                 }
             };
 
-            let output = render_inbox(&runs_dir, &recipient)?;
-            print!("{output}");
-            Ok(0)
-        }
-        "ack" => {
-            let mut ids = Vec::new();
-
-            let mut i = 0;
-            while i < subargs.len() {
-                if subargs[i] == "--as" {
-                    return Err("error: --as override is not permitted; caller identity is inferred from harness".to_string());
-                } else if let Ok(id) = subargs[i].parse::<u64>() {
-                    ids.push(id);
-                } else {
-                    return Err(format!("invalid mail id for ack: {}", subargs[i]));
-                }
-                i += 1;
+            if !is_safe_inbox_name(&consumer) {
+                return Err(format!(
+                    "invalid recipient name '{consumer}': cannot escape runs/"
+                ));
             }
 
-            if ids.is_empty() {
-                return Err("missing mail id(s) to ack".to_string());
-            }
-
-            let caller = {
-                let c = crate::identity::resolve_caller(herdr, &runs_dir);
-                if c.role != crate::identity::Role::Unknown {
-                    c.name
-                } else {
-                    return Err(
-                        "cannot determine caller identity from harness (unresolved caller)"
-                            .to_string(),
-                    );
-                }
-            };
-
-            let acked = ack_mail(&runs_dir, &caller, &ids)?;
-            for id in acked {
-                println!("acked mail {id}");
-            }
+            let db_path = runs_dir.join("quaqua.db");
+            let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
+            let mode = crate::bus::events::DeliverMode::new(!should_advance, all);
+            let mut stdout = std::io::stdout();
+            bus.deliver_page(
+                &consumer,
+                mode,
+                crate::bus::events::DeliverFormat::Plain,
+                &mut stdout,
+            )?;
             Ok(0)
         }
         "import" => {

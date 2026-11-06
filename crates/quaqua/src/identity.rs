@@ -248,7 +248,6 @@ pub fn resolve_caller_from_tokens(
             Role::Peer => tokens
                 .get("grid_name")
                 .cloned()
-                .or_else(|| tokens.get("grid_owner").cloned())
                 .unwrap_or_else(|| "unknown".to_string()),
             Role::Unknown => tokens
                 .get("grid_owner")

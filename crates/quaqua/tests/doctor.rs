@@ -382,8 +382,16 @@ fn doctor_workspace_drift_reports_problems_and_clean_passes() {
     fs::write(ws.join("AGENTS.md"), "@identity.md\n").unwrap();
 
     // Rule drift
-    fs::write(t_rules.join("lead-inbox.md"), "template lead inbox content").unwrap();
-    fs::write(ws_rules.join("lead-inbox.md"), "stale workspace lead inbox").unwrap();
+    fs::write(
+        t_rules.join("sample-rule.md"),
+        "template lead inbox content",
+    )
+    .unwrap();
+    fs::write(
+        ws_rules.join("sample-rule.md"),
+        "stale workspace lead inbox",
+    )
+    .unwrap();
 
     // Manifest with 2 hooks
     let manifest = r#"
@@ -420,7 +428,7 @@ command = ["quaqua", "events", "hook"]
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("rule drift: rules/_all/lead-inbox.md differs from template"),
+        stderr.contains("rule drift: rules/_all/sample-rule.md differs from template"),
         "{stderr}"
     );
     assert!(stderr.contains("cp "), "{stderr}");
@@ -443,7 +451,7 @@ command = ["quaqua", "events", "hook"]
 
     // 2. Fix both drifts
     fs::write(
-        ws_rules.join("lead-inbox.md"),
+        ws_rules.join("sample-rule.md"),
         "template lead inbox content",
     )
     .unwrap();
