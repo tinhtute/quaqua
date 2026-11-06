@@ -691,6 +691,50 @@ fn test_cos_inbox_hook_stop_blocks_once_and_skips_when_stop_hook_active() {
 }
 
 #[test]
+fn test_cos_inbox_hook_exits_zero_on_quaqua_exit_2() {
+    let runs_dir = hermetic_temp_dir("hook-exit-2");
+    let stub_bin = runs_dir.join("stub_quaqua.sh");
+    let script = "#!/bin/sh\necho \"error: unexpected argument '--format' found\" >&2\nexit 2\n";
+    std::fs::write(&stub_bin, script).expect("write stub quaqua");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&stub_bin)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_bin, perms).expect("chmod");
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let hook_script = manifest_dir.join("../../templates/workspace/scripts/hooks/cos-inbox.sh");
+    assert!(
+        hook_script.is_file(),
+        "hook script must exist at {}",
+        hook_script.display()
+    );
+
+    let guard = EnvGuard::new(&["QUAQUA_OWNER", "QUAQUA_RUNS_DIR", "QUAQUA_BIN"]);
+    guard.set("QUAQUA_OWNER", "cos");
+
+    for event_flag in ["--user-prompt-submit", "--stop"] {
+        let out_hook = std::process::Command::new("sh")
+            .arg(&hook_script)
+            .arg(event_flag)
+            .env("QUAQUA_BIN", &stub_bin)
+            .env("QUAQUA_RUNS_DIR", &runs_dir)
+            .output()
+            .expect("execute cos-inbox.sh");
+
+        assert_eq!(
+            out_hook.status.code(),
+            Some(0),
+            "hook must exit 0 even when quaqua exits 2 (flag: {event_flag})"
+        );
+    }
+}
+
+#[test]
 fn test_inbox_drops_foreign_blocked_pane_incidents_and_keeps_real_incidents() {
     let guard = EnvGuard::new(&[
         "QUAQUA_TEST",

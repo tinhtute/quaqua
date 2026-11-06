@@ -49,4 +49,4 @@ if [ "$EVENT" = "Stop" ]; then
   FORMAT="hook-stop"
 fi
 
-exec "$QUAQUA" inbox --for cos --format "$FORMAT"
+"$QUAQUA" inbox --for cos --format "$FORMAT" || exit 0
