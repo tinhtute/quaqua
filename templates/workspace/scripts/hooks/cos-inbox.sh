@@ -44,75 +44,9 @@ if [ -z "$QUAQUA" ] || (! command -v "$QUAQUA" >/dev/null 2>&1 && [ ! -x "$QUAQU
   exit 0
 fi
 
-# Run `quaqua inbox --for cos`
-RAW_OUT=$("$QUAQUA" inbox --for cos 2>/dev/null || true)
-
-if [ -z "$RAW_OUT" ]; then
-  exit 0
-fi
-
-# Check if there is no unacked mail or incidents
-if echo "$RAW_OUT" | grep -q -E "(no unacked mail or new incidents|no unread triggers)"; then
-  exit 0
-fi
-
-# Digest is capped to <= 20 lines by the renderer (per R4)
-DIGEST="$RAW_OUT"
-# Check if digest is empty after stripping whitespace
-if [ -z "$(printf '%s' "$DIGEST" | tr -d '[:space:]')" ]; then
-  exit 0
-fi
-
-# Output JSON for Claude Code hook
+FORMAT="hook-ups"
 if [ "$EVENT" = "Stop" ]; then
-  REASON="New lead mail received:
-$DIGEST"
-  if command -v jq >/dev/null 2>&1; then
-    jq -n --arg ctx "$DIGEST" --arg reason "$REASON" '{
-      decision: "block",
-      reason: $reason,
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext: $ctx
-      }
-    }' 2>/dev/null || exit 0
-  else
-    python3 -c '
-import json, sys
-ctx = sys.argv[1]
-reason = sys.argv[2]
-obj = {
-    "decision": "block",
-    "reason": reason,
-    "hookSpecificOutput": {
-        "hookEventName": "Stop",
-        "additionalContext": ctx
-    }
-}
-print(json.dumps(obj))
-' "$DIGEST" "$REASON" 2>/dev/null || exit 0
-  fi
-else
-  if command -v jq >/dev/null 2>&1; then
-    jq -n --arg ctx "$DIGEST" '{
-      hookSpecificOutput: {
-        hookEventName: "UserPromptSubmit",
-        additionalContext: $ctx
-      }
-    }' 2>/dev/null || exit 0
-  else
-    python3 -c '
-import json, sys
-ctx = sys.argv[1]
-obj = {
-    "hookSpecificOutput": {
-        "hookEventName": "UserPromptSubmit",
-        "additionalContext": ctx
-    }
-}
-print(json.dumps(obj))
-' "$DIGEST" 2>/dev/null || exit 0
-  fi
+  FORMAT="hook-stop"
 fi
 
-exit 0
+exec "$QUAQUA" inbox --for cos --format "$FORMAT"

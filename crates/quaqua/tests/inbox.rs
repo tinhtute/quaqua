@@ -234,6 +234,8 @@ fn test_finding_3_inbox_follow_no_duplicate_deliveries_and_only_new_items() {
     let mut child = std::process::Command::new(quaqua_bin)
         .args(["inbox", "--for", "cos", "--follow"])
         .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn quaqua inbox --follow");
@@ -909,23 +911,17 @@ fn test_finding_f5_follow_tick_preserves_project_and_reply_to() {
     let send_res = mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
     assert!(send_res.id > 0);
 
-    let mut last_seen_mail = 0;
-    let digest = bus
-        .follow_tick(&runs_dir, "cos", &mut last_seen_mail)
-        .expect("follow tick");
-
-    assert_eq!(digest.unacked_mail.len(), 1);
-    let msg = &digest.unacked_mail[0];
-
+    let digest = bus.inbox_digest(&runs_dir, "cos").expect("inbox digest");
+    assert_eq!(digest.triggers.len(), 1);
     assert_eq!(
-        msg.project.as_deref(),
-        Some("my-proj"),
-        "F5: project must be decoded from ref"
+        digest.triggers[0].ref_val.as_deref(),
+        Some("mail:42;project:my-proj"),
+        "F5: project and reply_to must be preserved in ref"
     );
-    assert_eq!(
-        msg.reply_to,
-        Some(42),
-        "F5: reply_to must be decoded from ref"
+    assert!(
+        digest.rendered_text.contains("→ mail:42;project:my-proj"),
+        "F5: ref must be rendered in digest: {}",
+        digest.rendered_text
     );
 }
 
@@ -1941,5 +1937,263 @@ fn test_regression_round2_finding_3_peer_cannot_advance_lead_or_cos_cursor() {
         bus.get_cursor("mu-lead").unwrap(),
         None,
         "Peer worker owned by mu-lead must NOT advance mu-lead cursor via mail inbox"
+    );
+}
+
+#[test]
+fn test_single_set_cursor_caller_in_src() {
+    use std::path::Path;
+    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut matching_lines = Vec::new();
+    fn visit(dir: &Path, matches: &mut Vec<(PathBuf, usize, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, matches);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let path_str = path.to_string_lossy();
+                if path_str.ends_with("bus/migrate.rs") || path_str.ends_with("bus/mod.rs") {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap();
+                for (idx, line) in content.lines().enumerate() {
+                    if line.contains("set_cursor(") && !line.trim_start().starts_with("//") {
+                        matches.push((path.clone(), idx + 1, line.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    visit(&src_dir, &mut matching_lines);
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "Structural gate: exactly 1 non-migration/mod set_cursor callsite expected in deliver_page, found: {matching_lines:#?}"
+    );
+    assert!(
+        matching_lines[0].0.ends_with("bus/events.rs"),
+        "the single set_cursor callsite must be in bus/events.rs"
+    );
+}
+
+struct PropLcg(u64);
+impl PropLcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+}
+
+fn seed_property_items(
+    bus: &FarmBus,
+    rng: &mut PropLcg,
+    n: u64,
+) -> std::collections::BTreeSet<u64> {
+    let mail_kinds = ["handoff", "accept", "ping", "query"];
+    let worker_kinds = ["done", "progress", "failed"];
+    for i in 0..n {
+        match rng.next() % 4 {
+            0 | 1 => {
+                let kind = mail_kinds[(rng.next() as usize) % mail_kinds.len()];
+                let thread = format!("agent:t{}", rng.next() % 3);
+                let summary = if i % 7 == 0 {
+                    "no unread triggers".to_string()
+                } else {
+                    format!("mail {i} body")
+                };
+                let t =
+                    NewTrigger::new("mail", kind, "x-lead", thread, summary).with_to_name("cos");
+                bus.record_trigger(&t).unwrap();
+            }
+            2 => {
+                let kind = worker_kinds[(rng.next() as usize) % worker_kinds.len()];
+                let thread = format!("agent:w{}", rng.next() % 3);
+                let t = NewTrigger::new(
+                    "worker",
+                    kind,
+                    format!("w{i}"),
+                    thread,
+                    format!("worker w{i} update"),
+                )
+                .with_to_name("cos");
+                bus.record_trigger(&t).unwrap();
+            }
+            _ => {
+                let ev = quaqua::bus::FarmEvent::new(
+                    "stalled",
+                    Some("watchdog"),
+                    Some(&format!("s{i}")),
+                    Some("cos"),
+                    Some("mu"),
+                )
+                .with_incident_key(format!("stall:s{i}:{i}"));
+                bus.record(&ev).unwrap();
+            }
+        }
+    }
+    let mut entitled = std::collections::BTreeSet::new();
+    for t in bus.load_unread_triggers("cos", 0).unwrap() {
+        entitled.insert(t.id);
+    }
+    for inc in bus.load_incidents(0, "cos").unwrap() {
+        entitled.insert(inc.seq);
+    }
+    entitled
+}
+
+#[test]
+fn prop_inbox_delivery_never_skips_and_always_drains() {
+    use quaqua::bus::events::{DeliverFormat, DeliverMode};
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "HERDR_PANE_ID",
+        "QUAQUA_OWNER",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.remove("HERDR_PANE_ID");
+    guard.set("QUAQUA_OWNER", "cos");
+
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let hook_script = manifest_dir.join("../../templates/workspace/scripts/hooks/cos-inbox.sh");
+
+    let mut seeds_with_loss = 0;
+    let mut seeds_stuck = 0;
+    let mut total_lost = 0;
+
+    for seed in 1..=60u64 {
+        let runs_dir = hermetic_temp_dir(&format!("prop-inbox-{seed}"));
+        guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+        let db_path = runs_dir.join("quaqua.db");
+        let bus = FarmBus::open(&db_path).unwrap();
+        let mut rng = PropLcg(seed);
+        let n = 5 + rng.next() % 40;
+        let entitled = seed_property_items(&bus, &mut rng, n);
+
+        let entry_point = match seed {
+            1..=15 => "inbox",
+            16..=30 => "mail_inbox",
+            31..=45 => "follow",
+            _ => "hook",
+        };
+
+        let mut reads = 0;
+        let max_allowed_reads = ((n as f64) / 19.0).ceil() as usize + 1;
+        let mut seed_lost = Vec::new();
+        let mut seed_stuck = false;
+
+        loop {
+            let prev = bus.get_cursor("cos").unwrap().unwrap_or(0);
+            let pending: Vec<u64> = entitled.iter().copied().filter(|&id| id > prev).collect();
+            if pending.is_empty() {
+                break;
+            }
+
+            reads += 1;
+            if reads > 50 {
+                seed_stuck = true;
+                break;
+            }
+
+            let (cur, rendered_ids, text_bytes) = if entry_point == "hook" {
+                // Exercise cos-inbox.sh hook bytes via CLI
+                let out = std::process::Command::new("sh")
+                    .arg(&hook_script)
+                    .arg("--user-prompt-submit")
+                    .env("QUAQUA_BIN", quaqua_bin)
+                    .env("QUAQUA_RUNS_DIR", &runs_dir)
+                    .env("QUAQUA_TEST", "1")
+                    .env("QUAQUA_OWNER", "cos")
+                    .env_remove("HERDR_PANE_ID")
+                    .output()
+                    .unwrap();
+                let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                // If stdout is JSON, extract additionalContext
+                let context = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    v.pointer("/hookSpecificOutput/additionalContext")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    stdout.clone()
+                };
+                let r_ids: Vec<u64> = pending.iter().copied().filter(|&id| id <= cur).collect();
+                (cur, r_ids, context)
+            } else {
+                let mut buf = Vec::new();
+                let outcome = match entry_point {
+                    "inbox" => bus
+                        .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
+                        .unwrap(),
+                    "mail_inbox" => bus
+                        .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
+                        .unwrap(),
+                    "follow" => bus
+                        .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
+                        .unwrap(),
+                    _ => unreachable!(),
+                };
+                let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
+                let txt = String::from_utf8_lossy(&buf).to_string();
+                (cur, outcome.rendered_ids, txt)
+            };
+
+            // Liveness check: non-empty pending set MUST advance cursor
+            if cur == prev {
+                seed_stuck = true;
+                break;
+            }
+
+            // Safety check: every pending id with prev < id <= cur MUST be in rendered_ids
+            for &id in &pending {
+                if id > prev && id <= cur {
+                    if !rendered_ids.contains(&id) {
+                        seed_lost.push(id);
+                    }
+                }
+            }
+
+            // Received bytes check: consumer received text must not be empty if cursor advanced
+            if cur > prev && text_bytes.trim().is_empty() {
+                seed_lost.push(cur);
+            }
+        }
+
+        if !seed_lost.is_empty() {
+            seeds_with_loss += 1;
+            total_lost += seed_lost.len();
+            if seeds_with_loss <= 3 {
+                eprintln!("LOSS {entry_point} seed={seed}: lost={seed_lost:?}");
+            }
+        }
+        if seed_stuck {
+            seeds_stuck += 1;
+            if seeds_stuck <= 3 {
+                eprintln!("STUCK {entry_point} seed={seed}: reads={reads}");
+            }
+        }
+        if reads > max_allowed_reads && !seed_stuck {
+            eprintln!(
+                "SLOW DRAIN {entry_point} seed={seed}: reads={reads} > max_allowed={max_allowed_reads}"
+            );
+        }
+    }
+
+    eprintln!(
+        "PROP TEST SUMMARY: seeds_with_loss={seeds_with_loss}/60 total_lost={total_lost} seeds_stuck={seeds_stuck}/60"
+    );
+    assert_eq!(
+        seeds_with_loss, 0,
+        "safety violation: messages lost under cursor advance"
+    );
+    assert_eq!(
+        seeds_stuck, 0,
+        "liveness violation: delivery stalled on pending backlog"
     );
 }

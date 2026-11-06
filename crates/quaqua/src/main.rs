@@ -152,6 +152,9 @@ enum Command {
         /// Show all triggers ignoring high-water mark
         #[arg(long)]
         all: bool,
+        /// Output format: plain, hook-ups, or hook-stop
+        #[arg(long, default_value = "plain")]
+        format: String,
     },
     /// Event bus operations: hook.
     Events {
@@ -934,6 +937,7 @@ fn main() {
             peek,
             follow,
             all,
+            format,
         }) => {
             let runs_dir = if let Ok(dir) = std::env::var("QUAQUA_RUNS_DIR") {
                 PathBuf::from(dir)
@@ -993,60 +997,29 @@ fn main() {
                         eprintln!("invalid recipient name '{consumer}': cannot escape runs/");
                         std::process::exit(1);
                     }
-
-                    if all {
-                        match bus.render_trigger_digest(&consumer, true, true) {
-                            Ok((out, _)) => {
-                                print!("{out}");
-                                0
-                            }
-                            Err(e) => {
-                                eprintln!("inbox error: {e}");
-                                1
-                            }
+                    let deliver_format = match quaqua::bus::events::DeliverFormat::parse(&format) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
                         }
-                    } else if follow {
-                        let mut last_seen_mail =
-                            match bus.inbox_digest_peek(&runs_dir, &consumer, !should_advance) {
-                                Ok(digest) => {
-                                    if !digest.triggers.is_empty()
-                                        || !digest.unacked_mail.is_empty()
-                                        || !digest.incidents.is_empty()
-                                    {
-                                        print!("{}", digest.render(&consumer));
-                                    }
-                                    digest.unacked_mail.iter().map(|m| m.id).max().unwrap_or(0)
-                                }
-                                Err(e) => {
-                                    eprintln!("inbox error: {e}");
-                                    0
-                                }
-                            };
+                    };
+                    let mode = quaqua::bus::events::DeliverMode::new(!should_advance, all);
+
+                    if follow {
+                        let mut stdout = std::io::stdout();
                         loop {
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            match bus.follow_tick_peek(
-                                &runs_dir,
-                                &consumer,
-                                &mut last_seen_mail,
-                                !should_advance,
-                            ) {
-                                Ok(digest) => {
-                                    if !digest.triggers.is_empty()
-                                        || !digest.unacked_mail.is_empty()
-                                        || !digest.incidents.is_empty()
-                                    {
-                                        print!("{}", digest.render(&consumer));
-                                    }
-                                }
-                                Err(e) => eprintln!("inbox error: {e}"),
+                            if let Err(e) =
+                                bus.deliver_page(&consumer, mode, deliver_format, &mut stdout)
+                            {
+                                eprintln!("inbox error: {e}");
                             }
+                            std::thread::sleep(std::time::Duration::from_secs(2));
                         }
                     } else {
-                        match bus.inbox_digest_peek(&runs_dir, &consumer, !should_advance) {
-                            Ok(digest) => {
-                                print!("{}", digest.render(&consumer));
-                                0
-                            }
+                        let mut stdout = std::io::stdout();
+                        match bus.deliver_page(&consumer, mode, deliver_format, &mut stdout) {
+                            Ok(_) => 0,
                             Err(e) => {
                                 eprintln!("error: {e}");
                                 1
