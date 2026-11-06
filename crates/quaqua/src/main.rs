@@ -1007,17 +1007,37 @@ fn main() {
                     let mode = quaqua::bus::events::DeliverMode::new(!should_advance, all);
 
                     if follow {
-                        let mut stdout = std::io::stdout();
+                        let mut stdout = quaqua::bus::events::SafeStdout;
+                        let mut in_memory_cursor: Option<u64> = None;
                         loop {
-                            if let Err(e) =
-                                bus.deliver_page(&consumer, mode, deliver_format, &mut stdout)
-                            {
-                                eprintln!("inbox error: {e}");
+                            let iter_mode = match (mode, in_memory_cursor) {
+                                (m, Some(cur)) if !m.should_advance() => {
+                                    quaqua::bus::events::DeliverMode::PeekFrom(cur)
+                                }
+                                (m, _) => m,
+                            };
+                            match bus.deliver_page(
+                                &consumer,
+                                iter_mode,
+                                deliver_format,
+                                &mut stdout,
+                            ) {
+                                Ok(outcome) => {
+                                    if !mode.should_advance() {
+                                        in_memory_cursor = Some(outcome.new_cursor);
+                                    }
+                                }
+                                Err(e) => {
+                                    if e.contains("Broken pipe") || e.contains("os error 32") {
+                                        std::process::exit(0);
+                                    }
+                                    eprintln!("inbox error: {e}");
+                                }
                             }
                             std::thread::sleep(std::time::Duration::from_secs(2));
                         }
                     } else {
-                        let mut stdout = std::io::stdout();
+                        let mut stdout = quaqua::bus::events::SafeStdout;
                         match bus.deliver_page(&consumer, mode, deliver_format, &mut stdout) {
                             Ok(_) => 0,
                             Err(e) => {

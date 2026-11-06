@@ -75,26 +75,42 @@ fn test_inbox_cursor_read_idempotent() {
     assert!(inserted, "ev1 must be newly inserted");
 
     // First inbox read for 'cos'
-    let digest1 = bus.inbox_digest(&runs_dir, "cos").expect("first digest");
+    let mut buf1 = Vec::new();
+    let outcome1 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf1,
+        )
+        .expect("first deliver");
     assert_eq!(
-        digest1.incidents.len(),
+        outcome1.incidents.len(),
         1,
-        "first digest must see 1 incident"
+        "first delivery must see 1 incident"
     );
     assert_eq!(
-        digest1.incidents[0].incident_key.as_deref(),
+        outcome1.incidents[0].incident_key.as_deref(),
         Some("blocked:p1:1000")
     );
     let cursor_after_first = bus
         .get_cursor("cos")
         .expect("get cursor")
         .expect("cursor set");
-    assert_eq!(cursor_after_first, digest1.incidents[0].seq);
+    assert_eq!(cursor_after_first, outcome1.incidents[0].seq);
 
     // Repeated inbox read for 'cos' with no new events
-    let digest2 = bus.inbox_digest(&runs_dir, "cos").expect("second digest");
+    let mut buf2 = Vec::new();
+    let outcome2 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf2,
+        )
+        .expect("second deliver");
     assert_eq!(
-        digest2.incidents.len(),
+        outcome2.incidents.len(),
         0,
         "repeated read with no new events must yield 0 new incidents"
     );
@@ -118,9 +134,17 @@ fn test_inbox_cursor_read_idempotent() {
     bus.record(&ev2).expect("record ev2");
 
     // Second consumer 'mu-lead' has isolated cursor
-    let digest_lead = bus.inbox_digest(&runs_dir, "mu-lead").expect("lead digest");
+    let mut buf_lead = Vec::new();
+    let outcome_lead = bus
+        .deliver_page(
+            "mu-lead",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf_lead,
+        )
+        .expect("lead deliver");
     assert_eq!(
-        digest_lead.incidents.len(),
+        outcome_lead.incidents.len(),
         1,
         "lead must see its 1 incident"
     );
@@ -323,27 +347,36 @@ fn test_inbox_noise_filter_drops_consumer_own_pane_blocked_incidents() {
     .with_payload_json(r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1X","agent_status":"blocked"}}"#);
     bus.record(&ev_noise2).expect("record noise2");
 
-    // Read inbox digest for cos:
+    // Deliver inbox for cos:
     // Must drop ev_noise1 and ev_noise2, but keep ev_real!
-    let digest = bus.inbox_digest(&runs_dir, "cos").expect("digest");
+    let mut buf1 = Vec::new();
+    let outcome = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf1,
+        )
+        .expect("first deliver");
     assert_eq!(
-        digest.incidents.len(),
+        outcome.incidents.len(),
         1,
         "must only include 1 real incident, dropping 2 noise incidents"
     );
-    assert_eq!(digest.incidents[0].subject.as_deref(), Some("w7:p2"));
+    assert_eq!(outcome.incidents[0].subject.as_deref(), Some("w7:p2"));
     assert_eq!(
-        digest.incidents[0].incident_key.as_deref(),
+        outcome.incidents[0].incident_key.as_deref(),
         Some("blocked:w7:p2:1792985802177")
     );
 
-    let rendered = digest.render("cos");
     assert!(
-        rendered.contains("blocked:w7:p2:1792985802177"),
+        outcome
+            .rendered_text
+            .contains("blocked:w7:p2:1792985802177"),
         "rendered must contain real incident"
     );
     assert!(
-        !rendered.contains("w1:p1X"),
+        !outcome.rendered_text.contains("w1:p1X"),
         "rendered must not contain any w1:p1X noise incidents"
     );
 
@@ -352,14 +385,22 @@ fn test_inbox_noise_filter_drops_consumer_own_pane_blocked_incidents() {
         .get_cursor("cos")
         .expect("get cursor")
         .expect("cursor set");
-    assert!(cursor >= digest.incidents[0].seq);
+    assert!(cursor >= outcome.incidents[0].seq);
 
     // Repeated call: 0 incidents (idempotent)
-    let digest2 = bus.inbox_digest(&runs_dir, "cos").expect("digest2");
+    let mut buf2 = Vec::new();
+    let outcome2 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf2,
+        )
+        .expect("second deliver");
     assert_eq!(
-        digest2.incidents.len(),
+        outcome2.incidents.len(),
         0,
-        "repeated digest must yield 0 incidents"
+        "repeated delivery must yield 0 incidents"
     );
 }
 
@@ -396,21 +437,37 @@ fn test_inbox_high_water_mark_mail_cursor_advances_and_deduplicates() {
     let res1 = mail::send_mail(&runs_dir, &opts1, &herdr).expect("send mail 1");
     assert!(res1.id > 0);
 
-    // First inbox read: sees Mail 1
-    let digest1 = bus.inbox_digest(&runs_dir, "cos").expect("digest 1");
-    assert_eq!(digest1.triggers.len(), 1, "first digest must see mail 1");
-    assert_eq!(digest1.triggers[0].id, res1.id);
+    // First inbox deliver: sees Mail 1
+    let mut buf1 = Vec::new();
+    let outcome1 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf1,
+        )
+        .expect("deliver 1");
+    assert_eq!(outcome1.triggers.len(), 1, "first deliver must see mail 1");
+    assert_eq!(outcome1.triggers[0].id, res1.id);
     assert_eq!(
         bus.get_mail_cursor("cos").expect("get cursor"),
         Some(res1.id)
     );
 
-    // Second inbox read: returns 0 mail (high-water mark prevents re-delivering)
-    let digest2 = bus.inbox_digest(&runs_dir, "cos").expect("digest 2");
+    // Second inbox deliver: returns 0 mail (high-water mark prevents re-delivering)
+    let mut buf2 = Vec::new();
+    let outcome2 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf2,
+        )
+        .expect("deliver 2");
     assert_eq!(
-        digest2.triggers.len(),
+        outcome2.triggers.len(),
         0,
-        "repeated digest must not re-yield already seen mail"
+        "repeated deliver must not re-yield already seen mail"
     );
     assert_eq!(
         bus.get_mail_cursor("cos").expect("get cursor"),
@@ -429,14 +486,22 @@ fn test_inbox_high_water_mark_mail_cursor_advances_and_deduplicates() {
     let res2 = mail::send_mail(&runs_dir, &opts2, &herdr).expect("send mail 2");
     assert!(res2.id > res1.id);
 
-    // Third inbox read: sees ONLY Mail 2
-    let digest3 = bus.inbox_digest(&runs_dir, "cos").expect("digest 3");
+    // Third inbox deliver: sees ONLY Mail 2
+    let mut buf3 = Vec::new();
+    let outcome3 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf3,
+        )
+        .expect("deliver 3");
     assert_eq!(
-        digest3.triggers.len(),
+        outcome3.triggers.len(),
         1,
-        "third digest must see only new mail"
+        "third deliver must see only new mail"
     );
-    assert_eq!(digest3.triggers[0].id, res2.id);
+    assert_eq!(outcome3.triggers[0].id, res2.id);
     assert_eq!(
         bus.get_mail_cursor("cos").expect("get cursor"),
         Some(res2.id)
@@ -912,21 +977,36 @@ fn test_inbox_digest_interleaved_mail_incident_no_redelivery() {
     .with_incident_key("k2");
     bus.record(&ev2).unwrap();
 
-    // First read: must see both incidents and mail, advancing cursor to 3
-    let digest1 = bus.inbox_digest(&runs_dir, "cos").unwrap();
-    assert!(digest1.triggers.iter().any(|t| t.id == send_res.id));
-    assert_eq!(digest1.incidents.len(), 2);
-    assert_eq!(digest1.new_cursor, 3);
+    // First deliver: must see both incidents and mail, advancing cursor to 3
+    let mut buf1 = Vec::new();
+    let outcome1 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf1,
+        )
+        .unwrap();
+    assert!(outcome1.triggers.iter().any(|t| t.id == send_res.id));
+    assert_eq!(outcome1.incidents.len(), 2);
+    assert_eq!(outcome1.new_cursor, 3);
     assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
 
-    // Second read: must be completely empty (F1: no redelivery of trigger 3)
-    let digest2 = bus.inbox_digest(&runs_dir, "cos").unwrap();
-    assert_eq!(digest2.triggers.len(), 0);
-    assert_eq!(digest2.incidents.len(), 0);
-    assert_eq!(digest2.new_cursor, 3);
+    // Second deliver: must be completely empty (F1: no redelivery of trigger 3)
+    let mut buf2 = Vec::new();
+    let outcome2 = bus
+        .deliver_page(
+            "cos",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf2,
+        )
+        .unwrap();
+    assert_eq!(outcome2.triggers.len(), 0);
+    assert_eq!(outcome2.incidents.len(), 0);
+    assert_eq!(outcome2.new_cursor, 3);
     assert_eq!(bus.get_cursor("cos").unwrap(), Some(3));
 }
-
 #[test]
 fn test_finding_f5_follow_tick_preserves_project_and_reply_to() {
     let runs_dir = hermetic_temp_dir("f5-follow-ref");
@@ -1477,9 +1557,17 @@ fn test_regression_finding_2_render_trigger_digest_truncation_caps_cursor() {
     }
 
     // First read: capped at 20 lines (19 triggers + 1 overflow line)
-    let (rendered, new_cursor) = bus
-        .render_trigger_digest("lead1", false, false)
-        .expect("render trigger digest");
+    let mut buf = Vec::new();
+    let outcome = bus
+        .deliver_page(
+            "lead1",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf,
+        )
+        .expect("deliver page");
+    let rendered = outcome.rendered_text;
+    let new_cursor = outcome.new_cursor;
     assert!(
         rendered.contains("… +6 more: quaqua mail inbox --all"),
         "must show overflow line"
@@ -1491,9 +1579,17 @@ fn test_regression_finding_2_render_trigger_digest_truncation_caps_cursor() {
     assert_eq!(bus.get_cursor("lead1").unwrap(), Some(19));
 
     // Second read with all=true: must show the 6 overflow items, NOT empty!
-    let (rendered_all, cursor_all) = bus
-        .render_trigger_digest("lead1", false, true)
-        .expect("render trigger digest all");
+    let mut buf_all = Vec::new();
+    let outcome_all = bus
+        .deliver_page(
+            "lead1",
+            quaqua::bus::events::DeliverMode::All,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf_all,
+        )
+        .expect("deliver page all");
+    let rendered_all = outcome_all.rendered_text;
+    let cursor_all = outcome_all.new_cursor;
     assert!(
         !rendered_all.is_empty(),
         "second read with all=true must return the 6 overflow items, but was empty"
@@ -1988,36 +2084,113 @@ fn test_regression_round2_finding_3_peer_cannot_advance_lead_or_cos_cursor() {
 fn test_single_set_cursor_caller_in_src() {
     use std::path::Path;
     let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut matching_lines = Vec::new();
-    fn visit(dir: &Path, matches: &mut Vec<(PathBuf, usize, String)>) {
+    let mut matching_callsites = Vec::new();
+    let mut raw_cursor_sqls = Vec::new();
+
+    fn visit(
+        dir: &Path,
+        callsites: &mut Vec<(PathBuf, usize, String)>,
+        raw_sqls: &mut Vec<(PathBuf, usize, String)>,
+    ) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
             if path.is_dir() {
-                visit(&path, matches);
+                visit(&path, callsites, raw_sqls);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                let path_str = path.to_string_lossy();
-                if path_str.ends_with("bus/migrate.rs") || path_str.ends_with("bus/mod.rs") {
-                    continue;
-                }
                 let content = std::fs::read_to_string(&path).unwrap();
+                let path_str = path.to_string_lossy();
+                let is_migrate = path_str.ends_with("bus/migrate.rs");
+
+                let mut in_test_mod = false;
                 for (idx, line) in content.lines().enumerate() {
-                    if line.contains("set_cursor(") && !line.trim_start().starts_with("//") {
-                        matches.push((path.clone(), idx + 1, line.to_string()));
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("#[cfg(test)]") {
+                        in_test_mod = true;
+                    }
+                    if in_test_mod {
+                        continue;
+                    }
+
+                    // Check for set_cursor calls
+                    if (line.contains("set_cursor(") || line.contains(".set_cursor("))
+                        && !trimmed.starts_with("//")
+                        && !trimmed.starts_with("pub(crate) fn set_cursor")
+                        && !trimmed.starts_with("pub fn set_cursor")
+                        && !trimmed.starts_with("fn set_cursor")
+                    {
+                        callsites.push((path.clone(), idx + 1, line.to_string()));
+                    }
+
+                    // Check for raw SQL writing to cursors table
+                    let upper = line.to_uppercase();
+                    if (upper.contains("INSERT INTO CURSORS")
+                        || upper.contains("UPDATE CURSORS")
+                        || upper.contains("DELETE FROM CURSORS")
+                        || upper.contains("REPLACE INTO CURSORS"))
+                        && !trimmed.starts_with("//")
+                    {
+                        if !is_migrate {
+                            raw_sqls.push((path.clone(), idx + 1, line.to_string()));
+                        }
                     }
                 }
             }
         }
     }
-    visit(&src_dir, &mut matching_lines);
+
+    visit(&src_dir, &mut matching_callsites, &mut raw_cursor_sqls);
+
+    // 1. Exactly 1 set_cursor callsite in all of src
     assert_eq!(
-        matching_lines.len(),
+        matching_callsites.len(),
         1,
-        "Structural gate: exactly 1 non-migration/mod set_cursor callsite expected in deliver_page, found: {matching_lines:#?}"
+        "Structural gate: exactly 1 non-test set_cursor callsite expected in deliver_page, found: {matching_callsites:#?}"
     );
     assert!(
-        matching_lines[0].0.ends_with("bus/events.rs"),
+        matching_callsites[0].0.ends_with("bus/events.rs"),
         "the single set_cursor callsite must be in bus/events.rs"
+    );
+
+    // Verify it sits inside deliver_page
+    let events_rs_content = std::fs::read_to_string(&matching_callsites[0].0).unwrap();
+    let target_line = matching_callsites[0].1;
+    let mut current_fn = String::new();
+    for (idx, line) in events_rs_content.lines().enumerate() {
+        let line_num = idx + 1;
+        if line.starts_with("    pub fn ") || line.starts_with("    fn ") {
+            let after_fn = if let Some(rest) = line.trim().strip_prefix("pub fn ") {
+                rest
+            } else if let Some(rest) = line.trim().strip_prefix("pub(crate) fn ") {
+                rest
+            } else {
+                line.trim().strip_prefix("fn ").unwrap_or("")
+            };
+            current_fn = after_fn
+                .split(['(', '<'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+        if line_num == target_line {
+            break;
+        }
+    }
+    assert_eq!(
+        current_fn, "deliver_page",
+        "set_cursor must sit inside deliver_page, but found in function: {current_fn}"
+    );
+
+    // 2. Raw cursor SQL must only be inside set_cursor in bus/mod.rs
+    assert_eq!(
+        raw_cursor_sqls.len(),
+        1,
+        "Structural gate: raw cursor SQL must only exist in bus/mod.rs (set_cursor) and bus/migrate.rs, found: {raw_cursor_sqls:#?}"
+    );
+    assert!(
+        raw_cursor_sqls[0].0.ends_with("bus/mod.rs"),
+        "raw cursor SQL must be in bus/mod.rs"
     );
 }
 
@@ -2089,6 +2262,53 @@ fn seed_property_items(
     entitled
 }
 
+fn parse_delivered_ids(
+    text: &str,
+    all_triggers: &[TriggerRecord],
+    _all_incidents: &[quaqua::bus::FarmEventRecord],
+) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("! #") {
+            if let Some(id_str) = rest.split_whitespace().next() {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    ids.push(id);
+                }
+            }
+        } else if line.starts_with('#') {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            if parts[0].contains("..#") {
+                let range_str = parts[0].trim_start_matches('#');
+                if let Some((start_s, end_s)) = range_str.split_once("..#") {
+                    if let (Ok(start), Ok(end)) = (start_s.parse::<u64>(), end_s.parse::<u64>()) {
+                        let kind = parts.get(1).copied().unwrap_or("");
+                        let thread = parts.get(4).copied().unwrap_or("");
+                        for t in all_triggers {
+                            if t.id >= start
+                                && t.id <= end
+                                && t.kind == kind
+                                && t.thread_id == thread
+                            {
+                                ids.push(t.id);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let id_str = parts[0].trim_start_matches('#');
+                if let Ok(id) = id_str.parse::<u64>() {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
 #[test]
 fn prop_inbox_delivery_never_skips_and_always_drains() {
     use quaqua::bus::events::{DeliverFormat, DeliverMode};
@@ -2118,11 +2338,13 @@ fn prop_inbox_delivery_never_skips_and_always_drains() {
         let mut rng = PropLcg(seed);
         let n = 5 + rng.next() % 40;
         let entitled = seed_property_items(&bus, &mut rng, n);
+        let all_triggers = bus.load_unread_triggers("cos", 0).unwrap();
+        let all_incidents = bus.load_incidents(0, "cos").unwrap();
 
         let entry_point = match seed {
             1..=15 => "inbox",
             16..=30 => "mail_inbox",
-            31..=45 => "follow",
+            31..=45 => "deliver_page",
             _ => "hook",
         };
 
@@ -2144,51 +2366,75 @@ fn prop_inbox_delivery_never_skips_and_always_drains() {
                 break;
             }
 
-            let (cur, rendered_ids, text_bytes) = if entry_point == "hook" {
-                // Exercise cos-inbox.sh hook bytes via CLI
-                let out = std::process::Command::new("sh")
-                    .arg(&hook_script)
-                    .arg("--user-prompt-submit")
-                    .env("QUAQUA_BIN", quaqua_bin)
-                    .env("QUAQUA_RUNS_DIR", &runs_dir)
-                    .env("QUAQUA_TEST", "1")
-                    .env("QUAQUA_OWNER", "cos")
-                    .env_remove("HERDR_PANE_ID")
-                    .output()
-                    .unwrap();
-                let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                // If stdout is JSON, extract additionalContext
-                let context = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    v.pointer("/hookSpecificOutput/additionalContext")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    stdout.clone()
-                };
-                let r_ids: Vec<u64> = pending.iter().copied().filter(|&id| id <= cur).collect();
-                (cur, r_ids, context)
-            } else {
-                let mut buf = Vec::new();
-                let outcome = match entry_point {
-                    "inbox" => bus
+            let (cur, rendered_ids, text_bytes) = match entry_point {
+                "hook" => {
+                    let out = std::process::Command::new("sh")
+                        .arg(&hook_script)
+                        .arg("--user-prompt-submit")
+                        .env("QUAQUA_BIN", quaqua_bin)
+                        .env("QUAQUA_RUNS_DIR", &runs_dir)
+                        .env("QUAQUA_TEST", "1")
+                        .env("QUAQUA_OWNER", "cos")
+                        .env_remove("HERDR_PANE_ID")
+                        .output()
+                        .unwrap();
+                    let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let context = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout)
+                    {
+                        v.pointer("/hookSpecificOutput/additionalContext")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        stdout.clone()
+                    };
+                    let r_ids = parse_delivered_ids(&context, &all_triggers, &all_incidents);
+                    (cur, r_ids, context)
+                }
+                "inbox" => {
+                    let out = std::process::Command::new(quaqua_bin)
+                        .args(["inbox", "--for", "cos"])
+                        .env("QUAQUA_BIN", quaqua_bin)
+                        .env("QUAQUA_RUNS_DIR", &runs_dir)
+                        .env("QUAQUA_TEST", "1")
+                        .env("QUAQUA_OWNER", "cos")
+                        .env_remove("HERDR_PANE_ID")
+                        .output()
+                        .unwrap();
+                    let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let r_ids = parse_delivered_ids(&stdout, &all_triggers, &all_incidents);
+                    (cur, r_ids, stdout)
+                }
+                "mail_inbox" => {
+                    let out = std::process::Command::new(quaqua_bin)
+                        .args(["mail", "inbox", "--for", "cos"])
+                        .env("QUAQUA_BIN", quaqua_bin)
+                        .env("QUAQUA_RUNS_DIR", &runs_dir)
+                        .env("QUAQUA_TEST", "1")
+                        .env("QUAQUA_OWNER", "cos")
+                        .env_remove("HERDR_PANE_ID")
+                        .output()
+                        .unwrap();
+                    let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let r_ids = parse_delivered_ids(&stdout, &all_triggers, &all_incidents);
+                    (cur, r_ids, stdout)
+                }
+                "deliver_page" => {
+                    let mut buf = Vec::new();
+                    let _outcome = bus
                         .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
-                        .unwrap(),
-                    "mail_inbox" => bus
-                        .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
-                        .unwrap(),
-                    "follow" => bus
-                        .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
-                        .unwrap(),
-                    _ => unreachable!(),
-                };
-                let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
-                let txt = String::from_utf8_lossy(&buf).to_string();
-                (cur, outcome.rendered_ids, txt)
+                        .unwrap();
+                    let cur = bus.get_cursor("cos").unwrap().unwrap_or(0);
+                    let txt = String::from_utf8_lossy(&buf).to_string();
+                    let r_ids = parse_delivered_ids(&txt, &all_triggers, &all_incidents);
+                    (cur, r_ids, txt)
+                }
+                _ => unreachable!(),
             };
 
-            // Liveness check: non-empty pending set MUST advance cursor
             if cur == prev {
                 seed_stuck = true;
                 break;
@@ -2222,15 +2468,13 @@ fn prop_inbox_delivery_never_skips_and_always_drains() {
                 eprintln!("STUCK {entry_point} seed={seed}: reads={reads}");
             }
         }
-        if reads > max_allowed_reads && !seed_stuck {
-            eprintln!(
-                "SLOW DRAIN {entry_point} seed={seed}: reads={reads} > max_allowed={max_allowed_reads}"
-            );
-        }
+        assert!(
+            reads <= max_allowed_reads,
+            "drain bound exceeded for {entry_point} seed={seed}: reads={reads} > max_allowed={max_allowed_reads}"
+        );
     }
-
     eprintln!(
-        "PROP TEST SUMMARY: seeds_with_loss={seeds_with_loss}/60 total_lost={total_lost} seeds_stuck={seeds_stuck}/60"
+        "PROP SUMMARY: seeds_with_loss={seeds_with_loss}/60 total_lost={total_lost} seeds_stuck={seeds_stuck}/60"
     );
     assert_eq!(
         seeds_with_loss, 0,
@@ -2239,5 +2483,273 @@ fn prop_inbox_delivery_never_skips_and_always_drains() {
     assert_eq!(
         seeds_stuck, 0,
         "liveness violation: delivery stalled on pending backlog"
+    );
+}
+
+#[test]
+fn test_page_selection_perf_n_2000_under_300ms_in_debug() {
+    use quaqua::bus::events::{DeliverFormat, DeliverMode};
+    use quaqua::bus::NewTrigger;
+    use std::time::Instant;
+    let runs_dir = hermetic_temp_dir("perf-page-selection");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+
+    // Seed 2000 triggers that collapse into 1 line (same kind and thread)
+    for i in 1..=2000 {
+        let t = NewTrigger::new("mail", "handoff", "x-lead", "agent:cos", format!("msg {i}"))
+            .with_to_name("cos");
+        bus.record_trigger(&t).expect("record trigger");
+    }
+
+    let start = Instant::now();
+    let mut buf = Vec::new();
+    let outcome = bus
+        .deliver_page("cos", DeliverMode::Advance, DeliverFormat::Plain, &mut buf)
+        .expect("deliver page");
+    let elapsed = start.elapsed();
+
+    assert_eq!(outcome.rendered_ids.len(), 2000);
+    assert_eq!(outcome.lines_count, 1);
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "page selection for n=2000 took {elapsed:?}, expected under 300ms"
+    );
+}
+
+#[test]
+fn test_closed_stdout_ebadf_does_not_advance_cursor() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+
+    let runs_dir = hermetic_temp_dir("ebadf-cursor");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "handoff".to_string(),
+        body: "test mail".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+    // Run quaqua inbox with closed stdout via sh 1>&-
+    let sh_cmd = format!("'{}' inbox --for cos 1>&-", quaqua_bin);
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sh_cmd)
+        .env("QUAQUA_BIN", quaqua_bin)
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .output()
+        .expect("run sh with closed stdout");
+
+    // Exit code must be non-zero (failed write)
+    assert_ne!(out.status.code(), Some(0));
+    // Cursor in database must NOT have advanced!
+    assert_eq!(bus.get_cursor("cos").unwrap(), None);
+
+    // Running normally must now deliver the message
+    let normal_out = std::process::Command::new(quaqua_bin)
+        .args(["inbox", "--for", "cos"])
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .output()
+        .expect("run inbox normally");
+    assert_eq!(normal_out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&normal_out.stdout);
+    assert!(stdout.contains("test mail"));
+    assert_eq!(bus.get_cursor("cos").unwrap(), Some(1));
+}
+
+#[test]
+fn test_follow_non_advancing_mode_does_not_reprint() {
+    use quaqua::bus::events::{DeliverFormat, DeliverMode};
+    use quaqua::bus::NewTrigger;
+    let runs_dir = hermetic_temp_dir("follow-non-advancing");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+
+    let t1 =
+        NewTrigger::new("mail", "handoff", "x-lead", "agent:cos", "mail 1").with_to_name("cos");
+    bus.record_trigger(&t1).expect("record t1");
+
+    // Tick 1 in Peek mode
+    let mut buf1 = Vec::new();
+    let outcome1 = bus
+        .deliver_page("cos", DeliverMode::Peek, DeliverFormat::Plain, &mut buf1)
+        .expect("tick 1");
+    assert_eq!(outcome1.rendered_ids, vec![1]);
+    assert_eq!(bus.get_cursor("cos").unwrap(), None); // did not advance
+
+    // Tick 2 using PeekFrom(outcome1.new_cursor) simulating follow loop
+    let mut buf2 = Vec::new();
+    let outcome2 = bus
+        .deliver_page(
+            "cos",
+            DeliverMode::PeekFrom(outcome1.new_cursor),
+            DeliverFormat::Plain,
+            &mut buf2,
+        )
+        .expect("tick 2");
+    assert_eq!(
+        outcome2.rendered_ids.len(),
+        0,
+        "must not reprint in non-advancing mode"
+    );
+    assert!(buf2.is_empty());
+
+    // New item arrives
+    let t2 =
+        NewTrigger::new("mail", "handoff", "x-lead", "agent:cos", "mail 2").with_to_name("cos");
+    bus.record_trigger(&t2).expect("record t2");
+
+    // Tick 3
+    let mut buf3 = Vec::new();
+    let outcome3 = bus
+        .deliver_page(
+            "cos",
+            DeliverMode::PeekFrom(outcome1.new_cursor),
+            DeliverFormat::Plain,
+            &mut buf3,
+        )
+        .expect("tick 3");
+    assert_eq!(
+        outcome3.rendered_ids,
+        vec![2],
+        "tick 3 must deliver only new item 2"
+    );
+    assert_eq!(bus.get_cursor("cos").unwrap(), None); // DB cursor still untouched
+}
+
+#[test]
+fn test_follow_exits_on_epipe() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+
+    let runs_dir = hermetic_temp_dir("follow-epipe");
+    guard.set("QUAQUA_RUNS_DIR", runs_dir.to_str().unwrap());
+    let db_path = runs_dir.join("quaqua.db");
+    let _bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    for i in 1..=25 {
+        let opts = SendMailOpts {
+            to: "cos".to_string(),
+            kind: format!("kind-{i}"),
+            body: format!("test mail {i}"),
+            project: None,
+            reply_to: None,
+            client_id: None,
+        };
+        mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    }
+
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+    // Run follow piped to `head -n 1`
+    let cmd = format!("'{}' inbox --for cos --follow | head -n 1", quaqua_bin);
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .env("QUAQUA_BIN", quaqua_bin)
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .output()
+        .expect("run follow pipe");
+
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn test_hook_stop_emits_digest_once() {
+    use quaqua::bus::events::{DeliverFormat, DeliverMode};
+    use quaqua::bus::NewTrigger;
+    let runs_dir = hermetic_temp_dir("hook-stop-once");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+
+    let t = NewTrigger::new(
+        "mail",
+        "escalate",
+        "arch-lead",
+        "agent:arch-lead",
+        "cost cap exceeded",
+    )
+    .with_to_name("cos");
+    bus.record_trigger(&t).expect("record trigger");
+
+    let mut buf = Vec::new();
+    bus.deliver_page(
+        "cos",
+        DeliverMode::Advance,
+        DeliverFormat::HookStop,
+        &mut buf,
+    )
+    .expect("deliver hook stop");
+    let s = String::from_utf8(buf).expect("utf8 string");
+    let v: serde_json::Value = serde_json::from_str(&s).expect("valid json");
+
+    assert_eq!(v["decision"], "block");
+    assert_eq!(v["reason"], "New lead mail received");
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("cost cap exceeded"));
+    assert!(!v["reason"].as_str().unwrap().contains("cost cap exceeded"));
+}
+
+#[test]
+fn test_inbox_digest_peek_only_does_not_advance_cursor() {
+    use quaqua::bus::NewTrigger;
+    let runs_dir = hermetic_temp_dir("digest-peek-only");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+
+    let t =
+        NewTrigger::new("mail", "handoff", "x-lead", "agent:cos", "mail msg").with_to_name("cos");
+    bus.record_trigger(&t).expect("record trigger");
+
+    let digest1 = bus.inbox_digest(&runs_dir, "cos").expect("digest1");
+    assert_eq!(digest1.triggers.len(), 1);
+    assert_eq!(
+        bus.get_cursor("cos").unwrap(),
+        None,
+        "inbox_digest must not advance cursor"
+    );
+
+    let digest2 = bus
+        .inbox_digest_peek(&runs_dir, "cos", false)
+        .expect("digest2");
+    assert_eq!(digest2.triggers.len(), 1);
+    assert_eq!(
+        bus.get_cursor("cos").unwrap(),
+        None,
+        "inbox_digest_peek must not advance cursor"
     );
 }

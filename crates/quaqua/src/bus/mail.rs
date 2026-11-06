@@ -1065,7 +1065,7 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
             let db_path = runs_dir.join("quaqua.db");
             let bus = FarmBus::open(&db_path).map_err(|e| format!("cannot open database: {e}"))?;
             let mode = crate::bus::events::DeliverMode::new(!should_advance, all);
-            let mut stdout = std::io::stdout();
+            let mut stdout = crate::bus::events::SafeStdout;
             bus.deliver_page(
                 &consumer,
                 mode,

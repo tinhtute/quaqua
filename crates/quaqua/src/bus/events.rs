@@ -30,6 +30,7 @@ pub enum DeliverMode {
     Peek,
     All,
     AllPeek,
+    PeekFrom(u64),
 }
 
 impl DeliverMode {
@@ -69,6 +70,52 @@ impl DeliverFormat {
                 "unknown deliver format '{other}': expected plain, hook-ups, or hook-stop"
             )),
         }
+    }
+}
+
+/// A checked stdout writer that does not swallow EBADF or sanitized closed stdout.
+pub struct SafeStdout;
+
+impl SafeStdout {
+    pub fn check_ebadf() -> std::io::Result<()> {
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        let fl = unsafe { fcntl(1, 3) };
+        if fl < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        #[cfg(target_os = "linux")]
+        if (fl & 3) == 2 && (fl & 0o100000) != 0 {
+            if let Ok(target) = std::fs::read_link("/proc/self/fd/1") {
+                if target == std::path::Path::new("/dev/null") {
+                    return Err(std::io::Error::from_raw_os_error(9));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for SafeStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Self::check_ebadf()?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        extern "C" {
+            fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+        }
+        let ret = unsafe { write(1, buf.as_ptr() as *const std::ffi::c_void, buf.len()) };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Self::check_ebadf()
     }
 }
 
@@ -562,6 +609,126 @@ pub fn is_incident_in_consumer_group(r: &FarmEventRecord, consumer: &str, runs_d
     }
 }
 
+fn load_incidents_conn(
+    conn: &rusqlite::Connection,
+    farm: &str,
+    events_watermark: u64,
+    since_seq: u64,
+    consumer: &str,
+) -> rusqlite::Result<Vec<FarmEventRecord>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT t.id, t.ts_ms, t.kind, t.actor, t.to_name, t.thread_id, t.dedupe_key, t.payload_json, t.farm, th.owner
+        FROM triggers t
+        LEFT JOIN threads th ON t.thread_id = th.id
+        WHERE t.source != 'mail' AND t.id > ?1 AND t.dedupe_key IS NOT NULL
+          AND (t.farm = ?2 OR (t.farm IS NULL AND t.id <= ?3))
+        ORDER BY t.id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![since_seq as i64, farm, events_watermark as i64],
+        |row| {
+            let thread_id: String = row.get(5)?;
+            let subject = thread_id
+                .strip_prefix("agent:")
+                .unwrap_or(&thread_id)
+                .to_string();
+            let payload_str: String = row
+                .get::<_, Option<String>>(7)?
+                .unwrap_or_else(|| "{}".to_string());
+            let thread_owner: Option<String> = row.get(9)?;
+
+            let (owner, project) =
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                    let o = v
+                        .get("owner")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                        .or(thread_owner);
+                    let p = v.get("project").and_then(|x| x.as_str()).map(String::from);
+                    (o, p)
+                } else {
+                    (thread_owner, None)
+                };
+
+            Ok(FarmEventRecord {
+                seq: row.get::<_, i64>(0)? as u64,
+                ts_ms: row.get::<_, i64>(1)? as u64,
+                event_type: row.get(2)?,
+                actor: Some(row.get(3)?),
+                subject: Some(subject),
+                owner,
+                project,
+                incident_key: row.get(6)?,
+                payload_json: payload_str,
+                farm: row.get(8)?,
+            })
+        },
+    )?;
+    let mut res = Vec::new();
+    for r in rows {
+        let rec = r?;
+        if consumer == "cos" {
+            res.push(rec);
+        } else {
+            let matches_consumer = rec.owner.as_deref() == Some(consumer)
+                || rec.owner.is_none()
+                || rec.subject.as_deref() == Some(consumer);
+            if matches_consumer {
+                res.push(rec);
+            }
+        }
+    }
+    Ok(res)
+}
+
+fn load_unread_triggers_conn(
+    conn: &rusqlite::Connection,
+    farm: &str,
+    consumer: &str,
+    since_cursor: u64,
+) -> rusqlite::Result<Vec<TriggerRecord>> {
+    let now = crate::bus::now_ms() as i64;
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT t.id, t.ts_ms, t.source, t.kind, t.actor, t.to_name, t.thread_id, t.summary, t.ref, t.payload_json, t.dedupe_key, t.farm
+        FROM triggers t
+        LEFT JOIN subscriptions s ON s.thread_id = t.thread_id AND s.consumer = ?1 AND s.until_ms >= ?2
+        WHERE t.id > ?3
+          AND (t.farm = ?4 OR t.farm IS NULL)
+          AND (t.to_name = ?1 OR s.consumer IS NOT NULL)
+        ORDER BY t.id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![consumer, now, since_cursor as i64, farm],
+        |row| {
+            Ok(TriggerRecord {
+                id: row.get::<_, i64>(0)? as u64,
+                ts_ms: row.get::<_, i64>(1)? as u64,
+                source: row.get(2)?,
+                kind: row.get(3)?,
+                actor: row.get(4)?,
+                to_name: row.get(5)?,
+                thread_id: row.get(6)?,
+                summary: row.get(7)?,
+                ref_val: row.get(8)?,
+                payload_json: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| "{}".to_string()),
+                dedupe_key: row.get(10)?,
+                farm: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+            })
+        },
+    )?;
+    let mut res = Vec::new();
+    for r in rows {
+        res.push(r?);
+    }
+    Ok(res)
+}
+
 impl FarmBus {
     /// Loads incidents (events where `incident_key IS NOT NULL`) ordered by `seq` ASC,
     /// strictly after `since_seq`.
@@ -575,71 +742,13 @@ impl FarmBus {
     ) -> rusqlite::Result<Vec<FarmEventRecord>> {
         let conn = self.conn_for_test();
         crate::engine::sqlite::retry_while_busy(|| {
-            let mut stmt = conn.prepare_cached(
-                r#"
-                SELECT t.id, t.ts_ms, t.kind, t.actor, t.to_name, t.thread_id, t.dedupe_key, t.payload_json, t.farm, th.owner
-                FROM triggers t
-                LEFT JOIN threads th ON t.thread_id = th.id
-                WHERE t.source != 'mail' AND t.id > ?1 AND t.dedupe_key IS NOT NULL
-                  AND (t.farm = ?2 OR (t.farm IS NULL AND t.id <= ?3))
-                ORDER BY t.id ASC
-                "#,
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![since_seq as i64, &self.farm, self.events_watermark as i64],
-                |row| {
-                    let thread_id: String = row.get(5)?;
-                    let subject = thread_id
-                        .strip_prefix("agent:")
-                        .unwrap_or(&thread_id)
-                        .to_string();
-                    let payload_str: String = row
-                        .get::<_, Option<String>>(7)?
-                        .unwrap_or_else(|| "{}".to_string());
-                    let thread_owner: Option<String> = row.get(9)?;
-
-                    let (owner, project) =
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload_str) {
-                            let o = v
-                                .get("owner")
-                                .and_then(|x| x.as_str())
-                                .map(String::from)
-                                .or(thread_owner);
-                            let p = v.get("project").and_then(|x| x.as_str()).map(String::from);
-                            (o, p)
-                        } else {
-                            (thread_owner, None)
-                        };
-
-                    Ok(FarmEventRecord {
-                        seq: row.get::<_, i64>(0)? as u64,
-                        ts_ms: row.get::<_, i64>(1)? as u64,
-                        event_type: row.get(2)?,
-                        actor: Some(row.get(3)?),
-                        subject: Some(subject),
-                        owner,
-                        project,
-                        incident_key: row.get(6)?,
-                        payload_json: payload_str,
-                        farm: row.get(8)?,
-                    })
-                },
-            )?;
-            let mut res = Vec::new();
-            for r in rows {
-                let rec = r?;
-                if consumer == "cos" {
-                    res.push(rec);
-                } else {
-                    let matches_consumer = rec.owner.as_deref() == Some(consumer)
-                        || rec.owner.is_none()
-                        || rec.subject.as_deref() == Some(consumer);
-                    if matches_consumer {
-                        res.push(rec);
-                    }
-                }
-            }
-            Ok(res)
+            load_incidents_conn(
+                &conn,
+                &self.farm,
+                self.events_watermark,
+                since_seq,
+                consumer,
+            )
         })
     }
 
@@ -651,45 +760,8 @@ impl FarmBus {
         since_cursor: u64,
     ) -> rusqlite::Result<Vec<TriggerRecord>> {
         let conn = self.conn_for_test();
-        let now = crate::bus::now_ms() as i64;
         crate::engine::sqlite::retry_while_busy(|| {
-            let mut stmt = conn.prepare_cached(
-                r#"
-                SELECT t.id, t.ts_ms, t.source, t.kind, t.actor, t.to_name, t.thread_id, t.summary, t.ref, t.payload_json, t.dedupe_key, t.farm
-                FROM triggers t
-                LEFT JOIN subscriptions s ON s.thread_id = t.thread_id AND s.consumer = ?1 AND s.until_ms >= ?2
-                WHERE t.id > ?3
-                  AND (t.farm = ?4 OR t.farm IS NULL)
-                  AND (t.to_name = ?1 OR s.consumer IS NOT NULL)
-                ORDER BY t.id ASC
-                "#,
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![consumer, now, since_cursor as i64, &self.farm],
-                |row| {
-                    Ok(TriggerRecord {
-                        id: row.get::<_, i64>(0)? as u64,
-                        ts_ms: row.get::<_, i64>(1)? as u64,
-                        source: row.get(2)?,
-                        kind: row.get(3)?,
-                        actor: row.get(4)?,
-                        to_name: row.get(5)?,
-                        thread_id: row.get(6)?,
-                        summary: row.get(7)?,
-                        ref_val: row.get(8)?,
-                        payload_json: row
-                            .get::<_, Option<String>>(9)?
-                            .unwrap_or_else(|| "{}".to_string()),
-                        dedupe_key: row.get(10)?,
-                        farm: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                    })
-                },
-            )?;
-            let mut res = Vec::new();
-            for r in rows {
-                res.push(r?);
-            }
-            Ok(res)
+            load_unread_triggers_conn(&conn, &self.farm, consumer, since_cursor)
         })
     }
 
@@ -708,18 +780,32 @@ impl FarmBus {
         format: DeliverFormat,
         sink: &mut W,
     ) -> Result<DeliveryOutcome, String> {
-        let prev_cursor = self
-            .get_cursor(consumer)
-            .map_err(|e| format!("cannot get cursor: {e}"))?
-            .unwrap_or(0);
+        let prev_cursor = match mode {
+            DeliverMode::PeekFrom(c) => c,
+            _ => self
+                .get_cursor(consumer)
+                .map_err(|e| format!("cannot get cursor: {e}"))?
+                .unwrap_or(0),
+        };
 
         let runs_dir = self.path.parent().unwrap_or(Path::new("."));
-        let raw_triggers = self
-            .load_unread_triggers(consumer, prev_cursor)
-            .map_err(|e| format!("cannot load triggers: {e}"))?;
-        let raw_incidents = self
-            .load_incidents(prev_cursor, consumer)
-            .map_err(|e| format!("cannot load incidents: {e}"))?;
+        let (raw_triggers, raw_incidents) = {
+            let mut conn = self.conn_for_test();
+            crate::engine::sqlite::retry_while_busy(|| {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+                let trs = load_unread_triggers_conn(&tx, &self.farm, consumer, prev_cursor)?;
+                let incs = load_incidents_conn(
+                    &tx,
+                    &self.farm,
+                    self.events_watermark,
+                    prev_cursor,
+                    consumer,
+                )?;
+                tx.finish()?;
+                Ok((trs, incs))
+            })
+        }
+        .map_err(|e| format!("cannot load pending items: {e}"))?;
 
         let own_pane = resolve_consumer_pane(consumer);
         let incidents: Vec<FarmEventRecord> = raw_incidents
@@ -809,10 +895,28 @@ impl FarmBus {
         let (k, overflow) = if mode.is_all() {
             (n, 0)
         } else {
+            let mut line_counts = Vec::with_capacity(n);
+            let mut last_kind_by_thread: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::new();
+            let mut cur_lines = 0;
+            for item in &pending {
+                match item {
+                    PendingItem::Incident(_) => {
+                        cur_lines += 1;
+                    }
+                    PendingItem::Trigger(t) => {
+                        if last_kind_by_thread.get(t.thread_id.as_str()) != Some(&t.kind.as_str()) {
+                            cur_lines += 1;
+                            last_kind_by_thread.insert(t.thread_id.as_str(), t.kind.as_str());
+                        }
+                    }
+                }
+                line_counts.push(cur_lines);
+            }
+
             let mut best_k = 1;
             for candidate in 1..=n {
-                let (lines, _, _) = render_slice(&pending[..candidate]);
-                let count = lines.len();
+                let count = line_counts[candidate - 1];
                 if candidate == n {
                     if count <= 20 {
                         best_k = n;
@@ -864,10 +968,9 @@ impl FarmBus {
                 s.into_bytes()
             }
             DeliverFormat::HookStop => {
-                let reason = format!("New lead mail received:\n{rendered_text}");
                 let val = serde_json::json!({
                     "decision": "block",
-                    "reason": reason,
+                    "reason": "New lead mail received",
                     "hookSpecificOutput": {
                         "hookEventName": "Stop",
                         "additionalContext": rendered_text,
@@ -905,39 +1008,21 @@ impl FarmBus {
         })
     }
 
-    /// Renders the superagent trigger digest for `consumer`.
-    /// Delegates to `deliver_page`.
-    pub fn render_trigger_digest(
-        &self,
-        consumer: &str,
-        peek: bool,
-        all: bool,
-    ) -> Result<(String, u64), String> {
-        let mode = DeliverMode::new(peek, all);
-        let mut buf = Vec::new();
-        let outcome = self.deliver_page(consumer, mode, DeliverFormat::Plain, &mut buf)?;
-        Ok((outcome.rendered_text, outcome.new_cursor))
-    }
-
     /// Reads the inbox digest for `consumer`:
-    /// - Delegates to `deliver_page`.
+    /// - Delegates to `deliver_page` in Peek mode (never advances cursor into memory).
     pub fn inbox_digest(&self, runs_dir: &Path, consumer: &str) -> Result<InboxDigest, String> {
-        self.inbox_digest_peek(runs_dir, consumer, false)
+        self.inbox_digest_peek(runs_dir, consumer, true)
     }
 
     /// Reads the inbox digest for `consumer`:
-    /// - Delegates to `deliver_page`.
+    /// - Delegates to `deliver_page` in Peek mode (never advances cursor into memory).
     pub fn inbox_digest_peek(
         &self,
         _runs_dir: &Path,
         consumer: &str,
-        peek: bool,
+        _peek: bool,
     ) -> Result<InboxDigest, String> {
-        let mode = if peek {
-            DeliverMode::Peek
-        } else {
-            DeliverMode::Advance
-        };
+        let mode = DeliverMode::Peek;
         let mut buf = Vec::new();
         let outcome = self.deliver_page(consumer, mode, DeliverFormat::Plain, &mut buf)?;
         Ok(InboxDigest {
