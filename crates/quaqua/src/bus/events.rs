@@ -42,10 +42,10 @@ pub struct InboxDigest {
 impl InboxDigest {
     /// Renders the inbox digest into a human- and agent-readable string.
     pub fn render(&self, _consumer: &str) -> String {
-        if !self.triggers.is_empty() {
-            return render_triggers(&self.triggers, false);
-        }
         let mut out = String::new();
+        if !self.triggers.is_empty() {
+            out.push_str(&render_triggers(&self.triggers, false));
+        }
         if !self.unacked_mail.is_empty() {
             for msg in &self.unacked_mail {
                 let tag = if msg.deliveries > 1 {
@@ -63,25 +63,28 @@ impl InboxDigest {
                 out.push('\n');
             }
         }
+        let rendered_trigger_ids: std::collections::HashSet<u64> =
+            self.triggers.iter().map(|t| t.id).collect();
         if !self.incidents.is_empty() {
             for ev in &self.incidents {
-                let key = ev.incident_key.as_deref().unwrap_or("none");
-                let actor = ev.actor.as_deref().unwrap_or("-");
-                let subj = ev.subject.as_deref().unwrap_or("-");
-                out.push_str(&format!(
-                    "! #{} {} {} [{} -> {}]\n",
-                    ev.seq, ev.event_type, key, actor, subj
-                ));
+                if !rendered_trigger_ids.contains(&ev.seq) {
+                    let key = ev.incident_key.as_deref().unwrap_or("none");
+                    let actor = ev.actor.as_deref().unwrap_or("-");
+                    let subj = ev.subject.as_deref().unwrap_or("-");
+                    out.push_str(&format!(
+                        "! #{} {} {} [{} -> {}]\n",
+                        ev.seq, ev.event_type, key, actor, subj
+                    ));
+                }
             }
         }
         out
     }
 }
-
-/// Renders triggers into the superagent digest format per spec §5-§6.
-pub fn render_triggers(triggers: &[TriggerRecord], all: bool) -> String {
+/// Internal helper returning both the rendered trigger digest and the list of trigger IDs actually rendered.
+pub fn render_triggers_internal(triggers: &[TriggerRecord], all: bool) -> (String, Vec<u64>) {
     if triggers.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
 
     // Group triggers by thread_id
@@ -99,7 +102,7 @@ pub fn render_triggers(triggers: &[TriggerRecord], all: bool) -> String {
         max_b.cmp(&max_a)
     });
 
-    let mut lines = Vec::new();
+    let mut line_records: Vec<(String, Vec<u64>)> = Vec::new();
 
     for (_thread_id, mut thread_triggers) in threads {
         // Ensure triggers are in ascending order by id within the thread
@@ -147,18 +150,58 @@ pub fn render_triggers(triggers: &[TriggerRecord], all: bool) -> String {
                     ref_suffix
                 )
             };
-            lines.push(line);
+            let group_ids: Vec<u64> = group.iter().map(|t| t.id).collect();
+            line_records.push((line, group_ids));
         }
     }
 
-    if !all && lines.len() > 20 {
-        let total_lines = lines.len();
-        lines.truncate(19);
-        let overflow = total_lines - 19;
+    let overflow = if !all && line_records.len() > 20 {
+        let total_lines = line_records.len();
+        line_records.truncate(19);
+        total_lines - 19
+    } else {
+        0
+    };
+
+    let rendered_ids: Vec<u64> = line_records
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    let mut lines: Vec<String> = line_records.into_iter().map(|(l, _)| l).collect();
+    if overflow > 0 {
         lines.push(format!("… +{} more: quaqua mail inbox --all\n", overflow));
     }
 
-    lines.concat()
+    (lines.concat(), rendered_ids)
+}
+
+/// Renders triggers into the superagent digest format per spec §5-§6.
+pub fn render_triggers(triggers: &[TriggerRecord], all: bool) -> String {
+    render_triggers_internal(triggers, all).0
+}
+
+/// Computes the safe cursor to advance to without passing any unrendered trigger.
+pub fn compute_safe_cursor(all_ids: &[u64], rendered_ids: &[u64], prev_cursor: u64) -> u64 {
+    if all_ids.is_empty() {
+        return prev_cursor;
+    }
+    let rendered_set: std::collections::HashSet<u64> = rendered_ids.iter().copied().collect();
+    let unrendered: Vec<u64> = all_ids
+        .iter()
+        .copied()
+        .filter(|id| !rendered_set.contains(id))
+        .collect();
+    if unrendered.is_empty() {
+        all_ids.iter().copied().max().unwrap_or(prev_cursor)
+    } else {
+        let min_unrendered = unrendered.into_iter().min().unwrap();
+        rendered_ids
+            .iter()
+            .copied()
+            .filter(|&id| id < min_unrendered)
+            .max()
+            .unwrap_or(prev_cursor)
+    }
 }
 
 /// Resolves the consumer's own pane ID if known (e.g. from HERDR_PANE_ID or herdr query).
@@ -665,15 +708,16 @@ impl FarmBus {
             return Ok((String::new(), prev_cursor));
         }
 
-        let max_id = triggers.iter().map(|t| t.id).max().unwrap_or(prev_cursor);
-        let rendered = render_triggers(&triggers, all);
+        let all_ids: Vec<u64> = triggers.iter().map(|t| t.id).collect();
+        let (rendered, rendered_ids) = render_triggers_internal(&triggers, all);
+        let safe_cursor = compute_safe_cursor(&all_ids, &rendered_ids, prev_cursor);
 
-        if !peek && max_id > prev_cursor {
-            self.set_cursor(consumer, max_id)
+        if !peek && safe_cursor > prev_cursor {
+            self.set_cursor(consumer, safe_cursor)
                 .map_err(|e| format!("cannot set cursor: {e}"))?;
         }
 
-        Ok((rendered, max_id))
+        Ok((rendered, safe_cursor))
     }
 
     /// Reads the inbox digest for `consumer`:
@@ -685,6 +729,23 @@ impl FarmBus {
     ///
     /// A repeated read with no new events is idempotent: the cursor remains unchanged.
     pub fn inbox_digest(&self, runs_dir: &Path, consumer: &str) -> Result<InboxDigest, String> {
+        self.inbox_digest_peek(runs_dir, consumer, false)
+    }
+
+    /// Reads the inbox digest for `consumer`:
+    /// - Checks lazy unacked mail incidents.
+    /// - Reads unacked mail addressed to `consumer`.
+    /// - Reads incidents since the consumer's cursor.
+    /// - Reads unread triggers since the consumer's cursor.
+    /// - Advances the cursor up to the safe rendered sequence (or leaves unchanged if `peek` is true).
+    ///
+    /// A repeated read with no new events is idempotent: the cursor remains unchanged.
+    pub fn inbox_digest_peek(
+        &self,
+        runs_dir: &Path,
+        consumer: &str,
+        peek: bool,
+    ) -> Result<InboxDigest, String> {
         let prev_cursor = self
             .get_cursor(consumer)
             .map_err(|e| format!("cannot get cursor: {e}"))?
@@ -717,10 +778,24 @@ impl FarmBus {
             .filter(|r| is_incident_in_consumer_group(r, consumer, runs_dir))
             .collect();
 
-        let new_cursor = if max_evaluated_seq > prev_cursor {
-            self.set_cursor(consumer, max_evaluated_seq)
-                .map_err(|e| format!("cannot set cursor: {e}"))?;
+        let safe_cursor = if triggers.is_empty() {
             max_evaluated_seq
+        } else {
+            let all_trigger_ids: Vec<u64> = triggers.iter().map(|t| t.id).collect();
+            let (_, rendered_trigger_ids) = render_triggers_internal(&triggers, false);
+            let safe_tr_cursor =
+                compute_safe_cursor(&all_trigger_ids, &rendered_trigger_ids, prev_cursor);
+            if safe_tr_cursor < max_trigger_seq {
+                safe_tr_cursor.max(prev_cursor)
+            } else {
+                max_evaluated_seq
+            }
+        };
+
+        let new_cursor = if !peek && safe_cursor > prev_cursor {
+            self.set_cursor(consumer, safe_cursor)
+                .map_err(|e| format!("cannot set cursor: {e}"))?;
+            safe_cursor
         } else {
             prev_cursor
         };
@@ -758,6 +833,16 @@ impl FarmBus {
         runs_dir: &Path,
         consumer: &str,
         last_seen_mail_id: &mut u64,
+    ) -> Result<InboxDigest, String> {
+        self.follow_tick_peek(runs_dir, consumer, last_seen_mail_id, false)
+    }
+
+    pub fn follow_tick_peek(
+        &self,
+        runs_dir: &Path,
+        consumer: &str,
+        last_seen_mail_id: &mut u64,
+        peek: bool,
     ) -> Result<InboxDigest, String> {
         let prev_cursor = self
             .get_cursor(consumer)
@@ -852,7 +937,7 @@ impl FarmBus {
             .filter(|r| is_incident_in_consumer_group(r, consumer, runs_dir))
             .collect();
 
-        let new_cursor = if max_evaluated_seq > prev_cursor {
+        let new_cursor = if !peek && max_evaluated_seq > prev_cursor {
             self.set_cursor(consumer, max_evaluated_seq)
                 .map_err(|e| format!("cannot set cursor: {e}"))?;
             max_evaluated_seq

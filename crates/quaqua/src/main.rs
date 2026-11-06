@@ -140,9 +140,12 @@ enum Command {
     },
     /// Show trigger and incident digest for a consumer.
     Inbox {
-        /// Recipient / consumer to read for (default: 'cos')
-        #[arg(long, default_value = "cos")]
-        r#for: String,
+        /// Recipient / consumer to read for (defaults to resolved caller if omitted)
+        #[arg(long)]
+        r#for: Option<String>,
+        /// Do not advance cursor (peek mode)
+        #[arg(long)]
+        peek: bool,
         /// Continuously follow and print new items every 2 seconds
         #[arg(long)]
         follow: bool,
@@ -926,7 +929,12 @@ fn main() {
                 }
             }
         }
-        Some(Command::Inbox { r#for, follow, all }) => {
+        Some(Command::Inbox {
+            r#for,
+            peek,
+            follow,
+            all,
+        }) => {
             let runs_dir = if let Ok(dir) = std::env::var("QUAQUA_RUNS_DIR") {
                 PathBuf::from(dir)
             } else {
@@ -935,8 +943,44 @@ fn main() {
             let db_path = runs_dir.join("quaqua.db");
             match quaqua::bus::FarmBus::open(&db_path) {
                 Ok(bus) => {
+                    let herdr = quaqua::herdr::Herdr::new();
+                    let caller = quaqua::identity::resolve_caller(&herdr, &runs_dir);
+
+                    let (consumer, should_advance) = match r#for {
+                        None => {
+                            if caller.role == quaqua::identity::Role::Unknown {
+                                eprintln!(
+                                    "cannot determine recipient identity from harness (unresolved caller)"
+                                );
+                                std::process::exit(1);
+                            }
+                            (caller.name, !peek && !all)
+                        }
+                        Some(target) => {
+                            if caller.role == quaqua::identity::Role::Unknown {
+                                eprintln!(
+                                    "warning: cannot determine caller identity from harness (unresolved caller); rendering in peek mode without advancing cursor"
+                                );
+                                (target, false)
+                            } else if caller.name != target {
+                                eprintln!(
+                                    "warning: caller '{}' does not match recipient '{}'; rendering in peek mode without advancing cursor",
+                                    caller.name, target
+                                );
+                                (target, false)
+                            } else {
+                                (target, !peek && !all)
+                            }
+                        }
+                    };
+
+                    if !quaqua::bus::mail::is_safe_inbox_name(&consumer) {
+                        eprintln!("invalid recipient name '{consumer}': cannot escape runs/");
+                        std::process::exit(1);
+                    }
+
                     if all {
-                        match bus.render_trigger_digest(&r#for, false, true) {
+                        match bus.render_trigger_digest(&consumer, true, true) {
                             Ok((out, _)) => {
                                 print!("{out}");
                                 0
@@ -947,39 +991,45 @@ fn main() {
                             }
                         }
                     } else if follow {
-                        let mut last_seen_mail = match bus.inbox_digest(&runs_dir, &r#for) {
-                            Ok(digest) => {
-                                if !digest.triggers.is_empty()
-                                    || !digest.unacked_mail.is_empty()
-                                    || !digest.incidents.is_empty()
-                                {
-                                    print!("{}", digest.render(&r#for));
-                                }
-                                digest.unacked_mail.iter().map(|m| m.id).max().unwrap_or(0)
-                            }
-                            Err(e) => {
-                                eprintln!("inbox error: {e}");
-                                0
-                            }
-                        };
-                        loop {
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            match bus.follow_tick(&runs_dir, &r#for, &mut last_seen_mail) {
+                        let mut last_seen_mail =
+                            match bus.inbox_digest_peek(&runs_dir, &consumer, !should_advance) {
                                 Ok(digest) => {
                                     if !digest.triggers.is_empty()
                                         || !digest.unacked_mail.is_empty()
                                         || !digest.incidents.is_empty()
                                     {
-                                        print!("{}", digest.render(&r#for));
+                                        print!("{}", digest.render(&consumer));
+                                    }
+                                    digest.unacked_mail.iter().map(|m| m.id).max().unwrap_or(0)
+                                }
+                                Err(e) => {
+                                    eprintln!("inbox error: {e}");
+                                    0
+                                }
+                            };
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            match bus.follow_tick_peek(
+                                &runs_dir,
+                                &consumer,
+                                &mut last_seen_mail,
+                                !should_advance,
+                            ) {
+                                Ok(digest) => {
+                                    if !digest.triggers.is_empty()
+                                        || !digest.unacked_mail.is_empty()
+                                        || !digest.incidents.is_empty()
+                                    {
+                                        print!("{}", digest.render(&consumer));
                                     }
                                 }
                                 Err(e) => eprintln!("inbox error: {e}"),
                             }
                         }
                     } else {
-                        match bus.inbox_digest(&runs_dir, &r#for) {
+                        match bus.inbox_digest_peek(&runs_dir, &consumer, !should_advance) {
                             Ok(digest) => {
-                                print!("{}", digest.render(&r#for));
+                                print!("{}", digest.render(&consumer));
                                 0
                             }
                             Err(e) => {

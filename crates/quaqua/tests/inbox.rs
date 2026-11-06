@@ -496,7 +496,8 @@ fn test_e2e_smoke_mail_send_hook_digest_idempotent_resend() {
         "hook script must exist at {}",
         hook_script.display()
     );
-
+    // CoS hook runs as cos:
+    guard.set("QUAQUA_OWNER", "cos");
     let out_hook = std::process::Command::new("sh")
         .arg(&hook_script)
         .arg("--user-prompt-submit")
@@ -550,8 +551,8 @@ fn test_e2e_smoke_mail_send_hook_digest_idempotent_resend() {
         out_stop.stdout.is_empty(),
         "stop hook must be silent when nothing new"
     );
-
-    // Step 4: idempotent resend
+    // Step 4: idempotent resend from mu-lead
+    guard.set("QUAQUA_OWNER", "mu-lead");
     let res2 = mail::send_mail(&runs_dir, &opts, &herdr).expect("resend mail");
     assert_eq!(res2.id, res1.id, "resend must return same mail id");
     assert!(res2.already_sent, "resend must report already_sent = true");
@@ -1346,4 +1347,262 @@ fn test_mail_inbox_cli_matching_caller_advances_cursor() {
     let res2 = mail::handle_mail(&["inbox".to_string()], &herdr);
     assert_eq!(res2.expect("second run succeeds"), 0);
     assert_eq!(bus.get_cursor("mu-lead").unwrap(), Some(2));
+}
+
+#[test]
+fn test_regression_finding_1_render_branch_never_drops_incidents() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    let runs_dir = hermetic_temp_dir("finding-1-render-branch");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    // 1 stalled incident on unsubscribed agent:w9
+    let ev = quaqua::bus::FarmEvent::new(
+        "stalled",
+        Some("watchdog"),
+        Some("w9"),
+        Some("cos"),
+        Some("mu"),
+    )
+    .with_incident_key("stall:w9:5000");
+    bus.record(&ev).expect("record incident");
+
+    // 1 mail trigger to cos
+    let opts = SendMailOpts {
+        to: "cos".to_string(),
+        kind: "accept".to_string(),
+        body: "mu-lead agent:cos ok".to_string(),
+        project: Some("mu".to_string()),
+        reply_to: None,
+        client_id: None,
+    };
+    let send_res = mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+
+    // Read inbox digest for cos
+    let digest = bus.inbox_digest(&runs_dir, "cos").expect("digest");
+    assert_eq!(digest.incidents.len(), 1, "must load 1 incident");
+    assert!(
+        digest.triggers.iter().any(|t| t.id == send_res.id),
+        "must load 1 mail trigger"
+    );
+
+    // Render digest
+    let rendered = digest.render("cos");
+    assert!(
+        rendered.contains("stall:w9:5000") || rendered.contains("stalled"),
+        "rendered digest must include the incident even when triggers are present, but got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("#{} accept", send_res.id)),
+        "rendered digest must include the mail trigger"
+    );
+}
+
+#[test]
+fn test_regression_finding_2_render_trigger_digest_truncation_caps_cursor() {
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    let runs_dir = hermetic_temp_dir("finding-2-truncation");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    // 25 triggers to lead1
+    for i in 1..=25 {
+        let opts = SendMailOpts {
+            to: "lead1".to_string(),
+            kind: format!("kind-{}", i),
+            body: format!("message {}", i),
+            project: None,
+            reply_to: None,
+            client_id: None,
+        };
+        mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    }
+
+    // First read: capped at 20 lines (19 triggers + 1 overflow line)
+    let (rendered, new_cursor) = bus
+        .render_trigger_digest("lead1", false, false)
+        .expect("render trigger digest");
+    assert!(
+        rendered.contains("… +6 more: quaqua mail inbox --all"),
+        "must show overflow line"
+    );
+    assert_eq!(
+        new_cursor, 19,
+        "cursor must be capped at last rendered id (19), but was advanced to {new_cursor}"
+    );
+    assert_eq!(bus.get_cursor("lead1").unwrap(), Some(19));
+
+    // Second read with all=true: must show the 6 overflow items, NOT empty!
+    let (rendered_all, cursor_all) = bus
+        .render_trigger_digest("lead1", false, true)
+        .expect("render trigger digest all");
+    assert!(
+        !rendered_all.is_empty(),
+        "second read with all=true must return the 6 overflow items, but was empty"
+    );
+    assert!(
+        rendered_all.contains("#20") && rendered_all.contains("#25"),
+        "overflow read must contain items 20..25, got:\n{rendered_all}"
+    );
+    assert_eq!(cursor_all, 25);
+    assert_eq!(bus.get_cursor("lead1").unwrap(), Some(25));
+}
+
+#[test]
+fn test_regression_finding_3_cos_inbox_hook_retains_up_to_20_lines() {
+    let runs_dir = hermetic_temp_dir("finding-3-hook-cap");
+    let db_path = runs_dir.join("quaqua.db");
+    let _bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+
+    // Insert 15 triggers to cos (so line count is 15 lines, exceeding head -n 10)
+    for i in 1..=15 {
+        let opts = SendMailOpts {
+            to: "cos".to_string(),
+            kind: format!("k{}", i),
+            body: format!("item {}", i),
+            project: None,
+            reply_to: None,
+            client_id: None,
+        };
+        mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let hook_script = manifest_dir.join("../../templates/workspace/scripts/hooks/cos-inbox.sh");
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+
+    let out_hook = std::process::Command::new("sh")
+        .arg(&hook_script)
+        .arg("--user-prompt-submit")
+        .env("QUAQUA_BIN", quaqua_bin)
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("execute cos-inbox.sh");
+
+    assert_eq!(out_hook.status.code(), Some(0));
+    let hook_stdout = String::from_utf8_lossy(&out_hook.stdout);
+
+    // Lines 11..15 must NOT be truncated by head -n 10
+    assert!(
+        hook_stdout.contains("#15"),
+        "hook output must retain up to 20 lines (R4), but line 15 was missing (head -n 10 truncated it):\n{hook_stdout}"
+    );
+}
+
+#[test]
+fn test_regression_finding_4_inbox_cli_for_another_consumer_peeks_and_all_peeks() {
+    let runs_dir = hermetic_temp_dir("finding-4-identity");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+    let herdr = Herdr::new();
+
+    let guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_OWNER",
+        "HERDR_PANE_ID",
+        "QUAQUA_RUNS_DIR",
+    ]);
+    guard.set("QUAQUA_TEST", "1");
+    guard.set("QUAQUA_OWNER", "cos");
+    guard.remove("HERDR_PANE_ID");
+    // Create trigger for mu-lead
+    let opts = SendMailOpts {
+        to: "mu-lead".to_string(),
+        kind: "handoff".to_string(),
+        body: "task finished".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    let _send_res = mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+
+    let quaqua_bin = env!("CARGO_BIN_EXE_quaqua");
+
+    // Case 1: Caller is NOT mu-lead (e.g. caller is cos)
+    // Running `quaqua inbox --for mu-lead` must peek (never advance mu-lead's cursor)
+    let out = std::process::Command::new(quaqua_bin)
+        .args(["inbox", "--for", "mu-lead"])
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run quaqua inbox --for mu-lead");
+
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("does not match recipient 'mu-lead'"),
+        "must warn that caller does not match recipient, got stderr:\n{stderr}"
+    );
+
+    let cursor = bus.get_cursor("mu-lead").unwrap();
+    assert_eq!(
+        cursor, None,
+        "caller 'cos' reading for 'mu-lead' must not advance mu-lead's cursor"
+    );
+
+    // Case 2: Running `quaqua inbox --for mu-lead --all`
+    // Must peek without advancing cursor
+    let out_all = std::process::Command::new(quaqua_bin)
+        .args(["inbox", "--for", "mu-lead", "--all"])
+        .env("QUAQUA_TEST", "1")
+        .env("QUAQUA_OWNER", "cos")
+        .env_remove("HERDR_PANE_ID")
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run quaqua inbox --for mu-lead --all");
+
+    assert_eq!(out_all.status.code(), Some(0));
+    assert_eq!(
+        bus.get_cursor("mu-lead").unwrap(),
+        None,
+        "--all must not advance cursor"
+    );
+
+    // Case 3: Running `quaqua inbox` without --for when caller is unknown
+    // Must fail closed with exit 1
+    let out_unknown = std::process::Command::new(quaqua_bin)
+        .arg("inbox")
+        .env("QUAQUA_TEST", "1")
+        .env_remove("QUAQUA_OWNER")
+        .env_remove("HERDR_PANE_ID")
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("run quaqua inbox without --for as unknown");
+
+    assert_eq!(
+        out_unknown.status.code(),
+        Some(1),
+        "inbox without --for when caller identity is unknown must exit 1"
+    );
 }
