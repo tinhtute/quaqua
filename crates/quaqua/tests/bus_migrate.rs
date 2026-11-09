@@ -1705,3 +1705,98 @@ fn test_finding_r3_defect3_migrate_cursor_and_acks_share_id_source() {
         "summary.consumer_cursors must reflect the actual trigger_id from last_insert_rowid"
     );
 }
+
+#[test]
+fn test_finding_r3_followup_migrated_mail_reply_to_points_to_trigger_id() {
+    let tmp = hermetic_temp_dir("r3-f1-reply-trigger-id");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // farm_event 1: ts=100 -> will become trigger 1
+        conn.execute(
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json, farm",
+                "100, 'agent_spawned', 'herdr', 'w1', 'cos', 'spawn:1', '{}', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+
+        // mail 1: ts=200, legacy id=1 -> will become trigger 2
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, reply_to, body, farm",
+                "1, 'm1', 200, 'cos', 'cos', 'w1', 'directive', NULL, 'parent task', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+
+        // farm_event 2: ts=300 -> will become trigger 3
+        conn.execute(
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json, farm",
+                "300, 'stalled', 'watchdog', 'w1', 'cos', 'inc:2', '{}', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+
+        // mail 2: ts=400, legacy id=2, reply_to=1 (replying to mail 1), project='proj-beta' -> will become trigger 4
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, farm",
+                "2, 'm2', 400, 'w1', 'worker', 'cos', 'handoff', 'proj-beta', 1, 'task finished', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.legacy_events_count, 2);
+    assert_eq!(summary.mail_count, 2);
+    assert_eq!(summary.triggers_count, 4);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let conn = bus.conn_for_test();
+
+    // Verify trigger sequence:
+    // id 1: fe 1
+    // id 2: mail 1 (legacy id 1)
+    // id 3: fe 2
+    // id 4: mail 2 (legacy id 2, replied to legacy mail 1)
+    let trigs: Vec<(u64, String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, source, ref FROM triggers ORDER BY id ASC")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    assert_eq!(trigs.len(), 4);
+    assert_eq!(trigs[0].0, 1);
+    assert_eq!(trigs[0].1, "herdr");
+
+    assert_eq!(trigs[1].0, 2);
+    assert_eq!(trigs[1].1, "mail");
+
+    assert_eq!(trigs[2].0, 3);
+    assert_eq!(trigs[2].1, "watchdog");
+
+    assert_eq!(trigs[3].0, 4);
+    assert_eq!(trigs[3].1, "mail");
+
+    // Finding 1: trigger 4 replied to legacy mail 1. Legacy mail 1 is trigger 2, so ref must be "mail:2;project:proj-beta"
+    assert_eq!(
+        trigs[3].2.as_deref(),
+        Some("mail:2;project:proj-beta"),
+        "migrated ref reply_to must point to new trigger id of replied-to mail (2), not legacy mail id (1)"
+    );
+}
