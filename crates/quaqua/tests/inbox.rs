@@ -2753,3 +2753,115 @@ fn test_inbox_digest_peek_only_does_not_advance_cursor() {
         "inbox_digest_peek must not advance cursor"
     );
 }
+
+#[test]
+fn test_finding_r3_defect2_follow_and_inbox_agree_on_mail_at_or_below_cursor() {
+    use quaqua::bus::events::{DeliverFormat, DeliverMode};
+    use quaqua::bus::NewTrigger;
+
+    let runs_dir = hermetic_temp_dir("r3-defect2-follow-agree");
+    let db_path = runs_dir.join("quaqua.db");
+    let bus = FarmBus::open(&db_path).expect("open bus");
+
+    // Mail 1 recorded
+    let t1 = NewTrigger::new("mail", "directive", "cos", "agent:w1", "mail 1").with_to_name("w1");
+    bus.record_trigger(&t1).expect("record t1");
+
+    // Advance w1's cursor to 1 so mail 1 is at/below the cursor
+    let mut init_buf = Vec::new();
+    let init_outcome = bus
+        .deliver_page(
+            "w1",
+            DeliverMode::Advance,
+            DeliverFormat::Plain,
+            &mut init_buf,
+        )
+        .expect("initial delivery");
+    assert_eq!(init_outcome.rendered_ids, vec![1]);
+    assert_eq!(bus.get_cursor("w1").unwrap(), Some(1));
+    // Plain inbox check (peek mode): mail at or below cursor is hidden
+    let mut plain_buf = Vec::new();
+    let plain_outcome = bus
+        .deliver_page(
+            "w1",
+            DeliverMode::Peek,
+            DeliverFormat::Plain,
+            &mut plain_buf,
+        )
+        .expect("plain inbox");
+    assert_eq!(
+        plain_outcome.rendered_ids.len(),
+        0,
+        "plain inbox must not deliver mail at or below cursor"
+    );
+    assert!(plain_buf.is_empty());
+
+    // Follow check on tick 0 (in_memory_cursor = None, uses DB cursor)
+    let mut follow_buf_tick0 = Vec::new();
+    let follow_outcome_tick0 = bus
+        .deliver_page(
+            "w1",
+            DeliverMode::Peek,
+            DeliverFormat::Plain,
+            &mut follow_buf_tick0,
+        )
+        .expect("follow tick 0");
+    assert_eq!(
+        follow_outcome_tick0.rendered_ids.len(),
+        0,
+        "follow tick 0 must agree with plain inbox and not re-show mail at or below cursor"
+    );
+    assert!(follow_buf_tick0.is_empty());
+
+    // Follow check on tick 1 with in_memory_cursor = Some(follow_outcome_tick0.new_cursor)
+    let mut follow_buf_tick1 = Vec::new();
+    let follow_outcome_tick1 = bus
+        .deliver_page(
+            "w1",
+            DeliverMode::PeekFrom(follow_outcome_tick0.new_cursor),
+            DeliverFormat::Plain,
+            &mut follow_buf_tick1,
+        )
+        .expect("follow tick 1");
+    assert_eq!(
+        follow_outcome_tick1.rendered_ids.len(),
+        0,
+        "follow tick 1 must continue to not re-show mail at or below cursor"
+    );
+    assert!(follow_buf_tick1.is_empty());
+
+    // New mail arrives above cursor (mail 2)
+    let t2 = NewTrigger::new("mail", "directive", "cos", "agent:w1", "mail 2").with_to_name("w1");
+    bus.record_trigger(&t2).expect("record t2");
+
+    // Both plain and follow see ONLY mail 2
+    let mut plain_buf2 = Vec::new();
+    let plain_outcome2 = bus
+        .deliver_page(
+            "w1",
+            DeliverMode::Peek,
+            DeliverFormat::Plain,
+            &mut plain_buf2,
+        )
+        .expect("plain inbox 2");
+    assert_eq!(
+        plain_outcome2.rendered_ids,
+        vec![2],
+        "plain inbox must deliver only new mail 2"
+    );
+
+    let mut follow_buf2 = Vec::new();
+    let follow_outcome2 = bus
+        .deliver_page(
+            "w1",
+            DeliverMode::PeekFrom(follow_outcome_tick0.new_cursor),
+            DeliverFormat::Plain,
+            &mut follow_buf2,
+        )
+        .expect("follow tick 2");
+    assert_eq!(
+        follow_outcome2.rendered_ids,
+        vec![2],
+        "follow must agree and deliver only new mail 2"
+    );
+}
