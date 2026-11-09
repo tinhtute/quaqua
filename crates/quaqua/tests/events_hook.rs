@@ -713,3 +713,389 @@ fn test_is_pane_in_runs_workspace_treats_factory_workspace_parent_as_local() {
         "a pane from another workspace is not local"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R3: nudge-on-idle. An idle non-CoS agent with unread triggers gets exactly one
+// one-line nudge per batch; a busy agent gets none; a second hook with no newer
+// trigger sends none; the CoS pane is never nudged. Mail send wakes an idle
+// recipient the same way. All through a fake HerdrOps — no live DB, no real herdr.
+// ---------------------------------------------------------------------------
+
+use quaqua::bus::NewTrigger;
+use quaqua::herdr::HerdrOps;
+use std::sync::Mutex;
+
+struct WakeHerdr {
+    /// agent name -> (agent_status, pane_id)
+    agents: Mutex<Vec<(String, String, String)>>,
+    calls: Mutex<Vec<String>>,
+    /// When set, `pane send-text` fails like a dead pane would.
+    fail_send: std::sync::atomic::AtomicBool,
+}
+
+impl WakeHerdr {
+    fn new(agents: &[(&str, &str, &str)]) -> Self {
+        Self {
+            agents: Mutex::new(
+                agents
+                    .iter()
+                    .map(|(n, s, p)| (n.to_string(), s.to_string(), p.to_string()))
+                    .collect(),
+            ),
+            calls: Mutex::new(Vec::new()),
+            fail_send: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn send_texts(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("pane send-text "))
+            .cloned()
+            .collect()
+    }
+
+    fn ok(&self) -> std::io::Result<std::process::Output> {
+        Ok(std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+impl HerdrOps for WakeHerdr {
+    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        self.calls.lock().unwrap().push(args.join(" "));
+        if args.first() == Some(&"pane")
+            && args.get(1) == Some(&"send-text")
+            && self.fail_send.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(std::process::Output {
+                status: std::os::unix::process::ExitStatusExt::from_raw(1),
+                stdout: Vec::new(),
+                stderr: b"pane not found".to_vec(),
+            });
+        }
+        self.ok()
+    }
+    fn agent_list(&self) -> std::io::Result<String> {
+        let agents: Vec<serde_json::Value> = self
+            .agents
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, status, pane)| {
+                serde_json::json!({"name": name, "agent_status": status, "pane_id": pane})
+            })
+            .collect();
+        Ok(serde_json::json!({"result": {"agents": agents}}).to_string())
+    }
+    fn agent_get(&self, name: &str) -> std::io::Result<(bool, String)> {
+        let agents = self.agents.lock().unwrap();
+        match agents.iter().find(|(n, _, _)| n == name) {
+            Some((_, status, pane)) => Ok((
+                true,
+                format!(
+                    r#"{{"result":{{"agent":{{"name":"{name}","agent_status":"{status}","pane_id":"{pane}"}}}}}}"#
+                ),
+            )),
+            None => Ok((false, r#"{"error":{"code":"agent_not_found"}}"#.to_string())),
+        }
+    }
+    fn agent_read(&self, _n: &str, _s: &str, _l: u32) -> std::io::Result<String> {
+        Ok(String::new())
+    }
+    fn agent_start(
+        &self,
+        _n: &str,
+        _k: &str,
+        _p: &str,
+        _t: u32,
+        _a: &[&str],
+    ) -> std::io::Result<std::process::Output> {
+        self.ok()
+    }
+    fn pane_split(
+        &self,
+        _c: &str,
+        _o: &str,
+        _e: &[(&str, &str)],
+    ) -> std::io::Result<std::process::Output> {
+        self.ok()
+    }
+    fn pane_close(&self, _p: &str) -> std::io::Result<std::process::Output> {
+        self.ok()
+    }
+    fn pane_report_metadata(&self, _p: &str, _t: &[&str]) -> std::io::Result<std::process::Output> {
+        self.ok()
+    }
+    fn pane_wait_output(&self, _p: &str, _pat: &str, _t: u32) -> bool {
+        false
+    }
+    fn pane_read(&self, _p: &str, _s: &str, _l: u32) -> std::io::Result<String> {
+        Ok(String::new())
+    }
+    fn pane_send_keys(&self, pane: &str, key: &str) -> std::io::Result<std::process::Output> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("pane send-keys {pane} {key}"));
+        self.ok()
+    }
+    fn agent_send_keys(&self, _n: &str, _k: &str) -> std::io::Result<std::process::Output> {
+        self.ok()
+    }
+    fn agent_prompt_nowait(&self, _n: &str, _p: &str) -> std::io::Result<std::process::Output> {
+        self.ok()
+    }
+    fn agent_prompt_wait_background(
+        &self,
+        _n: &str,
+        _p: &str,
+        _t: u32,
+        _log: std::fs::File,
+    ) -> std::io::Result<std::process::Child> {
+        unimplemented!()
+    }
+}
+
+fn record_trigger_to(bus: &FarmBus, to: &str, summary: &str) -> u64 {
+    let t =
+        NewTrigger::new("mail", "handoff", "cos", format!("agent:{to}"), summary).with_to_name(to);
+    assert!(bus.record_trigger(&t).expect("record trigger"));
+    let conn = bus.conn_for_test();
+    conn.query_row("SELECT MAX(id) FROM triggers", [], |r| r.get::<_, i64>(0))
+        .expect("max trigger id") as u64
+}
+
+/// A `pane.agent_status_changed` payload as herdr really emits it: `agent` is
+/// the harness kind, and the pane is the only thing that names the agent.
+fn status_event(pane: &str, status: &str) -> String {
+    serde_json::json!({
+        "type": "pane_agent_status_changed",
+        "data": {"agent": "omp", "agent_status": status, "pane_id": pane}
+    })
+    .to_string()
+}
+
+#[test]
+fn test_wake_idle_agent_with_unread_trigger_nudges_once_per_batch() {
+    let runs_dir = hermetic_temp_dir("wake-idle");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    record_trigger_to(&bus, "worker-w", "review the diff");
+    let herdr = WakeHerdr::new(&[("worker-w", "idle", "w1:p9")]);
+
+    let res = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "idle")),
+        &herdr,
+    );
+    assert_eq!(res, Ok(false), "a status change is not an incident");
+
+    let sends = herdr.send_texts();
+    assert_eq!(
+        sends.len(),
+        1,
+        "idle + unread must nudge exactly once: {sends:?}"
+    );
+    let line = sends[0]
+        .strip_prefix("pane send-text w1:p9 ")
+        .expect("nudge goes to the agent's own pane");
+    assert!(!line.contains('\n'), "nudge must be one line: {line:?}");
+    assert!(
+        line.contains("1 new trigger") && line.contains("quaqua mail inbox"),
+        "nudge must count the batch and name the read command: {line:?}"
+    );
+    assert_eq!(
+        herdr
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.as_str() == "pane send-keys w1:p9 Enter")
+            .count(),
+        1,
+        "the nudge line must be submitted"
+    );
+
+    // Same batch, no newer trigger: the read cursor has not moved, yet no second nudge.
+    let res = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "idle")),
+        &herdr,
+    );
+    assert_eq!(res, Ok(false));
+    assert_eq!(
+        herdr.send_texts().len(),
+        1,
+        "a second hook with no newer trigger must not nudge again"
+    );
+
+    // A newer trigger is a new batch: one more nudge, not a permanent mute.
+    record_trigger_to(&bus, "worker-w", "second message");
+    let _ = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "idle")),
+        &herdr,
+    );
+    let sends = herdr.send_texts();
+    assert_eq!(
+        sends.len(),
+        2,
+        "a newer trigger must nudge again: {sends:?}"
+    );
+    assert!(
+        sends[1].contains("2 new trigger"),
+        "the second nudge counts the whole batch: {:?}",
+        sends[1]
+    );
+}
+
+#[test]
+fn test_wake_skips_busy_agent() {
+    let runs_dir = hermetic_temp_dir("wake-busy");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    record_trigger_to(&bus, "worker-w", "review the diff");
+    let herdr = WakeHerdr::new(&[("worker-w", "working", "w1:p9")]);
+
+    let _ = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "working")),
+        &herdr,
+    );
+    assert!(
+        herdr.send_texts().is_empty(),
+        "a working agent must not be nudged: {:?}",
+        herdr.send_texts()
+    );
+
+    // Even when the hook says idle, the live status decides.
+    let _ = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "idle")),
+        &herdr,
+    );
+    assert!(
+        herdr.send_texts().is_empty(),
+        "a working agent must not be nudged even on an idle event: {:?}",
+        herdr.send_texts()
+    );
+}
+
+#[test]
+fn test_wake_never_nudges_cos() {
+    let runs_dir = hermetic_temp_dir("wake-cos");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    record_trigger_to(&bus, "cos", "handoff from mu-lead");
+    let herdr = WakeHerdr::new(&[("cos", "idle", "w1:p1")]);
+
+    let _ = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p1", "idle")),
+        &herdr,
+    );
+    assert!(
+        herdr.send_texts().is_empty(),
+        "the CoS pane is never nudged: {:?}",
+        herdr.send_texts()
+    );
+}
+
+#[test]
+fn test_mail_send_wakes_idle_recipient() {
+    let runs_dir = hermetic_temp_dir("wake-mail");
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prev_test = std::env::var("QUAQUA_TEST").ok();
+    let prev_owner = std::env::var("QUAQUA_OWNER").ok();
+    let prev_pane = std::env::var("HERDR_PANE_ID").ok();
+    std::env::set_var("QUAQUA_TEST", "1");
+    std::env::set_var("QUAQUA_OWNER", "cos");
+    std::env::remove_var("HERDR_PANE_ID");
+
+    let herdr = WakeHerdr::new(&[("worker-w", "idle", "w1:p9")]);
+    let opts = quaqua::bus::mail::SendMailOpts {
+        to: "worker-w".to_string(),
+        kind: "handoff".to_string(),
+        body: "please review".to_string(),
+        project: None,
+        reply_to: None,
+        client_id: None,
+    };
+    let res = quaqua::bus::mail::send_mail(&runs_dir, &opts, &herdr).expect("send mail");
+    assert!(res.id > 0);
+
+    let sends = herdr.send_texts();
+    assert_eq!(
+        sends.len(),
+        1,
+        "mail send must wake an idle recipient: {sends:?}"
+    );
+    assert!(
+        sends[0].starts_with("pane send-text w1:p9 "),
+        "nudge goes to the recipient's own pane: {:?}",
+        sends[0]
+    );
+
+    // A duplicate send (same body) is not a new batch and must not nudge again.
+    let _ = quaqua::bus::mail::send_mail(&runs_dir, &opts, &herdr).expect("resend mail");
+    assert_eq!(
+        herdr.send_texts().len(),
+        1,
+        "an already-sent mail must not nudge again"
+    );
+
+    for (k, v) in [
+        ("QUAQUA_TEST", prev_test),
+        ("QUAQUA_OWNER", prev_owner),
+        ("HERDR_PANE_ID", prev_pane),
+    ] {
+        match v {
+            Some(val) => std::env::set_var(k, val),
+            None => std::env::remove_var(k),
+        }
+    }
+}
+
+#[test]
+fn test_failed_nudge_does_not_consume_the_batch() {
+    let runs_dir = hermetic_temp_dir("wake-fail");
+    let bus = FarmBus::open(&runs_dir.join("quaqua.db")).expect("open bus");
+    record_trigger_to(&bus, "worker-w", "review the diff");
+    let herdr = WakeHerdr::new(&[("worker-w", "idle", "w1:p9")]);
+    herdr
+        .fail_send
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let _ = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "idle")),
+        &herdr,
+    );
+    assert_eq!(herdr.send_texts().len(), 1, "one attempt was made");
+
+    // The pane is back: the same batch is still unannounced, so it is nudged now.
+    herdr
+        .fail_send
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = quaqua::bus::events::handle_event_hook(
+        &runs_dir,
+        Some("pane.agent_status_changed"),
+        Some(&status_event("w1:p9", "idle")),
+        &herdr,
+    );
+    assert_eq!(
+        herdr.send_texts().len(),
+        2,
+        "a failed send must leave the batch unclaimed so the next hook retries"
+    );
+}

@@ -21,7 +21,7 @@ pub use observer::{lead_waiting, report_ready};
 pub use outcome::{parse_report_outcome, OutcomeLevel, OutcomeParseError};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 pub use watchdog::{is_lessons_heading, nap, prepend_header, validate_report_content};
@@ -393,10 +393,180 @@ fn parse_submit_output(out: &std::process::Output) -> (bool, String, String) {
     (out.status.success(), status, code)
 }
 
+/// One live subscription of the watched agent, with the newest trigger on that
+/// thread inside the quiet window (`None` when nothing landed).
+struct LiveSubscription {
+    thread_id: String,
+    recent_trigger_ms: Option<u64>,
+}
+
+/// R8: the watched agent is legitimately waiting on the bus.
+///
+/// True when `name` holds a live subscription on a thread whose Peer is live
+/// (`herdr agent list`) or that received a trigger inside `quiet_ms`. The
+/// reason feeds the `WATCHDOG waiting` line; `None` keeps the stall behaviour.
+///
+/// A thread's Peer is the agent the thread is named after (`quaqua/<peer>`,
+/// when that agent is a known worker). Any other thread — the project thread
+/// `quaqua/<slug>-integ` — is watched on behalf of the workers that record
+/// `name` as their owner: the same set `lead cleanup` refuses to leave behind.
+pub fn peer_waiting<H: HerdrOps>(
+    runs_dir: &Path,
+    name: &str,
+    now_ms: u64,
+    quiet_ms: u64,
+    herdr: &H,
+) -> Option<String> {
+    let subs = live_subscriptions(&runs_dir.join("quaqua.db"), name, now_ms, quiet_ms);
+    if subs.is_empty() {
+        return None;
+    }
+    let mut live: Option<Vec<String>> = None;
+    for sub in &subs {
+        if let Some(ts_ms) = sub.recent_trigger_ms {
+            return Some(format!(
+                "thread {}: trigger {}s ago",
+                sub.thread_id,
+                now_ms.saturating_sub(ts_ms) / 1000
+            ));
+        }
+        let peers = thread_peers(runs_dir, name, &sub.thread_id);
+        if peers.is_empty() {
+            continue;
+        }
+        let agents = live.get_or_insert_with(|| live_agents(herdr));
+        if let Some(peer) = peers.iter().find(|p| agents.iter().any(|a| a == *p)) {
+            return Some(format!("thread {}: peer {peer} live", sub.thread_id));
+        }
+    }
+    None
+}
+
+/// R8: the trigger window to hand `peer_waiting`, or `None` when no exit
+/// branch could fire yet.
+///
+/// `quiet_sec` is the time since the last observed progress, `elapsed_sec` the
+/// session age (it covers `--resume`, whose stall baseline predates this
+/// process), and `status` the agent's resolved state.
+///
+/// The window is one stall period. Growing it with the session would cover
+/// every trigger since the watch started, so a Lead that hung after
+/// dispatching its Peers would never reach the stall exit.
+pub fn peer_wait_window(
+    quiet_sec: u64,
+    elapsed_sec: u64,
+    status: &str,
+    stall_sec: u64,
+) -> Option<u64> {
+    let near_a_stall =
+        quiet_sec >= stall_sec || elapsed_sec >= stall_sec || status == "idle" || status == "done";
+    near_a_stall.then(|| stall_sec.saturating_mul(1000))
+}
+
+/// Live subscriptions of `consumer`, each with the newest trigger on its thread
+/// at or after `now_ms - quiet_ms`.
+fn live_subscriptions(
+    db_path: &Path,
+    consumer: &str,
+    now_ms: u64,
+    quiet_ms: u64,
+) -> Vec<LiveSubscription> {
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    // `bus/` exposes no consumer-scoped subscription query, and this unit may
+    // not edit it: read the columns the check needs through the shared opener,
+    // which carries the live-DB guard and the busy timeout. `threads.last_trigger_ms`
+    // is the thread's open time, not a trigger, so the window reads `triggers`.
+    let Ok(conn) = crate::engine::sqlite::open_conn(db_path) else {
+        return Vec::new();
+    };
+    let since_ms = now_ms.saturating_sub(quiet_ms);
+    crate::engine::sqlite::retry_while_busy(|| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT t.id, (SELECT MAX(tr.ts_ms) FROM triggers tr \
+                           WHERE tr.thread_id = t.id AND tr.ts_ms >= ?3) \
+             FROM subscriptions s JOIN threads t ON t.id = s.thread_id \
+             WHERE s.consumer = ?1 AND s.until_ms >= ?2 ORDER BY t.id ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![consumer, now_ms as i64, since_ms as i64],
+            |r| {
+                Ok(LiveSubscription {
+                    thread_id: r.get(0)?,
+                    recent_trigger_ms: r.get::<_, Option<i64>>(1)?.map(|ms| ms.max(0) as u64),
+                })
+            },
+        )?;
+        rows.collect()
+    })
+    .unwrap_or_default()
+}
+
+fn thread_peers(runs_dir: &Path, name: &str, thread_id: &str) -> Vec<String> {
+    if let Some(agent) = thread_id.strip_prefix("quaqua/") {
+        if agent != name && runs_dir.join(format!("{agent}.owner")).exists() {
+            return vec![agent.to_string()];
+        }
+    }
+    owned_workers(runs_dir, name)
+}
+
+/// Workers that record `name` as their owner, sorted for a stable reason line.
+fn owned_workers(runs_dir: &Path, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(runs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("owner") {
+                continue;
+            }
+            let peer = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !peer.is_empty() && WorkerMetadata::load_owner(runs_dir, peer) == name {
+                out.push(peer.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Agent names from one `herdr agent list` that are actually working the
+/// thread: `working` has a turn in flight and `blocked` is sitting on a
+/// question. A `done` or `idle` worker whose pane lingers until cleanup has
+/// nothing left to answer, so it must not hold the Lead past its stall.
+/// An unreadable or empty list proves no Peer live, which keeps the old stall
+/// behaviour (absence is not evidence).
+fn live_agents<H: HerdrOps>(herdr: &H) -> Vec<String> {
+    herdr
+        .agent_list()
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.pointer("/result/agents")
+                .and_then(|a| a.as_array())
+                .cloned()
+        })
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|a| {
+                    matches!(
+                        a.get("agent_status").and_then(|s| s.as_str()),
+                        Some("working") | Some("blocked")
+                    )
+                })
+                .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 struct PromptActivities {
     inner: SystemActivities,
     runs_dir: PathBuf,
     time_budget_sec: u64,
+    stall_sec: u64,
     nudge_pct: u64,
     heartbeat_sec: u64,
     start_sec: u64,
@@ -461,6 +631,7 @@ impl Activity for PromptActivities {
                         session_value,
                         harness,
                         cwd,
+                        lead_waiting,
                         ..
                     },
                 )) = &mut res
@@ -487,6 +658,30 @@ impl Activity for PromptActivities {
                     stop_now = tracker.take_stop();
                     drop(tracker);
                     let quiet = now.saturating_sub(*self.last_progress.lock().unwrap());
+                    // R8: a Lead waiting on a live Peer, or on a thread that
+                    // moved inside the quiet window, is not stalled. The
+                    // workflow already honours `lead_waiting` in its idle and
+                    // stall branches; the bus fills it in here, and only when
+                    // one of those branches could fire.
+                    if !*lead_waiting && err.is_empty() {
+                        if let Some(window_ms) = peer_wait_window(
+                            quiet,
+                            now.saturating_sub(self.start_sec),
+                            status.as_str(),
+                            self.stall_sec,
+                        ) {
+                            if let Some(why) = peer_waiting(
+                                &self.runs_dir,
+                                name,
+                                crate::bus::now_ms(),
+                                window_ms,
+                                &Herdr::new(),
+                            ) {
+                                *lead_waiting = true;
+                                eprintln!("WATCHDOG waiting | name={name} quiet={quiet}s | {why}");
+                            }
+                        }
+                    }
                     let diff = self.last_diff.lock().unwrap().clone();
                     let diffstat = if diff.is_empty() {
                         "clean".to_string()
@@ -1123,6 +1318,7 @@ fn prompt_worker_once<G: GitOps>(
         inner: sys_acts,
         runs_dir: runs_dir.clone(),
         time_budget_sec: active_budget,
+        stall_sec: config.stall_sec,
         nudge_pct,
         heartbeat_sec,
         start_sec,
