@@ -77,6 +77,29 @@ struct LegacyCursor {
     mail_id: u64,
 }
 
+fn map_consumer_cursors(
+    cursors: &[LegacyCursor],
+    candidates: &[CandidateTrigger],
+    trigger_ids: &[u64],
+) -> Vec<(String, u64, u64, u64)> {
+    let mut consumer_cursors = Vec::with_capacity(cursors.len());
+    for c in cursors {
+        let mut new_cursor = trigger_ids.last().copied().unwrap_or(0); // default: all read
+        for (idx, cand) in candidates.iter().enumerate() {
+            let is_read = match cand.legacy_ref {
+                LegacyRef::FarmEvent(seq) => seq <= c.seq,
+                LegacyRef::Mail(mail_id) => mail_id <= c.mail_id,
+            };
+            if !is_read {
+                new_cursor = if idx == 0 { 0 } else { trigger_ids[idx - 1] };
+                break;
+            }
+        }
+        consumer_cursors.push((c.consumer.clone(), c.seq, c.mail_id, new_cursor));
+    }
+    consumer_cursors
+}
+
 /// Executes or simulates migration on `db_path`.
 pub fn migrate_bus<H: HerdrOps>(
     db_path: &Path,
@@ -475,22 +498,9 @@ pub fn migrate_bus<H: HerdrOps>(
             })
     });
 
-    // Compute new cursors
-    let mut consumer_cursors = Vec::new();
-    for c in &cursors {
-        let mut new_cursor = candidates.len() as u64; // default: all read
-        for (idx, cand) in candidates.iter().enumerate() {
-            let is_read = match cand.legacy_ref {
-                LegacyRef::FarmEvent(seq) => seq <= c.seq,
-                LegacyRef::Mail(mail_id) => mail_id <= c.mail_id,
-            };
-            if !is_read {
-                new_cursor = idx as u64;
-                break;
-            }
-        }
-        consumer_cursors.push((c.consumer.clone(), c.seq, c.mail_id, new_cursor));
-    }
+    // Compute projected cursors for dry-run
+    let projected_trigger_ids: Vec<u64> = (1..=candidates.len() as u64).collect();
+    let consumer_cursors = map_consumer_cursors(&cursors, &candidates, &projected_trigger_ids);
 
     if dry_run {
         println!("quaqua bus migrate --dry-run: {}", db_path.display());
@@ -567,7 +577,7 @@ pub fn migrate_bus<H: HerdrOps>(
     .map_err(|e| format!("VACUUM INTO backup failed: {e}"))?;
 
     // 5. Transaction: Create schema, insert data, map cursors, drop legacy tables, record watermark
-    crate::engine::sqlite::retry_while_busy(|| {
+    let consumer_cursors = crate::engine::sqlite::retry_while_busy(|| {
         let tx = conn.transaction().map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
         })?;
@@ -637,6 +647,7 @@ pub fn migrate_bus<H: HerdrOps>(
         }
 
         // Populate triggers and trigger_acks
+        let mut cand_trigger_ids = Vec::with_capacity(candidates.len());
         {
             let mut trig_stmt = tx.prepare_cached(
                 r#"
@@ -663,6 +674,7 @@ pub fn migrate_bus<H: HerdrOps>(
                     cand.farm,
                 ])?;
                 let new_trigger_id = tx.last_insert_rowid() as u64;
+                cand_trigger_ids.push(new_trigger_id);
                 if let LegacyRef::Mail(mail_id) = cand.legacy_ref {
                     if let Some(m) = mails.iter().find(|m| m.id == mail_id) {
                         if let Some(acked_ms) = m.acked_ms {
@@ -676,12 +688,14 @@ pub fn migrate_bus<H: HerdrOps>(
                 }
             }
         }
-        // Populate cursors_new
+        // Populate cursors_new using the exact same trigger IDs from last_insert_rowid
+        let real_consumer_cursors =
+            map_consumer_cursors(&cursors, &candidates, &cand_trigger_ids);
         {
             let mut cur_stmt = tx.prepare_cached(
                 "INSERT INTO cursors_new (consumer, trigger_id) VALUES (?1, ?2)",
             )?;
-            for (consumer, _old_s, _old_m, new_c) in &consumer_cursors {
+            for (consumer, _old_s, _old_m, new_c) in &real_consumer_cursors {
                 cur_stmt.execute(rusqlite::params![consumer, *new_c as i64])?;
             }
         }
@@ -698,7 +712,7 @@ pub fn migrate_bus<H: HerdrOps>(
         )?;
 
         tx.commit()?;
-        Ok(())
+        Ok(real_consumer_cursors)
     })
     .map_err(|e| format!("migration transaction failed: {e}"))?;
 
