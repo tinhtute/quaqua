@@ -14,8 +14,8 @@ use quaqua::engine::child::SingleWorkerInput;
 use quaqua::engine::testkit::{run_to_completion, InMemoryJournal, MockActivities, VirtualClock};
 use quaqua::herdr::HerdrOps;
 use quaqua::state::WorkerMetadata;
-use quaqua::worker::prompt::peer_waiting;
 use quaqua::worker::prompt::peer_wait_window;
+use quaqua::worker::prompt::peer_waiting;
 use quaqua::worker::prompt::workflow::{SingleWorkerState, SingleWorkerWorkflow, WatchdogConfig};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -346,13 +346,7 @@ fn a_trigger_older_than_one_stall_period_does_not_hold_a_quiet_lead() {
     let window =
         peer_wait_window(1400, 1400, "working", 600).expect("a 1400 s quiet Lead is near a stall");
     assert_eq!(
-        peer_waiting(
-            runs.path(),
-            LEAD,
-            now,
-            window,
-            &FakeHerdr::with_agents(&[])
-        ),
+        peer_waiting(runs.path(), LEAD, now, window, &FakeHerdr::with_agents(&[])),
         None,
         "a trigger 700 s old is outside the 600 s window"
     );
@@ -364,14 +358,8 @@ fn a_trigger_inside_one_stall_period_holds_a_quiet_lead() {
     trigger_at(runs.path(), now - 60_000);
     let window =
         peer_wait_window(1400, 1400, "working", 600).expect("a 1400 s quiet Lead is near a stall");
-    let why = peer_waiting(
-        runs.path(),
-        LEAD,
-        now,
-        window,
-        &FakeHerdr::with_agents(&[]),
-    )
-    .expect("a trigger 60 s old is inside the window");
+    let why = peer_waiting(runs.path(), LEAD, now, window, &FakeHerdr::with_agents(&[]))
+        .expect("a trigger 60 s old is inside the window");
     assert!(why.contains("trigger 60s ago"), "reason: {why}");
 }
 

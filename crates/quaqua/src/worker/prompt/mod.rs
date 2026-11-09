@@ -448,20 +448,19 @@ pub fn peer_waiting<H: HerdrOps>(
 /// `quiet_sec` is the time since the last observed progress, `elapsed_sec` the
 /// session age (it covers `--resume`, whose stall baseline predates this
 /// process), and `status` the agent's resolved state.
+///
+/// The window is one stall period. Growing it with the session would cover
+/// every trigger since the watch started, so a Lead that hung after
+/// dispatching its Peers would never reach the stall exit.
 pub fn peer_wait_window(
     quiet_sec: u64,
     elapsed_sec: u64,
     status: &str,
     stall_sec: u64,
 ) -> Option<u64> {
-    let near_a_stall = quiet_sec >= stall_sec
-        || elapsed_sec >= stall_sec
-        || status == "idle"
-        || status == "done";
-    if !near_a_stall {
-        return None;
-    }
-    Some(quiet_sec.max(elapsed_sec).max(stall_sec) * 1000)
+    let near_a_stall =
+        quiet_sec >= stall_sec || elapsed_sec >= stall_sec || status == "idle" || status == "done";
+    near_a_stall.then(|| stall_sec.saturating_mul(1000))
 }
 
 /// Live subscriptions of `consumer`, each with the newest trigger on its thread
@@ -532,8 +531,12 @@ fn owned_workers(runs_dir: &Path, name: &str) -> Vec<String> {
     out
 }
 
-/// Agent names from one `herdr agent list`. An unreadable or empty list proves
-/// no Peer live, which keeps the old stall behaviour (absence is not evidence).
+/// Agent names from one `herdr agent list` that are actually working the
+/// thread: `working` has a turn in flight and `blocked` is sitting on a
+/// question. A `done` or `idle` worker whose pane lingers until cleanup has
+/// nothing left to answer, so it must not hold the Lead past its stall.
+/// An unreadable or empty list proves no Peer live, which keeps the old stall
+/// behaviour (absence is not evidence).
 fn live_agents<H: HerdrOps>(herdr: &H) -> Vec<String> {
     herdr
         .agent_list()
@@ -547,6 +550,12 @@ fn live_agents<H: HerdrOps>(herdr: &H) -> Vec<String> {
         .map(|agents| {
             agents
                 .iter()
+                .filter(|a| {
+                    matches!(
+                        a.get("agent_status").and_then(|s| s.as_str()),
+                        Some("working") | Some("blocked")
+                    )
+                })
                 .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(str::to_string))
                 .collect()
         })

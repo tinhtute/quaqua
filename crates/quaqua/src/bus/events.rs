@@ -1281,6 +1281,25 @@ fn wake_nudge_line(count: usize, latest: &TriggerRecord) -> String {
     )
 }
 
+/// Agent name that owns `pane_id`, from one `herdr agent list`.
+///
+/// A `pane.agent_status_changed` payload names the harness kind in `agent`
+/// (`"omp"`, `"claude"`), never the agent, so the name has to come from the
+/// pane the event carries.
+fn agent_name_for_pane<H: HerdrOps>(herdr: &H, pane_id: &str) -> Option<String> {
+    if pane_id.is_empty() {
+        return None;
+    }
+    let val = crate::lead::tag::get_agent_list_json(herdr)?;
+    val.pointer("/result/agents")?
+        .as_array()?
+        .iter()
+        .find(|a| a.get("pane_id").and_then(|p| p.as_str()) == Some(pane_id))
+        .and_then(|a| a.get("name").and_then(|n| n.as_str()))
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
 /// Nudges an idle consumer about its unread triggers: one `pane send-text` line plus
 /// Enter into the agent's own pane, at most once per batch.
 ///
@@ -1571,8 +1590,8 @@ pub fn handle_event_hook<H: HerdrOps>(
             }
             // R3: an agent that just went idle picks up whatever arrived while it worked.
             if agent_status == "idle" || agent_status == "done" {
-                if let Some(name) = agent.filter(|s| !s.is_empty()) {
-                    let _ = wake_idle_consumer(&bus, name, herdr);
+                if let Some(name) = agent_name_for_pane(herdr, pid) {
+                    let _ = wake_idle_consumer(&bus, &name, herdr);
                 }
             }
             return Ok(false);
