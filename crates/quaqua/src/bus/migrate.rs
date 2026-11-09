@@ -648,6 +648,8 @@ pub fn migrate_bus<H: HerdrOps>(
 
         // Populate triggers and trigger_acks
         let mut cand_trigger_ids = Vec::with_capacity(candidates.len());
+        let mut legacy_mail_to_trigger_id = std::collections::HashMap::new();
+        let mut mail_replies_to_remap = Vec::new();
         {
             let mut trig_stmt = tx.prepare_cached(
                 r#"
@@ -676,6 +678,7 @@ pub fn migrate_bus<H: HerdrOps>(
                 let new_trigger_id = tx.last_insert_rowid() as u64;
                 cand_trigger_ids.push(new_trigger_id);
                 if let LegacyRef::Mail(mail_id) = cand.legacy_ref {
+                    legacy_mail_to_trigger_id.insert(mail_id, new_trigger_id);
                     if let Some(m) = mails.iter().find(|m| m.id == mail_id) {
                         if let Some(acked_ms) = m.acked_ms {
                             ack_stmt.execute(rusqlite::params![
@@ -684,7 +687,34 @@ pub fn migrate_bus<H: HerdrOps>(
                                 m.acked_by.as_deref(),
                             ])?;
                         }
+                        if let Some(parent_mail_id) = m.reply_to {
+                            mail_replies_to_remap.push((
+                                new_trigger_id,
+                                parent_mail_id,
+                                m.project.clone(),
+                            ));
+                        }
                     }
+                }
+            }
+
+            // Remap reply_to in triggers.ref from legacy mail id to new trigger id
+            if !mail_replies_to_remap.is_empty() {
+                let mut update_ref_stmt =
+                    tx.prepare_cached("UPDATE triggers SET ref = ?1 WHERE id = ?2")?;
+                for (new_tid, parent_legacy_id, project) in &mail_replies_to_remap {
+                    let remapped_id = legacy_mail_to_trigger_id
+                        .get(parent_legacy_id)
+                        .copied()
+                        .unwrap_or(*parent_legacy_id);
+                    let mut ref_parts = vec![format!("mail:{remapped_id}")];
+                    if let Some(p) = project {
+                        if !p.is_empty() {
+                            ref_parts.push(format!("project:{p}"));
+                        }
+                    }
+                    let ref_val = ref_parts.join(";");
+                    update_ref_stmt.execute(rusqlite::params![ref_val, *new_tid as i64])?;
                 }
             }
         }
