@@ -7,7 +7,7 @@
 //!   both `<slug>-lead` and `cos` subscribed for 14 days.
 //! - `lead cleanup` keeps thread + subscriptions.
 //! - Each new trigger extends active subscriptions by 14 days; expired subscriptions
-//!   are not extended.
+//!   are not extended and deliver nothing.
 
 use quaqua::bus::{now_ms, open_bus, FarmBus, NewTrigger};
 use quaqua::config::Config;
@@ -454,6 +454,180 @@ fn test_r6_trigger_extends_active_subscriptions() {
         exp_sub.1,
         t0 - 86_400_000,
         "expired subscription must not be extended"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Extension is monotonic: a backdated trigger never shortens the lease
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_r6_trigger_extension_is_monotonic() {
+    let tmp = hermetic_temp_dir("extension-monotonic");
+    let db_path = tmp.join("quaqua.db");
+    let bus = open_bus(&db_path).expect("open fresh bus");
+
+    let t0 = 1_000_000_000_000u64;
+    let thread_id = "quaqua/monotonic";
+    bus.open_thread_and_subscribe(thread_id, "cos", "cos", t0 + 86_400_000)
+        .expect("open sub");
+
+    let t1 = t0 + 3_600_000;
+    let later =
+        NewTrigger::new("worker", "progress", "worker", thread_id, "later trigger").with_ts_ms(t1);
+    assert!(bus.record_trigger(&later).expect("record later trigger"));
+    let after_later = bus.get_subscriptions(thread_id).expect("get subs")[0].1;
+    assert_eq!(
+        after_later,
+        t1 + FOURTEEN_DAYS_MS,
+        "a new trigger must set the lease to trigger_ts + 14 days"
+    );
+
+    let backdated =
+        NewTrigger::new("worker", "progress", "worker", thread_id, "backdated").with_ts_ms(t0);
+    assert!(bus.record_trigger(&backdated).expect("record backdated"));
+    let after_backdated = bus.get_subscriptions(thread_id).expect("get subs")[0].1;
+    assert_eq!(
+        after_backdated, after_later,
+        "a backdated trigger must not shorten the lease"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3c. A deduped trigger is not a new trigger: it must not renew the lease
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_r6_duplicate_trigger_does_not_extend_subscription() {
+    let tmp = hermetic_temp_dir("duplicate-extension");
+    let db_path = tmp.join("quaqua.db");
+    let bus = open_bus(&db_path).expect("open fresh bus");
+
+    let t0 = 1_000_000_000_000u64;
+    let thread_id = "quaqua/dup-ext";
+    bus.open_thread_and_subscribe(thread_id, "cos", "cos", t0 + 86_400_000)
+        .expect("open sub");
+
+    let t1 = t0 + 3_600_000;
+    let first = NewTrigger::new("github-ci", "ci_failed", "github", thread_id, "ci failed")
+        .with_ts_ms(t1)
+        .with_dedupe_key("gh-run:42");
+    assert!(
+        bus.record_trigger(&first).expect("record first"),
+        "first trigger is new and must be inserted"
+    );
+    let after_first = bus.get_subscriptions(thread_id).expect("get subs")[0].1;
+    assert_eq!(after_first, t1 + FOURTEEN_DAYS_MS);
+
+    let t2 = t1 + 3_600_000;
+    let duplicate = NewTrigger::new("github-ci", "ci_failed", "github", thread_id, "ci failed")
+        .with_ts_ms(t2)
+        .with_dedupe_key("gh-run:42");
+    assert!(
+        !bus.record_trigger(&duplicate).expect("record duplicate"),
+        "duplicate dedupe_key must not insert a row"
+    );
+    let after_duplicate = bus.get_subscriptions(thread_id).expect("get subs")[0].1;
+    assert_eq!(
+        after_duplicate, after_first,
+        "a deduped trigger must not renew the lease"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3d. Expired subscriptions deliver nothing; active ones still do
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_r6_delivery_skips_expired_subscriptions() {
+    let tmp = hermetic_temp_dir("delivery-expiry");
+    let db_path = tmp.join("quaqua.db");
+    let bus = open_bus(&db_path).expect("open fresh bus");
+
+    let now = now_ms();
+    let thread_id = "quaqua/expiry-delivery";
+    bus.open_thread_and_subscribe(thread_id, "cos", "active-user", now + FOURTEEN_DAYS_MS)
+        .expect("open active sub");
+    bus.subscribe(thread_id, "expired-user", now.saturating_sub(1_000))
+        .expect("open expired sub");
+
+    let trigger =
+        NewTrigger::new("worker", "progress", "worker", thread_id, "still running").with_ts_ms(now);
+    assert!(bus.record_trigger(&trigger).expect("record trigger"));
+
+    let active = bus
+        .load_unread_triggers("active-user", 0)
+        .expect("load active");
+    assert_eq!(
+        active.len(),
+        1,
+        "active subscriber must receive the trigger"
+    );
+    assert_eq!(active[0].thread_id, thread_id);
+
+    let expired = bus
+        .load_unread_triggers("expired-user", 0)
+        .expect("load expired");
+    assert!(
+        expired.is_empty(),
+        "expired subscription must deliver nothing"
+    );
+
+    let mut buf = Vec::new();
+    let outcome = bus
+        .deliver_page(
+            "expired-user",
+            quaqua::bus::events::DeliverMode::Advance,
+            quaqua::bus::events::DeliverFormat::Plain,
+            &mut buf,
+        )
+        .expect("deliver for expired consumer");
+    assert!(
+        outcome.triggers.is_empty(),
+        "the digest must not render triggers for an expired subscription"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3e. Clock-injected boundary: until_ms >= now_ms is inclusive
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_r6_clock_injected_expiry_boundary() {
+    let tmp = hermetic_temp_dir("clock-expiry");
+    let db_path = tmp.join("quaqua.db");
+    let bus = open_bus(&db_path).expect("open fresh bus");
+
+    // Whole-second value: now_ms() multiplies the clock file by 1000.
+    let until = 1_000_000_000_000u64;
+    let thread_id = "quaqua/clock-expiry";
+    bus.open_thread_and_subscribe(thread_id, "cos", "cos", until)
+        .expect("open sub");
+    let trigger = NewTrigger::new("worker", "progress", "worker", thread_id, "on the clock")
+        .with_ts_ms(until - FOURTEEN_DAYS_MS);
+    assert!(bus.record_trigger(&trigger).expect("record trigger"));
+
+    let clock = tmp.join("clock");
+    fs::write(&clock, (until / 1000).to_string()).expect("write clock");
+    let guard = EnvGuard::new(&["PROMPT_WORKER_CLOCK_FILE"]);
+    guard.set("PROMPT_WORKER_CLOCK_FILE", clock.to_str().unwrap());
+
+    let at_deadline = bus
+        .load_unread_triggers("cos", 0)
+        .expect("load at deadline");
+    assert_eq!(
+        at_deadline.len(),
+        1,
+        "subscription is still active at exactly until_ms"
+    );
+
+    fs::write(&clock, ((until + 1000) / 1000).to_string()).expect("advance clock");
+    let past_deadline = bus
+        .load_unread_triggers("cos", 0)
+        .expect("load past deadline");
+    assert!(
+        past_deadline.is_empty(),
+        "one second past until_ms the subscription delivers nothing"
     );
 }
 
