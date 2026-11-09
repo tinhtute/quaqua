@@ -578,7 +578,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
     assert_eq!(trigs[1].to_name.as_deref(), Some("w1"));
     assert_eq!(trigs[1].thread_id, "agent:w1");
     assert_eq!(trigs[1].summary, "Fix bug");
-    assert_eq!(trigs[1].dedupe_key, None);
+    assert_eq!(trigs[1].dedupe_key.as_deref(), Some("mail:m:1"));
     assert_eq!(trigs[1].farm, "farmA");
 
     // Verify trigger 3: farm_event (ts=300)
@@ -601,6 +601,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
         trigs[3].summary,
         "Tiến độ hoàn thành 100% tiếng Việt có dấu"
     );
+    assert_eq!(trigs[3].dedupe_key.as_deref(), Some("mail:m:2"));
 
     // Verify threads
     // Verify threads: exactly agent:w1 and agent:cos (no phantom agent:unknown)
@@ -1497,5 +1498,402 @@ fn test_finding_m2_legacy_migration_preserves_per_mail_ack_state() {
     assert_eq!(
         m2_ack_count, 0,
         "m2 must remain unacked with no trigger_acks row"
+    );
+}
+
+#[test]
+fn test_finding_r3_defect1_migrate_preserves_mail_msg_key_and_project_ref() {
+    let tmp = hermetic_temp_dir("r3-defect1-msgkey-project");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // Mail 1: has msg_key and project, NO reply_to
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'key-alpha', ?1, 'lead-1', 'lead', 'cos', 'report', 'proj-alpha', NULL, 'body 1'",
+            ),
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        // Mail 2: has msg_key, project, and reply_to=1 (references mail 1)
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'key-beta', ?1, 'lead-2', 'lead', 'cos', 'handoff', 'proj-beta', 1, 'body 2'",
+            ),
+            rusqlite::params![now as i64 + 10],
+        )
+        .unwrap();
+        // Mail 3: has msg_key and reply_to=1, but NO project
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'mail:key-gamma', ?1, 'lead-3', 'lead', 'cos', 'ask', NULL, 1, 'body 3'",
+            ),
+            rusqlite::params![now as i64 + 20],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.mail_count, 3);
+    assert_eq!(summary.triggers_count, 3);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let conn = bus.conn_for_test();
+
+    struct MigratedMailTrig {
+        actor: String,
+        ref_val: Option<String>,
+        dedupe_key: Option<String>,
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT actor, ref, dedupe_key FROM triggers WHERE source = 'mail' ORDER BY id ASC",
+        )
+        .expect("prepare select triggers");
+    let rows: Vec<MigratedMailTrig> = stmt
+        .query_map([], |r| {
+            Ok(MigratedMailTrig {
+                actor: r.get(0)?,
+                ref_val: r.get(1)?,
+                dedupe_key: r.get(2)?,
+            })
+        })
+        .expect("query map")
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(rows.len(), 3);
+
+    // Mail 1: project=proj-alpha, reply_to=None -> ref="project:proj-alpha", dedupe_key="mail:key-alpha"
+    assert_eq!(rows[0].actor, "lead-1");
+    assert_eq!(
+        rows[0].ref_val.as_deref(),
+        Some("project:proj-alpha"),
+        "legacy mail with project only must preserve project: in ref"
+    );
+    assert_eq!(
+        rows[0].dedupe_key.as_deref(),
+        Some("mail:key-alpha"),
+        "legacy mail msg_key must become dedupe_key with mail: prefix"
+    );
+
+    // Mail 2: reply_to=1 and project=proj-beta -> ref="mail:1;project:proj-beta", dedupe_key="mail:key-beta"
+    assert_eq!(rows[1].actor, "lead-2");
+    assert_eq!(
+        rows[1].ref_val.as_deref(),
+        Some("mail:1;project:proj-beta"),
+        "legacy mail with reply_to and project must preserve both in ref"
+    );
+    assert_eq!(
+        rows[1].dedupe_key.as_deref(),
+        Some("mail:key-beta"),
+        "legacy mail msg_key must become dedupe_key"
+    );
+
+    // Mail 3: reply_to=1, project=None -> ref="mail:1", dedupe_key="mail:key-gamma"
+    assert_eq!(rows[2].actor, "lead-3");
+    assert_eq!(
+        rows[2].ref_val.as_deref(),
+        Some("mail:1"),
+        "legacy mail with reply_to only must preserve mail: in ref"
+    );
+    assert_eq!(
+        rows[2].dedupe_key.as_deref(),
+        Some("mail:key-gamma"),
+        "legacy mail msg_key already prefixed with mail: must not duplicate prefix"
+    );
+}
+
+#[test]
+fn test_finding_r3_defect3_migrate_cursor_and_acks_share_id_source() {
+    let tmp = hermetic_temp_dir("r3-defect3-id-source");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // Pre-seed sqlite_sequence for triggers so next inserted id is 501
+        conn.execute_batch(
+            r#"
+            CREATE TABLE dummy (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            INSERT INTO dummy DEFAULT VALUES;
+            INSERT INTO sqlite_sequence (name, seq) VALUES ('triggers', 500);
+            DROP TABLE dummy;
+            "#,
+        )
+        .unwrap();
+
+        // Legacy mail 1 with ack state
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body, acked_ms, acked_by",
+                &format!("1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done', ?2, 'cos'"),
+            ),
+            rusqlite::params![now as i64, now as i64 + 50],
+        )
+        .unwrap();
+
+        // Legacy cursor: cos has read mail 1 (mail_id = 1)
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq, mail_id) VALUES ('cos', 0, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.mail_count, 1);
+    assert_eq!(summary.triggers_count, 1);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let conn = bus.conn_for_test();
+
+    // Inspect trigger id
+    let trig_id: u64 = conn
+        .query_row("SELECT id FROM triggers LIMIT 1", [], |r| {
+            r.get::<_, i64>(0).map(|v| v as u64)
+        })
+        .expect("query trigger id");
+    assert_eq!(trig_id, 501, "trigger must receive id 501 from sequence");
+
+    // Inspect trigger_acks id
+    let ack_tid: u64 = conn
+        .query_row("SELECT trigger_id FROM trigger_acks LIMIT 1", [], |r| {
+            r.get::<_, i64>(0).map(|v| v as u64)
+        })
+        .expect("query ack trigger_id");
+    assert_eq!(
+        ack_tid, 501,
+        "trigger_acks must use trigger_id 501 from last_insert_rowid"
+    );
+
+    // Inspect cursors table
+    let cur_tid: u64 = conn
+        .query_row(
+            "SELECT trigger_id FROM cursors WHERE consumer = 'cos'",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )
+        .expect("query cursor trigger_id");
+    assert_eq!(
+        cur_tid, ack_tid,
+        "cursor and ack must share the exact same trigger_id from last_insert_rowid"
+    );
+    assert_eq!(cur_tid, 501);
+
+    // Also check summary.consumer_cursors
+    let cos_summary_cursor = summary
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        cos_summary_cursor,
+        Some(501),
+        "summary.consumer_cursors must reflect the actual trigger_id from last_insert_rowid"
+    );
+}
+
+#[test]
+fn test_finding_r3_followup_migrated_mail_reply_to_points_to_trigger_id() {
+    let tmp = hermetic_temp_dir("r3-f1-reply-trigger-id");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // farm_event 1: ts=100 -> will become trigger 1
+        conn.execute(
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json, farm",
+                "100, 'agent_spawned', 'herdr', 'w1', 'cos', 'spawn:1', '{}', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+
+        // mail 1: ts=200, legacy id=1 -> will become trigger 2
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, reply_to, body, farm",
+                "1, 'm1', 200, 'cos', 'cos', 'w1', 'directive', NULL, 'parent task', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+
+        // farm_event 2: ts=300 -> will become trigger 3
+        conn.execute(
+            &sql_insert_fe(
+                "ts_ms, type, actor, subject, owner, incident_key, payload_json, farm",
+                "300, 'stalled', 'watchdog', 'w1', 'cos', 'inc:2', '{}', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+
+        // mail 2: ts=400, legacy id=2, reply_to=1 (replying to mail 1), project='proj-beta' -> will become trigger 4
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body, farm",
+                "2, 'm2', 400, 'w1', 'worker', 'cos', 'handoff', 'proj-beta', 1, 'task finished', 'farmA'",
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.legacy_events_count, 2);
+    assert_eq!(summary.mail_count, 2);
+    assert_eq!(summary.triggers_count, 4);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let conn = bus.conn_for_test();
+
+    // Verify trigger sequence:
+    // id 1: fe 1
+    // id 2: mail 1 (legacy id 1)
+    // id 3: fe 2
+    // id 4: mail 2 (legacy id 2, replied to legacy mail 1)
+    let trigs: Vec<(u64, String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, source, ref FROM triggers ORDER BY id ASC")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    assert_eq!(trigs.len(), 4);
+    assert_eq!(trigs[0].0, 1);
+    assert_eq!(trigs[0].1, "herdr");
+
+    assert_eq!(trigs[1].0, 2);
+    assert_eq!(trigs[1].1, "mail");
+
+    assert_eq!(trigs[2].0, 3);
+    assert_eq!(trigs[2].1, "watchdog");
+
+    assert_eq!(trigs[3].0, 4);
+    assert_eq!(trigs[3].1, "mail");
+
+    // Finding 1: trigger 4 replied to legacy mail 1. Legacy mail 1 is trigger 2, so ref must be "mail:2;project:proj-beta"
+    assert_eq!(
+        trigs[3].2.as_deref(),
+        Some("mail:2;project:proj-beta"),
+        "migrated ref reply_to must point to new trigger id of replied-to mail (2), not legacy mail id (1)"
+    );
+}
+
+#[test]
+fn test_finding_r3_followup_dry_run_matches_real_run_under_sqlite_sequence_offset() {
+    let tmp = hermetic_temp_dir("r3-f2-dryrun-offset");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // Pre-seed sqlite_sequence for triggers with 500
+        conn.execute_batch(
+            r#"
+            CREATE TABLE dummy (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            INSERT INTO dummy DEFAULT VALUES;
+            INSERT INTO sqlite_sequence (name, seq) VALUES ('triggers', 500);
+            DROP TABLE dummy;
+            "#,
+        )
+        .unwrap();
+
+        // Legacy mail 1
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                &format!("1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done'"),
+            ),
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+
+        // cos_read: read mail 1 (mail_id = 1)
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq, mail_id) VALUES ('cos_read', 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        // cos_unread: unread (mail_id = 0)
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq, mail_id) VALUES ('cos_unread', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    // 1. Dry run
+    let summary_dry = migrate_bus(&db_path, None, true, &herdr).expect("dry run");
+
+    let dry_read_cursor = summary_dry
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_read")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        dry_read_cursor,
+        Some(501),
+        "dry-run must project trigger id 501 when sqlite_sequence is offset to 500"
+    );
+
+    let dry_unread_cursor = summary_dry
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_unread")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        dry_unread_cursor,
+        Some(500),
+        "dry-run must project unread cursor to 500 (offset) rather than 0"
+    );
+
+    // 2. Real migration
+    let summary_real =
+        migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr).expect("real run");
+    let real_read_cursor = summary_real
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_read")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        real_read_cursor,
+        Some(501),
+        "real run must match dry-run trigger id 501"
+    );
+
+    let real_unread_cursor = summary_real
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_unread")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        real_unread_cursor,
+        Some(500),
+        "real run unread cursor must be 500"
     );
 }

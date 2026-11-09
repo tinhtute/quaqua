@@ -58,10 +58,12 @@ struct LegacyFarmEvent {
 
 struct LegacyMail {
     id: u64,
+    msg_key: Option<String>,
     ts_ms: u64,
     from_name: String,
     to_name: String,
     kind: String,
+    project: Option<String>,
     reply_to: Option<u64>,
     body: String,
     farm: Option<String>,
@@ -73,6 +75,36 @@ struct LegacyCursor {
     consumer: String,
     seq: u64,
     mail_id: u64,
+}
+
+fn map_consumer_cursors(
+    cursors: &[LegacyCursor],
+    candidates: &[CandidateTrigger],
+    trigger_ids: &[u64],
+) -> Vec<(String, u64, u64, u64)> {
+    let mut consumer_cursors = Vec::with_capacity(cursors.len());
+    for c in cursors {
+        let mut new_cursor = trigger_ids.last().copied().unwrap_or(0); // default: all read
+        for (idx, cand) in candidates.iter().enumerate() {
+            let is_read = match cand.legacy_ref {
+                LegacyRef::FarmEvent(seq) => seq <= c.seq,
+                LegacyRef::Mail(mail_id) => mail_id <= c.mail_id,
+            };
+            if !is_read {
+                new_cursor = if idx == 0 {
+                    trigger_ids
+                        .first()
+                        .map(|id| id.saturating_sub(1))
+                        .unwrap_or(0)
+                } else {
+                    trigger_ids[idx - 1]
+                };
+                break;
+            }
+        }
+        consumer_cursors.push((c.consumer.clone(), c.seq, c.mail_id, new_cursor));
+    }
+    consumer_cursors
 }
 
 /// Executes or simulates migration on `db_path`.
@@ -242,31 +274,53 @@ pub fn migrate_bus<H: HerdrOps>(
 
     // Read legacy mail
     let mails: Vec<LegacyMail> = if has_mail {
+        let has_msg_key_col = table_has_column(&conn, "mail", "msg_key");
+        let has_project_col = table_has_column(&conn, "mail", "project");
         let has_farm_col = table_has_column(&conn, "mail", "farm");
         let has_acked_ms_col = table_has_column(&conn, "mail", "acked_ms");
         let has_acked_by_col = table_has_column(&conn, "mail", "acked_by");
 
+        let msg_key_expr = if has_msg_key_col {
+            "msg_key"
+        } else {
+            "NULL AS msg_key"
+        };
+        let project_expr = if has_project_col {
+            "project"
+        } else {
+            "NULL AS project"
+        };
         let farm_expr = if has_farm_col { "farm" } else { "NULL AS farm" };
-        let acked_ms_expr = if has_acked_ms_col { "acked_ms" } else { "NULL AS acked_ms" };
-        let acked_by_expr = if has_acked_by_col { "acked_by" } else { "NULL AS acked_by" };
+        let acked_ms_expr = if has_acked_ms_col {
+            "acked_ms"
+        } else {
+            "NULL AS acked_ms"
+        };
+        let acked_by_expr = if has_acked_by_col {
+            "acked_by"
+        } else {
+            "NULL AS acked_by"
+        };
 
         let query = format!(
-            "SELECT id, ts_ms, from_name, to_name, kind, reply_to, body, {farm_expr}, {acked_ms_expr}, {acked_by_expr} FROM mail ORDER BY ts_ms ASC, id ASC"
+            "SELECT id, {msg_key_expr}, ts_ms, from_name, to_name, kind, {project_expr}, reply_to, body, {farm_expr}, {acked_ms_expr}, {acked_by_expr} FROM mail ORDER BY ts_ms ASC, id ASC"
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(LegacyMail {
                     id: row.get::<_, i64>(0)? as u64,
-                    ts_ms: row.get::<_, i64>(1)? as u64,
-                    from_name: row.get(2)?,
-                    to_name: row.get(3)?,
-                    kind: row.get(4)?,
-                    reply_to: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                    body: row.get(6)?,
-                    farm: row.get(7)?,
-                    acked_ms: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                    acked_by: row.get(9)?,
+                    msg_key: row.get(1)?,
+                    ts_ms: row.get::<_, i64>(2)? as u64,
+                    from_name: row.get(3)?,
+                    to_name: row.get(4)?,
+                    kind: row.get(5)?,
+                    project: row.get(6)?,
+                    reply_to: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                    body: row.get(8)?,
+                    farm: row.get(9)?,
+                    acked_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                    acked_by: row.get(11)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -401,6 +455,28 @@ pub fn migrate_bus<H: HerdrOps>(
 
         let farm_final = m.farm.clone().unwrap_or_else(|| local_farm.clone());
 
+        let dedupe_key = m.msg_key.as_ref().filter(|k| !k.is_empty()).map(|k| {
+            if k.starts_with("mail:") {
+                k.clone()
+            } else {
+                format!("mail:{k}")
+            }
+        });
+        let mut ref_parts = Vec::new();
+        if let Some(r) = m.reply_to {
+            ref_parts.push(format!("mail:{r}"));
+        }
+        if let Some(p) = &m.project {
+            if !p.is_empty() {
+                ref_parts.push(format!("project:{p}"));
+            }
+        }
+        let ref_val = if ref_parts.is_empty() {
+            None
+        } else {
+            Some(ref_parts.join(";"))
+        };
+
         candidates.push(CandidateTrigger {
             legacy_ref: LegacyRef::Mail(m.id),
             ts_ms: m.ts_ms,
@@ -410,9 +486,9 @@ pub fn migrate_bus<H: HerdrOps>(
             to_name: Some(m.to_name.clone()),
             thread_id,
             summary: summary_final,
-            ref_val: m.reply_to.map(|id| format!("mail:{id}")),
+            ref_val,
             payload_json: Some(m.body.clone()),
-            dedupe_key: None,
+            dedupe_key,
             farm: farm_final,
         });
     }
@@ -429,22 +505,22 @@ pub fn migrate_bus<H: HerdrOps>(
             })
     });
 
-    // Compute new cursors
-    let mut consumer_cursors = Vec::new();
-    for c in &cursors {
-        let mut new_cursor = candidates.len() as u64; // default: all read
-        for (idx, cand) in candidates.iter().enumerate() {
-            let is_read = match cand.legacy_ref {
-                LegacyRef::FarmEvent(seq) => seq <= c.seq,
-                LegacyRef::Mail(mail_id) => mail_id <= c.mail_id,
-            };
-            if !is_read {
-                new_cursor = idx as u64;
-                break;
-            }
-        }
-        consumer_cursors.push((c.consumer.clone(), c.seq, c.mail_id, new_cursor));
-    }
+    // Compute projected cursors for dry-run, accounting for any pre-existing triggers sequence
+    let initial_seq: u64 = if table_has_column(&conn, "sqlite_sequence", "name") {
+        conn.query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'triggers'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|s| s as u64)
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    let projected_trigger_ids: Vec<u64> = (1..=candidates.len() as u64)
+        .map(|i| initial_seq + i)
+        .collect();
+    let consumer_cursors = map_consumer_cursors(&cursors, &candidates, &projected_trigger_ids);
 
     if dry_run {
         println!("quaqua bus migrate --dry-run: {}", db_path.display());
@@ -521,7 +597,7 @@ pub fn migrate_bus<H: HerdrOps>(
     .map_err(|e| format!("VACUUM INTO backup failed: {e}"))?;
 
     // 5. Transaction: Create schema, insert data, map cursors, drop legacy tables, record watermark
-    crate::engine::sqlite::retry_while_busy(|| {
+    let consumer_cursors = crate::engine::sqlite::retry_while_busy(|| {
         let tx = conn.transaction().map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
         })?;
@@ -591,6 +667,9 @@ pub fn migrate_bus<H: HerdrOps>(
         }
 
         // Populate triggers and trigger_acks
+        let mut cand_trigger_ids = Vec::with_capacity(candidates.len());
+        let mut legacy_mail_to_trigger_id = std::collections::HashMap::new();
+        let mut mail_replies_to_remap = Vec::new();
         {
             let mut trig_stmt = tx.prepare_cached(
                 r#"
@@ -617,7 +696,9 @@ pub fn migrate_bus<H: HerdrOps>(
                     cand.farm,
                 ])?;
                 let new_trigger_id = tx.last_insert_rowid() as u64;
+                cand_trigger_ids.push(new_trigger_id);
                 if let LegacyRef::Mail(mail_id) = cand.legacy_ref {
+                    legacy_mail_to_trigger_id.insert(mail_id, new_trigger_id);
                     if let Some(m) = mails.iter().find(|m| m.id == mail_id) {
                         if let Some(acked_ms) = m.acked_ms {
                             ack_stmt.execute(rusqlite::params![
@@ -626,16 +707,45 @@ pub fn migrate_bus<H: HerdrOps>(
                                 m.acked_by.as_deref(),
                             ])?;
                         }
+                        if let Some(parent_mail_id) = m.reply_to {
+                            mail_replies_to_remap.push((
+                                new_trigger_id,
+                                parent_mail_id,
+                                m.project.clone(),
+                            ));
+                        }
                     }
                 }
             }
+
+            // Remap reply_to in triggers.ref from legacy mail id to new trigger id
+            if !mail_replies_to_remap.is_empty() {
+                let mut update_ref_stmt =
+                    tx.prepare_cached("UPDATE triggers SET ref = ?1 WHERE id = ?2")?;
+                for (new_tid, parent_legacy_id, project) in &mail_replies_to_remap {
+                    let remapped_id = legacy_mail_to_trigger_id
+                        .get(parent_legacy_id)
+                        .copied()
+                        .unwrap_or(*parent_legacy_id);
+                    let mut ref_parts = vec![format!("mail:{remapped_id}")];
+                    if let Some(p) = project {
+                        if !p.is_empty() {
+                            ref_parts.push(format!("project:{p}"));
+                        }
+                    }
+                    let ref_val = ref_parts.join(";");
+                    update_ref_stmt.execute(rusqlite::params![ref_val, *new_tid as i64])?;
+                }
+            }
         }
-        // Populate cursors_new
+        // Populate cursors_new using the exact same trigger IDs from last_insert_rowid
+        let real_consumer_cursors =
+            map_consumer_cursors(&cursors, &candidates, &cand_trigger_ids);
         {
             let mut cur_stmt = tx.prepare_cached(
                 "INSERT INTO cursors_new (consumer, trigger_id) VALUES (?1, ?2)",
             )?;
-            for (consumer, _old_s, _old_m, new_c) in &consumer_cursors {
+            for (consumer, _old_s, _old_m, new_c) in &real_consumer_cursors {
                 cur_stmt.execute(rusqlite::params![consumer, *new_c as i64])?;
             }
         }
@@ -652,7 +762,7 @@ pub fn migrate_bus<H: HerdrOps>(
         )?;
 
         tx.commit()?;
-        Ok(())
+        Ok(real_consumer_cursors)
     })
     .map_err(|e| format!("migration transaction failed: {e}"))?;
 
