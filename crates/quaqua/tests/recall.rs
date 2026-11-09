@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 struct Fixture {
     root: PathBuf,
+    /// A sibling of `root`, outside the workspace, for escape attempts.
+    outside: PathBuf,
 }
 
 impl Fixture {
@@ -19,7 +21,12 @@ impl Fixture {
             std::process::id()
         ));
         std::fs::create_dir_all(root.join("runs")).expect("create fixture root");
-        Self { root }
+        let outside = root.with_file_name(format!(
+            "{}-outside",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        Self { root, outside }
     }
 
     fn runs(&self) -> PathBuf {
@@ -34,6 +41,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.outside);
     }
 }
 
@@ -141,13 +149,13 @@ fn recall_ref_prints_path_and_first_forty_lines() {
 }
 
 #[test]
-fn recall_absolute_ref_is_read_as_is() {
-    let fx = Fixture::new("abs-ref");
+fn recall_absolute_ref_outside_workspace_is_not_read() {
+    let fx = Fixture::new("abs-outside");
     let bus = fx.bus();
     bus.open_thread("quaqua/abs", "lead").expect("open thread");
 
-    let outside = fx.root.join("abs.txt");
-    std::fs::write(&outside, "absolute ref body\n").expect("write abs file");
+    let outside = fx.outside.join("abs.txt");
+    std::fs::write(&outside, "absolute ref body\n").expect("write outside file");
     let id = record(
         &bus,
         trigger("handoff", "quaqua/abs", "abs").with_ref(outside.to_str().unwrap()),
@@ -155,9 +163,141 @@ fn recall_absolute_ref_is_read_as_is() {
 
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert!(!detail.exists, "an outside ref is reported, not resolved");
+    assert!(detail.head.is_empty(), "an outside ref is never read");
+    assert_eq!(detail.commit, None);
+
+    let text = render_text(&recall);
+    assert!(text.contains("(outside the workspace"), "{text}");
+    assert!(
+        !text.contains("absolute ref body"),
+        "the file body never leaks: {text}"
+    );
+}
+
+#[test]
+fn recall_parent_escape_ref_is_not_read() {
+    let fx = Fixture::new("dotdot");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/dotdot", "lead").expect("open thread");
+
+    let outside = fx.outside.join("dotdot.txt");
+    std::fs::write(&outside, "parent escape body\n").expect("write outside file");
+    let ref_val = format!(
+        "../{}/dotdot.txt",
+        fx.outside.file_name().unwrap().to_string_lossy()
+    );
+    let id = record(
+        &bus,
+        trigger("handoff", "quaqua/dotdot", "dotdot").with_ref(&ref_val),
+    );
+
+    let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+    let detail = recall.ref_detail.as_ref().unwrap();
+    assert!(!detail.exists, "`..` must not escape the workspace");
+    assert!(detail.head.is_empty());
+    assert!(
+        !render_text(&recall).contains("parent escape body"),
+        "the file body never leaks"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recall_symlink_escape_ref_is_not_read() {
+    let fx = Fixture::new("symlink");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/link", "lead").expect("open thread");
+
+    let target = fx.outside.join("target.txt");
+    std::fs::write(&target, "symlink target body\n").expect("write target");
+    std::os::unix::fs::symlink(&target, fx.root.join("escape.txt")).expect("create symlink");
+
+    let id = record(
+        &bus,
+        trigger("handoff", "quaqua/link", "link").with_ref("escape.txt"),
+    );
+
+    let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+    let detail = recall.ref_detail.as_ref().unwrap();
+    assert!(!detail.exists, "a symlink out of the workspace is not followed");
+    assert!(detail.head.is_empty());
+    assert!(!render_text(&recall).contains("symlink target body"));
+}
+
+#[test]
+fn recall_scheme_refs_are_printed_verbatim() {
+    let fx = Fixture::new("scheme");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/scheme", "lead").expect("open thread");
+
+    for raw in [
+        "mail:12",
+        "project:quaqua",
+        "mail:12;project:quaqua",
+        "https://github.com/tinhtute/quaqua/actions/runs/123",
+        "http://example.com/runs/1",
+    ] {
+        let id = record(
+            &bus,
+            trigger("handoff", "quaqua/scheme", "scheme").with_ref(raw),
+        );
+        let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+        let detail = recall.ref_detail.as_ref().unwrap();
+        assert!(!detail.exists, "{raw} is not a workspace file");
+        assert!(detail.head.is_empty(), "{raw} is never read");
+        assert_eq!(detail.commit, None);
+
+        let text = render_text(&recall);
+        assert!(
+            text.contains(&format!("\nref {raw}\n")),
+            "a scheme ref is printed as written: {text}"
+        );
+        assert!(
+            !text.contains("(missing)"),
+            "{raw} is not a missing workspace file: {text}"
+        );
+    }
+}
+
+#[test]
+fn recall_path_ref_with_colon_is_not_a_scheme() {
+    let fx = Fixture::new("colon");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/colon", "lead").expect("open thread");
+
+    let notes = fx.root.join("docs/notes:1.md");
+    std::fs::create_dir_all(notes.parent().unwrap()).expect("create docs dir");
+    std::fs::write(&notes, "colon path body\n").expect("write notes");
+    let id = record(
+        &bus,
+        trigger("handoff", "quaqua/colon", "colon").with_ref("docs/notes:1.md"),
+    );
+
+    let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+    let detail = recall.ref_detail.as_ref().unwrap();
     assert!(detail.exists);
-    assert_eq!(detail.head, vec!["absolute ref body".to_string()]);
-    assert!(!detail.truncated);
+    assert_eq!(detail.head, vec!["colon path body".to_string()]);
+}
+
+#[test]
+fn recall_parent_ref_inside_workspace_is_read() {
+    let fx = Fixture::new("inside-dotdot");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/inside", "lead").expect("open thread");
+
+    let notes = fx.root.join("docs/notes.txt");
+    std::fs::create_dir_all(notes.parent().unwrap()).expect("create docs dir");
+    std::fs::write(&notes, "inside body\n").expect("write notes");
+    let id = record(
+        &bus,
+        trigger("handoff", "quaqua/inside", "inside").with_ref("docs/../docs/notes.txt"),
+    );
+
+    let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+    let detail = recall.ref_detail.as_ref().unwrap();
+    assert!(detail.exists, "`..` that stays inside the workspace is fine");
+    assert_eq!(detail.head, vec!["inside body".to_string()]);
 }
 
 #[test]
