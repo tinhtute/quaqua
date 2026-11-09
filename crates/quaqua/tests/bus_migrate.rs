@@ -1800,3 +1800,100 @@ fn test_finding_r3_followup_migrated_mail_reply_to_points_to_trigger_id() {
         "migrated ref reply_to must point to new trigger id of replied-to mail (2), not legacy mail id (1)"
     );
 }
+
+#[test]
+fn test_finding_r3_followup_dry_run_matches_real_run_under_sqlite_sequence_offset() {
+    let tmp = hermetic_temp_dir("r3-f2-dryrun-offset");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // Pre-seed sqlite_sequence for triggers with 500
+        conn.execute_batch(
+            r#"
+            CREATE TABLE dummy (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            INSERT INTO dummy DEFAULT VALUES;
+            INSERT INTO sqlite_sequence (name, seq) VALUES ('triggers', 500);
+            DROP TABLE dummy;
+            "#,
+        )
+        .unwrap();
+
+        // Legacy mail 1
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body",
+                &format!("1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done'"),
+            ),
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+
+        // cos_read: read mail 1 (mail_id = 1)
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq, mail_id) VALUES ('cos_read', 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        // cos_unread: unread (mail_id = 0)
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq, mail_id) VALUES ('cos_unread', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    // 1. Dry run
+    let summary_dry = migrate_bus(&db_path, None, true, &herdr).expect("dry run");
+
+    let dry_read_cursor = summary_dry
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_read")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        dry_read_cursor,
+        Some(501),
+        "dry-run must project trigger id 501 when sqlite_sequence is offset to 500"
+    );
+
+    let dry_unread_cursor = summary_dry
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_unread")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        dry_unread_cursor,
+        Some(500),
+        "dry-run must project unread cursor to 500 (offset) rather than 0"
+    );
+
+    // 2. Real migration
+    let summary_real =
+        migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr).expect("real run");
+    let real_read_cursor = summary_real
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_read")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        real_read_cursor,
+        Some(501),
+        "real run must match dry-run trigger id 501"
+    );
+
+    let real_unread_cursor = summary_real
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos_unread")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        real_unread_cursor,
+        Some(500),
+        "real run unread cursor must be 500"
+    );
+}
