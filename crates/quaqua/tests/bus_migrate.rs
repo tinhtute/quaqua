@@ -578,7 +578,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
     assert_eq!(trigs[1].to_name.as_deref(), Some("w1"));
     assert_eq!(trigs[1].thread_id, "agent:w1");
     assert_eq!(trigs[1].summary, "Fix bug");
-    assert_eq!(trigs[1].dedupe_key, None);
+    assert_eq!(trigs[1].dedupe_key.as_deref(), Some("mail:m:1"));
     assert_eq!(trigs[1].farm, "farmA");
 
     // Verify trigger 3: farm_event (ts=300)
@@ -601,6 +601,7 @@ fn test_migrate_1_to_1_row_mapping_and_order() {
         trigs[3].summary,
         "Tiến độ hoàn thành 100% tiếng Việt có dấu"
     );
+    assert_eq!(trigs[3].dedupe_key.as_deref(), Some("mail:m:2"));
 
     // Verify threads
     // Verify threads: exactly agent:w1 and agent:cos (no phantom agent:unknown)
