@@ -1242,8 +1242,8 @@ mod tests {
         fs::create_dir_all(&ws_rules_dir).unwrap();
 
         fs::write(
-            template_dir.join("lead-inbox.md"),
-            "template lead inbox content",
+            template_dir.join("sample-rule.md"),
+            "template sample rule content",
         )
         .unwrap();
         fs::write(template_dir.join("brief.md"), "common brief content").unwrap();
@@ -1251,8 +1251,8 @@ mod tests {
 
         // ws has differing lead-inbox, identical brief, and missing.md is absent
         fs::write(
-            ws_rules_dir.join("lead-inbox.md"),
-            "stale workspace lead inbox",
+            ws_rules_dir.join("sample-rule.md"),
+            "stale workspace sample rule",
         )
         .unwrap();
         fs::write(ws_rules_dir.join("brief.md"), "common brief content").unwrap();
@@ -1262,7 +1262,7 @@ mod tests {
 
         let diff_lead = problems
             .iter()
-            .find(|p| p.drift.contains("lead-inbox.md"))
+            .find(|p| p.drift.contains("sample-rule.md"))
             .unwrap();
         assert!(diff_lead.drift.contains("differs from template"));
         assert!(diff_lead.fix.starts_with("cp "));
@@ -1276,8 +1276,8 @@ mod tests {
 
         // When workspace is synced: 0 problems
         fs::write(
-            ws_rules_dir.join("lead-inbox.md"),
-            "template lead inbox content",
+            ws_rules_dir.join("sample-rule.md"),
+            "template sample rule content",
         )
         .unwrap();
         fs::write(ws_rules_dir.join("missing.md"), "template only content").unwrap();

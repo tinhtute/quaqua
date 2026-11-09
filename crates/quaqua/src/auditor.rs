@@ -52,7 +52,7 @@ Audit six things:
      covered by that file's flag — do not report it twice.
 5. Live workers. Flag any live task worker in herdr that is stalled, untracked,
    or in an unhandled error state.
-6. Lead inbox timeline review (runs/*-lead.inbox.md). Inspect Lead-to-CoS inbox
+6. Lead inbox timeline review. Inspect Lead-to-CoS inbox
    timelines for authority-gradient, self-acceptance, and lost-momentum with
    file:line. Flag:
    - unverified acceptances or handoffs citing missing runs/<x>.md or raw/<x>.md files;
@@ -220,9 +220,7 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<i32, (i32, String)> {
             .filter(|f| {
                 f.starts_with("- runs/pipeline-")
                     || (f.starts_with("- runs/") && f.contains("'## Challenge'"))
-                    || (f.starts_with("- runs/")
-                        && f.contains(".inbox.md")
-                        && !f.contains("live worker"))
+                    || (f.starts_with("- trigger #") && !f.contains("live worker"))
             })
             .map(|s| s.as_str())
             .collect();
@@ -598,33 +596,6 @@ fn collect_rules_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn parse_inbox_header(line: &str) -> Option<(&str, &str, &str)> {
-    let rest = line.strip_prefix("## ")?;
-    let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() == 3 {
-        let iso = parts[0];
-        let name = parts[1];
-        let kind = parts[2];
-        if matches!(
-            kind,
-            "handoff" | "accept" | "challenge" | "escalate" | "blocked"
-        ) {
-            return Some((iso, name, kind));
-        }
-    } else if parts.len() == 5 && parts[2] == "->" {
-        let iso = parts[0];
-        let name = parts[1];
-        let kind = parts[4];
-        if matches!(
-            kind,
-            "handoff" | "accept" | "challenge" | "escalate" | "blocked"
-        ) {
-            return Some((iso, name, kind));
-        }
-    }
-    None
-}
-
 fn extract_cited_md_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
@@ -662,9 +633,7 @@ fn extract_cited_md_paths(text: &str) -> Vec<String> {
                             });
                         if valid_middle {
                             let candidate = &text[i..i + p_len + md_idx + 3];
-                            if !candidate.ends_with(".inbox.md")
-                                && !candidate.ends_with(".rules.md")
-                            {
+                            if !candidate.ends_with(".rules.md") {
                                 out.push(candidate.to_string());
                             }
                         }
@@ -1128,20 +1097,9 @@ pub fn run_deterministic_prechecks_at(
         }
     }
 
-    // ── 7. lead inbox timeline pre-checks (runs/*-lead.inbox.md) ─────────────
-    if let Ok(entries) = std::fs::read_dir(&runs_dir) {
-        let mut inbox_files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|name| name.ends_with("-lead.inbox.md"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        inbox_files.sort();
-
+    // ── 7. lead inbox timeline pre-checks (from DB triggers) ───────────────────
+    let db_path = runs_dir.join("quaqua.db");
+    if db_path.is_file() {
         let mut lead_workers: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         if let Ok(owner_entries) = std::fs::read_dir(&runs_dir) {
@@ -1168,138 +1126,129 @@ pub fn run_deterministic_prechecks_at(
             workers.sort();
         }
 
-        for ib in inbox_files {
-            let fname = match ib.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            let lead_name = fname.strip_suffix(".inbox.md").unwrap_or("");
-            let slug = lead_name.strip_suffix("-lead").unwrap_or(lead_name);
-
-            let content = match std::fs::read_to_string(&ib) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            struct InboxEntry {
-                line_num: usize,
-                _iso: String,
-                _name: String,
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            struct TriggerEntry {
+                id: u64,
+                ts_ms: u64,
+                actor: String,
                 kind: String,
-                ts_secs: Option<u64>,
-                body: Vec<String>,
+                body: String,
             }
 
-            let mut parsed_entries: Vec<InboxEntry> = Vec::new();
-            let mut cur_header: Option<(usize, String, String, String, Option<u64>)> = None;
-            let mut cur_body: Vec<String> = Vec::new();
-
-            for (idx, line) in content.lines().enumerate() {
-                let line_num = idx + 1;
-                if let Some((iso, name, kind)) = parse_inbox_header(line) {
-                    if let Some((h_line, h_iso, h_name, h_kind, h_ts)) = cur_header.take() {
-                        parsed_entries.push(InboxEntry {
-                            line_num: h_line,
-                            _iso: h_iso,
-                            _name: h_name,
-                            kind: h_kind,
-                            ts_secs: h_ts,
-                            body: std::mem::take(&mut cur_body),
-                        });
-                    }
-                    let ts_secs = crate::worker::prompt::cost::parse_iso_timestamp_ms(iso)
-                        .map(|ms| ms / 1000)
-                        .or_else(|| parse_ymd(iso).map(|(y, m, d)| ymd_to_days(y, m, d) * 86400));
-                    cur_header = Some((
-                        line_num,
-                        iso.to_string(),
-                        name.to_string(),
-                        kind.to_string(),
-                        ts_secs,
-                    ));
-                } else if cur_header.is_some() {
-                    cur_body.push(line.to_string());
-                }
-            }
-            if let Some((h_line, h_iso, h_name, h_kind, h_ts)) = cur_header.take() {
-                parsed_entries.push(InboxEntry {
-                    line_num: h_line,
-                    _iso: h_iso,
-                    _name: h_name,
-                    kind: h_kind,
-                    ts_secs: h_ts,
-                    body: cur_body,
+            let stmt = conn.prepare(
+                "SELECT id, ts_ms, actor, kind, payload_json FROM triggers WHERE source = 'mail' ORDER BY id ASC",
+            );
+            if let Ok(mut stmt) = stmt {
+                let rows = stmt.query_map([], |row| {
+                    let id = row.get::<_, i64>(0)? as u64;
+                    let ts_ms = row.get::<_, i64>(1)? as u64;
+                    let actor: String = row.get(2)?;
+                    let kind: String = row.get(3)?;
+                    let payload: Option<String> = row.get(4)?;
+                    let body = payload
+                        .as_deref()
+                        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                        .and_then(|v| {
+                            v.get("body")
+                                .and_then(|b| b.as_str().map(|s| s.to_string()))
+                        })
+                        .unwrap_or_else(|| payload.unwrap_or_default());
+                    Ok(TriggerEntry {
+                        id,
+                        ts_ms,
+                        actor,
+                        kind,
+                        body,
+                    })
                 });
-            }
 
-            for entry in &parsed_entries {
-                let full_text = entry.body.join("\n");
-                let cited_paths = extract_cited_md_paths(&full_text);
-
-                if entry.kind == "accept" || entry.kind == "handoff" {
-                    for cited in &cited_paths {
-                        let target_path = root.join(cited);
-                        if !target_path.is_file() {
-                            flags.push(format!(
-                                "- runs/{fname}:{}: {} cites '{cited}' that does not exist",
-                                entry.line_num, entry.kind
-                            ));
-                        }
+                if let Ok(entries) = rows {
+                    let mut lead_entries: std::collections::BTreeMap<String, Vec<TriggerEntry>> =
+                        std::collections::BTreeMap::new();
+                    for entry in entries.flatten() {
+                        lead_entries
+                            .entry(entry.actor.clone())
+                            .or_default()
+                            .push(entry);
                     }
-                }
 
-                if entry.kind == "accept" {
-                    for cited in &cited_paths {
-                        if cited.starts_with("runs/") {
-                            let target_path = root.join(cited);
-                            if let Ok(c) = std::fs::read_to_string(&target_path) {
-                                for l in c.lines() {
-                                    let trimmed = l.trim();
-                                    let lower = trimmed.to_ascii_lowercase();
-                                    if let Some(rest) = lower.strip_prefix("outcome:") {
-                                        let val = rest.trim();
-                                        if val.starts_with("blocked") || val.starts_with("disputed")
-                                        {
-                                            let out_word = if val.starts_with("blocked") {
-                                                "BLOCKED"
-                                            } else {
-                                                "DISPUTED"
-                                            };
-                                            flags.push(format!(
-                                                "- runs/{fname}:{}: accept cites '{cited}' with Outcome: {out_word}",
-                                                entry.line_num
-                                            ));
-                                            break;
+                    for (lead_name, triggers) in lead_entries {
+                        let slug = lead_name.strip_suffix("-lead").unwrap_or(&lead_name);
+
+                        for entry in &triggers {
+                            let cited_paths = extract_cited_md_paths(&entry.body);
+
+                            if entry.kind == "accept" || entry.kind == "handoff" {
+                                for cited in &cited_paths {
+                                    let target_path = root.join(cited);
+                                    if !target_path.is_file() {
+                                        flags.push(format!(
+                                            "- trigger #{} ({}): {} cites '{cited}' that does not exist",
+                                            entry.id, entry.actor, entry.kind
+                                        ));
+                                    }
+                                }
+                            }
+
+                            if entry.kind == "accept" {
+                                for cited in &cited_paths {
+                                    if cited.starts_with("runs/") {
+                                        let target_path = root.join(cited);
+                                        if let Ok(c) = std::fs::read_to_string(&target_path) {
+                                            for l in c.lines() {
+                                                let trimmed = l.trim();
+                                                let lower = trimmed.to_ascii_lowercase();
+                                                if let Some(rest) = lower.strip_prefix("outcome:") {
+                                                    let val = rest.trim();
+                                                    if val.starts_with("blocked")
+                                                        || val.starts_with("disputed")
+                                                    {
+                                                        let out_word = if val.starts_with("blocked")
+                                                        {
+                                                            "BLOCKED"
+                                                        } else {
+                                                            "DISPUTED"
+                                                        };
+                                                        flags.push(format!(
+                                                            "- trigger #{} ({}): accept cites '{cited}' with Outcome: {out_word}",
+                                                            entry.id, entry.actor
+                                                        ));
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                }
-            }
 
-            if let Some(last_entry) = parsed_entries.last() {
-                if let Some(last_ts) = last_entry.ts_secs {
-                    let age_secs = now_secs.saturating_sub(last_ts);
-                    if age_secs >= 86_400 {
-                        let workers_by_lead = lead_workers.get(lead_name);
-                        let workers_by_slug = lead_workers.get(slug);
-                        let mut all_workers = Vec::new();
-                        if let Some(w) = workers_by_lead {
-                            all_workers.extend(w.clone());
-                        }
-                        if let Some(w) = workers_by_slug {
-                            all_workers.extend(w.clone());
-                        }
-                        all_workers.sort();
-                        all_workers.dedup();
+                        if let Some(last_entry) = triggers.last() {
+                            let last_ts = last_entry.ts_ms / 1000;
+                            let age_secs = now_secs.saturating_sub(last_ts);
+                            if age_secs >= 86_400 {
+                                let workers_by_lead = lead_workers.get(&lead_name);
+                                let workers_by_slug = lead_workers.get(slug);
+                                let mut all_workers = Vec::new();
+                                if let Some(w) = workers_by_lead {
+                                    all_workers.extend(w.clone());
+                                }
+                                if let Some(w) = workers_by_slug {
+                                    all_workers.extend(w.clone());
+                                }
+                                all_workers.sort();
+                                all_workers.dedup();
 
-                        if !all_workers.is_empty() {
-                            flags.push(format!(
-                                "- runs/{fname}: last entry is older than 24h (lost momentum) while owning live worker '{}'",
-                                all_workers.join(", ")
-                            ));
+                                if !all_workers.is_empty() {
+                                    flags.push(format!(
+                                        "- lead {lead_name}: last entry is older than 24h (lost momentum) while owning live worker '{}'",
+                                        all_workers.join(", ")
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -1736,38 +1685,63 @@ mod tests {
         let now_secs = 1_800_000_000u64;
         let today = days_to_ymd(now_secs / 86400);
 
-        fn to_iso(secs: u64) -> String {
-            let days = secs / 86400;
-            let rem = secs % 86400;
-            let h = rem / 3600;
-            let m = (rem % 3600) / 60;
-            let s = rem % 60;
-            let (year, month, day) = days_to_ymd(days);
-            format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
-        }
+        let conn = rusqlite::Connection::open(runs_dir.join("quaqua.db")).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                state TEXT NOT NULL,
+                last_trigger_ms INTEGER NOT NULL
+            );
+            CREATE TABLE triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                to_name TEXT,
+                thread_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                ref TEXT,
+                payload_json TEXT,
+                dedupe_key TEXT UNIQUE,
+                farm TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
 
-        // 1. Clean inbox: valid accept of existing COMPLETE run, recent timestamp
+        // 1. Clean lead: valid accept of existing COMPLETE run, recent timestamp
         let clean_worker = runs_dir.join("clean-worker.md");
         std::fs::write(&clean_worker, "Outcome: COMPLETE\n## Lessons\nnone\n").unwrap();
-        let clean_inbox = runs_dir.join("clean-lead.inbox.md");
-        std::fs::write(
-            &clean_inbox,
-            format!(
-                "## {} clean-lead accept\nAccepted clean work in runs/clean-worker.md\n",
-                to_iso(now_secs - 3600)
-            ),
+        conn.execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+             VALUES (?1, 'mail', 'accept', 'clean-lead', 'cos', 't', 'clean', ?2, 'test')",
+            rusqlite::params![
+                (now_secs - 3600) as i64 * 1000,
+                serde_json::json!({ "body": "Accepted clean work in runs/clean-worker.md" }).to_string(),
+            ],
         )
         .unwrap();
 
         // 2. Fixture (a): missing runs/<x>.md and missing raw/<x>.md
-        let missing_inbox = runs_dir.join("missing-lead.inbox.md");
-        std::fs::write(
-            &missing_inbox,
-            format!(
-                "## {} missing-lead accept\nAccepted runs/nonexistent-worker.md with verified sha\n\n## {} missing-lead handoff\nHandoff notes in raw/missing-notes.md\n",
-                to_iso(now_secs - 7200),
-                to_iso(now_secs - 3600)
-            ),
+        conn.execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+             VALUES (?1, 'mail', 'accept', 'missing-lead', 'cos', 't', 'missing-accept', ?2, 'test')",
+            rusqlite::params![
+                (now_secs - 7200) as i64 * 1000,
+                serde_json::json!({ "body": "Accepted runs/nonexistent-worker.md with verified sha" }).to_string(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+             VALUES (?1, 'mail', 'handoff', 'missing-lead', 'cos', 't', 'missing-handoff', ?2, 'test')",
+            rusqlite::params![
+                (now_secs - 3600) as i64 * 1000,
+                serde_json::json!({ "body": "Handoff notes in raw/missing-notes.md" }).to_string(),
+            ],
         )
         .unwrap();
 
@@ -1785,48 +1759,56 @@ mod tests {
         )
         .unwrap();
 
-        let blocked_inbox = runs_dir.join("blocked-lead.inbox.md");
-        std::fs::write(
-            &blocked_inbox,
-            format!(
-                "## {} blocked-lead accept\nAccepted runs/blocked-worker.md\n\n## {} blocked-lead accept\nAccepted runs/disputed-worker.md\n",
-                to_iso(now_secs - 7200),
-                to_iso(now_secs - 3600)
-            ),
+        conn.execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+             VALUES (?1, 'mail', 'accept', 'blocked-lead', 'cos', 't', 'blocked-accept', ?2, 'test')",
+            rusqlite::params![
+                (now_secs - 7200) as i64 * 1000,
+                serde_json::json!({ "body": "Accepted runs/blocked-worker.md" }).to_string(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+             VALUES (?1, 'mail', 'accept', 'blocked-lead', 'cos', 't', 'disputed-accept', ?2, 'test')",
+            rusqlite::params![
+                (now_secs - 3600) as i64 * 1000,
+                serde_json::json!({ "body": "Accepted runs/disputed-worker.md" }).to_string(),
+            ],
         )
         .unwrap();
 
         // 4. Fixture (c): last entry older than 24h while owning live worker
         std::fs::write(runs_dir.join("sude-active.owner"), "momentum-lead\n").unwrap();
-        let momentum_inbox = runs_dir.join("momentum-lead.inbox.md");
-        std::fs::write(
-            &momentum_inbox,
-            format!(
-                "## {} momentum-lead handoff\nOld handoff from yesterday\n",
-                to_iso(now_secs - 100_000)
-            ),
+        conn.execute(
+            "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+             VALUES (?1, 'mail', 'handoff', 'momentum-lead', 'cos', 't', 'momentum-handoff', ?2, 'test')",
+            rusqlite::params![
+                (now_secs - 100_000) as i64 * 1000,
+                serde_json::json!({ "body": "Old handoff from yesterday" }).to_string(),
+            ],
         )
         .unwrap();
 
         let flags = run_deterministic_prechecks_at(&root, today, now_secs);
 
-        // Clean inbox has no findings
+        // Clean lead has no findings
         assert!(
-            !flags.iter().any(|f| f.contains("clean-lead.inbox.md")),
-            "clean inbox must not be flagged: {:?}",
+            !flags.iter().any(|f| f.contains("clean-lead")),
+            "clean lead must not be flagged: {:?}",
             flags
         );
 
         // (a) Missing files flagged
         assert!(
-            flags.iter().any(|f| f.contains("missing-lead.inbox.md")
+            flags.iter().any(|f| f.contains("missing-lead")
                 && f.contains("runs/nonexistent-worker.md")
                 && f.contains("does not exist")),
             "missing runs file must be flagged for (a): {:?}",
             flags
         );
         assert!(
-            flags.iter().any(|f| f.contains("missing-lead.inbox.md")
+            flags.iter().any(|f| f.contains("missing-lead")
                 && f.contains("raw/missing-notes.md")
                 && f.contains("does not exist")),
             "missing raw file must be flagged for (a): {:?}",
@@ -1835,14 +1817,14 @@ mod tests {
 
         // (b) Accept over BLOCKED or DISPUTED flagged
         assert!(
-            flags.iter().any(|f| f.contains("blocked-lead.inbox.md")
+            flags.iter().any(|f| f.contains("blocked-lead")
                 && f.contains("runs/blocked-worker.md")
                 && f.contains("Outcome: BLOCKED")),
             "accept over BLOCKED must be flagged for (b): {:?}",
             flags
         );
         assert!(
-            flags.iter().any(|f| f.contains("blocked-lead.inbox.md")
+            flags.iter().any(|f| f.contains("blocked-lead")
                 && f.contains("runs/disputed-worker.md")
                 && f.contains("Outcome: DISPUTED")),
             "accept over DISPUTED must be flagged for (b): {:?}",
@@ -1851,7 +1833,7 @@ mod tests {
 
         // (c) Older than 24h with live worker flagged
         assert!(
-            flags.iter().any(|f| f.contains("momentum-lead.inbox.md")
+            flags.iter().any(|f| f.contains("momentum-lead")
                 && f.contains("older than 24h")
                 && f.contains("sude-active")),
             "lost momentum (>24h with live worker) must be flagged for (c): {:?}",
