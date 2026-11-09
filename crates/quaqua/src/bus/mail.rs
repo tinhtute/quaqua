@@ -574,10 +574,16 @@ pub fn send_mail<H: HerdrOps>(
             ));
         }
     };
-    if !result.already_sent && (opts.kind == "escalate" || opts.kind == "blocked") {
-        let title = format!("quaqua mail: {}", opts.kind);
-        let body = format!("{} -> {}: {}", from_name, opts.to, opts.kind);
-        let _ = herdr.notification_show(&title, &body, Some("request"));
+    // The connection guard must go before the wake, which locks the same connection.
+    drop(conn);
+    if !result.already_sent {
+        if opts.kind == "escalate" || opts.kind == "blocked" {
+            let title = format!("quaqua mail: {}", opts.kind);
+            let body = format!("{} -> {}: {}", from_name, opts.to, opts.kind);
+            let _ = herdr.notification_show(&title, &body, Some("request"));
+        }
+        // R3: a recipient that is idle right now is nudged about this trigger.
+        let _ = super::events::wake_idle_consumer(&bus, &opts.to, herdr);
     }
 
     Ok(result)

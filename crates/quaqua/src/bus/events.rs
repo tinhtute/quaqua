@@ -1236,6 +1236,134 @@ fn is_foreign_workspace_cos_pane(pid: &str, pane_val: &serde_json::Value, runs_d
     !is_pane_in_runs_workspace(pid, cwd, runs_dir, tokens)
 }
 
+/// `source_state` key holding the highest trigger id already nudged for a consumer.
+fn wake_state_key(consumer: &str) -> String {
+    format!("wake:{consumer}")
+}
+
+/// Highest trigger id already nudged for `consumer`; 0 when it was never nudged.
+fn wake_watermark(bus: &FarmBus, consumer: &str) -> u64 {
+    let key = wake_state_key(consumer);
+    let conn = bus.conn_for_test();
+    conn.query_row(
+        "SELECT value FROM source_state WHERE source = ?1",
+        rusqlite::params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse().ok())
+    .unwrap_or(0)
+}
+
+fn set_wake_watermark(bus: &FarmBus, consumer: &str, trigger_id: u64) -> rusqlite::Result<()> {
+    let key = wake_state_key(consumer);
+    let value = trigger_id.to_string();
+    let conn = bus.conn_for_test();
+    crate::engine::sqlite::retry_while_busy(|| {
+        conn.execute(
+            "INSERT INTO source_state (source, value) VALUES (?1, ?2)
+             ON CONFLICT(source) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    })
+}
+
+/// The single line typed into an idle agent's pane. Always one line: newlines in
+/// the actor or kind are folded to spaces.
+fn wake_nudge_line(count: usize, latest: &TriggerRecord) -> String {
+    let actor = latest.actor.replace(['\n', '\r'], " ");
+    let kind = latest.kind.replace(['\n', '\r'], " ");
+    let plural = if count == 1 { "" } else { "s" };
+    format!(
+        "quaqua: {count} new trigger{plural}, latest #{} {kind} from {actor}. Run: quaqua mail inbox",
+        latest.id
+    )
+}
+
+/// Nudges an idle consumer about its unread triggers: one `pane send-text` line plus
+/// Enter into the agent's own pane, at most once per batch.
+///
+/// A batch is the consumer's unread set (`to_name = consumer`, or a live subscription)
+/// above its read cursor. The `wake:<consumer>` watermark in `source_state` records the
+/// newest trigger id already announced, so a second hook with no newer trigger sends
+/// nothing even though the read cursor has not moved. The watermark is claimed before
+/// the send: a crash between the two costs one missed nudge (the next trigger nudges
+/// again), never a second turn in the same batch.
+///
+/// Never nudges `cos` (that pane is where anh iu types) and never nudges an agent that
+/// is not idle/done — `working` has its own turn, `blocked` is sitting on a prompt.
+pub fn wake_idle_consumer<H: HerdrOps>(
+    bus: &FarmBus,
+    consumer: &str,
+    herdr: &H,
+) -> Result<bool, String> {
+    let consumer = consumer.trim();
+    if consumer.is_empty() || consumer == "cos" {
+        return Ok(false);
+    }
+
+    let cursor = bus
+        .get_cursor(consumer)
+        .map_err(|e| format!("cannot get cursor for {consumer}: {e}"))?
+        .unwrap_or(0);
+    let unread = bus
+        .load_unread_triggers(consumer, cursor)
+        .map_err(|e| format!("cannot load unread triggers for {consumer}: {e}"))?;
+    let latest = match unread.iter().max_by_key(|t| t.id) {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    let prev_watermark = wake_watermark(bus, consumer);
+    if latest.id <= prev_watermark {
+        return Ok(false);
+    }
+
+    let agent_json = match herdr.agent_get(consumer) {
+        Ok((true, body)) => body,
+        _ => return Ok(false),
+    };
+    let agent: serde_json::Value = match serde_json::from_str(&agent_json) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    let status = agent
+        .pointer("/result/agent/agent_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if status != "idle" && status != "done" {
+        return Ok(false);
+    }
+    let pane = agent
+        .pointer("/result/agent/pane_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if pane.is_empty() {
+        return Ok(false);
+    }
+
+    set_wake_watermark(bus, consumer, latest.id)
+        .map_err(|e| format!("cannot claim wake watermark for {consumer}: {e}"))?;
+
+    let line = wake_nudge_line(unread.len(), latest);
+    let sent = herdr
+        .run(&["pane", "send-text", pane, &line])
+        .and_then(|out| {
+            if out.status.success() {
+                herdr.pane_send_keys(pane, "Enter")
+            } else {
+                Ok(out)
+            }
+        });
+    match sent {
+        Ok(out) if out.status.success() => Ok(true),
+        _ => {
+            let _ = set_wake_watermark(bus, consumer, prev_watermark);
+            Ok(false)
+        }
+    }
+}
+
 /// Handles an incoming herdr plugin hook event:
 /// - Extracts pane, agent, and status.
 /// - On `pane.agent_status_changed` where status is `blocked`, records an incident with
@@ -1439,6 +1567,12 @@ pub fn handle_event_hook<H: HerdrOps>(
                     .with_payload_json(ej)
                     .with_farm(&farm);
                     let _ = bus.record(&ev);
+                }
+            }
+            // R3: an agent that just went idle picks up whatever arrived while it worked.
+            if agent_status == "idle" || agent_status == "done" {
+                if let Some(name) = agent.filter(|s| !s.is_empty()) {
+                    let _ = wake_idle_consumer(&bus, name, herdr);
                 }
             }
             return Ok(false);
