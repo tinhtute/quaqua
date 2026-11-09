@@ -91,7 +91,14 @@ fn map_consumer_cursors(
                 LegacyRef::Mail(mail_id) => mail_id <= c.mail_id,
             };
             if !is_read {
-                new_cursor = if idx == 0 { 0 } else { trigger_ids[idx - 1] };
+                new_cursor = if idx == 0 {
+                    trigger_ids
+                        .first()
+                        .map(|id| id.saturating_sub(1))
+                        .unwrap_or(0)
+                } else {
+                    trigger_ids[idx - 1]
+                };
                 break;
             }
         }
@@ -498,8 +505,21 @@ pub fn migrate_bus<H: HerdrOps>(
             })
     });
 
-    // Compute projected cursors for dry-run
-    let projected_trigger_ids: Vec<u64> = (1..=candidates.len() as u64).collect();
+    // Compute projected cursors for dry-run, accounting for any pre-existing triggers sequence
+    let initial_seq: u64 = if table_has_column(&conn, "sqlite_sequence", "name") {
+        conn.query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'triggers'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|s| s as u64)
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    let projected_trigger_ids: Vec<u64> = (1..=candidates.len() as u64)
+        .map(|i| initial_seq + i)
+        .collect();
     let consumer_cursors = map_consumer_cursors(&cursors, &candidates, &projected_trigger_ids);
 
     if dry_run {
