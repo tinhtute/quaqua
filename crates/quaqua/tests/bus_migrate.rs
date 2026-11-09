@@ -1499,3 +1499,115 @@ fn test_finding_m2_legacy_migration_preserves_per_mail_ack_state() {
         "m2 must remain unacked with no trigger_acks row"
     );
 }
+
+#[test]
+fn test_finding_r3_defect1_migrate_preserves_mail_msg_key_and_project_ref() {
+    let tmp = hermetic_temp_dir("r3-defect1-msgkey-project");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // Mail 1: has msg_key and project, NO reply_to
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'key-alpha', ?1, 'lead-1', 'lead', 'cos', 'report', 'proj-alpha', NULL, 'body 1'",
+            ),
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        // Mail 2: has msg_key, project, and reply_to=1 (references mail 1)
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'key-beta', ?1, 'lead-2', 'lead', 'cos', 'handoff', 'proj-beta', 1, 'body 2'",
+            ),
+            rusqlite::params![now as i64 + 10],
+        )
+        .unwrap();
+        // Mail 3: has msg_key and reply_to=1, but NO project
+        conn.execute(
+            &sql_insert_mail(
+                "msg_key, ts_ms, from_name, from_role, to_name, kind, project, reply_to, body",
+                "'mail:key-gamma', ?1, 'lead-3', 'lead', 'cos', 'ask', NULL, 1, 'body 3'",
+            ),
+            rusqlite::params![now as i64 + 20],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.mail_count, 3);
+    assert_eq!(summary.triggers_count, 3);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let conn = bus.conn_for_test();
+
+    struct MigratedMailTrig {
+        actor: String,
+        ref_val: Option<String>,
+        dedupe_key: Option<String>,
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT actor, ref, dedupe_key FROM triggers WHERE source = 'mail' ORDER BY id ASC",
+        )
+        .expect("prepare select triggers");
+    let rows: Vec<MigratedMailTrig> = stmt
+        .query_map([], |r| {
+            Ok(MigratedMailTrig {
+                actor: r.get(0)?,
+                ref_val: r.get(1)?,
+                dedupe_key: r.get(2)?,
+            })
+        })
+        .expect("query map")
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(rows.len(), 3);
+
+    // Mail 1: project=proj-alpha, reply_to=None -> ref="project:proj-alpha", dedupe_key="mail:key-alpha"
+    assert_eq!(rows[0].actor, "lead-1");
+    assert_eq!(
+        rows[0].ref_val.as_deref(),
+        Some("project:proj-alpha"),
+        "legacy mail with project only must preserve project: in ref"
+    );
+    assert_eq!(
+        rows[0].dedupe_key.as_deref(),
+        Some("mail:key-alpha"),
+        "legacy mail msg_key must become dedupe_key with mail: prefix"
+    );
+
+    // Mail 2: reply_to=1 and project=proj-beta -> ref="mail:1;project:proj-beta", dedupe_key="mail:key-beta"
+    assert_eq!(rows[1].actor, "lead-2");
+    assert_eq!(
+        rows[1].ref_val.as_deref(),
+        Some("mail:1;project:proj-beta"),
+        "legacy mail with reply_to and project must preserve both in ref"
+    );
+    assert_eq!(
+        rows[1].dedupe_key.as_deref(),
+        Some("mail:key-beta"),
+        "legacy mail msg_key must become dedupe_key"
+    );
+
+    // Mail 3: reply_to=1, project=None -> ref="mail:1", dedupe_key="mail:key-gamma"
+    assert_eq!(rows[2].actor, "lead-3");
+    assert_eq!(
+        rows[2].ref_val.as_deref(),
+        Some("mail:1"),
+        "legacy mail with reply_to only must preserve mail: in ref"
+    );
+    assert_eq!(
+        rows[2].dedupe_key.as_deref(),
+        Some("mail:key-gamma"),
+        "legacy mail msg_key already prefixed with mail: must not duplicate prefix"
+    );
+}
