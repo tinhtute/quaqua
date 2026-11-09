@@ -442,6 +442,28 @@ pub fn peer_waiting<H: HerdrOps>(
     None
 }
 
+/// R8: the trigger window to hand `peer_waiting`, or `None` when no exit
+/// branch could fire yet.
+///
+/// `quiet_sec` is the time since the last observed progress, `elapsed_sec` the
+/// session age (it covers `--resume`, whose stall baseline predates this
+/// process), and `status` the agent's resolved state.
+pub fn peer_wait_window(
+    quiet_sec: u64,
+    elapsed_sec: u64,
+    status: &str,
+    stall_sec: u64,
+) -> Option<u64> {
+    let near_a_stall = quiet_sec >= stall_sec
+        || elapsed_sec >= stall_sec
+        || status == "idle"
+        || status == "done";
+    if !near_a_stall {
+        return None;
+    }
+    Some(quiet_sec.max(elapsed_sec).max(stall_sec) * 1000)
+}
+
 /// Live subscriptions of `consumer`, each with the newest trigger on its thread
 /// at or after `now_ms - quiet_ms`.
 fn live_subscriptions(
@@ -631,26 +653,24 @@ impl Activity for PromptActivities {
                     // moved inside the quiet window, is not stalled. The
                     // workflow already honours `lead_waiting` in its idle and
                     // stall branches; the bus fills it in here, and only when
-                    // one of those branches could fire. The session term covers
-                    // `--resume`, whose stall baseline predates this process.
-                    let near_a_stall = quiet >= self.stall_sec
-                        || now.saturating_sub(self.start_sec) >= self.stall_sec
-                        || status == "idle"
-                        || status == "done";
-                    if !*lead_waiting && err.is_empty() && near_a_stall {
-                        let window_ms = quiet
-                            .max(now.saturating_sub(self.start_sec))
-                            .max(self.stall_sec)
-                            * 1000;
-                        if let Some(why) = peer_waiting(
-                            &self.runs_dir,
-                            name,
-                            crate::bus::now_ms(),
-                            window_ms,
-                            &Herdr::new(),
+                    // one of those branches could fire.
+                    if !*lead_waiting && err.is_empty() {
+                        if let Some(window_ms) = peer_wait_window(
+                            quiet,
+                            now.saturating_sub(self.start_sec),
+                            status.as_str(),
+                            self.stall_sec,
                         ) {
-                            *lead_waiting = true;
-                            eprintln!("WATCHDOG waiting | name={name} quiet={quiet}s | {why}");
+                            if let Some(why) = peer_waiting(
+                                &self.runs_dir,
+                                name,
+                                crate::bus::now_ms(),
+                                window_ms,
+                                &Herdr::new(),
+                            ) {
+                                *lead_waiting = true;
+                                eprintln!("WATCHDOG waiting | name={name} quiet={quiet}s | {why}");
+                            }
                         }
                     }
                     let diff = self.last_diff.lock().unwrap().clone();

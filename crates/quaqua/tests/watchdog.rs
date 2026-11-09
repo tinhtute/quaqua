@@ -15,6 +15,7 @@ use quaqua::engine::testkit::{run_to_completion, InMemoryJournal, MockActivities
 use quaqua::herdr::HerdrOps;
 use quaqua::state::WorkerMetadata;
 use quaqua::worker::prompt::peer_waiting;
+use quaqua::worker::prompt::peer_wait_window;
 use quaqua::worker::prompt::workflow::{SingleWorkerState, SingleWorkerWorkflow, WatchdogConfig};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,13 +56,17 @@ impl Drop for RunsDir {
 
 /// `herdr agent list` only: the check is one list call, never a per-peer probe.
 struct FakeHerdr {
-    agents: Vec<String>,
+    /// (name, agent_status), as `herdr agent list` reports them.
+    agents: Vec<(String, String)>,
 }
 
 impl FakeHerdr {
-    fn with_agents(agents: &[&str]) -> Self {
+    fn with_agents(agents: &[(&str, &str)]) -> Self {
         Self {
-            agents: agents.iter().map(|s| s.to_string()).collect(),
+            agents: agents
+                .iter()
+                .map(|(n, s)| (n.to_string(), s.to_string()))
+                .collect(),
         }
     }
 }
@@ -74,7 +79,7 @@ impl HerdrOps for FakeHerdr {
         let agents: Vec<serde_json::Value> = self
             .agents
             .iter()
-            .map(|n| serde_json::json!({ "name": n }))
+            .map(|(n, s)| serde_json::json!({ "name": n, "agent_status": s }))
             .collect();
         Ok(serde_json::json!({ "result": { "agents": agents } }).to_string())
     }
@@ -159,7 +164,7 @@ fn lead_waiting_while_a_subscribed_threads_peer_is_live() {
         LEAD,
         now,
         QUIET_MS,
-        &FakeHerdr::with_agents(&[PEER]),
+        &FakeHerdr::with_agents(&[(PEER, "working")]),
     )
     .expect("a live Peer keeps the Lead waiting");
     assert!(why.contains("peer w1 live"), "reason names the Peer: {why}");
@@ -229,7 +234,7 @@ fn an_expired_subscription_does_not_count() {
             LEAD,
             now,
             QUIET_MS,
-            &FakeHerdr::with_agents(&[PEER])
+            &FakeHerdr::with_agents(&[(PEER, "working")])
         ),
         None
     );
@@ -247,7 +252,7 @@ fn no_subscription_means_no_waiting() {
             LEAD,
             now,
             QUIET_MS,
-            &FakeHerdr::with_agents(&[PEER])
+            &FakeHerdr::with_agents(&[(PEER, "working")])
         ),
         None
     );
@@ -271,10 +276,116 @@ fn a_thread_named_after_its_peer_uses_that_peer() {
         LEAD,
         now,
         QUIET_MS,
-        &FakeHerdr::with_agents(&[PEER]),
+        &FakeHerdr::with_agents(&[(PEER, "working")]),
     )
     .expect("the named Peer is live");
     assert!(why.contains("peer w1 live"), "reason names the Peer: {why}");
+}
+
+// ---------------------------------------------------------------------------
+// A Peer is live only while it works. A done or idle worker whose pane lingers
+// until cleanup must not hold the Lead past its stall threshold.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_done_peer_does_not_hold_a_quiet_lead() {
+    let (runs, now) = lead_on_integ_thread("peer-done", Some(PEER));
+    assert_eq!(
+        peer_waiting(
+            runs.path(),
+            LEAD,
+            now,
+            QUIET_MS,
+            &FakeHerdr::with_agents(&[(PEER, "done")])
+        ),
+        None,
+        "a done worker has no turn left to answer"
+    );
+}
+
+#[test]
+fn an_idle_peer_does_not_hold_a_quiet_lead() {
+    let (runs, now) = lead_on_integ_thread("peer-idle", Some(PEER));
+    assert_eq!(
+        peer_waiting(
+            runs.path(),
+            LEAD,
+            now,
+            QUIET_MS,
+            &FakeHerdr::with_agents(&[(PEER, "idle")])
+        ),
+        None,
+        "an idle worker is not working on the thread"
+    );
+}
+
+#[test]
+fn a_blocked_peer_holds_the_lead() {
+    let (runs, now) = lead_on_integ_thread("peer-blocked", Some(PEER));
+    let why = peer_waiting(
+        runs.path(),
+        LEAD,
+        now,
+        QUIET_MS,
+        &FakeHerdr::with_agents(&[(PEER, "blocked")]),
+    )
+    .expect("a blocked Peer is still live");
+    assert!(why.contains("peer w1 live"), "reason names the Peer: {why}");
+}
+
+// ---------------------------------------------------------------------------
+// The trigger window is one stall period, never the whole session: a window
+// that grew with elapsed time would cover every trigger since the watch began
+// and hide a Lead that hung after dispatching its Peers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_trigger_older_than_one_stall_period_does_not_hold_a_quiet_lead() {
+    let (runs, now) = lead_on_integ_thread("window-stale", Some(PEER));
+    trigger_at(runs.path(), now - 700_000);
+    let window =
+        peer_wait_window(1400, 1400, "working", 600).expect("a 1400 s quiet Lead is near a stall");
+    assert_eq!(
+        peer_waiting(
+            runs.path(),
+            LEAD,
+            now,
+            window,
+            &FakeHerdr::with_agents(&[])
+        ),
+        None,
+        "a trigger 700 s old is outside the 600 s window"
+    );
+}
+
+#[test]
+fn a_trigger_inside_one_stall_period_holds_a_quiet_lead() {
+    let (runs, now) = lead_on_integ_thread("window-fresh", Some(PEER));
+    trigger_at(runs.path(), now - 60_000);
+    let window =
+        peer_wait_window(1400, 1400, "working", 600).expect("a 1400 s quiet Lead is near a stall");
+    let why = peer_waiting(
+        runs.path(),
+        LEAD,
+        now,
+        window,
+        &FakeHerdr::with_agents(&[]),
+    )
+    .expect("a trigger 60 s old is inside the window");
+    assert!(why.contains("trigger 60s ago"), "reason: {why}");
+}
+
+#[test]
+fn no_window_before_an_exit_branch_can_fire() {
+    assert_eq!(
+        peer_wait_window(10, 10, "working", 600),
+        None,
+        "a Lead still inside its stall threshold is not consulted"
+    );
+    assert!(
+        peer_wait_window(10, 10, "idle", 600).is_some(),
+        "the idle branch fires whatever the quiet time"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +468,7 @@ fn run_quiet_lead(lead_waiting: bool) -> (i32, u64) {
 #[test]
 fn watchdog_keeps_watching_a_lead_quiet_for_1400s_with_a_live_peer() {
     let (runs, now) = lead_on_integ_thread("exit-live-peer", Some(PEER));
-    let herdr = FakeHerdr::with_agents(&[PEER]);
+    let herdr = FakeHerdr::with_agents(&[(PEER, "working")]);
     let waiting = peer_waiting(runs.path(), LEAD, now, QUIET_MS, &herdr).is_some();
     assert!(waiting, "fixture must be the waiting case");
 

@@ -782,7 +782,16 @@ impl HerdrOps for WakeHerdr {
         self.ok()
     }
     fn agent_list(&self) -> std::io::Result<String> {
-        Ok(r#"{"result":{"agents":[]}}"#.to_string())
+        let agents: Vec<serde_json::Value> = self
+            .agents
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, status, pane)| {
+                serde_json::json!({"name": name, "agent_status": status, "pane_id": pane})
+            })
+            .collect();
+        Ok(serde_json::json!({"result": {"agents": agents}}).to_string())
     }
     fn agent_get(&self, name: &str) -> std::io::Result<(bool, String)> {
         let agents = self.agents.lock().unwrap();
@@ -862,11 +871,12 @@ fn record_trigger_to(bus: &FarmBus, to: &str, summary: &str) -> u64 {
         .expect("max trigger id") as u64
 }
 
-fn status_event(agent: &str, status: &str) -> String {
+/// A `pane.agent_status_changed` payload as herdr really emits it: `agent` is
+/// the harness kind, and the pane is the only thing that names the agent.
+fn status_event(pane: &str, status: &str) -> String {
     serde_json::json!({
         "type": "pane_agent_status_changed",
-        "agent": agent,
-        "agent_status": status
+        "data": {"agent": "omp", "agent_status": status, "pane_id": pane}
     })
     .to_string()
 }
@@ -881,7 +891,7 @@ fn test_wake_idle_agent_with_unread_trigger_nudges_once_per_batch() {
     let res = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "idle")),
+        Some(&status_event("w1:p9", "idle")),
         &herdr,
     );
     assert_eq!(res, Ok(false), "a status change is not an incident");
@@ -916,7 +926,7 @@ fn test_wake_idle_agent_with_unread_trigger_nudges_once_per_batch() {
     let res = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "idle")),
+        Some(&status_event("w1:p9", "idle")),
         &herdr,
     );
     assert_eq!(res, Ok(false));
@@ -931,7 +941,7 @@ fn test_wake_idle_agent_with_unread_trigger_nudges_once_per_batch() {
     let _ = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "idle")),
+        Some(&status_event("w1:p9", "idle")),
         &herdr,
     );
     let sends = herdr.send_texts();
@@ -957,7 +967,7 @@ fn test_wake_skips_busy_agent() {
     let _ = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "working")),
+        Some(&status_event("w1:p9", "working")),
         &herdr,
     );
     assert!(
@@ -970,7 +980,7 @@ fn test_wake_skips_busy_agent() {
     let _ = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "idle")),
+        Some(&status_event("w1:p9", "idle")),
         &herdr,
     );
     assert!(
@@ -990,7 +1000,7 @@ fn test_wake_never_nudges_cos() {
     let _ = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("cos", "idle")),
+        Some(&status_event("w1:p1", "idle")),
         &herdr,
     );
     assert!(
@@ -1068,7 +1078,7 @@ fn test_failed_nudge_does_not_consume_the_batch() {
     let _ = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "idle")),
+        Some(&status_event("w1:p9", "idle")),
         &herdr,
     );
     assert_eq!(herdr.send_texts().len(), 1, "one attempt was made");
@@ -1080,7 +1090,7 @@ fn test_failed_nudge_does_not_consume_the_batch() {
     let _ = quaqua::bus::events::handle_event_hook(
         &runs_dir,
         Some("pane.agent_status_changed"),
-        Some(&status_event("worker-w", "idle")),
+        Some(&status_event("w1:p9", "idle")),
         &herdr,
     );
     assert_eq!(
