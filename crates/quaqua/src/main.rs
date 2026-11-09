@@ -166,6 +166,26 @@ enum Command {
         #[command(subcommand)]
         cmd: BusCmd,
     },
+    /// Event source operations: poll.
+    Source {
+        #[command(subcommand)]
+        cmd: SourceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCmd {
+    /// GitHub CI source: record a ci_failed trigger per failed run.
+    GithubCi {
+        #[command(subcommand)]
+        cmd: GithubCiCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubCiCmd {
+    /// Poll the engine repo once and record new ci_failed triggers.
+    Poll,
 }
 
 #[derive(Subcommand)]
@@ -1073,6 +1093,18 @@ fn main() {
                     eprintln!("error: {e}");
                     1
                 }
+            },
+        },
+        Some(Command::Source { cmd }) => match cmd {
+            SourceCmd::GithubCi { cmd } => match cmd {
+                GithubCiCmd::Poll => match quaqua::source::github_ci::run_poll(&default_runs_dir())
+                {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        1
+                    }
+                },
             },
         },
         None => 0,
