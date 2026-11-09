@@ -1612,3 +1612,96 @@ fn test_finding_r3_defect1_migrate_preserves_mail_msg_key_and_project_ref() {
         "legacy mail msg_key already prefixed with mail: must not duplicate prefix"
     );
 }
+
+#[test]
+fn test_finding_r3_defect3_migrate_cursor_and_acks_share_id_source() {
+    let tmp = hermetic_temp_dir("r3-defect3-id-source");
+    let db_path = tmp.join("quaqua.db");
+    create_legacy_fixture_db(&db_path);
+
+    let now = quaqua::bus::now_ms();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // Pre-seed sqlite_sequence for triggers so next inserted id is 501
+        conn.execute_batch(
+            r#"
+            CREATE TABLE dummy (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            INSERT INTO dummy DEFAULT VALUES;
+            INSERT INTO sqlite_sequence (name, seq) VALUES ('triggers', 500);
+            DROP TABLE dummy;
+            "#,
+        )
+        .unwrap();
+
+        // Legacy mail 1 with ack state
+        conn.execute(
+            &sql_insert_mail(
+                "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body, acked_ms, acked_by",
+                &format!("1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done', ?2, 'cos'"),
+            ),
+            rusqlite::params![now as i64, now as i64 + 50],
+        )
+        .unwrap();
+
+        // Legacy cursor: cos has read mail 1 (mail_id = 1)
+        conn.execute(
+            "INSERT INTO cursors (consumer, seq, mail_id) VALUES ('cos', 0, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let herdr = MockHerdr::idle_clean();
+    let summary = migrate_bus(&db_path, Some(&tmp.join("raw")), false, &herdr)
+        .expect("migration must succeed");
+    assert_eq!(summary.mail_count, 1);
+    assert_eq!(summary.triggers_count, 1);
+
+    let bus = FarmBus::open(&db_path).expect("open migrated bus");
+    let conn = bus.conn_for_test();
+
+    // Inspect trigger id
+    let trig_id: u64 = conn
+        .query_row("SELECT id FROM triggers LIMIT 1", [], |r| {
+            r.get::<_, i64>(0).map(|v| v as u64)
+        })
+        .expect("query trigger id");
+    assert_eq!(trig_id, 501, "trigger must receive id 501 from sequence");
+
+    // Inspect trigger_acks id
+    let ack_tid: u64 = conn
+        .query_row("SELECT trigger_id FROM trigger_acks LIMIT 1", [], |r| {
+            r.get::<_, i64>(0).map(|v| v as u64)
+        })
+        .expect("query ack trigger_id");
+    assert_eq!(
+        ack_tid, 501,
+        "trigger_acks must use trigger_id 501 from last_insert_rowid"
+    );
+
+    // Inspect cursors table
+    let cur_tid: u64 = conn
+        .query_row(
+            "SELECT trigger_id FROM cursors WHERE consumer = 'cos'",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )
+        .expect("query cursor trigger_id");
+    assert_eq!(
+        cur_tid, ack_tid,
+        "cursor and ack must share the exact same trigger_id from last_insert_rowid"
+    );
+    assert_eq!(cur_tid, 501);
+
+    // Also check summary.consumer_cursors
+    let cos_summary_cursor = summary
+        .consumer_cursors
+        .iter()
+        .find(|(c, _, _, _)| c == "cos")
+        .map(|(_, _, _, new_c)| *new_c);
+    assert_eq!(
+        cos_summary_cursor,
+        Some(501),
+        "summary.consumer_cursors must reflect the actual trigger_id from last_insert_rowid"
+    );
+}
