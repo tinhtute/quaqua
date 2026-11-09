@@ -586,7 +586,14 @@ impl FarmBus {
     }
 
     /// Records a new trigger into `triggers`, updating the thread's `last_trigger_ms`
-    /// and extending active subscriptions by 14 days.
+    /// in the same transaction.
+    ///
+    /// A newly inserted trigger renews the lease of every subscription on the thread
+    /// that is still active at `trigger.ts_ms`: `until_ms = MAX(until_ms, ts_ms + 14 days)`.
+    /// Expired subscriptions are left alone, so an expired consumer is never revived.
+    ///
+    /// If `trigger.dedupe_key` already exists the insert is ignored, this method returns
+    /// `Ok(false)`, and the lease is not renewed: a duplicate is not a new trigger.
     pub fn record_trigger(&self, trigger: &NewTrigger) -> rusqlite::Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let farm_str = trigger.farm.as_deref().unwrap_or(&self.farm);
@@ -609,13 +616,6 @@ impl FarmBus {
                 rusqlite::params![now, &trigger.thread_id],
             )?;
 
-            // Extend active subscriptions on this thread: now + 14 days (R6)
-            let ext_until = (trigger.ts_ms + 14 * 86_400 * 1000) as i64;
-            tx.execute(
-                "UPDATE subscriptions SET until_ms = MAX(until_ms, ?1) WHERE thread_id = ?2 AND until_ms >= ?3",
-                rusqlite::params![ext_until, &trigger.thread_id, now],
-            )?;
-
             let rows = tx.execute(
                 r#"
                 INSERT OR IGNORE INTO triggers (
@@ -636,6 +636,15 @@ impl FarmBus {
                     farm_str,
                 ],
             )?;
+            // A duplicate (`dedupe_key` already present) is not a new trigger: it must
+            // not renew the lease. The extension is monotonic, so re-running converges.
+            if rows > 0 {
+                let ext_until = (trigger.ts_ms + 14 * 86_400 * 1000) as i64;
+                tx.execute(
+                    "UPDATE subscriptions SET until_ms = MAX(until_ms, ?1) WHERE thread_id = ?2 AND until_ms >= ?3",
+                    rusqlite::params![ext_until, &trigger.thread_id, now],
+                )?;
+            }
             tx.commit()?;
             Ok(rows > 0)
         })
