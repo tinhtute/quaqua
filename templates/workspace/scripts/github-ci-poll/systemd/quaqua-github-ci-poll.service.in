@@ -3,4 +3,6 @@ Description=quaqua GitHub CI source: record ci_failed triggers (quaqua source gi
 
 [Service]
 Type=oneshot
+Environment=PATH=@PATH@
+Environment=QUAQUA_RUNS_DIR=@RUNS_DIR@
 ExecStart=@QUAQUA@ source github-ci poll --repo @REPO@

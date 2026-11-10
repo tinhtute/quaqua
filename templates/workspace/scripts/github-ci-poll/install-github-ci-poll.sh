@@ -4,6 +4,9 @@
 # Installs the 5-minute `quaqua source github-ci poll` timer:
 #   Linux: renders the user service, symlinks the timer, reloads the user manager.
 #   macOS: renders a launchd LaunchAgent plist in ~/Library/LaunchAgents.
+# The unit carries the resolved `quaqua`, the repo, the install-time PATH and
+# the workspace runs dir (`$QUAQUA_RUNS_DIR`, else `<checkout>/runs`), because
+# both managers start it with a bare PATH and no shell profile.
 # Nothing is enabled, started or bootstrapped: the installer prints the
 # activation command for the user to run.
 #
@@ -52,19 +55,29 @@ while (($#)); do
   esac
 done
 
+# `owner/name` only: the unit interpolates it into an ExecStart word, so a
+# path-shaped origin must be refused, not guessed at.
+valid_repo() {
+  [[ $1 =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  local owner=${1%%/*} name=${1#*/}
+  [[ $owner != . && $owner != .. && $name != . && $name != .. ]]
+}
+
 # `owner/name` from a clone URL: https://host/owner/name(.git),
-# git@host:owner/name(.git), ssh://git@host/owner/name(.git).
+# git@host:owner/name(.git), ssh://git@host/owner/name(.git). A local path is
+# not a clone URL: it names no repository on a forge.
 repo_from_url() {
-  local url=$1 name owner
-  url=${url%.git}
+  local url=$1
   url=${url%/}
+  url=${url%.git}
   case $url in
     *://*) url=${url#*://}; url=${url#*/} ;;
     *@*:*) url=${url#*:} ;;
+    *) return 1 ;;
   esac
-  name=${url##*/}
-  owner=${url%/*}
+  local name=${url##*/} owner=${url%/*}
   owner=${owner##*/}
+  valid_repo "$owner/$name" || return 1
   printf '%s/%s\n' "$owner" "$name"
 }
 
@@ -74,12 +87,15 @@ if [[ -z $repo ]]; then
     echo "error: no --repo given and $root has no git origin remote; pass --repo <owner/name>" >&2
     exit 1
   }
-  repo=$(repo_from_url "$origin")
+  repo=$(repo_from_url "$origin") || {
+    echo "error: cannot derive <owner/name> from the origin remote ($origin); pass --repo <owner/name>" >&2
+    exit 1
+  }
 fi
-if [[ ! $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+valid_repo "$repo" || {
   echo "error: --repo must be <owner>/<name>, got: $repo" >&2
   exit 2
-fi
+}
 
 quaqua_bin=$(command -v quaqua || true)
 if [[ -z $quaqua_bin ]]; then
@@ -109,11 +125,18 @@ plain_replacement() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
 
-render() { # render <template> <quaqua> <repo> <path-env> <escape-fn>
-  sed -e "s|@QUAQUA@|$($5 "$2")|g" \
-      -e "s|@REPO@|$($5 "$3")|g" \
-      -e "s|@PATH@|$($5 "$4")|g" \
-      -e "s|@HOME@|$($5 "$HOME")|g" \
+# Both managers start the job with a bare PATH and no shell profile: pin the
+# install-time PATH (so `gh` resolves) and the runs dir (so the poll records
+# into this workspace's database, not `$HOME/quaqua`).
+job_path="$(dirname "$quaqua_bin"):${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
+runs_dir=${QUAQUA_RUNS_DIR:-$root/runs}
+
+render() { # render <template> <quaqua> <repo> <path-env> <runs-dir> <escape-fn>
+  sed -e "s|@QUAQUA@|$($6 "$2")|g" \
+      -e "s|@REPO@|$($6 "$3")|g" \
+      -e "s|@PATH@|$($6 "$4")|g" \
+      -e "s|@RUNS_DIR@|$($6 "$5")|g" \
+      -e "s|@HOME@|$($6 "$HOME")|g" \
       "$1"
 }
 
@@ -131,16 +154,16 @@ install_rendered() { # install_rendered <destination>  (content on stdin)
 
 case $(uname -s) in
   Darwin)
-    job_path="$(dirname "$quaqua_bin"):${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
     dst="$HOME/Library/LaunchAgents"
     plist="$dst/com.quaqua.github-ci-poll.plist"
     template="$root/scripts/github-ci-poll/launchd/com.quaqua.github-ci-poll.plist.in"
     if ((dry_run)); then
-      render "$template" "$quaqua_bin" "$repo" "$job_path" xml_replacement
+      render "$template" "$quaqua_bin" "$repo" "$job_path" "$runs_dir" xml_replacement
       exit 0
     fi
     mkdir -p "$dst" "$HOME/Library/Logs"
-    render "$template" "$quaqua_bin" "$repo" "$job_path" xml_replacement | install_rendered "$plist"
+    render "$template" "$quaqua_bin" "$repo" "$job_path" "$runs_dir" xml_replacement \
+      | install_rendered "$plist"
     # %q keeps the printed command safe for paths containing spaces.
     printf 'installed %s — activate manually with:\n' "$plist"
     printf 'launchctl bootstrap gui/%s %q\n' "$(id -u)" "$plist"
@@ -151,11 +174,11 @@ case $(uname -s) in
     service="$dst/quaqua-github-ci-poll.service"
     timer="$dst/quaqua-github-ci-poll.timer"
     if ((dry_run)); then
-      render "$src/quaqua-github-ci-poll.service.in" "$quaqua_bin" "$repo" "" plain_replacement
+      render "$src/quaqua-github-ci-poll.service.in" "$quaqua_bin" "$repo" "$job_path" "$runs_dir" plain_replacement
       exit 0
     fi
     mkdir -p "$dst"
-    render "$src/quaqua-github-ci-poll.service.in" "$quaqua_bin" "$repo" "" plain_replacement \
+    render "$src/quaqua-github-ci-poll.service.in" "$quaqua_bin" "$repo" "$job_path" "$runs_dir" plain_replacement \
       | install_rendered "$service"
     # The timer carries no per-install value: symlink it, like the auditor.
     ln -sfn "$src/quaqua-github-ci-poll.timer" "$timer"

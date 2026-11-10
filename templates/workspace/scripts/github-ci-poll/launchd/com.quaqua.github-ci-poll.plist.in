@@ -18,6 +18,8 @@
   <dict>
     <key>PATH</key>
     <string>@PATH@</string>
+    <key>QUAQUA_RUNS_DIR</key>
+    <string>@RUNS_DIR@</string>
   </dict>
   <key>StartInterval</key>
   <integer>300</integer>

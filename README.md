@@ -158,16 +158,25 @@ bash templates/workspace/scripts/github-ci-poll/install-github-ci-poll.sh [--rep
 ```
 
 `--repo` defaults to the `origin` remote of the checkout the script lives in, so a
-clone of any fork polls its own repository. `gh` and `quaqua` must be on PATH.
+clone of any fork polls its own repository; the origin must be a clone URL
+(`https://`, `ssh://`, `git@host:owner/name`), never a local path. `gh` and `quaqua`
+must be on PATH.
+
+Both units pin the install-time PATH and `QUAQUA_RUNS_DIR` (`$QUAQUA_RUNS_DIR`, else
+`<checkout>/runs`): the managers start the job with a bare PATH and no shell profile,
+and the poll must record into this workspace's database rather than `$HOME/quaqua/runs`.
 
 Linux: renders `~/.config/systemd/user/quaqua-github-ci-poll.service`, symlinks the
 timer beside it, and calls only `systemctl --user daemon-reload`. Activate with
 `systemctl --user enable --now quaqua-github-ci-poll.timer`; `OnCalendar=*:0/5` with
-`Persistent=true` runs it every 5 minutes and replays a missed run.
+`Persistent=true` runs it every 5 minutes and replays a missed run. `quaqua doctor`
+checks the pair: an installed, active timer is fine; a dangling symlink or an inactive
+timer fails the run; a timer that was never installed warns (installing it is a
+per-workspace choice).
 
 macOS: renders `~/Library/LaunchAgents/com.quaqua.github-ci-poll.plist` with
-`StartInterval` 300, the resolved `quaqua` path and the install-time PATH (launchd
-does not source shell profiles, so `gh` must be on that PATH). Logs go to
+`StartInterval` 300, the resolved `quaqua` path, the install-time PATH and the runs
+dir (launchd does not source shell profiles, so `gh` must be on that PATH). Logs go to
 `~/Library/Logs/quaqua-github-ci-poll.log`. It never calls launchctl; run the printed
 `launchctl bootstrap` command yourself.
 

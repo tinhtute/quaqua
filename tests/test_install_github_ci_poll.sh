@@ -39,14 +39,24 @@ exit 0
 EOF
 chmod +x "$T/bin/uname" "$T/bin/systemctl" "$T/bin/launchctl" "$T/bin/quaqua" "$T/bin/gh"
 
-# run <os> [installer args...] — HOME and PATH are the sandbox's, never the user's.
-run() {
-  local os=$1
-  shift
+# run_in <checkout> <os> [installer args...] — HOME and PATH are the sandbox's,
+# never the user's. The installer is invoked through "$BASH", the interpreter
+# this suite runs under, not whatever `bash` PATH resolves to.
+run_in() {
+  local dir=$1 os=$2
+  shift 2
   rc=0
   TEST_OS=$os HOME="$T/home" CALLS="$T/calls" \
     PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-    bash "$root/scripts/github-ci-poll/install-github-ci-poll.sh" "$@" >"$T/out" 2>"$T/err" || rc=$?
+    "$BASH" "$dir/scripts/github-ci-poll/install-github-ci-poll.sh" "$@" >"$T/out" 2>"$T/err" || rc=$?
+}
+run() { run_in "$root" "$@"; }
+# mk_repo <dir> <origin-url> — a checkout whose `origin` is the given URL.
+mk_repo() {
+  mkdir -p "$1/scripts/github-ci-poll"
+  cp -R "$src/github-ci-poll/." "$1/scripts/github-ci-poll/"
+  git -C "$1" init -q
+  git -C "$1" remote add origin "$2"
 }
 calls() { cat "$T/calls" 2>/dev/null || true; }
 reset() { rm -rf "$T/home" "$T/calls" "$T/out" "$T/err"; mkdir -p "$T/home"; }
@@ -63,6 +73,14 @@ timer="$T/home/.config/systemd/user/quaqua-github-ci-poll.timer"
   || fail "Linux: timer points at $(readlink -f "$timer")"
 grep -qxF "ExecStart=$T/bin/quaqua source github-ci poll --repo acme/widget" "$service" \
   || fail "Linux: service does not poll the origin repo: $(cat "$service")"
+# The user manager starts the job with a bare PATH and no shell profile: the
+# install-time PATH must be pinned, like the launchd plist does.
+grep -qF "Environment=PATH=$T/bin:" "$service" \
+  || fail "Linux: service does not pin the install-time PATH: $(cat "$service")"
+grep -qF ':/usr/bin' "$service" || fail "Linux: pinned PATH lost /usr/bin"
+# The poll records into this workspace's runs dir, not $HOME/quaqua/runs.
+grep -qxF "Environment=QUAQUA_RUNS_DIR=$root/runs" "$service" \
+  || fail "Linux: service does not name the workspace runs dir: $(cat "$service")"
 grep -qxF 'OnCalendar=*:0/5' "$timer" || fail 'Linux: timer is not on a 5-minute cadence'
 grep -qxF 'Persistent=true' "$timer" || fail 'Linux: timer does not replay a missed run'
 [[ $(calls) == 'systemctl --user daemon-reload' ]] \
@@ -108,9 +126,9 @@ plist="$T/home/Library/LaunchAgents/com.quaqua.github-ci-poll.plist"
 [[ -f $plist ]] || fail 'Darwin: no LaunchAgents plist'
 [[ -d $T/home/Library/Logs ]] || fail 'Darwin: log directory not created'
 [[ ! -s $T/calls ]] || fail "Darwin: invoked a manager: $(calls)"
-python3 - "$plist" "$T/bin/quaqua" "$T/bin" <<'PY' || fail 'Darwin: plist does not match the contract'
+python3 - "$plist" "$T/bin/quaqua" "$T/bin" "$root/runs" <<'PY' || fail 'Darwin: plist does not match the contract'
 import plistlib, sys
-plist, quaqua, bindir = sys.argv[1:4]
+plist, quaqua, bindir, runs = sys.argv[1:5]
 with open(plist, 'rb') as f:
     d = plistlib.load(f)
 assert d['Label'] == 'com.quaqua.github-ci-poll', d['Label']
@@ -118,6 +136,7 @@ assert d['ProgramArguments'] == [quaqua, 'source', 'github-ci', 'poll', '--repo'
     d['ProgramArguments']
 assert d['StartInterval'] == 300, d['StartInterval']
 assert bindir in d['EnvironmentVariables']['PATH'].split(':'), d['EnvironmentVariables']['PATH']
+assert d['EnvironmentVariables']['QUAQUA_RUNS_DIR'] == runs, d['EnvironmentVariables']['QUAQUA_RUNS_DIR']
 assert d['StandardErrorPath'].endswith('/Library/Logs/quaqua-github-ci-poll.log'), d['StandardErrorPath']
 PY
 grep -qF 'launchctl bootstrap' "$T/out" || fail 'Darwin: no manual bootstrap instruction'
@@ -140,34 +159,66 @@ grep -qF '<integer>300</integer>' "$T/out" || fail 'Darwin dry-run: no 300s inte
 echo 'ok: Darwin --dry-run -> prints the plist, writes nothing'
 
 # ── the repo is derived from the origin URL, whatever its shape ─────────────
-https_root="$T/https-repo"
-mkdir -p "$https_root/scripts/github-ci-poll"
-cp -R "$src/github-ci-poll/." "$https_root/scripts/github-ci-poll/"
-git -C "$https_root" init -q
-git -C "$https_root" remote add origin 'https://github.com/acme/widget.git'
+mk_repo "$T/https-repo" 'https://github.com/acme/widget.git'
 reset
-rc=0
-TEST_OS=Linux HOME="$T/home" CALLS="$T/calls" \
-  PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-  bash "$https_root/scripts/github-ci-poll/install-github-ci-poll.sh" >"$T/out" 2>"$T/err" || rc=$?
+run_in "$T/https-repo" Linux
 [[ $rc -eq 0 ]] || fail "https origin: exit $rc: $(cat "$T/err")"
 grep -qF -- '--repo acme/widget' "$T/home/.config/systemd/user/quaqua-github-ci-poll.service" \
   || fail 'https origin: repo not parsed from an https clone URL'
 echo 'ok: https clone URL -> owner/name, no .git suffix'
+
+# A trailing slash after `.git` is a legal clone URL; strip `/` before `.git`.
+mk_repo "$T/slash-repo" 'https://github.com/acme/widget.git/'
+reset
+run_in "$T/slash-repo" Linux
+[[ $rc -eq 0 ]] || fail "trailing slash origin: exit $rc: $(cat "$T/err")"
+grep -qxF "ExecStart=$T/bin/quaqua source github-ci poll --repo acme/widget" \
+  "$T/home/.config/systemd/user/quaqua-github-ci-poll.service" \
+  || fail "trailing slash origin: repo is not acme/widget: $(cat "$T/home/.config/systemd/user/quaqua-github-ci-poll.service")"
+echo 'ok: clone URL with a trailing slash -> owner/name, no .git suffix'
+
+# A local path names no repository on a forge: refuse instead of guessing an
+# owner from the last two path segments.
+mk_repo "$T/path-repo" '/srv/git/to/widget.git'
+reset
+run_in "$T/path-repo" Linux
+[[ $rc -eq 1 ]] || fail "path origin: exit $rc, want 1"
+grep -q 'cannot derive <owner/name>' "$T/err" || fail 'path origin: no diagnostic'
+grep -q -- '--repo' "$T/err" || fail 'path origin: diagnostic does not name --repo'
+[[ ! -e $T/home/.config && ! -s $T/calls ]] || fail 'path origin: installed anyway'
+echo 'ok: local-path origin -> refuses and points at --repo'
+
+# `.`/`..` segments are not a repository name.
+mk_repo "$T/dot-repo" 'https://github.com/../widget'
+reset
+run_in "$T/dot-repo" Linux
+[[ $rc -eq 1 ]] || fail "dot-segment origin: exit $rc, want 1"
+grep -q 'cannot derive <owner/name>' "$T/err" || fail 'dot-segment origin: no diagnostic'
+[[ ! -e $T/home/.config ]] || fail 'dot-segment origin: installed anyway'
+echo 'ok: .. segment in an origin URL -> refuses'
 
 # No origin and no --repo: refuse before writing anything, and say how.
 no_origin="$T/no-origin"
 mkdir -p "$no_origin/scripts/github-ci-poll"
 cp -R "$src/github-ci-poll/." "$no_origin/scripts/github-ci-poll/"
 reset
-rc=0
-TEST_OS=Linux HOME="$T/home" CALLS="$T/calls" \
-  PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-  bash "$no_origin/scripts/github-ci-poll/install-github-ci-poll.sh" >"$T/out" 2>"$T/err" || rc=$?
+run_in "$no_origin" Linux
 [[ $rc -eq 1 ]] || fail "no origin: exit $rc, want 1"
 grep -q -- '--repo' "$T/err" || fail 'no origin: diagnostic does not name --repo'
 [[ ! -e $T/home/.config && ! -s $T/calls ]] || fail 'no origin: installed anyway'
 echo 'ok: no origin -> refuses and points at --repo'
+
+# ── QUAQUA_RUNS_DIR overrides the workspace runs dir ────────────────────────
+reset
+rc=0
+TEST_OS=Linux HOME="$T/home" CALLS="$T/calls" QUAQUA_RUNS_DIR="$T/other-runs" \
+  PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  "$BASH" "$root/scripts/github-ci-poll/install-github-ci-poll.sh" >"$T/out" 2>"$T/err" || rc=$?
+[[ $rc -eq 0 ]] || fail "QUAQUA_RUNS_DIR: exit $rc: $(cat "$T/err")"
+grep -qxF "Environment=QUAQUA_RUNS_DIR=$T/other-runs" \
+  "$T/home/.config/systemd/user/quaqua-github-ci-poll.service" \
+  || fail 'QUAQUA_RUNS_DIR: the unit does not record the override'
+echo 'ok: QUAQUA_RUNS_DIR -> rendered into the unit instead of the workspace runs dir'
 
 # ── refusals: bad --repo, missing tools, unsupported OS ─────────────────────
 reset
@@ -175,6 +226,12 @@ run Linux --repo noslash
 [[ $rc -eq 2 ]] || fail "bad --repo: exit $rc, want 2"
 grep -q 'must be <owner>/<name>' "$T/err" || fail 'bad --repo: no diagnostic'
 [[ ! -e $T/home/.config ]] || fail 'bad --repo: installed anyway'
+
+reset
+run Linux --repo ../widget
+[[ $rc -eq 2 ]] || fail "dot-segment --repo: exit $rc, want 2"
+grep -q 'must be <owner>/<name>' "$T/err" || fail 'dot-segment --repo: no diagnostic'
+[[ ! -e $T/home/.config ]] || fail 'dot-segment --repo: installed anyway'
 
 reset
 run Linux --bogus

@@ -96,6 +96,50 @@ pub const AUDITOR_FIX_CMD: &str =
     "bash scripts/auditor/install-auditor.sh && systemctl --user enable --now quaqua-auditor.timer";
 pub const AUDITOR_UNITS: [&str; 2] = ["quaqua-auditor.service", "quaqua-auditor.timer"];
 
+const GITHUB_CI_POLL_FIX_CMD: &str = "bash scripts/github-ci-poll/install-github-ci-poll.sh --repo <owner/name> && systemctl --user enable --now quaqua-github-ci-poll.timer";
+const GITHUB_CI_POLL_UNITS: [&str; 2] = [
+    "quaqua-github-ci-poll.service",
+    "quaqua-github-ci-poll.timer",
+];
+
+/// One user timer `quaqua doctor` checks: the unit files an install writes
+/// under `$HOME/.config/systemd/user` and the timer `systemctl --user
+/// is-active` must report active.
+struct TimerUnits {
+    /// Label used in every message ("auditor", "github-ci poll").
+    label: &'static str,
+    /// Unit files the install writes.
+    units: &'static [&'static str],
+    /// The timer unit `is-active` is asked about.
+    timer: &'static str,
+    /// `list-unit-files` glob covering [`TimerUnits::units`].
+    pattern: &'static str,
+    /// Activation command printed after a problem.
+    fix: &'static str,
+    /// Whether a timer that was never installed is a warning instead of a
+    /// problem: the github-ci poll timer takes a per-workspace `--repo` at
+    /// install time, so never installing it is a legal state.
+    absent_is_warning: bool,
+}
+
+const AUDITOR_TIMER: TimerUnits = TimerUnits {
+    label: "auditor",
+    units: &AUDITOR_UNITS,
+    timer: "quaqua-auditor.timer",
+    pattern: "quaqua-auditor*",
+    fix: AUDITOR_FIX_CMD,
+    absent_is_warning: false,
+};
+
+const GITHUB_CI_POLL_TIMER: TimerUnits = TimerUnits {
+    label: "github-ci poll",
+    units: &GITHUB_CI_POLL_UNITS,
+    timer: "quaqua-github-ci-poll.timer",
+    pattern: "quaqua-github-ci-poll*",
+    fix: GITHUB_CI_POLL_FIX_CMD,
+    absent_is_warning: true,
+};
+
 pub trait SystemdRunner {
     fn list_unit_files(&self, pattern: &str) -> Result<String, String>;
     fn is_active(&self, unit: &str) -> Result<bool, String>;
@@ -122,66 +166,81 @@ impl SystemdRunner for RealSystemd {
     }
 }
 
-/// Check auditor systemd units ($HOME/.config/systemd/user/quaqua-auditor.{timer,service}).
+/// Check one user timer's systemd units (`$HOME/.config/systemd/user/<unit>`).
 ///
 /// On Linux:
 /// - Fails if unit files are missing
 /// - Fails if unit symlinks are dangling
 /// - Fails if `systemctl --user list-unit-files` reports `bad`
-/// - Fails if `systemctl --user is-active quaqua-auditor.timer` is not active
-/// Each failure records a problem with the fix line:
-/// `bash scripts/auditor/install-auditor.sh && systemctl --user enable --now quaqua-auditor.timer`.
+/// - Fails if `systemctl --user is-active <timer>` is not active
+/// - Warns instead of failing when no unit is installed at all and
+///   [`TimerUnits::absent_is_warning`] is set: such a timer needs a
+///   per-workspace value at install time, so its absence is legal.
+///
+/// Each failure records a problem with the spec's fix line.
 ///
 /// On macOS:
 /// - Reports manual activation required in notes rather than failing.
-pub fn check_auditor_units_with<S: SystemdRunner>(
+fn check_timer_units_with<S: SystemdRunner>(
     home: Option<&Path>,
     is_macos: bool,
+    spec: &TimerUnits,
     runner: &S,
     report: &mut Report,
 ) {
     if is_macos {
         report
             .notes
-            .push("auditor: macOS manual activation required".to_string());
+            .push(format!("{}: macOS manual activation required", spec.label));
         return;
     }
 
     let Some(home_path) = home else {
         report.problems.push(format!(
-            "cannot resolve HOME directory to check auditor systemd units — fix: {AUDITOR_FIX_CMD}"
+            "cannot resolve HOME directory to check {} systemd units — fix: {}",
+            spec.label, spec.fix
         ));
         return;
     };
 
     let user_dir = home_path.join(".config/systemd/user");
-    let mut files_ok = true;
+    let installed = spec
+        .units
+        .iter()
+        .filter(|unit| std::fs::symlink_metadata(user_dir.join(unit)).is_ok())
+        .count();
+    if installed == 0 && spec.absent_is_warning {
+        report.warnings.push(format!(
+            "{} timer is not installed ({} absent from {}) — install with: {}",
+            spec.label,
+            spec.timer,
+            user_dir.display(),
+            spec.fix
+        ));
+        return;
+    }
 
-    for unit in AUDITOR_UNITS {
+    let mut files_ok = true;
+    for unit in spec.units {
         let path = user_dir.join(unit);
         match std::fs::symlink_metadata(&path) {
-            Ok(meta) => {
-                if meta.is_symlink() {
-                    if !path.exists() {
-                        files_ok = false;
-                        report.problems.push(format!(
-                            "auditor systemd unit symlink is dangling: {} — fix: {AUDITOR_FIX_CMD}",
-                            path.display()
-                        ));
-                    }
-                } else if !path.exists() {
-                    files_ok = false;
-                    report.problems.push(format!(
-                        "auditor systemd unit is missing: {} — fix: {AUDITOR_FIX_CMD}",
-                        path.display()
-                    ));
-                }
+            Ok(meta) if meta.is_symlink() && !path.exists() => {
+                files_ok = false;
+                report.problems.push(format!(
+                    "{} systemd unit symlink is dangling: {} — fix: {}",
+                    spec.label,
+                    path.display(),
+                    spec.fix
+                ));
             }
+            Ok(_) => {}
             Err(_) => {
                 files_ok = false;
                 report.problems.push(format!(
-                    "auditor systemd unit is missing: {} — fix: {AUDITOR_FIX_CMD}",
-                    path.display()
+                    "{} systemd unit is missing: {} — fix: {}",
+                    spec.label,
+                    path.display(),
+                    spec.fix
                 ));
             }
         }
@@ -191,7 +250,7 @@ pub fn check_auditor_units_with<S: SystemdRunner>(
         return;
     }
 
-    match runner.list_unit_files("quaqua-auditor*") {
+    match runner.list_unit_files(spec.pattern) {
         Ok(output) => {
             let mut bad_unit = false;
             for line in output.lines() {
@@ -199,10 +258,11 @@ pub fn check_auditor_units_with<S: SystemdRunner>(
                 if parts.len() >= 2 {
                     let unit_name = parts[0];
                     let state = parts[1];
-                    if AUDITOR_UNITS.contains(&unit_name) && state == "bad" {
+                    if spec.units.contains(&unit_name) && state == "bad" {
                         bad_unit = true;
                         report.problems.push(format!(
-                            "auditor systemd unit file is bad: {unit_name} — fix: {AUDITOR_FIX_CMD}"
+                            "{} systemd unit file is bad: {unit_name} — fix: {}",
+                            spec.label, spec.fix
                         ));
                     }
                 }
@@ -213,30 +273,62 @@ pub fn check_auditor_units_with<S: SystemdRunner>(
         }
         Err(e) => {
             report.problems.push(format!(
-                "failed to query systemctl list-unit-files: {e} — fix: {AUDITOR_FIX_CMD}"
+                "failed to query systemctl list-unit-files: {e} — fix: {}",
+                spec.fix
             ));
             return;
         }
     }
 
-    match runner.is_active("quaqua-auditor.timer") {
+    match runner.is_active(spec.timer) {
         Ok(true) => {}
         Ok(false) => {
             report.problems.push(format!(
-                "auditor systemd timer is inactive (quaqua-auditor.timer) — fix: {AUDITOR_FIX_CMD}"
+                "{} systemd timer is inactive ({}) — fix: {}",
+                spec.label, spec.timer, spec.fix
             ));
         }
         Err(e) => {
             report.problems.push(format!(
-                "failed to query systemctl is-active: {e} — fix: {AUDITOR_FIX_CMD}"
+                "failed to query systemctl is-active: {e} — fix: {}",
+                spec.fix
             ));
         }
     }
 }
 
+/// Check the auditor timer
+/// (`$HOME/.config/systemd/user/quaqua-auditor.{timer,service}`).
+pub fn check_auditor_units_with<S: SystemdRunner>(
+    home: Option<&Path>,
+    is_macos: bool,
+    runner: &S,
+    report: &mut Report,
+) {
+    check_timer_units_with(home, is_macos, &AUDITOR_TIMER, runner, report);
+}
+
 pub fn check_auditor_units(home: Option<&Path>, report: &mut Report) {
     let is_macos = cfg!(target_os = "macos");
     check_auditor_units_with(home, is_macos, &RealSystemd, report);
+}
+
+/// Check the github-ci poll timer
+/// (`$HOME/.config/systemd/user/quaqua-github-ci-poll.{timer,service}`).
+/// Never installing it is a warning, not a problem: the unit carries a
+/// per-workspace `--repo`, so the install is a choice.
+pub fn check_github_ci_poll_units_with<S: SystemdRunner>(
+    home: Option<&Path>,
+    is_macos: bool,
+    runner: &S,
+    report: &mut Report,
+) {
+    check_timer_units_with(home, is_macos, &GITHUB_CI_POLL_TIMER, runner, report);
+}
+
+pub fn check_github_ci_poll_units(home: Option<&Path>, report: &mut Report) {
+    let is_macos = cfg!(target_os = "macos");
+    check_github_ci_poll_units_with(home, is_macos, &RealSystemd, report);
 }
 
 /// The real checks: PATH lookup, checkout discovery, and `$SHELL`.
@@ -254,6 +346,7 @@ pub fn diagnose() -> Report {
     );
     let home = std::env::var_os("HOME").map(PathBuf::from);
     check_auditor_units(home.as_deref(), &mut report);
+    check_github_ci_poll_units(home.as_deref(), &mut report);
     report
 }
 
