@@ -11,6 +11,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FOURTEEN_DAYS_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+/// The repo every poll passes to `gh`; the flag, not the cwd, selects it.
+const REPO: &str = "tinhtute/quaqua";
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -123,19 +125,64 @@ fn failing_gh(dir: &Path) -> PathBuf {
     path
 }
 
-fn poll(runs_dir: &Path, bin_dir: &Path, fixture: &Path, argv_file: &Path) -> Output {
+/// Writes an executable `herdr` stub into `dir` and returns its path.
+fn herdr_stub(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("herdr");
+    fs::write(&path, body).expect("write fake herdr");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake herdr");
+    path
+}
+
+/// A `herdr` that reports nothing: `agent get` does not parse, so no nudge.
+fn quiet_herdr(dir: &Path) -> PathBuf {
+    herdr_stub(dir, "#!/bin/sh\nexit 0\n")
+}
+
+/// A `herdr` whose agent is idle and which logs every invocation to `$HERDR_LOG`.
+fn nudging_herdr(dir: &Path) -> PathBuf {
+    herdr_stub(
+        dir,
+        "#!/bin/sh\n\
+         if [ -n \"$HERDR_LOG\" ]; then printf '%s\\n' \"$*\" >> \"$HERDR_LOG\"; fi\n\
+         if [ \"$1 $2\" = \"agent get\" ]; then\n\
+           echo '{\"result\":{\"agent\":{\"agent_status\":\"idle\",\"pane_id\":\"pane-7\"}}}'\n\
+         fi\n\
+         exit 0\n",
+    )
+}
+
+/// One nudge is one `pane send-text` invocation.
+fn nudge_count(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("pane send-text"))
+        .count()
+}
+
+fn poll(
+    runs_dir: &Path,
+    bin_dir: &Path,
+    herdr_bin: &Path,
+    herdr_log: &Path,
+    fixture: &Path,
+    argv_file: &Path,
+) -> Output {
     let path_env = format!(
         "{}:{}",
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
     Command::new(env!("CARGO_BIN_EXE_quaqua"))
-        .args(["source", "github-ci", "poll"])
+        .args(["source", "github-ci", "poll", "--repo", REPO])
         .env("QUAQUA_RUNS_DIR", runs_dir)
         .env("QUAQUA_TEST", "1")
         .env_remove("QUAQUA_HOME")
         .env_remove("QUAQUA_ROOT")
         .env("PATH", path_env)
+        .env("HERDR_BIN_PATH", herdr_bin)
+        .env("HERDR_LOG", herdr_log)
         .env("GH_FIXTURE", fixture)
         .env("GH_ARGV_FILE", argv_file)
         .output()
@@ -164,8 +211,17 @@ fn failed_run_on_known_branch_emits_one_trigger() {
             "url":"https://github.com/tinhtute/quaqua/actions/runs/900","workflowName":"test"}]"#,
     );
     let argv_file = dir.join("argv.txt");
+    let herdr_bin = quiet_herdr(&dir);
+    let herdr_log = dir.join("herdr.log");
 
-    let out = poll(&runs_dir, &bin_dir, &fixture, &argv_file);
+    let out = poll(
+        &runs_dir,
+        &bin_dir,
+        &herdr_bin,
+        &herdr_log,
+        &fixture,
+        &argv_file,
+    );
     assert!(
         out.status.success(),
         "poll must exit 0: {}\n{}",
@@ -200,11 +256,20 @@ fn failed_run_on_known_branch_emits_one_trigger() {
 
     assert_eq!(position(&runs_dir).as_deref(), Some("900"));
 
-    // The gh contract: the run list of the engine repo, 50 entries, these fields.
+    // The gh contract: the named repo, not the cwd, 50 entries, these fields.
     let argv = fs::read_to_string(&argv_file).expect("fake gh recorded argv");
     let args: Vec<&str> = argv.lines().collect();
     assert_eq!(args[0], "run");
     assert_eq!(args[1], "list");
+    let repo_at = args
+        .iter()
+        .position(|a| *a == "--repo")
+        .unwrap_or_else(|| panic!("gh must be told the repo explicitly, argv: {argv}"));
+    assert_eq!(
+        args.get(repo_at + 1).copied(),
+        Some(REPO),
+        "gh must poll the requested repo, argv: {argv}"
+    );
     assert!(args.contains(&"--json"), "argv: {argv}");
     assert!(
         args.contains(&"databaseId,headBranch,conclusion,url,workflowName"),
@@ -239,8 +304,17 @@ fn success_unknown_branch_and_foreign_branch_are_ignored() {
              "url":"https://example.test/904","workflowName":"test"}]"#,
     );
     let argv_file = dir.join("argv.txt");
+    let herdr_bin = quiet_herdr(&dir);
+    let herdr_log = dir.join("herdr.log");
 
-    let out = poll(&runs_dir, &bin_dir, &fixture, &argv_file);
+    let out = poll(
+        &runs_dir,
+        &bin_dir,
+        &herdr_bin,
+        &herdr_log,
+        &fixture,
+        &argv_file,
+    );
     assert!(out.status.success(), "poll must exit 0");
 
     assert!(
@@ -271,9 +345,18 @@ fn repeat_poll_records_each_run_once() {
              "url":"https://example.test/900","workflowName":"test"}]"#,
     );
     let argv_file = dir.join("argv.txt");
+    let herdr_bin = quiet_herdr(&dir);
+    let herdr_log = dir.join("herdr.log");
 
     for attempt in 1..=2 {
-        let out = poll(&runs_dir, &bin_dir, &fixture, &argv_file);
+        let out = poll(
+            &runs_dir,
+            &bin_dir,
+            &herdr_bin,
+            &herdr_log,
+            &fixture,
+            &argv_file,
+        );
         assert!(out.status.success(), "poll #{attempt} must exit 0");
     }
 
@@ -299,8 +382,17 @@ fn failed_gh_leaves_position_unchanged() {
     failing_gh(&bin_dir);
     let fixture = write_fixture(&dir, "[]");
     let argv_file = dir.join("argv.txt");
+    let herdr_bin = quiet_herdr(&dir);
+    let herdr_log = dir.join("herdr.log");
 
-    let out = poll(&runs_dir, &bin_dir, &fixture, &argv_file);
+    let out = poll(
+        &runs_dir,
+        &bin_dir,
+        &herdr_bin,
+        &herdr_log,
+        &fixture,
+        &argv_file,
+    );
     assert!(
         out.status.success(),
         "a failed read is not an error: {}\n{}",
@@ -316,5 +408,116 @@ fn failed_gh_leaves_position_unchanged() {
         position(&runs_dir).as_deref(),
         Some("100"),
         "a failed read must not advance the watermark"
+    );
+}
+
+#[test]
+fn missing_gh_exits_one_with_a_clear_error() {
+    let dir = temp_dir("no-gh");
+    let runs_dir = dir.join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "tieude");
+
+    // A PATH with no `gh` at all: the binary is invoked by absolute path, so
+    // only the source's own lookup is affected.
+    let empty_bin = dir.join("empty-bin");
+    fs::create_dir_all(&empty_bin).unwrap();
+    let herdr_bin = quiet_herdr(&dir);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_quaqua"))
+        .args(["source", "github-ci", "poll", "--repo", REPO])
+        .env("QUAQUA_RUNS_DIR", &runs_dir)
+        .env("QUAQUA_TEST", "1")
+        .env_remove("QUAQUA_HOME")
+        .env_remove("QUAQUA_ROOT")
+        .env("PATH", &empty_bin)
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .expect("spawn quaqua source github-ci poll");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a missing gh is a permanent misconfiguration, not a retryable read"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gh"), "error must name gh: {stderr}");
+    assert!(
+        stderr.contains("PATH"),
+        "error must point at PATH: {stderr}"
+    );
+    assert!(
+        triggers(&runs_dir).is_empty(),
+        "a missing gh must record nothing"
+    );
+    assert_eq!(
+        position(&runs_dir),
+        None,
+        "a missing gh must not write a position"
+    );
+}
+
+#[test]
+fn new_trigger_wakes_each_live_subscriber_once() {
+    let dir = temp_dir("wake");
+    let runs_dir = dir.join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "tieude");
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "reviewer");
+
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fake_gh(&bin_dir);
+    let herdr_bin = nudging_herdr(&dir);
+    let herdr_log = dir.join("herdr.log");
+    let fixture = write_fixture(
+        &dir,
+        r#"[{"databaseId":900,"headBranch":"quaqua/alpha","conclusion":"failure",
+             "url":"https://example.test/900","workflowName":"test"}]"#,
+    );
+    let argv_file = dir.join("argv.txt");
+
+    let out = poll(
+        &runs_dir,
+        &bin_dir,
+        &herdr_bin,
+        &herdr_log,
+        &fixture,
+        &argv_file,
+    );
+    assert!(
+        out.status.success(),
+        "poll must exit 0: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert_eq!(
+        nudge_count(&herdr_log),
+        2,
+        "each live subscriber must be nudged once, log:\n{log}"
+    );
+    assert!(
+        log.lines()
+            .filter(|l| l.starts_with("pane send-text"))
+            .all(|l| l.contains("ci_failed")),
+        "the nudge must name the trigger kind, log:\n{log}"
+    );
+
+    // A duplicate run records nothing, so it wakes nobody.
+    let out = poll(
+        &runs_dir,
+        &bin_dir,
+        &herdr_bin,
+        &herdr_log,
+        &fixture,
+        &argv_file,
+    );
+    assert!(out.status.success(), "repeat poll must exit 0");
+    assert_eq!(
+        nudge_count(&herdr_log),
+        2,
+        "a duplicate run must not nudge again, log:\n{}",
+        fs::read_to_string(&herdr_log).unwrap_or_default()
     );
 }
