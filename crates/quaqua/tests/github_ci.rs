@@ -4,7 +4,8 @@
 //! farm bus afterwards: what the caller observes is the trigger rows, the
 //! `source_state` watermark, and the `gh` invocation itself.
 
-use quaqua::bus::{now_ms, FarmBus};
+use quaqua::bus::{now_ms, FarmBus, NewTrigger};
+use quaqua::herdr::Herdr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -51,17 +52,29 @@ fn seed_position(runs_dir: &Path, value: &str) {
         .expect("seed source_state");
 }
 
-fn position(runs_dir: &Path) -> Option<String> {
+/// One `source_state` row, by key.
+fn state_value(runs_dir: &Path, key: &str) -> Option<String> {
     let bus = open_bus(runs_dir);
     let value = bus
         .conn_for_test()
         .query_row(
-            "SELECT value FROM source_state WHERE source = 'github-ci'",
-            [],
+            "SELECT value FROM source_state WHERE source = ?1",
+            [key],
             |row| row.get(0),
         )
         .ok();
     value
+}
+
+fn position(runs_dir: &Path) -> Option<String> {
+    state_value(runs_dir, "github-ci")
+}
+
+/// Highest trigger id already nudged for `consumer`, as the wake path records it.
+fn wake_watermark(runs_dir: &Path, consumer: &str) -> u64 {
+    state_value(runs_dir, &format!("wake:{consumer}"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// (source, kind, actor, thread_id, summary, ref, dedupe_key) per trigger row.
@@ -152,6 +165,34 @@ fn nudging_herdr(dir: &Path) -> PathBuf {
     )
 }
 
+/// A `herdr` whose `agent get <name>` reports the status stored in
+/// `<status_dir>/<name>` (default `idle`), names that agent's pane `pane-<name>`,
+/// and appends every invocation to `log`.
+///
+/// The status is read on every call, so a test can flip one agent between polls;
+/// the log path is baked in because a test may also drive this stub in-process.
+fn status_herdr(dir: &Path, status_dir: &Path, log: &Path) -> PathBuf {
+    herdr_stub(
+        dir,
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
+             if [ \"$1 $2\" = \"agent get\" ]; then\n\
+             status=$(cat '{status_dir}/'\"$3\" 2>/dev/null || echo idle)\n\
+             printf '{{\"result\":{{\"agent\":{{\"agent_status\":\"%s\",\"pane_id\":\"pane-%s\"}}}}}}\\n' \"$status\" \"$3\"\n\
+             fi\n\
+             exit 0\n",
+            log = log.display(),
+            status_dir = status_dir.display(),
+        ),
+    )
+}
+
+/// Sets the status `status_herdr` reports for `agent`.
+fn set_status(status_dir: &Path, agent: &str, status: &str) {
+    fs::write(status_dir.join(agent), status).expect("write agent status");
+}
+
 /// One nudge is one `pane send-text` invocation.
 fn nudge_count(log: &Path) -> usize {
     fs::read_to_string(log)
@@ -215,12 +256,7 @@ fn failed_run_on_known_branch_emits_one_trigger() {
     let herdr_log = dir.join("herdr.log");
 
     let out = poll(
-        &runs_dir,
-        &bin_dir,
-        &herdr_bin,
-        &herdr_log,
-        &fixture,
-        &argv_file,
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
     );
     assert!(
         out.status.success(),
@@ -308,12 +344,7 @@ fn success_unknown_branch_and_foreign_branch_are_ignored() {
     let herdr_log = dir.join("herdr.log");
 
     let out = poll(
-        &runs_dir,
-        &bin_dir,
-        &herdr_bin,
-        &herdr_log,
-        &fixture,
-        &argv_file,
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
     );
     assert!(out.status.success(), "poll must exit 0");
 
@@ -350,12 +381,7 @@ fn repeat_poll_records_each_run_once() {
 
     for attempt in 1..=2 {
         let out = poll(
-            &runs_dir,
-            &bin_dir,
-            &herdr_bin,
-            &herdr_log,
-            &fixture,
-            &argv_file,
+            &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
         );
         assert!(out.status.success(), "poll #{attempt} must exit 0");
     }
@@ -386,12 +412,7 @@ fn failed_gh_leaves_position_unchanged() {
     let herdr_log = dir.join("herdr.log");
 
     let out = poll(
-        &runs_dir,
-        &bin_dir,
-        &herdr_bin,
-        &herdr_log,
-        &fixture,
-        &argv_file,
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
     );
     assert!(
         out.status.success(),
@@ -478,12 +499,7 @@ fn new_trigger_wakes_each_live_subscriber_once() {
     let argv_file = dir.join("argv.txt");
 
     let out = poll(
-        &runs_dir,
-        &bin_dir,
-        &herdr_bin,
-        &herdr_log,
-        &fixture,
-        &argv_file,
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
     );
     assert!(
         out.status.success(),
@@ -506,12 +522,7 @@ fn new_trigger_wakes_each_live_subscriber_once() {
 
     // A duplicate run records nothing, so it wakes nobody.
     let out = poll(
-        &runs_dir,
-        &bin_dir,
-        &herdr_bin,
-        &herdr_log,
-        &fixture,
-        &argv_file,
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
     );
     assert!(out.status.success(), "repeat poll must exit 0");
     assert_eq!(
@@ -519,5 +530,227 @@ fn new_trigger_wakes_each_live_subscriber_once() {
         2,
         "a duplicate run must not nudge again, log:\n{}",
         fs::read_to_string(&herdr_log).unwrap_or_default()
+    );
+}
+
+/// A duplicate run records nothing, so the poll must not wake anybody — not even a
+/// subscriber the wake watermark does not cover.
+///
+/// The watermark alone would hide a poll that woke on every run: after the first
+/// nudge it sits at the CI trigger's id, so a second wake for the same batch is a
+/// no-op whatever the poll does. The direct trigger below moves it past that id,
+/// and `late` (busy when the CI trigger landed, idle now) is still behind it, so a
+/// poll that woke on a duplicate run would reach `late` and be caught here.
+#[test]
+fn duplicate_poll_wakes_nobody_even_after_the_watermark_moves() {
+    let dir = temp_dir("wake-duplicate");
+    let runs_dir = dir.join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "tieude");
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "late");
+
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fake_gh(&bin_dir);
+    let status_dir = dir.join("status");
+    fs::create_dir_all(&status_dir).unwrap();
+    set_status(&status_dir, "late", "working");
+    let herdr_log = dir.join("herdr.log");
+    let herdr_bin = status_herdr(&dir, &status_dir, &herdr_log);
+    let fixture = write_fixture(
+        &dir,
+        r#"[{"databaseId":900,"headBranch":"quaqua/alpha","conclusion":"failure",
+             "url":"https://example.test/900","workflowName":"test"}]"#,
+    );
+    let argv_file = dir.join("argv.txt");
+
+    let out = poll(
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
+    );
+    assert!(
+        out.status.success(),
+        "poll must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        nudge_count(&herdr_log),
+        1,
+        "only the idle subscriber is nudged, log:\n{}",
+        fs::read_to_string(&herdr_log).unwrap_or_default()
+    );
+    let after_first = wake_watermark(&runs_dir, "tieude");
+    assert!(
+        after_first > 0,
+        "the first nudge must claim the wake watermark"
+    );
+
+    // An unrelated direct trigger for the same consumer, announced like any other
+    // wake: it moves the watermark past the CI trigger.
+    let bus = open_bus(&runs_dir);
+    bus.record_trigger(
+        &NewTrigger::new("mail", "handoff", "cos", "agent:tieude", "direct handoff")
+            .with_to_name("tieude"),
+    )
+    .expect("record direct trigger");
+    let woke = quaqua::bus::events::wake_idle_consumer(
+        &bus,
+        "tieude",
+        &Herdr {
+            bin: herdr_bin.display().to_string(),
+        },
+    )
+    .expect("wake the direct trigger");
+    assert!(woke, "the direct trigger must nudge the idle consumer");
+    assert_eq!(
+        nudge_count(&herdr_log),
+        2,
+        "the direct trigger is a new batch, log:\n{}",
+        fs::read_to_string(&herdr_log).unwrap_or_default()
+    );
+    assert!(
+        wake_watermark(&runs_dir, "tieude") > after_first,
+        "the direct trigger must move the watermark"
+    );
+    drop(bus);
+
+    // `late` is idle now: if the duplicate poll woke anyone, this is who it reaches.
+    set_status(&status_dir, "late", "idle");
+    let out = poll(
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
+    );
+    assert!(out.status.success(), "repeat poll must exit 0");
+    let log = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert_eq!(
+        nudge_count(&herdr_log),
+        2,
+        "a duplicate run records nothing, so it wakes nobody, log:\n{log}"
+    );
+    assert!(
+        !log.contains("pane send-text pane-late"),
+        "the duplicate poll must not reach the subscriber the watermark misses, log:\n{log}"
+    );
+    assert_eq!(
+        triggers(&runs_dir).len(),
+        1,
+        "the duplicate run must not record a second trigger"
+    );
+}
+
+/// The CI path routes through `wake_idle_consumer`, so it inherits both of its
+/// guards: the CoS pane is never nudged, and an agent that is not idle/done is not
+/// nudged whatever the trigger says.
+#[test]
+fn ci_poll_never_nudges_cos_or_a_busy_subscriber() {
+    let dir = temp_dir("wake-guards");
+    let runs_dir = dir.join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "cos");
+    seed_thread(&runs_dir, "quaqua/alpha", "tieude", "busy");
+
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fake_gh(&bin_dir);
+    let status_dir = dir.join("status");
+    fs::create_dir_all(&status_dir).unwrap();
+    // `cos` would be nudged if only its live status decided, `busy` if only the
+    // consumer name did: each guard has to hold on its own.
+    set_status(&status_dir, "cos", "idle");
+    set_status(&status_dir, "busy", "working");
+    let herdr_log = dir.join("herdr.log");
+    let herdr_bin = status_herdr(&dir, &status_dir, &herdr_log);
+    let fixture = write_fixture(
+        &dir,
+        r#"[{"databaseId":900,"headBranch":"quaqua/alpha","conclusion":"failure",
+             "url":"https://example.test/900","workflowName":"test"}]"#,
+    );
+    let argv_file = dir.join("argv.txt");
+
+    let out = poll(
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
+    );
+    assert!(
+        out.status.success(),
+        "poll must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        triggers(&runs_dir).len(),
+        1,
+        "the failure must be recorded, so a wake was attempted"
+    );
+
+    let log = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert_eq!(
+        nudge_count(&herdr_log),
+        0,
+        "neither the CoS pane nor a working agent may be nudged, log:\n{log}"
+    );
+    assert!(
+        log.contains("agent get busy"),
+        "the CI path must consult the busy subscriber's live status, log:\n{log}"
+    );
+}
+
+/// An expired lease is skipped: a new CI trigger on that thread must not wake the
+/// consumer, even though the consumer has unread work that a nudge would carry.
+#[test]
+fn ci_poll_skips_an_expired_subscription() {
+    let dir = temp_dir("wake-expired");
+    let runs_dir = dir.join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+    let expired_at = now_ms() - 60_000;
+    {
+        let bus = open_bus(&runs_dir);
+        bus.open_thread_and_subscribe("quaqua/alpha", "tieude", "stale", expired_at)
+            .expect("seed expired subscription");
+        // Unread work the consumer already has: a nudge is possible, so the expired
+        // lease on this thread is the only reason it stays silent.
+        bus.record_trigger(
+            &NewTrigger::new("mail", "handoff", "cos", "agent:stale", "direct handoff")
+                .with_to_name("stale"),
+        )
+        .expect("record direct trigger");
+    }
+
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fake_gh(&bin_dir);
+    let status_dir = dir.join("status");
+    fs::create_dir_all(&status_dir).unwrap();
+    let herdr_log = dir.join("herdr.log");
+    let herdr_bin = status_herdr(&dir, &status_dir, &herdr_log);
+    let fixture = write_fixture(
+        &dir,
+        r#"[{"databaseId":900,"headBranch":"quaqua/alpha","conclusion":"failure",
+             "url":"https://example.test/900","workflowName":"test"}]"#,
+    );
+    let argv_file = dir.join("argv.txt");
+
+    let out = poll(
+        &runs_dir, &bin_dir, &herdr_bin, &herdr_log, &fixture, &argv_file,
+    );
+    assert!(
+        out.status.success(),
+        "poll must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        triggers(&runs_dir).len(),
+        1,
+        "the CI failure is recorded for the thread regardless of the lease"
+    );
+    assert_eq!(
+        nudge_count(&herdr_log),
+        0,
+        "an expired subscription must not be woken, log:\n{}",
+        fs::read_to_string(&herdr_log).unwrap_or_default()
+    );
+
+    let bus = open_bus(&runs_dir);
+    assert_eq!(
+        bus.get_subscriptions("quaqua/alpha")
+            .expect("subscriptions"),
+        vec![("stale".to_string(), expired_at)],
+        "a new trigger must not revive an expired lease"
     );
 }
