@@ -6,7 +6,8 @@
 //! A scheme ref (`mail:`, `project:`, `http(s)://`) is printed as written and never
 //! looked up; a path that resolves outside the workspace is reported and never read.
 //! No external link is followed, and recall never writes: a repeated call returns
-//! the same answer and leaves every cursor untouched.
+//! the same answer and leaves every cursor untouched. A database shared with other
+//! farms answers from the caller's farm only, and it is opened read-only.
 
 use super::events::TriggerRecord;
 use super::FarmBus;
@@ -133,13 +134,18 @@ fn row_to_trigger(row: &rusqlite::Row<'_>) -> rusqlite::Result<TriggerRecord> {
 
 const TRIGGER_COLUMNS: &str = "id, ts_ms, source, kind, actor, to_name, thread_id, summary, ref, payload_json, dedupe_key, farm";
 
+/// A shared database holds every farm's rows; recall answers from the caller's
+/// farm only. A row written before the farm column existed is unattributed and
+/// belongs to the local farm, as every other bus reader treats it.
+const FARM_SCOPE: &str = "(farm = ?2 OR farm IS NULL)";
+
 fn load_trigger(bus: &FarmBus, id: u64) -> rusqlite::Result<Option<TriggerRecord>> {
     let conn = bus.conn_for_test();
     crate::engine::sqlite::retry_while_busy(|| {
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE id = ?1"
+            "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE id = ?1 AND {FARM_SCOPE}"
         ))?;
-        let mut rows = stmt.query(rusqlite::params![id as i64])?;
+        let mut rows = stmt.query(rusqlite::params![id as i64, bus.farm()])?;
         match rows.next()? {
             Some(row) => Ok(Some(row_to_trigger(row)?)),
             None => Ok(None),
@@ -170,9 +176,9 @@ fn load_recent(bus: &FarmBus, thread_id: &str) -> rusqlite::Result<Vec<TriggerRe
     let conn = bus.conn_for_test();
     crate::engine::sqlite::retry_while_busy(|| {
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE thread_id = ?1 ORDER BY id DESC LIMIT {RECENT_LIMIT}"
+            "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE thread_id = ?1 AND {FARM_SCOPE} ORDER BY id DESC LIMIT {RECENT_LIMIT}"
         ))?;
-        let rows = stmt.query_map(rusqlite::params![thread_id], row_to_trigger)?;
+        let rows = stmt.query_map(rusqlite::params![thread_id, bus.farm()], row_to_trigger)?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);
@@ -443,12 +449,13 @@ pub fn render_text(recall: &Recall) -> String {
 /// Runs `quaqua recall <id>` against the workspace bus.
 ///
 /// Exit codes: `0` printed, `1` no trigger with that id. Bus errors are returned
-/// as `Err` so the CLI can map a legacy database to exit 2.
+/// as `Err` so the CLI can map a legacy database to exit 2. The bus is opened
+/// read-only: recall never creates, migrates or writes the database.
 pub fn run_recall(id: u64, json: bool) -> Result<i32, String> {
     let runs_dir = crate::worker::cleanup::default_runs_dir();
     let workspace_root = runs_dir.parent().unwrap_or(&runs_dir).to_path_buf();
     let db_path = runs_dir.join("quaqua.db");
-    let bus = FarmBus::open(&db_path)
+    let bus = FarmBus::open_read_only(&db_path)
         .map_err(|e| format!("cannot open bus at {}: {e}", db_path.display()))?;
 
     let Some(recall) = load_recall(&bus, id, &workspace_root)? else {
