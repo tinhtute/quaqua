@@ -540,6 +540,12 @@ fn test_r6_duplicate_trigger_does_not_extend_subscription() {
 
 #[test]
 fn test_r6_delivery_skips_expired_subscriptions() {
+    // `now_ms()` reads the process-global `PROMPT_WORKER_CLOCK_FILE`, and
+    // `test_r6_clock_injected_expiry_boundary` sets it. Hold the env lock so the
+    // clock cannot move between the `now` read below and the delivery reads: a
+    // fake clock that jumps backwards makes the expired subscription look active.
+    let _clock = EnvGuard::new(&["PROMPT_WORKER_CLOCK_FILE"]);
+
     let tmp = hermetic_temp_dir("delivery-expiry");
     let db_path = tmp.join("quaqua.db");
     let bus = open_bus(&db_path).expect("open fresh bus");
