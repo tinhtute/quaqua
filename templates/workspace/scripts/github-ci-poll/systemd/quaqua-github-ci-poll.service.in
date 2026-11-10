@@ -1,0 +1,6 @@
+[Unit]
+Description=quaqua GitHub CI source: record ci_failed triggers (quaqua source github-ci poll)
+
+[Service]
+Type=oneshot
+ExecStart=@QUAQUA@ source github-ci poll --repo @REPO@

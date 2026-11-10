@@ -52,6 +52,8 @@ Rules:
 | `templates/workspace/.claude/skills/herdr-orchestration/` | Worker flow + consolidated command, recovery, and assignment/acceptance references |
 | `quaqua auditor run` | Auditor: read-only drift + pipeline-run audit → `reports/audit-*.md` |
 | `templates/workspace/scripts/auditor/install-auditor.sh`, `templates/workspace/scripts/auditor/systemd/`, `templates/workspace/scripts/auditor/launchd/` | Auditor scheduling: systemd user units (Linux) or a rendered LaunchAgent plist (macOS), 2×/day |
+| `quaqua source github-ci poll --repo <owner/name>` | GitHub CI source: one `ci_failed` trigger per failed run on a `quaqua/*` branch that has a thread; deduped by run id, read position persisted |
+| `templates/workspace/scripts/github-ci-poll/install-github-ci-poll.sh`, `templates/workspace/scripts/github-ci-poll/systemd/`, `templates/workspace/scripts/github-ci-poll/launchd/` | GitHub CI poll scheduling: systemd user unit+timer (Linux) or a rendered LaunchAgent plist (macOS), every 5 minutes |
 | `quaqua init`, `templates/workspace/`, `templates/seed/` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
 | `tests/` | Sandboxed test suite: `tests/run.sh` runs every `tests/test_*.sh` (the 2 slow suites only when the change touches a script they cover, or with `--slow`) and exits non-zero on any failure |
 | `templates/seed/USER.example.md` | Template for the per-workspace `USER.md` |
@@ -145,6 +147,32 @@ in this checkout's `reports/`. It never calls launchctl; run the printed bootstr
 command yourself. Reinstall after moving the checkout or changing toolchain paths.
 Calendar intervals run at 07:00/19:00; unlike systemd's `Persistent=true`, launchd does
 not replay missed runs while logged out (sleep wakeups may coalesce missed intervals).
+
+### GitHub CI poll timer
+
+`quaqua source github-ci poll --repo <owner/name>` records a `ci_failed` trigger for
+each failed run on a `quaqua/*` branch that already has a thread. Schedule it with:
+
+```bash
+bash templates/workspace/scripts/github-ci-poll/install-github-ci-poll.sh [--repo <owner/name>]
+```
+
+`--repo` defaults to the `origin` remote of the checkout the script lives in, so a
+clone of any fork polls its own repository. `gh` and `quaqua` must be on PATH.
+
+Linux: renders `~/.config/systemd/user/quaqua-github-ci-poll.service`, symlinks the
+timer beside it, and calls only `systemctl --user daemon-reload`. Activate with
+`systemctl --user enable --now quaqua-github-ci-poll.timer`; `OnCalendar=*:0/5` with
+`Persistent=true` runs it every 5 minutes and replays a missed run.
+
+macOS: renders `~/Library/LaunchAgents/com.quaqua.github-ci-poll.plist` with
+`StartInterval` 300, the resolved `quaqua` path and the install-time PATH (launchd
+does not source shell profiles, so `gh` must be on that PATH). Logs go to
+`~/Library/Logs/quaqua-github-ci-poll.log`. It never calls launchctl; run the printed
+`launchctl bootstrap` command yourself.
+
+`--dry-run` prints the rendered unit and writes nothing, which is the safe way to
+inspect the result on a machine where the timer should not be installed.
 
 Tests live in `tests/` and require Bash >= 4.4 (macOS system Bash 3.2 is insufficient),
 git, jq, Perl, python3 (for plist validation), and ripgrep. They use temporary homes and

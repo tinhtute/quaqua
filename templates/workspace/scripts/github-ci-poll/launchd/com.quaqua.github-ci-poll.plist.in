@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: install-github-ci-poll.sh resolves paths and the repo; never bootstrap this file directly. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quaqua.github-ci-poll</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@QUAQUA@</string>
+    <string>source</string>
+    <string>github-ci</string>
+    <string>poll</string>
+    <string>--repo</string>
+    <string>@REPO@</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/quaqua-github-ci-poll.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/quaqua-github-ci-poll.log</string>
+</dict>
+</plist>
