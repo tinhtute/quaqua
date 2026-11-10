@@ -166,6 +166,14 @@ enum Command {
         #[command(subcommand)]
         cmd: BusCmd,
     },
+    /// Recall one trigger with its thread and ref.
+    Recall {
+        /// Trigger id shown by `quaqua mail inbox`.
+        id: u64,
+        /// Print the recall as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1074,6 +1082,17 @@ fn main() {
                     1
                 }
             },
+        },
+        Some(Command::Recall { id, json }) => match quaqua::bus::recall::run_recall(id, json) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
+                    2
+                } else {
+                    1
+                }
+            }
         },
         None => 0,
     };

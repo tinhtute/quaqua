@@ -6,6 +6,7 @@
 pub mod events;
 pub mod mail;
 pub mod migrate;
+pub mod recall;
 pub use events::InboxDigest;
 pub const LEGACY_DB_ERROR_MSG: &str = "legacy database detected; run quaqua bus migrate";
 
