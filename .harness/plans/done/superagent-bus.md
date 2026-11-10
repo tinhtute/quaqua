@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 lane: high-risk
 ---
 # Superagent bus: Source → Trigger → Thread → Subscription
@@ -79,7 +79,7 @@ lane: high-risk
   - review: done — `suhuynh` r3 `PASS+NOTES` (`raw/2026-11-03-superagent-pr210r3-review.md`; minor findings carried to open_items); PR #210 merged → main `8f698f6`; binary installed from it before T4 (that order is what made T4 safe)
   - phase check: `cargo test --locked && cargo clippy --locked -p quaqua` (the hermetic guard runs in CI)
 - phase_slug: `channel`
-  status: planned
+  status: done (main `dabc11b` PR #228/#229; minors `b0b630e` PR #230)
   - goal: R2, R4 | depends_on: model
   - surfaces: `bus/mail.rs`, `bus/events.rs` (InboxDigest → renderer), `doctor.rs` (inbox.md drift checks), `auditor.rs` (#199 precheck), `main.rs` (drop `mail ack`), `templates/workspace/{AGENTS.md,rules/_all/lead-inbox.md,scripts/hooks/cos-inbox.sh}` | avoided: herdr hook wake logic, watchdog
   - escalate_when: `suhuynh`'s review finds a channel still reading inbox.md; the `rg` gate still hits ack outside the excluded files
@@ -92,7 +92,7 @@ lane: high-risk
   - review: `suhuynh` diff review → Lead accepts into integ → anh iu approves the integ→main PR → install binary (the install is T3's prerequisite)
   - phase check: `cargo test --locked && cargo clippy --locked -p quaqua`
 - phase_slug: `wake`
-  status: planned
+  status: done (main `dabc11b` PR #228/#229; minors `b0b630e` PR #230)
   - goal: R3, R8; needs pre·0b (#163 — without the caller identity, a nudge after a herdr restart names the wrong consumer) | depends_on: channel, pre
   - surfaces: `bus/events.rs` (`handle_event_hook`), `bus/mail.rs` (post-send wake call), `worker/prompt/mod.rs` (watchdog stall branch, `stall: no worktree diff or session write for {quiet}s`, line 1358 at `da7a053`) | avoided: `recall`, CI source
   - escalate_when: herdr hook does not deliver `pane.agent_status_changed` for idle transitions of a non-Claude kind
@@ -102,7 +102,7 @@ lane: high-risk
   - review: `suhuynh` diff review → Lead accepts into integ → anh iu approves the integ→main PR → install binary
   - phase check: `cargo test --locked`
 - phase_slug: `recall`
-  status: planned
+  status: done (main `dabc11b` PR #228/#229; minors `b0b630e` PR #230)
   - goal: R5 | depends_on: channel
   - surfaces: new `bus/recall.rs`, `main.rs` (subcommand) | avoided: `bus/events.rs`, `worker/`
   - escalate_when: anh iu has not confirmed the `quaqua recall` seam
@@ -111,7 +111,7 @@ lane: high-risk
   - review: `suhuynh` diff review → Lead accepts into integ → anh iu approves the integ→main PR → install binary
   - phase check: `cargo test --locked`
 - phase_slug: `ci-source`
-  status: planned
+  status: done (main `dabc11b` PR #228/#229; minors `b0b630e` PR #230)
   - goal: R7, R6 (expiry and extension) | depends_on: wake, recall
   - surfaces: new `source/github_ci.rs`, `main.rs`, `templates/workspace/` user timer units (systemd `.service`/`.timer` on Linux, launchd agent on macOS), `bus/mod.rs` (subscription expiry query) | avoided: `gate/policy.rs`
   - escalate_when: anh iu has not confirmed the `quaqua source github-ci poll` seam or timer cadence
@@ -134,10 +134,14 @@ lane: high-risk
 - 2026-11-09 — channel — done: P2 T1+T2 merged via PR #225 (`0c81ce0`); r3 minors fixed via PR #226 (`984ed73`): legacy `msg_key`→`dedupe_key` and `project` kept in `ref`, cursor and ack ids share `last_insert_rowid`, legacy `reply_to` remapped to new trigger ids, dry-run ids start at `sqlite_sequence`; follow/digest disagreement already gone since `deliver_page` unification, now locked by a test; workspace 1067 pass; live DB needed no repair (backup had 0 `reply_to` mail); binary installed from `984ed73`
 
 ## Validation
+- 2026-11-10 CoS: code requirements R0–R8 on main `b0b630e`, main CI green; binary 2.6.0 installed from it.
+- (b) holds: no `runs/*.inbox.md`; `.tables` has no `farm_events`/`mail`. R2 `rg` gate: only legacy-schema fixtures in `tests/bus_migrate.rs`.
+- (a) and (c) not observed live: no Lead run since P5; the github-ci poll timer was removed by anh iu's choice, so the poll runs by hand.
+- Residual minor (not blocking): `threads` has no farm column.
 
 ## Current State and Next Action
-- active_phase: channel (P2) — T1+T2 on main via #225 (`b91eecc`), r3 follow-ups via #226 (`984ed73`); only T3 left
-- lifecycle_status: in_progress
+- active_phase: none
+- lifecycle_status: done (closed 2026-11-10 by CoS, anh iu approved)
 - blockers: none
-- open_items: anh iu confirms new seams `quaqua recall` (before P4) and `quaqua source github-ci poll` + timer cadence default 5 min (before P5); approval for P2 T3 trash of the 9 legacy `runs/*.inbox.md`
-- exact_next_action: P2 T3 (owner: CoS, needs anh iu approval): `quaqua init --update`, match each `runs/*-lead.inbox.md` entry to a trigger, `trash` the files; then P3 wake + watchdog
+- open_items: live signals (a)/(c) unobserved; threads farm column
+- exact_next_action: none
