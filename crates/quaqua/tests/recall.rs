@@ -471,6 +471,77 @@ fn recall_is_read_only_and_repeatable() {
     assert_eq!(bus.get_cursor("lead").unwrap(), None);
 }
 
+/// A shared database holds rows of several farms; recall must answer from the
+/// caller's farm only, both for the trigger and for its thread's recent list.
+#[test]
+fn recall_ignores_triggers_recorded_by_another_farm() {
+    let fx = Fixture::new("cross-farm");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/shared", "lead").expect("open thread");
+
+    let mine = record(&bus, trigger("handoff", "quaqua/shared", "this farm"));
+    let theirs = record(
+        &bus,
+        trigger("handoff", "quaqua/shared", "another farm").with_farm("other-farm"),
+    );
+
+    assert!(
+        load_recall(&bus, theirs, &fx.root).unwrap().is_none(),
+        "a trigger recorded by another farm is not recalled"
+    );
+
+    let recall = load_recall(&bus, mine, &fx.root).unwrap().unwrap();
+    let recent: Vec<u64> = recall.thread.recent.iter().map(|t| t.id).collect();
+    assert_eq!(recent, vec![mine], "the thread's recent list is farm-scoped");
+}
+
+/// `quaqua recall` must work on a database it cannot write: the file is
+/// read-only and a live writer holds the WAL, so a read-write open, a
+/// journal-mode switch or a schema migration would fail or rewrite the file.
+#[test]
+fn recall_reads_a_read_only_database_without_writing_it() {
+    let fx = Fixture::new("ro-cli");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/x", "lead").expect("open thread");
+    let id = record(&bus, trigger("handoff", "quaqua/x", "read only"));
+
+    let db = fx.runs().join("quaqua.db");
+    let mut perms = std::fs::metadata(&db).expect("stat db").permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&db, perms).expect("make db read-only");
+
+    let before = std::fs::read(&db).expect("read db bytes");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"))
+        .arg("recall")
+        .arg(id.to_string())
+        .env("QUAQUA_RUNS_DIR", fx.runs())
+        .output()
+        .expect("run quaqua recall");
+
+    // Restore before asserting, so a failed assertion still leaves a deletable fixture.
+    let mut perms = std::fs::metadata(&db).expect("stat db").permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&db, perms).expect("restore db permissions");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "recall on a read-only database must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("read only"),
+        "recall printed the trigger: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read db bytes"),
+        before,
+        "recall leaves the database byte-identical"
+    );
+    drop(bus);
+}
+
 #[test]
 fn extract_commit_reads_snapshot_then_verified_lines() {
     assert_eq!(

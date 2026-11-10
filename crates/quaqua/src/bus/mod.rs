@@ -15,6 +15,10 @@ pub fn is_legacy_db_error(err: &rusqlite::Error) -> bool {
     err.to_string().contains(LEGACY_DB_ERROR_MSG)
 }
 
+fn legacy_db_error() -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(LEGACY_DB_ERROR_MSG)))
+}
+
 /// Opens or creates the bus at `path`, initializing schema idempotently.
 /// Refuses a legacy database without dropping anything (returning an error).
 pub fn open_bus(path: &Path) -> rusqlite::Result<FarmBus> {
@@ -205,9 +209,7 @@ impl FarmBus {
         if path.exists() {
             let is_legacy = crate::bus::migrate::is_legacy_db_probe(path).unwrap_or(false);
             if is_legacy {
-                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    std::io::Error::other(LEGACY_DB_ERROR_MSG),
-                )));
+                return Err(legacy_db_error());
             }
         }
 
@@ -216,9 +218,7 @@ impl FarmBus {
             crate::bus::migrate::is_legacy_db_conn(&conn)
         })?;
         if has_legacy {
-            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::other(LEGACY_DB_ERROR_MSG),
-            )));
+            return Err(legacy_db_error());
         }
 
         crate::engine::sqlite::retry_while_busy(|| {
@@ -275,6 +275,63 @@ impl FarmBus {
 
         let events_watermark: u64 = crate::bus::migrate::legacy_events_watermark(&conn);
 
+        let mail_watermark: u64 = conn
+            .query_row(
+                "SELECT watermark FROM bus_migration WHERE name = 'mail_id'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: path.to_path_buf(),
+            farm: local_farm,
+            events_watermark,
+            mail_watermark,
+        })
+    }
+
+    /// Opens the existing bus at `path` read-only: no directory creation, no
+    /// journal-mode switch, no schema initialization and no migration. A missing
+    /// database is an error rather than an empty bus, and a legacy database is
+    /// refused exactly like [`FarmBus::open`] refuses it.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Self> {
+        if crate::workspace::live_db_open_refused(path) {
+            return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+        }
+        if !path.exists() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no bus database at {}", path.display()),
+                ),
+            )));
+        }
+        let runs_dir = path.parent().unwrap_or(path);
+        let local_farm = crate::workspace::farm_of_runs_dir(runs_dir);
+
+        // No journal-mode pragma runs here, so the legacy probe (which exists to
+        // avoid touching header bytes before the check) is unnecessary: the
+        // read-only connection itself answers the same question.
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(
+            None,
+            "busy_timeout",
+            crate::engine::sqlite::busy_timeout_ms(),
+        )?;
+
+        let has_legacy: bool = crate::engine::sqlite::retry_while_busy(|| {
+            crate::bus::migrate::is_legacy_db_conn(&conn)
+        })?;
+        if has_legacy {
+            return Err(legacy_db_error());
+        }
+
+        let events_watermark: u64 = crate::bus::migrate::legacy_events_watermark(&conn);
         let mail_watermark: u64 = conn
             .query_row(
                 "SELECT watermark FROM bus_migration WHERE name = 'mail_id'",
