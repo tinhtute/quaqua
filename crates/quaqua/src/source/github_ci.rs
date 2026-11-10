@@ -1,10 +1,14 @@
-//! GitHub CI source: `quaqua source github-ci poll` (spec §9, R7).
+//! GitHub CI source: `quaqua source github-ci poll --repo <owner/name>` (spec §9, R7).
 //!
-//! One poll reads the engine repo's most recent runs with
-//! `gh run list --json databaseId,headBranch,conclusion,url,workflowName --limit 50`
+//! One poll reads the named repo's most recent runs with
+//! `gh run list --repo <owner/name> --json databaseId,headBranch,conclusion,url,workflowName --limit 50`
 //! and records one `ci_failed` trigger for each run that failed on a `quaqua/*`
 //! branch whose thread already exists. Everything else is dropped here, at the
 //! fast path, before any write.
+//!
+//! The repo is an explicit argument, never the caller's cwd: a timer started from
+//! `$HOME` must poll the repo it was configured for, and a poll started inside
+//! another checkout must not silently read that checkout's remote.
 //!
 //! Idempotence: every trigger carries `dedupe_key = "gh-run:<databaseId>"`, so a
 //! repeated poll, a second poll racing the first, or a poll after a crash
@@ -13,10 +17,17 @@
 //! thread appears later is still emitted by a later poll, and a crash between
 //! the trigger write and the watermark write loses nothing.
 //!
-//! A failed read — `gh` missing, non-zero exit, unparsable output — records
-//! nothing, leaves the watermark untouched and exits 0: the next tick retries.
+//! Wake: a newly recorded trigger nudges every live subscriber of its thread
+//! through the same path `send_mail` uses (`wake_idle_consumer`). A duplicate
+//! run records nothing and wakes nobody.
+//!
+//! A transient failed read — non-zero exit, unparsable output — records nothing,
+//! leaves the watermark untouched and exits 0: the next tick retries. A `gh`
+//! that is not on PATH is a permanent misconfiguration, not a network blip, so
+//! it exits 1 with an actionable error instead of polling nothing forever.
 
 use crate::bus::{FarmBus, NewTrigger};
+use crate::herdr::HerdrOps;
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::process::Command;
@@ -46,13 +57,20 @@ struct GhRun {
 /// Polls GitHub CI once. Returns the process exit code.
 ///
 /// Exit codes follow the CLI contract: 0 polled (including a skipped poll after
-/// a failed read), 1 database or write error, 2 legacy database.
-pub fn run_poll(runs_dir: &Path) -> Result<i32, String> {
+/// a transient read failure), 1 database/write error or `gh` not on PATH, 2
+/// legacy database.
+pub fn run_poll<H: HerdrOps>(runs_dir: &Path, repo: &str, herdr: &H) -> Result<i32, String> {
     let db_path = runs_dir.join("quaqua.db");
 
-    let runs = match fetch_runs() {
+    let runs = match fetch_runs(repo) {
         Ok(runs) => runs,
-        Err(e) => {
+        Err(FetchError::GhMissing) => {
+            eprintln!(
+                "error: cannot run gh: `gh` was not found on PATH; install the GitHub CLI or fix PATH"
+            );
+            return Ok(1);
+        }
+        Err(FetchError::Other(e)) => {
             eprintln!("warning: github-ci poll skipped: {e}");
             return Ok(0);
         }
@@ -83,6 +101,7 @@ pub fn run_poll(runs_dir: &Path) -> Result<i32, String> {
 
     let mut recorded = 0usize;
     let mut max_seen = 0u64;
+    let mut wake_threads: Vec<String> = Vec::new();
     for (id, run) in &runs {
         max_seen = max_seen.max(*id);
         if run.conclusion.as_deref() != Some("failure") {
@@ -115,7 +134,16 @@ pub fn run_poll(runs_dir: &Path) -> Result<i32, String> {
             .map_err(|e| format!("cannot record trigger for run {id}: {e}"))?
         {
             recorded += 1;
+            if !wake_threads.iter().any(|t| t == branch) {
+                wake_threads.push(branch.to_string());
+            }
         }
+    }
+
+    // R7: the trigger reaches the owner through the subscription, then a wake.
+    // A duplicate run recorded nothing, so it wakes nobody.
+    for thread_id in &wake_threads {
+        wake_live_subscribers(&bus, thread_id, herdr);
     }
 
     // The 50-run window is the only place a run can be missed: everything older
@@ -137,29 +165,62 @@ pub fn run_poll(runs_dir: &Path) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Reads the recent runs of the engine repo. Any failure is a failed read.
-fn fetch_runs() -> Result<Vec<GhRun>, String> {
+/// Why the run list could not be read.
+enum FetchError {
+    /// `gh` is not on PATH: a permanent misconfiguration, not a network blip.
+    GhMissing,
+    /// Any other read failure: transient, retried by the next tick.
+    Other(String),
+}
+
+/// Reads the recent runs of `repo`. Any failure is a failed read.
+fn fetch_runs(repo: &str) -> Result<Vec<GhRun>, FetchError> {
     let output = Command::new("gh")
         .args([
             "run",
             "list",
+            "--repo",
+            repo,
             "--json",
             RUN_FIELDS,
             "--limit",
             &RUN_LIMIT.to_string(),
         ])
         .output()
-        .map_err(|e| format!("cannot run gh: {e}"))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FetchError::GhMissing
+            } else {
+                FetchError::Other(format!("cannot run gh: {e}"))
+            }
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+        return Err(FetchError::Other(format!(
             "gh run list exited {}: {}",
             output.status,
             stderr.trim()
-        ));
+        )));
     }
     serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("cannot parse gh run list output: {e}"))
+        .map_err(|e| FetchError::Other(format!("cannot parse gh run list output: {e}")))
+}
+
+/// Nudges every live subscriber of `thread_id` through the P3 wake path.
+///
+/// Best-effort, like the wake after `send_mail`: a herdr failure must not turn a
+/// recorded trigger into a failed poll. `wake_idle_consumer` re-checks the
+/// consumer's unread set and status, so an already-announced batch sends nothing.
+fn wake_live_subscribers<H: HerdrOps>(bus: &FarmBus, thread_id: &str, herdr: &H) {
+    let now = crate::bus::now_ms();
+    let Ok(subscriptions) = bus.get_subscriptions(thread_id) else {
+        return;
+    };
+    for (consumer, until_ms) in subscriptions {
+        if until_ms >= now {
+            let _ = crate::bus::events::wake_idle_consumer(bus, &consumer, herdr);
+        }
+    }
 }
 
 fn read_position(conn: &Connection) -> Result<u64, String> {

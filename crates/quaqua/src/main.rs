@@ -184,8 +184,12 @@ enum SourceCmd {
 
 #[derive(Subcommand)]
 enum GithubCiCmd {
-    /// Poll the engine repo once and record new ci_failed triggers.
-    Poll,
+    /// Poll one repo once and record new ci_failed triggers.
+    Poll {
+        /// Repository to poll, as owner/name. Never inferred from the cwd.
+        #[arg(long)]
+        repo: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1097,14 +1101,19 @@ fn main() {
         },
         Some(Command::Source { cmd }) => match cmd {
             SourceCmd::GithubCi { cmd } => match cmd {
-                GithubCiCmd::Poll => match quaqua::source::github_ci::run_poll(&default_runs_dir())
-                {
-                    Ok(code) => code,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        1
+                GithubCiCmd::Poll { repo } => {
+                    match quaqua::source::github_ci::run_poll(
+                        &default_runs_dir(),
+                        &repo,
+                        &Herdr::new(),
+                    ) {
+                        Ok(code) => code,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            1
+                        }
                     }
-                },
+                }
             },
         },
         None => 0,
