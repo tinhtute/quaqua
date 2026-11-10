@@ -236,6 +236,43 @@ fn recall_symlink_escape_ref_is_not_read() {
     assert!(!render_text(&recall).contains("symlink target body"));
 }
 
+/// A missing component followed by `..` gives the lenient resolver a prefix it
+/// cannot canonicalize; the `..` must not be popped lexically, because that hides
+/// the symlink the rest of the path goes through.
+#[cfg(unix)]
+#[test]
+fn recall_symlink_escape_through_missing_component_is_not_read() {
+    let fx = Fixture::new("missing-dotdot-link");
+    let bus = fx.bus();
+    bus.open_thread("quaqua/misslink", "lead").expect("open thread");
+
+    let secret = fx.outside.join("secret.txt");
+    std::fs::write(&secret, "outside secret body\n").expect("write secret");
+    std::os::unix::fs::symlink(&fx.outside, fx.root.join("link")).expect("create symlink");
+
+    for raw in ["nope/../link/secret.txt", "runs/../nope/../link/secret.txt"] {
+        let id = record(
+            &bus,
+            trigger("handoff", "quaqua/misslink", "misslink").with_ref(raw),
+        );
+        let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+        let detail = recall.ref_detail.as_ref().unwrap();
+
+        assert_eq!(
+            detail.kind,
+            RefKind::Outside,
+            "{raw} cannot be proven inside the workspace"
+        );
+        assert!(!detail.exists, "{raw} is not a workspace file");
+        assert!(detail.head.is_empty(), "{raw} is never read");
+        let text = render_text(&recall);
+        assert!(
+            !text.contains("outside secret body"),
+            "{raw} leaked the outside file: {text}"
+        );
+    }
+}
+
 #[test]
 fn recall_scheme_refs_are_printed_verbatim() {
     let fx = Fixture::new("scheme");
