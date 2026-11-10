@@ -3,12 +3,15 @@
 //! Spec §8: print the full trigger (including `payload_json`), the thread's owner,
 //! state and 5 most recent triggers, and the `ref`: a workspace file's path plus its
 //! first 40 lines, and for a `runs/<name>.md` report the commit SHA written in it.
+//! A scheme ref (`mail:`, `project:`, `http(s)://`) is printed as written and never
+//! looked up; a path that resolves outside the workspace is reported and never read.
 //! No external link is followed, and recall never writes: a repeated call returns
 //! the same answer and leaves every cursor untouched.
 
 use super::events::TriggerRecord;
 use super::FarmBus;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Number of most recent thread triggers recalled with the trigger.
@@ -27,11 +30,27 @@ pub struct RecallThread {
     pub recent: Vec<TriggerRecord>,
 }
 
+/// How a ref was interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RefKind {
+    /// A workspace path; `exists`, `head`, `truncated` and `commit` describe it.
+    Path,
+    /// A scheme ref (`mail:`, `project:`, `http(s)://`, `;`-joined list) printed
+    /// as written; no path lookup was made.
+    Scheme,
+    /// A path that resolves outside the workspace; never read.
+    Outside,
+}
+
 /// The trigger's `ref`, resolved inside the workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecallRef {
-    /// Resolved path as displayed.
+    /// Resolved path for a workspace path, or the ref as written for a scheme
+    /// ref or an outside path.
     pub path: String,
+    /// How the ref was interpreted.
+    pub kind: RefKind,
     /// True when the path exists (a file or a directory).
     pub exists: bool,
     /// First [`REF_HEAD_LINES`] lines of a regular file; empty otherwise.
@@ -54,8 +73,10 @@ pub struct Recall {
 /// Loads the trigger `id`, its thread and its ref from `bus`.
 ///
 /// Returns `Ok(None)` when no trigger has that id. Relative refs resolve against
-/// `workspace_root` (the directory holding `runs/`); an absolute ref is used as is.
-/// Read-only: no cursor is read or advanced.
+/// `workspace_root` (the directory holding `runs/`); any ref whose path resolves
+/// outside the canonical workspace root is reported as [`RefKind::Outside`] and
+/// never read. Scheme refs are printed as written. Read-only: no cursor is read
+/// or advanced.
 pub fn load_recall(
     bus: &FarmBus,
     id: u64,
@@ -161,17 +182,50 @@ fn load_recent(bus: &FarmBus, thread_id: &str) -> rusqlite::Result<Vec<TriggerRe
 }
 
 fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
-    let raw = Path::new(ref_val);
-    let resolved: PathBuf = if raw.is_absolute() {
-        raw.to_path_buf()
+    let raw = ref_val.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if is_scheme_ref(raw) {
+        return Some(RecallRef {
+            path: raw.to_string(),
+            kind: RefKind::Scheme,
+            exists: false,
+            head: Vec::new(),
+            truncated: false,
+            commit: None,
+        });
+    }
+
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let raw_path = Path::new(raw);
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
     } else {
-        workspace_root.join(raw)
+        root.join(raw_path)
     };
+    let resolved = canonicalize_lenient(&joined);
+
+    if !resolved.starts_with(&root) {
+        return Some(RecallRef {
+            path: raw.to_string(),
+            kind: RefKind::Outside,
+            exists: false,
+            head: Vec::new(),
+            truncated: false,
+            commit: None,
+        });
+    }
+
     let display = resolved.display().to_string();
 
     if !resolved.exists() {
         return Some(RecallRef {
             path: display,
+            kind: RefKind::Path,
             exists: false,
             head: Vec::new(),
             truncated: false,
@@ -182,6 +236,7 @@ fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
     if !resolved.is_file() {
         return Some(RecallRef {
             path: display,
+            kind: RefKind::Path,
             exists: true,
             head: Vec::new(),
             truncated: false,
@@ -207,11 +262,68 @@ fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
 
     Some(RecallRef {
         path: display,
+        kind: RefKind::Path,
         exists: true,
         head,
         truncated: total_lines > REF_HEAD_LINES,
         commit,
     })
+}
+
+/// Scheme prefixes a ref producer writes instead of a workspace path: `mail send`
+/// writes `mail:<id>` / `project:<p>` joined with `;`, and the GitHub CI source
+/// writes the run URL.
+fn is_scheme_ref(ref_val: &str) -> bool {
+    let s = ref_val.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return true;
+    }
+    s.split(';')
+        .all(|part| part.starts_with("mail:") || part.starts_with("project:"))
+}
+
+/// Resolves `path` as far as the filesystem allows: canonicalizes the longest
+/// existing prefix (following symlinks) and appends the rest, so a missing file
+/// still gets a `..`-free, symlink-resolved answer.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let mut prefix = path.to_path_buf();
+    let mut tail: Vec<OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = prefix.canonicalize() {
+            let mut out = canonical;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (prefix.parent(), prefix.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                prefix = parent.to_path_buf();
+            }
+            _ => return lexical_normalize(path),
+        }
+    }
+}
+
+/// Normalizes `.` and `..` without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// A report is a markdown file directly under a `runs/` directory.
@@ -294,20 +406,22 @@ pub fn render_text(recall: &Recall) -> String {
     if let Some(detail) = &recall.ref_detail {
         out.push('\n');
         out.push_str(&format!("ref {}\n", detail.path));
-        if !detail.exists {
-            out.push_str("  (missing)\n");
-        } else if detail.head.is_empty() {
-            out.push_str("  (not a regular file)\n");
-        } else {
-            if let Some(sha) = &detail.commit {
-                out.push_str(&format!("  commit: {sha}\n"));
-            }
-            out.push_str(&format!("  first {REF_HEAD_LINES} lines:\n"));
-            for line in &detail.head {
-                out.push_str(&format!("    {line}\n"));
-            }
-            if detail.truncated {
-                out.push_str("  … (truncated)\n");
+        match detail.kind {
+            RefKind::Scheme => out.push_str("  (scheme ref, not followed)\n"),
+            RefKind::Outside => out.push_str("  (outside the workspace, not read)\n"),
+            RefKind::Path if !detail.exists => out.push_str("  (missing)\n"),
+            RefKind::Path if detail.head.is_empty() => out.push_str("  (not a regular file)\n"),
+            RefKind::Path => {
+                if let Some(sha) = &detail.commit {
+                    out.push_str(&format!("  commit: {sha}\n"));
+                }
+                out.push_str(&format!("  first {REF_HEAD_LINES} lines:\n"));
+                for line in &detail.head {
+                    out.push_str(&format!("    {line}\n"));
+                }
+                if detail.truncated {
+                    out.push_str("  … (truncated)\n");
+                }
             }
         }
     }

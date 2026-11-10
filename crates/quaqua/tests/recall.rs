@@ -1,6 +1,6 @@
 //! Tests for `quaqua recall <id>`: trigger → thread → ref, at most two hops.
 
-use quaqua::bus::recall::{extract_commit, load_recall, render_text, REF_HEAD_LINES};
+use quaqua::bus::recall::{extract_commit, load_recall, render_text, RefKind, REF_HEAD_LINES};
 use quaqua::bus::{FarmBus, NewTrigger};
 use std::path::PathBuf;
 
@@ -54,6 +54,13 @@ fn record(bus: &FarmBus, trigger: NewTrigger) -> u64 {
 
 fn trigger(kind: &str, thread: &str, summary: &str) -> NewTrigger {
     NewTrigger::new("mail", kind, "suhuynh", thread, summary)
+}
+
+fn canonical(path: &std::path::Path) -> String {
+    path.canonicalize()
+        .expect("canonicalize fixture path")
+        .display()
+        .to_string()
 }
 
 #[test]
@@ -126,7 +133,8 @@ fn recall_ref_prints_path_and_first_forty_lines() {
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().expect("ref resolved");
 
-    assert_eq!(detail.path, notes.display().to_string());
+    assert_eq!(detail.kind, RefKind::Path);
+    assert_eq!(detail.path, canonical(&notes));
     assert!(detail.exists);
     assert_eq!(detail.head.len(), REF_HEAD_LINES);
     assert_eq!(detail.head.first().unwrap(), "Snapshot: 3a3cd55");
@@ -138,7 +146,7 @@ fn recall_ref_prints_path_and_first_forty_lines() {
     );
 
     let text = render_text(&recall);
-    assert!(text.contains(&format!("ref {}", notes.display())));
+    assert!(text.contains(&format!("ref {}", canonical(&notes))));
     assert!(text.contains("Snapshot: 3a3cd55"));
     assert!(text.contains("line 38"));
     assert!(
@@ -163,6 +171,7 @@ fn recall_absolute_ref_outside_workspace_is_not_read() {
 
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Outside);
     assert!(!detail.exists, "an outside ref is reported, not resolved");
     assert!(detail.head.is_empty(), "an outside ref is never read");
     assert_eq!(detail.commit, None);
@@ -194,6 +203,7 @@ fn recall_parent_escape_ref_is_not_read() {
 
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Outside);
     assert!(!detail.exists, "`..` must not escape the workspace");
     assert!(detail.head.is_empty());
     assert!(
@@ -220,6 +230,7 @@ fn recall_symlink_escape_ref_is_not_read() {
 
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Outside);
     assert!(!detail.exists, "a symlink out of the workspace is not followed");
     assert!(detail.head.is_empty());
     assert!(!render_text(&recall).contains("symlink target body"));
@@ -244,6 +255,8 @@ fn recall_scheme_refs_are_printed_verbatim() {
         );
         let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
         let detail = recall.ref_detail.as_ref().unwrap();
+        assert_eq!(detail.kind, RefKind::Scheme);
+        assert_eq!(detail.path, raw, "a scheme ref is printed as written");
         assert!(!detail.exists, "{raw} is not a workspace file");
         assert!(detail.head.is_empty(), "{raw} is never read");
         assert_eq!(detail.commit, None);
@@ -276,6 +289,7 @@ fn recall_path_ref_with_colon_is_not_a_scheme() {
 
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Path);
     assert!(detail.exists);
     assert_eq!(detail.head, vec!["colon path body".to_string()]);
 }
@@ -296,6 +310,7 @@ fn recall_parent_ref_inside_workspace_is_read() {
 
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Path);
     assert!(detail.exists, "`..` that stays inside the workspace is fine");
     assert_eq!(detail.head, vec!["inside body".to_string()]);
 }
@@ -321,6 +336,7 @@ fn recall_report_ref_extracts_commit_sha() {
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
 
+    assert_eq!(detail.kind, RefKind::Path);
     assert!(detail.exists);
     assert_eq!(detail.commit.as_deref(), Some("3a3cd55"));
     assert!(detail.head.contains(&"Outcome: COMPLETE".to_string()));
@@ -354,7 +370,8 @@ fn recall_json_carries_trigger_thread_and_ref() {
     assert_eq!(value["thread"]["owner"], "sude-lead");
     assert_eq!(value["thread"]["state"], "open");
     assert_eq!(value["thread"]["recent"].as_array().unwrap().len(), 1);
-    assert_eq!(value["ref"]["path"], report.display().to_string());
+    assert_eq!(value["ref"]["path"], canonical(&report));
+    assert_eq!(value["ref"]["kind"], "path");
     assert_eq!(value["ref"]["commit"], "3a3cd55");
     assert_eq!(value["ref"]["truncated"], false);
 }
@@ -378,6 +395,7 @@ fn recall_missing_ref_is_reported_without_following_links() {
     );
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Path);
     assert!(!detail.exists);
     assert!(detail.head.is_empty());
     assert_eq!(detail.commit, None);
@@ -388,9 +406,12 @@ fn recall_missing_ref_is_reported_without_following_links() {
         trigger("handoff", "quaqua/x", "url").with_ref("https://example.com/runs/gone.md"),
     );
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
+    let detail = recall.ref_detail.as_ref().unwrap();
+    assert_eq!(detail.kind, RefKind::Scheme);
+    assert!(!detail.exists, "an external link is never fetched");
     assert!(
-        !recall.ref_detail.as_ref().unwrap().exists,
-        "an external link is never fetched"
+        !render_text(&recall).contains("(missing)"),
+        "a URL is not a missing workspace file"
     );
 }
 
