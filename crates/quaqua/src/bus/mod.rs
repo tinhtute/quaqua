@@ -19,12 +19,6 @@ fn legacy_db_error() -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(LEGACY_DB_ERROR_MSG)))
 }
 
-/// Opens an existing bus at `path` read-only, initializing nothing.
-/// A missing database is an error: recall must never create one.
-pub fn open_bus_read_only(path: &Path) -> rusqlite::Result<FarmBus> {
-    FarmBus::open_read_only(path)
-}
-
 /// Opens or creates the bus at `path`, initializing schema idempotently.
 /// Refuses a legacy database without dropping anything (returning an error).
 pub fn open_bus(path: &Path) -> rusqlite::Result<FarmBus> {
