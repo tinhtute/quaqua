@@ -166,6 +166,38 @@ enum Command {
         #[command(subcommand)]
         cmd: BusCmd,
     },
+    /// Event source operations: poll.
+    Source {
+        #[command(subcommand)]
+        cmd: SourceCmd,
+    },
+    /// Recall one trigger with its thread and ref.
+    Recall {
+        /// Trigger id shown by `quaqua mail inbox`.
+        id: u64,
+        /// Print the recall as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCmd {
+    /// GitHub CI source: record a ci_failed trigger per failed run.
+    GithubCi {
+        #[command(subcommand)]
+        cmd: GithubCiCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubCiCmd {
+    /// Poll one repo once and record new ci_failed triggers.
+    Poll {
+        /// Repository to poll, as owner/name. Never inferred from the cwd.
+        #[arg(long)]
+        repo: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1074,6 +1106,34 @@ fn main() {
                     1
                 }
             },
+        },
+        Some(Command::Source { cmd }) => match cmd {
+            SourceCmd::GithubCi { cmd } => match cmd {
+                GithubCiCmd::Poll { repo } => {
+                    match quaqua::source::github_ci::run_poll(
+                        &default_runs_dir(),
+                        &repo,
+                        &Herdr::new(),
+                    ) {
+                        Ok(code) => code,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            1
+                        }
+                    }
+                }
+            },
+        },
+        Some(Command::Recall { id, json }) => match quaqua::bus::recall::run_recall(id, json) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                if e.contains(quaqua::bus::LEGACY_DB_ERROR_MSG) {
+                    2
+                } else {
+                    1
+                }
+            }
         },
         None => 0,
     };

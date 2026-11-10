@@ -51,31 +51,44 @@ impl Fixture {
     }
 
     /// Model the systemd user session a healthy Linux workstation has: the
-    /// auditor units installed under `$HOME/.config/systemd/user` and a
-    /// `systemctl` stub on the fixture PATH that reports them `enabled` and
-    /// the timer `active`. `doctor` checks both (issue #198), and the check is
-    /// hermetic here because the fixture owns `$HOME` and the whole `PATH`.
+    /// auditor and github-ci poll units installed under
+    /// `$HOME/.config/systemd/user` and a `systemctl` stub on the fixture PATH
+    /// that reports them `enabled` and both timers `active`. `doctor` checks
+    /// both (issue #198), and the check is hermetic here because the fixture
+    /// owns `$HOME` and the whole `PATH`.
     fn install_systemd_session(&self) {
         let user_dir = self.home.join(".config/systemd/user");
         fs::create_dir_all(&user_dir).unwrap();
-        for unit in ["quaqua-auditor.service", "quaqua-auditor.timer"] {
-            fs::write(user_dir.join(unit), "[Unit]\nDescription=fixture auditor\n").unwrap();
+        for unit in [
+            "quaqua-auditor.service",
+            "quaqua-auditor.timer",
+            "quaqua-github-ci-poll.service",
+            "quaqua-github-ci-poll.timer",
+        ] {
+            fs::write(user_dir.join(unit), "[Unit]\nDescription=fixture timer\n").unwrap();
         }
         self.install_systemctl("active");
     }
 
-    /// `systemctl --user …` stub: `list-unit-files` reports both auditor units
-    /// enabled, `is-active` reports `timer_state` (and only `active` exits 0,
-    /// like the real one).
+    /// `systemctl --user …` stub: `list-unit-files` reports every fixture unit
+    /// enabled, `is-active` reports `timer_state` for the auditor timer (and
+    /// only `active` exits 0, like the real one). The github-ci poll timer
+    /// stays `active`; [`Fixture::install_systemctl_states`] sets both.
     fn install_systemctl(&self, timer_state: &str) {
+        self.install_systemctl_states(timer_state, "active");
+    }
+
+    /// [`Fixture::install_systemctl`] with a state per timer.
+    fn install_systemctl_states(&self, auditor_state: &str, poll_state: &str) {
         let path = self.bin_dir.join("systemctl");
         fs::write(
             &path,
             format!(
                 "#!/bin/sh\n\
                  case \"$*\" in\n\
-                 *is-active*) printf '%s\\n' '{timer_state}'; [ '{timer_state}' = active ] ;;\n\
-                 *list-unit-files*) printf 'quaqua-auditor.service enabled enabled\\nquaqua-auditor.timer enabled enabled\\n' ;;\n\
+                 *is-active*quaqua-auditor.timer*) printf '%s\\n' '{auditor_state}'; [ '{auditor_state}' = active ] ;;\n\
+                 *is-active*quaqua-github-ci-poll.timer*) printf '%s\\n' '{poll_state}'; [ '{poll_state}' = active ] ;;\n\
+                 *list-unit-files*) printf 'quaqua-auditor.service enabled enabled\\nquaqua-auditor.timer enabled enabled\\nquaqua-github-ci-poll.service enabled enabled\\nquaqua-github-ci-poll.timer enabled enabled\\n' ;;\n\
                  *) exit 1 ;;\n\
                  esac\n"
             ),
@@ -324,6 +337,87 @@ fn an_inactive_auditor_timer_fails_the_run() {
         stderr.contains("auditor systemd timer is inactive"),
         "{stderr}"
     );
+}
+
+/// The github-ci poll timer is checked like the auditor's: installed and
+/// active is the healthy state, so the run stays green and quiet about it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_active_github_ci_poll_timer_is_ok() {
+    let f = Fixture::new("poll-ok", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("github-ci poll"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_inactive_github_ci_poll_timer_fails_the_run() {
+    let f = Fixture::new("poll-inactive", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    f.install_systemctl_states("active", "inactive");
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("github-ci poll systemd timer is inactive (quaqua-github-ci-poll.timer)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("install-github-ci-poll.sh"), "{stderr}");
+}
+
+/// Moving the checkout leaves the timer symlink dangling; that is the failure
+/// the auditor check exists for, so the poll timer must report it too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dangling_github_ci_poll_timer_fails_the_run() {
+    let f = Fixture::new("poll-dangling", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    let timer = f
+        .home
+        .join(".config/systemd/user/quaqua-github-ci-poll.timer");
+    let moved = f.root.join("moved-checkout/quaqua-github-ci-poll.timer");
+    fs::remove_file(&timer).unwrap();
+    std::os::unix::fs::symlink(&moved, &timer).unwrap();
+    assert!(!timer.exists(), "fixture timer symlink must not resolve");
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("github-ci poll systemd unit symlink is dangling"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&timer.display().to_string()), "{stderr}");
+}
+
+/// Installing the poll timer is a choice (it needs a per-workspace `--repo`),
+/// so a workstation that never installed it gets a warning, not a failure.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_never_installed_github_ci_poll_timer_warns_and_still_exits_zero() {
+    let f = Fixture::new("poll-absent", "quaqua is /tmp/bin/quaqua");
+    f.install_binary();
+    let user_dir = f.home.join(".config/systemd/user");
+    fs::remove_file(user_dir.join("quaqua-github-ci-poll.service")).unwrap();
+    fs::remove_file(user_dir.join("quaqua-github-ci-poll.timer")).unwrap();
+
+    let out = f.run(&f.bin_dir);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("warning:"), "{stderr}");
+    assert!(
+        stderr.contains("github-ci poll timer is not installed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("install-github-ci-poll.sh"), "{stderr}");
+    assert!(stderr.contains("--repo"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ok:"), "{stdout}");
 }
 
 /// `QUAQUA_TEST=1` exists so a suite cannot write live workspace state; the
