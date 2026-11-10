@@ -207,30 +207,20 @@ fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
     } else {
         root.join(raw_path)
     };
-    let resolved = canonicalize_lenient(&joined);
 
+    // Only a successful canonicalize proves a path is inside the workspace; a
+    // path with no canonicalizable prefix is reported, never guessed at.
+    let Some(resolved) = canonicalize_lenient(&joined) else {
+        return Some(outside_ref(raw));
+    };
     if !resolved.starts_with(&root) {
-        return Some(RecallRef {
-            path: raw.to_string(),
-            kind: RefKind::Outside,
-            exists: false,
-            head: Vec::new(),
-            truncated: false,
-            commit: None,
-        });
+        return Some(outside_ref(raw));
     }
 
     let display = resolved.display().to_string();
 
     if !resolved.exists() {
-        return Some(RecallRef {
-            path: display,
-            kind: RefKind::Path,
-            exists: false,
-            head: Vec::new(),
-            truncated: false,
-            commit: None,
-        });
+        return Some(missing_ref(display));
     }
 
     if !resolved.is_file() {
@@ -244,8 +234,17 @@ fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
         });
     }
 
+    // Prove the exact path again before reading it: the check above proved the
+    // existing prefix, and a component can be swapped for a symlink in between.
+    let Ok(real) = resolved.canonicalize() else {
+        return Some(missing_ref(display));
+    };
+    if !real.starts_with(&root) {
+        return Some(outside_ref(raw));
+    }
+
     // A ref can point at a binary file; lossy decoding keeps recall readable.
-    let text = std::fs::read(&resolved)
+    let text = std::fs::read(&real)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
     let total_lines = text.lines().count();
@@ -254,7 +253,7 @@ fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
         .take(REF_HEAD_LINES)
         .map(|l| l.to_string())
         .collect();
-    let commit = if is_report(&resolved) {
+    let commit = if is_report(&real) {
         extract_commit(&text)
     } else {
         None
@@ -268,6 +267,30 @@ fn resolve_ref(ref_val: &str, workspace_root: &Path) -> Option<RecallRef> {
         truncated: total_lines > REF_HEAD_LINES,
         commit,
     })
+}
+
+/// A ref that no canonicalize proved inside the workspace: reported, never read.
+fn outside_ref(raw: &str) -> RecallRef {
+    RecallRef {
+        path: raw.to_string(),
+        kind: RefKind::Outside,
+        exists: false,
+        head: Vec::new(),
+        truncated: false,
+        commit: None,
+    }
+}
+
+/// A workspace path that does not exist.
+fn missing_ref(path: String) -> RecallRef {
+    RecallRef {
+        path,
+        kind: RefKind::Path,
+        exists: false,
+        head: Vec::new(),
+        truncated: false,
+        commit: None,
+    }
 }
 
 /// Scheme prefixes a ref producer writes instead of a workspace path: `mail send`
@@ -288,7 +311,12 @@ fn is_scheme_ref(ref_val: &str) -> bool {
 /// Resolves `path` as far as the filesystem allows: canonicalizes the longest
 /// existing prefix (following symlinks) and appends the rest, so a missing file
 /// still gets a `..`-free, symlink-resolved answer.
-fn canonicalize_lenient(path: &Path) -> PathBuf {
+///
+/// Returns `None` when no prefix can be canonicalized. The walk-up stops at a
+/// prefix ending in `..`, where `file_name()` is `None`; popping that `..`
+/// lexically instead would resolve a path the filesystem never did, hiding the
+/// symlink the rest of the path goes through.
+fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     let mut prefix = path.to_path_buf();
     let mut tail: Vec<OsString> = Vec::new();
     loop {
@@ -297,33 +325,16 @@ fn canonicalize_lenient(path: &Path) -> PathBuf {
             for part in tail.iter().rev() {
                 out.push(part);
             }
-            return out;
+            return Some(out);
         }
         match (prefix.parent(), prefix.file_name()) {
             (Some(parent), Some(name)) => {
                 tail.push(name.to_os_string());
                 prefix = parent.to_path_buf();
             }
-            _ => return lexical_normalize(path),
+            _ => return None,
         }
     }
-}
-
-/// Normalizes `.` and `..` without touching the filesystem.
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// A report is a markdown file directly under a `runs/` directory.
