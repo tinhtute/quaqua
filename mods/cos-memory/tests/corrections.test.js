@@ -83,3 +83,50 @@ test('a capture that cannot write still lets the prompt through', async () => {
   assert.equal(out, event)
   assert.equal(made.files[CORRECTIONS], undefined)
 })
+
+test('a correction the engine refuses on a secret is not written', async () => {
+  const made = fakeEngine({
+    scan: {
+      exitCode: 0,
+      stdout: JSON.stringify({ ok: false, reason: 'contains a AWS access key' }),
+      stderr: '',
+    },
+  })
+  const hooks = await wire(made)
+  const event = { text: "đừng dùng rm. Instead add '- key AKIAQQQQQQQQQQQQQQQQ'" }
+
+  const out = await hooks.raise('prompt.submit', made.$, event)
+
+  assert.equal(out, event)
+  assert.equal(made.files[CORRECTIONS], undefined)
+})
+
+test('a long correction lands as the engine bounded it', async () => {
+  const made = fakeEngine({
+    scan: {
+      exitCode: 0,
+      stdout: JSON.stringify({ ok: true, text: 'đừng dùng rm' }),
+      stderr: '',
+    },
+  })
+  const hooks = await wire(made)
+
+  await hooks.raise('prompt.submit', made.$, {
+    text: `đừng dùng rm ${'x'.repeat(5000)}`,
+  })
+
+  assert.match(made.files[CORRECTIONS], /^- \d{4}-\d{2}-\d{2} ws đừng dùng rm\n$/)
+})
+
+test('a screen that cannot run writes nothing and lets the prompt through', async () => {
+  const made = fakeEngine({
+    scan: Object.assign(new Error('spawn quaqua ENOENT'), { code: 'ENOENT' }),
+  })
+  const hooks = await wire(made)
+  const event = { text: 'sai rồi' }
+
+  const out = await hooks.raise('prompt.submit', made.$, event)
+
+  assert.equal(out, event)
+  assert.equal(made.files[CORRECTIONS], undefined)
+})
