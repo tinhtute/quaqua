@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 lane: high-risk
 ---
 # CoS persistent memory and learning loop
@@ -59,7 +59,7 @@ lane: high-risk
   - surfaces: crates/quaqua/src/ (new memory module, init.rs, main.rs CLI), crates/quaqua/tests/ | avoided: gate/, grid/, pipeline/, worker/, merge/
   - phase check: `cargo test -p quaqua memory_check` `cargo test -p quaqua memory_hooks` `cargo test`
 - phase_slug: `transcripts`
-  status: planned
+  status: done (41cf36d · PR #234)
   - goal: R4, R5, R6 | depends_on: none
   - surfaces: new `crates/quaqua/src/transcripts/`, `crates/quaqua/src/main.rs` (one `Transcripts` command block), `crates/quaqua/src/lib.rs` (one `pub mod` line), new `crates/quaqua/tests/transcripts.rs` | avoided: gate/, grid/, pipeline/, worker/, merge/, `memory.rs`, `init.rs`, `templates/`
   - escalate_when: the bundled SQLite has no FTS5 or no trigram tokenizer and the fallback (`unicode61` + `LIKE`) cannot meet R5
@@ -68,7 +68,7 @@ lane: high-risk
   - review: suhuynh diff review → Lead accepts into `quaqua/cosmem-integ` → anh iu approves the integ→main PR → install the binary
   - phase check: `cargo test -p quaqua transcripts`
 - phase_slug: `compact`
-  status: planned
+  status: done (41cf36d · PR #234)
   - goal: R7, R8, R9, R10 | depends_on: transcripts (the script calls `quaqua transcripts tail`; branch from integ after it merges)
   - surfaces: new `templates/workspace/scripts/hooks/memory-compact.sh`, `templates/workspace/.claude/settings.json` (PreCompact + SessionStart entries), `crates/quaqua/src/init.rs` (`install_memory_hooks` gains the two entries), new `crates/quaqua/tests/compact_hook.rs`, new `tests/test_memory_compact.sh` | avoided: gate/, grid/, pipeline/, worker/, merge/, `main.rs`, `lib.rs`, `memory.rs`
   - escalate_when: the PreCompact event JSON carries no `transcript_path` or no `session_id` in the installed Claude Code, or a second SessionStart handler cannot coexist with `herdr-gate.sh --session-start`
@@ -77,7 +77,7 @@ lane: high-risk
   - review: suhuynh diff review → Lead accepts into `quaqua/cosmem-integ` → anh iu approves the integ→main PR → install the binary, then `quaqua init --update` in `~/quaqua`
   - phase check: `cargo test -p quaqua compact_hook` `bash tests/test_memory_compact.sh`
 - phase_slug: `mod`
-  status: planned
+  status: done (41cf36d · PR #234)
   - goal: R11, R12, R13, R14 | depends_on: none (reuses the shipped G5 gate; runs parallel with `transcripts` and `compact`)
   - surfaces: new `mods/` — `mods/.claude-plugin/marketplace.json`, `mods/cos-memory/.claude-plugin/plugin.json`, `mods/cos-memory/hooks/hooks.json`, `mods/cos-memory/src/*.mjs`, `mods/cos-memory/tests/*.test.mjs`, `mods/cos-memory/tests/install_smoke.sh`, `mods/cos-memory/README.md` | avoided: gate/, grid/, pipeline/, worker/, merge/, `crates/`, `templates/`
   - escalate_when: `$.model.fork` or `$.tool.register` is absent from the installed Claude Code, or the plugin API needs a version above 2.1.322
@@ -170,7 +170,7 @@ lane: high-risk
 
 ## Current State and Next Action
 - active_phase: none
-- lifecycle_status: implemented (all phases merged to main; not validated)
+- lifecycle_status: done (closed 2026-11-11 by CoS; all four phases validated on main `004e614`)
 - blockers: none
-- open_items: 3 — (1) independent full validation of phases transcripts/compact/mod (none recorded); (2) R12 review fork never fired live (needs 10 turns / 15 tool calls in a real CoS session); (3) agy reports no usage, so cost caps never fire for kind `sude`
-- exact_next_action: spawn a `suhuynh` worker for `check` full mode on main `004e614` against R4–R14, writing one `## Validation` entry per phase with `judge: independent`; then run handoff step 5–6 to close the plan
+- open_items: none for this plan — R12 partial (unit-tested, never fired in a live CoS session; `$.model.fork` cannot restrict tools) is carried to the next plan (harness MVP), and the agy-no-usage cost-cap gap for kind `sude` belongs to the worker/cost track
+- exact_next_action: none — closed 2026-11-11, plan moved to `.harness/plans/done/`
