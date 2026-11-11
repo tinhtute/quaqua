@@ -274,7 +274,9 @@ pub struct LaunchCmd {
 /// --auto/--continue/--session/--prompt), so its model+effort travel as the
 /// config `model` object `{"providerID": "...", "model": "...", "variant": "..."}`
 /// in OPENCODE_CONFIG_CONTENT in the pane env.
-/// omp and pi take `--model`/`--thinking`, claude takes `--model`/`--effort`.
+/// omp and pi take `--model`/`--thinking`, claude takes `--model`/`--effort`,
+/// agy takes `--model`/`--effort` and reads its rules from an `AGENTS.md` in a
+/// per-name `--add-dir` directory.
 ///
 /// Building a claude command writes `runs/.<name>.settings.json` (the caller
 /// must have created `runs_dir`) and names it on `--settings`, so the launch
@@ -358,6 +360,61 @@ pub fn build_launch_cmd(
                 args.push("read,grep,find,ls,bash".to_string());
             }
             args
+        }
+        "agy" => {
+            // agy reads `AGENTS.md` from the workspace root and from every
+            // `--add-dir` directory, and has no system-prompt flag, so the
+            // worker rules land as a context file in a per-name dir instead of
+            // on the typed launch line (see the claude settings note above).
+            let rules_dir = format!("{runs_dir}/.agy/{name}");
+            std::fs::create_dir_all(&rules_dir).map_err(|e| {
+                (
+                    1,
+                    format!("error: cannot create agy rules dir {rules_dir}: {e}\n"),
+                )
+            })?;
+            let rules_copy = format!("{rules_dir}/AGENTS.md");
+            let rules_body = std::fs::read_to_string(rules_file).map_err(|e| {
+                (
+                    1,
+                    format!("error: cannot read worker rules {rules_file}: {e}\n"),
+                )
+            })?;
+            std::fs::write(&rules_copy, rules_body).map_err(|e| {
+                (
+                    1,
+                    format!("error: cannot write agy rules file {rules_copy}: {e}\n"),
+                )
+            })?;
+            // agy asks "Do you trust the contents of this project?" on the
+            // first run in a directory and records the answer per path, so
+            // every new worktree would stall on the dialog with the brief
+            // typed into it. A session-only `trustedWorkspaces` entry for the
+            // worktree skips it; the file keeps the JSON off the typed launch
+            // line (herdr types the whole command into the pane).
+            let settings_file = format!("{rules_dir}/settings.json");
+            let settings = serde_json::json!({ "trustedWorkspaces": [wt] }).to_string();
+            std::fs::write(&settings_file, settings).map_err(|e| {
+                (
+                    1,
+                    format!("error: cannot write agy settings {settings_file}: {e}\n"),
+                )
+            })?;
+            vec![
+                "--".to_string(),
+                "--model".to_string(),
+                launch.model.clone(),
+                "--effort".to_string(),
+                launch.effort.clone(),
+                "--dangerously-skip-permissions".to_string(),
+                "--settings".to_string(),
+                settings_file,
+                "--add-dir".to_string(),
+                rules_dir,
+                // The report lives outside the worktree; claude gets the same.
+                "--add-dir".to_string(),
+                runs_dir.to_string(),
+            ]
         }
         "claude" => {
             let claude_model = if launch.model.starts_with("claude-") {

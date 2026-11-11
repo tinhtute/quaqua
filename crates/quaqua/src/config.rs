@@ -1171,6 +1171,19 @@ workers_tab = "workers"
     }
 
     #[test]
+    fn agy_kind_validates_by_agy_effort_set() {
+        let mut c = base();
+        let k = c.kinds.get_mut("tieude").unwrap();
+        k.harness = "agy".to_string();
+        k.model = "gemini-3.8-flash".to_string();
+        k.effort = Some("high".to_string());
+        assert!(validate(&c).is_ok());
+        c.kinds.get_mut("tieude").unwrap().effort = Some("off".to_string());
+        let err = validate(&c).unwrap_err();
+        assert!(err.contains("harness 'agy' does not take effort 'off'"), "{err}");
+    }
+
+    #[test]
     fn cap_over_is_rejected() {
         let mut c = base();
         c.limits.max_workers_per_orchestrator = 9;

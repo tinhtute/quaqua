@@ -11,7 +11,7 @@ use serde_json::Value;
 pub const USAGE: &str = "\
 # Usage: quaqua worker stop <name>
 #   Interrupts a running worker with the key sequence its harness needs:
-#     opencode: esc esc (one esc only arms)   omp: esc
+#     opencode: esc esc (one esc only arms)   omp: esc   agy: esc
 #   A harness with no verified sequence is refused — nothing is sent.
 #   Never ctrl+c. Stop leaves the worker alive: use `quaqua worker cleanup` after.";
 

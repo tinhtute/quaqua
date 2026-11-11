@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Caps are constants**: no config key, CLI flag or env var raises them.
 - **`quaqua memory scan`**: screens one line for a memory file that is not itself capped — stdin → `{"ok":true,"text":…}` with the line cut to its 200-char bound, or `{"ok":false,"reason":…}` when the secret scan matches. The cos-memory mod's correction capture runs through it, so a prompt carrying a key is never written to `memory/corrections.md` and a long prompt lands as one bounded line.
 
+### Harness (agy)
+- **Antigravity CLI joins the registry**: `harness = "agy"` validates in `team.toml`, and `quaqua worker spawn` launches `agy` with `--model`/`--effort` (agy's `low|medium|high|xhigh|max`), `--dangerously-skip-permissions`, and a per-worker `--settings` file that pre-trusts the worktree, so the first-run "do you trust the contents of this project?" dialog never takes the brief. agy has no system-prompt flag, so the worker rules land as the `AGENTS.md` of an `--add-dir` directory (`runs/.agy/<name>/`), which agy loads as context.
+- **Idle detection and stop**: herdr's built-in `agy` kind reports working/idle/done through screen detection (its antigravity-cli integration only records the conversation), so the watchdog uses the longer fallback idle limit; `esc` interrupts a running turn, so `quaqua worker stop` works. agy spend is reported as `agy-usage-unavailable`: usage is printed only in headless print mode, and the interactive conversation store is an opaque sqlite blob.
+- **Auditor**: `quaqua auditor run --harness agy` runs `agy -p` headless, and `agy` is the last autodetect fallback after `claude` and `opencode`.
+
 ## [2.6.0] - 2026-11-05
 
 ### Bus & Farm Scoping
