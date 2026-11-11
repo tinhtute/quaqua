@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hash::md5_hex;
 use crate::herdr::{Herdr, HerdrOps};
+use crate::memory;
 use crate::workspace::workspace_root;
 
 const INSTALL_LINE: &str = "cargo install --path <checkout>/crates/quaqua --locked";
@@ -272,6 +273,7 @@ fn run_init(root: &Path, entries: &[Entry], lock: &mut Lock, dry_run: bool) -> R
         }
     }
 
+    install_memory_hooks(root, lock, dry_run)?;
     if dry_run {
         println!("dry run: nothing written");
         return Ok(());
@@ -405,6 +407,8 @@ fn run_update(
             println!("removed upstream {rel} (kept)");
         }
     }
+
+    install_memory_hooks(root, lock, dry_run)?;
 
     if !dry_run {
         lock.save(root)?;
@@ -790,6 +794,146 @@ fn wire_hooks(root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The workspace settings file the memory hooks are merged into.
+const SETTINGS_REL: &str = ".claude/settings.json";
+
+/// Install the CoS memory hooks into `<root>/.claude/settings.json`.
+///
+/// This is the one home for the two hook commands ([`memory::HOOK_PRE_COMMAND`],
+/// [`memory::HOOK_BATCH_COMMAND`]): the template ships the rest of the settings
+/// file, and this step adds what the engine owns. Idempotent — a handler that
+/// already carries the command is left alone, so re-running `init` writes
+/// nothing and a hand-edited settings file keeps its other hooks.
+///
+/// A settings file that is not a JSON object is reported and left untouched:
+/// `init` is a boot step, not a repair step, and the gate is a guardrail.
+fn install_memory_hooks(root: &Path, lock: &mut Lock, dry_run: bool) -> Result<(), String> {
+    let path = root.join(SETTINGS_REL);
+    let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(body) if body.trim().is_empty() => serde_json::json!({}),
+        Ok(body) => match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "init: {} is not valid JSON ({e}) — memory hooks not installed",
+                    path.display()
+                );
+                return Ok(());
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            eprintln!(
+                "init: cannot read {} ({e}) — memory hooks not installed",
+                path.display()
+            );
+            return Ok(());
+        }
+    };
+    if !doc.is_object() {
+        eprintln!(
+            "init: {} is not a JSON object — memory hooks not installed",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let mut changed = false;
+    changed |= ensure_hook(
+        &mut doc,
+        "PreToolUse",
+        Some(memory::HOOK_PRE_MATCHER),
+        memory::HOOK_PRE_COMMAND,
+    );
+    changed |= ensure_hook(&mut doc, "PostToolBatch", None, memory::HOOK_BATCH_COMMAND);
+    if !changed {
+        return Ok(());
+    }
+    if dry_run {
+        println!("would install memory hooks in {SETTINGS_REL}");
+        return Ok(());
+    }
+
+    let mut body = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("init: cannot serialize {}: {e}", path.display()))?;
+    body.push('\n');
+    write_file(&path, body.as_bytes(), 0o644)?;
+    println!("memory hooks: installed in {SETTINGS_REL}");
+    // The lock records what quaqua last wrote. Recording the merged hash keeps
+    // the next `--update` on the "untouched locally" row, so it reconciles the
+    // file instead of reporting a conflict against the shipped template.
+    if let Some(entry) = lock.files.get_mut(SETTINGS_REL) {
+        if let Ok(Some(md5)) = md5_file(&path) {
+            entry.md5 = md5;
+        }
+    }
+    Ok(())
+}
+
+/// True when some handler under `groups` already runs `command`.
+fn has_command(groups: &[serde_json::Value], command: &str) -> bool {
+    groups.iter().any(|g| {
+        g.get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hs| {
+                hs.iter()
+                    .any(|h| h.get("command").and_then(serde_json::Value::as_str) == Some(command))
+            })
+    })
+}
+
+/// Ensure `hooks[event]` carries a command handler running `command`, adding it
+/// to the group with the same matcher (or a new group) only when absent.
+/// Returns true when the document changed.
+fn ensure_hook(
+    doc: &mut serde_json::Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> bool {
+    use serde_json::{Map, Value};
+
+    let Some(root) = doc.as_object_mut() else {
+        return false;
+    };
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(hooks) = hooks.as_object_mut() else {
+        return false;
+    };
+    let groups = hooks
+        .entry(event)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(groups) = groups.as_array_mut() else {
+        return false;
+    };
+    if has_command(groups, command) {
+        return false;
+    }
+
+    let handler = serde_json::json!({ "type": "command", "command": command });
+    let slot = groups.iter_mut().find(|g| match matcher {
+        Some(m) => g.get("matcher").and_then(Value::as_str) == Some(m),
+        None => g.get("matcher").is_none(),
+    });
+    match slot {
+        Some(group) => match group.get_mut("hooks").and_then(Value::as_array_mut) {
+            Some(handlers) => handlers.push(handler),
+            None => group["hooks"] = Value::Array(vec![handler]),
+        },
+        None => {
+            let mut group = Map::new();
+            if let Some(m) = matcher {
+                group.insert("matcher".to_string(), Value::String(m.to_string()));
+            }
+            group.insert("hooks".to_string(), Value::Array(vec![handler]));
+            groups.push(Value::Object(group));
+        }
+    }
+    true
 }
 
 /// `quaqua init --git-hooks <repo>`: install the embedded portable-paths
