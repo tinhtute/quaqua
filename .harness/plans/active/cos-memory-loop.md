@@ -111,6 +111,63 @@ lane: high-risk
 
 ## Validation
 
+- 2026-11-11T08:56:34Z — phase `main` — verdict: APPROVE_WITH_REQUESTS — mode: full (lane high-risk)
+  - `cargo test --locked -p quaqua --test memory_check` — 10 passed, 0 failed
+  - `cargo test --locked -p quaqua --test memory_hooks` — 17 passed, 0 failed
+  - `cargo test --locked -p quaqua memory_hooks` — 2 passed (the init-install pair only; 15 filtered out)
+  - scope: on target — caps `RULES_CAP` 2200 / `USER_CAP` 1375 live only in `crates/quaqua/src/memory.rs:27-29`; `grep -rnwE '2200|1375'` over `crates/quaqua/src`, `mods/cos-memory/src`, `mods/cos-memory/hooks`, `templates/workspace/scripts` finds nothing else
+  - proof_classes: output, unit, integration
+  - requirements: R1 met (`--test memory_check`: chars-not-bytes, per-file cap, secret, missing-dir cases) | R2 met (`--test memory_hooks` 17 cases; init installs PreToolUse `Write|Edit|MultiEdit` + PostToolBatch, `init.rs:867`) | R3 met (`no_env_var_raises_a_cap`, grep above)
+  - requests: 1. [major] the acceptance command for R1/R3, `cargo test -p quaqua memory_check`, runs 0 tests (every binary reports `0 passed`): the filter matches test names, not the file; use `--test memory_check`. 2. [minor] the R2 acceptance filter `memory_hooks` covers 2 of 17 tests, none of the deny/batch behaviour; use `--test memory_hooks`. 3. [major, outside R1–R14] `cargo test --locked --workspace --no-fail-fast` on 004e614 is not green on this machine: with the real HOME 1186 passed / 3 failed (`worker::prompt::tests::test_prompt_{caps_retries_after_a_harness_exhausted_line,escalates_a_signed_out_turn_without_retry,retries_an_overloaded_turn_with_backoff_then_escalates}`, exit 5 ≠ 7) because they read the live workspace `team.toml` (kind `sude` → harness `agy`, classifier `retry.rs:298` returns None since #236); under `env -i` with a temp HOME those pass and `events_hook::test_events_hook_drops_foreign_cos_pane_to_prevent_cross_cos_inbox_leak` fails instead (`events_hook.rs:673`, Ok(true) ≠ Ok(false)). Both are test-isolation defects, not R regressions. 4. [minor] #235 (`41cf36d..8d68283`) edited `memory.rs` (+`memory scan`) and `main.rs`, which the file-ownership rule above says no phase edits; caps did not move.
+  - rollback_point: 3b7d685
+  - proof_gaps: PostToolBatch additionalContext on a real Bash write and the PreToolUse deny in a live `quaqua init` workspace were not exercised (tests only); `judge: independent` is testimony
+  - judge: independent (runs/suhuynh-cmval.md)
+  - judge_model: claude-opus-5-5
+  - judged_sha: 004e614d19d82a39d44a9d102f90b2378e952f49
+
+- 2026-11-11T08:56:34Z — phase `transcripts` — verdict: APPROVED — mode: full (lane high-risk)
+  - `cargo test --locked -p quaqua --test transcripts` — 12 passed, 0 failed
+  - `cargo test --locked -p quaqua transcripts_index` — 3 passed (incremental, default db under runs/, never writes the bus DB)
+  - `cargo test --locked -p quaqua transcripts_search` — 7 passed
+  - `cargo test --locked -p quaqua transcripts_tail` — 2 passed
+  - live corpus (read-only, scratch `--db`, 891 MB / 609 files under the Claude projects dir): first `index` 58.6 s → 13851 rows; second `index` 0.29 s, `1/609 files, 608 unchanged` (the one changed file is this judge's own live session); `search "PreCompact snapshot" --limit 3` wall 0.00 s with `path:line  <ts> <role>  <excerpt>` lines
+  - edge queries: `"unbalanced`, `NEAR(`, `*`, `a AND` return hits or `no matches`, exit 0 — FTS syntax is escaped, no SQL error; a leading `-x` is taken as a clap flag (needs `--`)
+  - scope: on target
+  - proof_classes: output, unit, integration
+  - requirements: R4 met | R5 met (success signal (b) < 1 s on the live corpus) | R6 met
+  - requests: none blocking. 1. [trivial] some hits print `-` for ts (e.g. compaction-summary user rows); allowed by the format but worth knowing.
+  - rollback_point: 3b7d685
+  - proof_gaps: the live first-build timing is a one-off measurement, not a re-runnable proof
+  - judge: independent (runs/suhuynh-cmval.md)
+  - judge_model: claude-opus-5-5
+  - judged_sha: 004e614d19d82a39d44a9d102f90b2378e952f49
+
+- 2026-11-11T08:56:34Z — phase `compact` — verdict: APPROVED — mode: full (lane high-risk)
+  - `cargo test --locked -p quaqua --test compact_hook` — 5 passed (idempotent, dry-run, non-object settings untouched, beside herdr gate, template matches)
+  - `bash tests/test_memory_compact.sh` — 7 ok lines, `PASS: memory-compact.sh` (writes only memory/.compact/, 496-char steer, snapshot ≤ 8192 B, additionalContext ≤ 9000, inject on source=compact only, degraded inputs exit 0)
+  - scope: on target — `init.rs` and the settings template changed only in 185bb91 (this phase)
+  - proof_classes: output, unit, integration
+  - requirements: R7 met | R8 met | R9 met | R10 met
+  - requests: none
+  - rollback_point: 3b7d685
+  - proof_gaps: no real Claude Code compaction ran; success signal (c) is unproven live until the first compaction after `quaqua init --update`
+  - judge: independent (runs/suhuynh-cmval.md)
+  - judge_model: claude-opus-5-5
+  - judged_sha: 004e614d19d82a39d44a9d102f90b2378e952f49
+
+- 2026-11-11T08:56:34Z — phase `mod` — verdict: APPROVE_WITH_REQUESTS — mode: full (lane high-risk)
+  - `node --test mods/cos-memory/tests/` — 35 tests, 35 pass, 0 fail (node v26.13.0)
+  - `bash mods/cos-memory/tests/install_smoke.sh` — 10 ok lines incl. `claude plugin validate` (marketplace, plugin) and `claude plugin test`, `all checks passed`
+  - scope: on target — no `crates/` or `templates/` file in 3d06cf4/42d983c/ce05c34; `quaqua init` unchanged by the mod
+  - proof_classes: output, unit, integration
+  - requirements: R11 met (gate refusal returned verbatim; unparsable/failed gate = refusal; no cap literal in mod source per smoke) | R12 partial (see requests 1–2) | R13 met with a deliberate deviation: since #235 the line is screened by `quaqua memory scan` (`corrections.js:5-8`) — a secret-bearing correction is refused and a long prompt is cut, so "verbatim" holds only for clean text | R14 met
+  - requests: 1. [major] R12 never fired in a live CoS session (needs 10 Stops / 15 tool calls + 10 user turns); only the counter/guard logic is unit-tested with a fake `$`. 2. [major] `$.model.fork` takes `{ prompt, effort? }` and cannot restrict tools (`review.js:1-5`); "with only the memory tools" is enforced by prompt plus a JSON-op schema filter scoped to the capped pair, not by the fork's toolset — the fork could still call tools it is told not to. 3. [minor] R12 counter adds a 5-min in-flight marker and a prompts≥10 spacing (`counter.js:13-19,84-86`) consistent with "at most once per 10 turns".
+  - rollback_point: 3b7d685
+  - proof_gaps: live fork behaviour, live `$.tool.register` tool calls in a CoS session, marketplace install via `/plugin marketplace add`
+  - judge: independent (runs/suhuynh-cmval.md)
+  - judge_model: claude-opus-5-5
+  - judged_sha: 004e614d19d82a39d44a9d102f90b2378e952f49
+
 ## Current State and Next Action
 - active_phase: none
 - lifecycle_status: implemented (all phases merged to main; not validated)
