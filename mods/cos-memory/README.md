@@ -127,17 +127,31 @@ for a JSON array of `{op, file, …}` and no tool calls, and `src/review.js` dro
 every element that is not one of the three operations on one of the two capped
 files. What survives goes through the same gate as the tools.
 
-It fires on a `Stop` after 10 turns or 15 tool calls, only when
-`stop_hook_active` is false and neither `memory/rules.md` nor today's
-`memory/<date>.md` changed since the last review. Counters reset only when the
-fork actually answered with an array; a fork that does not answer leaves them
-alone so a later Stop retries. A review that never reports back (the process died
-mid-fork) stops blocking after five minutes.
+It fires on a `Stop` when two things hold at once:
+
+- **due** — 10 `Stop` events or 15 tool calls since the last review;
+- **spaced** — at least 10 user turns (`prompt.submit`, meta prompts excluded)
+  since the last review. This is R12's "at most once per 10 turns", and it is
+  what stops a burst of tool calls in one turn from pulling a second review
+  forward.
+
+It never fires while `stop_hook_active` is true, and only while neither
+`memory/rules.md` nor today's `memory/<date>.md` changed since the last review.
+
+That last guard is a window, not a latch: when a review is due but memory moved,
+the mod treats the agent's own write as the work the review would have asked for,
+advances the baseline and restarts the window. Without that, one write would
+silence every later review for the life of the store.
+
+Counters reset only when the fork actually answered with an array; a fork that
+does not answer leaves them alone so a later Stop retries, and a review that
+throws releases its marker. A review that never reports back at all (the process
+died mid-fork) stops blocking after five minutes.
 
 ## Tests
 
 ```
-node --test mods/cos-memory/tests/     # 27 tests, no network, no engine
+node --test mods/cos-memory/tests/     # 32 tests, no network, no engine
 bash mods/cos-memory/tests/install_smoke.sh
 ```
 

@@ -11,6 +11,7 @@ import {
   shouldReview,
   noteAttempt,
   noteReview,
+  noteVeto,
   noteMiss,
   memoryStamp,
   today,
@@ -47,7 +48,7 @@ export const register = on => {
     return runTool($, tool.slice(prefix.length), e)
   })
 
-  // The review nudge: count the turn, then decide. The fork itself runs after
+  // The review nudge: count the Stop, then decide. The fork itself runs after
   // this hook returns, so a slow model never eats the hook's budget.
   on('classic.Stop', async ($, e, next) => {
     const r = await next(e)
@@ -55,26 +56,53 @@ export const register = on => {
     const date = today()
 
     const state = await load($)
-    await save($, { ...state, turns: state.turns + 1 })
+    await save($, { ...state, stops: state.stops + 1 })
 
-    const { fire, stamp } = await shouldReview($, {
+    const { fire, vetoed, stamp } = await shouldReview($, {
       stopHookActive: e?.stop_hook_active,
       root,
       date,
     })
+
+    // Memory moved since the last review: the agent already did the work this
+    // review would ask for. Advance the baseline so the next window is judged
+    // from here, not from a state that will never come back.
+    if (vetoed) {
+      await noteVeto($, await load($), stamp)
+      return r
+    }
     if (!fire) return r
 
     await noteAttempt($, await load($))
     void (async () => {
-      const out = await runReview($, { root })
-      if (out.reviewed) await noteReview($, await memoryStamp($, root, date))
-      else await noteMiss($, await load($))
+      try {
+        const out = await runReview($, { root })
+        if (out.reviewed) await noteReview($, await memoryStamp($, root, date))
+        else await noteMiss($, await load($))
+      } catch {
+        // A review that throws must still release its marker, or the trigger
+        // waits out the stale window for nothing.
+        try {
+          await noteMiss($, await load($))
+        } catch {
+          // The store is gone too; the stale marker ages out on its own.
+        }
+      }
     })()
     return r
   })
 
   // Correction capture: append, never block, never print.
   on('prompt.submit', async ($, e, next) => {
+    try {
+      if (e?.isMeta !== true) {
+        const state = await load($)
+        await save($, { ...state, prompts: state.prompts + 1 })
+      }
+    } catch {
+      // A counter that cannot be written must never block a prompt.
+    }
+
     try {
       if (CORRECTION.test(String(e?.text ?? ''))) {
         const root = await $.session.root()
