@@ -1,0 +1,8 @@
+{
+  "name": "cos-memory",
+  "version": "0.1.0",
+  "description": "Capped memory tools, a periodic review fork and correction capture for the CoS, gated by the quaqua engine.",
+  "author": {
+    "name": "quaqua"
+  }
+}
