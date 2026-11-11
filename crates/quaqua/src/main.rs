@@ -128,6 +128,11 @@ enum Command {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Past-session recall: index, search, tail.
+    Transcripts {
+        #[command(subcommand)]
+        cmd: TranscriptsCmd,
+    },
     /// Identity operations: heal.
     Identity {
         #[command(subcommand)]
@@ -283,6 +288,53 @@ enum MemoryHookCmd {
     Pre,
     /// PostToolBatch: flag a violation a Bash/other write left behind.
     Batch,
+}
+
+#[derive(Subcommand)]
+enum TranscriptsCmd {
+    /// Index past sessions into runs/transcripts.db (incremental).
+    Index {
+        /// Corpus root (default: ~/.claude/projects).
+        #[arg(long, value_name = "DIR")]
+        projects: Option<PathBuf>,
+        /// Index file (default: <runs>/transcripts.db).
+        #[arg(long, value_name = "FILE")]
+        db: Option<PathBuf>,
+    },
+    /// Search the index, best bm25 match first.
+    Search {
+        /// Words to look for (each word is a case-insensitive substring).
+        query: String,
+        /// Maximum hits (default 20).
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Only hits from this project directory or cwd.
+        /// (Claude Code encodes cwds as `-home-user-repo`, so the value itself
+        /// starts with a hyphen.)
+        #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+        project: Option<String>,
+        /// Only hits at or after this date (YYYY-MM-DD).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Corpus root, for building a missing index (default: ~/.claude/projects).
+        #[arg(long, value_name = "DIR")]
+        projects: Option<PathBuf>,
+        /// Index file (default: <runs>/transcripts.db).
+        #[arg(long, value_name = "FILE")]
+        db: Option<PathBuf>,
+    },
+    /// Print the last N user messages of one session.
+    Tail {
+        /// Session id, or a path to a .jsonl file.
+        #[arg(long, value_name = "ID|PATH")]
+        session: String,
+        /// How many messages (default 10).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+        /// Corpus root, for resolving a session id (default: ~/.claude/projects).
+        #[arg(long, value_name = "DIR")]
+        projects: Option<PathBuf>,
+    },
 }
 #[derive(Subcommand)]
 enum IdentityCmd {
@@ -684,6 +736,35 @@ fn main() {
                 MemoryHookCmd::Pre => quaqua::memory::hook_pre(),
                 MemoryHookCmd::Batch => quaqua::memory::hook_batch(),
             },
+        },
+        Some(Command::Transcripts { cmd }) => match cmd {
+            TranscriptsCmd::Index { projects, db } => {
+                quaqua::transcripts::run_index(&quaqua::transcripts::IndexOptions { projects, db })
+            }
+            TranscriptsCmd::Search {
+                query,
+                limit,
+                project,
+                since,
+                projects,
+                db,
+            } => quaqua::transcripts::run_search(&quaqua::transcripts::SearchOptions {
+                query,
+                limit,
+                project,
+                since,
+                projects,
+                db,
+            }),
+            TranscriptsCmd::Tail {
+                session,
+                last,
+                projects,
+            } => quaqua::transcripts::run_tail(&quaqua::transcripts::TailOptions {
+                session,
+                last,
+                projects,
+            }),
         },
         Some(Command::Cos { cmd }) => match cmd {
             CosCmd::Tag { pane } => match quaqua::cos::resolve_cos_pane(&herdr, pane.as_deref()) {
