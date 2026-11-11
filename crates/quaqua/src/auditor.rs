@@ -281,6 +281,30 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<i32, (i32, String)> {
             c.args(["run", "--standalone", "--auto", "-m", &m, &prompt]);
             (m, c)
         }
+        "agy" => {
+            let m = opts
+                .model
+                .clone()
+                .or_else(|| {
+                    std::env::var("AUDITOR_MODEL")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "gemini-3.8-flash".to_string());
+            let mut c = Command::new("agy");
+            c.current_dir(&root);
+            // `-p` takes the next argument as its prompt, so the prompt is last.
+            c.arg("--model")
+                .arg(&m)
+                .arg("--effort")
+                .arg("high")
+                .arg("--dangerously-skip-permissions")
+                .arg("--output-format")
+                .arg("text")
+                .arg("-p")
+                .arg(&prompt);
+            (m, c)
+        }
         _ => {
             let m = opts
                 .model
@@ -406,6 +430,8 @@ fn resolve_harness(explicit: Option<&str>) -> String {
         "claude".to_string()
     } else if is_on_path("opencode") {
         "opencode".to_string()
+    } else if is_on_path("agy") {
+        "agy".to_string()
     } else {
         "claude".to_string()
     }

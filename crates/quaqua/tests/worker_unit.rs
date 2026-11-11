@@ -2026,6 +2026,77 @@ fn test_launch_args_pi_exact_and_isolated() {
 }
 
 #[test]
+fn test_launch_args_agy_exact_and_rules_context() {
+    let runs = launch_runs_dir("agy");
+    let rules = format!("{runs}/sude-x.rules.md");
+    std::fs::write(&rules, "# Worker rules\nRULE-TOKEN: zebra-42\n").unwrap();
+
+    let agy = resolve_launch(&kind("agy", "gemini-3.8-flash", Some("high")), "sude").unwrap();
+    let build = build_launch_cmd(&agy, "sude-x", &rules, &runs, "/repo/.wt/sude-x", false).unwrap();
+    assert!(build.split_envs.is_empty(), "agy takes no pane env");
+    let rules_dir = format!("{runs}/.agy/sude-x");
+    let settings_path = format!("{rules_dir}/settings.json");
+    assert_eq!(
+        build.agent_args,
+        vec![
+            "--",
+            "--model",
+            "gemini-3.8-flash",
+            "--effort",
+            "high",
+            "--dangerously-skip-permissions",
+            "--settings",
+            settings_path.as_str(),
+            "--add-dir",
+            rules_dir.as_str(),
+            "--add-dir",
+            runs.as_str(),
+        ]
+    );
+
+    // agy has no system-prompt flag: the rules land as the AGENTS.md of the
+    // added directory, which agy loads as context.
+    let context = format!("{rules_dir}/AGENTS.md");
+    assert_eq!(
+        std::fs::read_to_string(&context).unwrap(),
+        "# Worker rules\nRULE-TOKEN: zebra-42\n"
+    );
+
+    // The worktree is pre-trusted for the session, so the first-run
+    // "do you trust the contents of this project?" dialog never takes the brief.
+    let body = std::fs::read_to_string(&settings_path).unwrap();
+    let settings: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        settings["trustedWorkspaces"],
+        serde_json::json!(["/repo/.wt/sude-x"])
+    );
+
+    // A relaunch converges on the current rules instead of keeping the old copy.
+    std::fs::write(&rules, "# Worker rules v2\n").unwrap();
+    build_launch_cmd(&agy, "sude-x", &rules, &runs, "/repo/.wt/sude-x", false).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&context).unwrap(),
+        "# Worker rules v2\n"
+    );
+
+    // agy's effort vocabulary is `agy --help`'s, not pi's or omp's.
+    assert!(resolve_launch(&kind("agy", "gemini-3.8-flash", Some("max")), "sude").is_ok());
+    assert!(resolve_launch(&kind("agy", "gemini-3.8-flash", Some("off")), "sude").is_err());
+
+    // A missing rules file is a loud failure, not an empty context.
+    let err = build_launch_cmd(
+        &agy,
+        "sude-y",
+        &format!("{runs}/missing.rules.md"),
+        &runs,
+        "/repo/.wt/sude-y",
+        false,
+    )
+    .unwrap_err();
+    assert!(err.1.contains("cannot read worker rules"), "{}", err.1);
+}
+
+#[test]
 fn test_launch_review_args_per_harness() {
     let runs = launch_runs_dir("review-per-harness");
     let cmd = |harness: &str, model: &str, effort: &str, review: bool| {
@@ -3836,6 +3907,7 @@ fn test_stop_keys_by_harness() {
     // No verified sequence for claude yet (Lead decision B, 2026-10-17):
     // esc esc would open Claude Code's message selector, so stop refuses.
     assert_eq!(stop_keys("claude"), None);
+    assert_eq!(stop_keys("agy"), Some(&["esc"][..]));
     assert_eq!(stop_keys("aider"), None);
     assert_eq!(stop_keys(""), None);
 }

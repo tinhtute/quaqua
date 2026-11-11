@@ -775,6 +775,10 @@ pub fn read_worker_spend_with(
         tokens: None,
         spend_src: if harness.is_empty() {
             "unknown-harness".to_string()
+        } else if Harness::parse(harness) == Some(Harness::Agy) {
+            // agy prints usage only in headless print mode; its interactive
+            // conversation store is an opaque sqlite blob with no priced spend.
+            "agy-usage-unavailable".to_string()
         } else {
             format!("unsupported-harness:{harness}")
         },
@@ -972,8 +976,19 @@ pub fn session_store_mtime(
             )
         }
         Some(Harness::Pi) => pi_session_mtime(session_value),
+        Some(Harness::Agy) => agy_session_mtime(session_value),
         None => file_mtime_ms(Path::new(session_value)),
     }
+}
+
+/// agy's per-conversation store: `~/.gemini/antigravity-cli/conversations/<id>.db`.
+fn agy_session_mtime(conversation_id: &str) -> Option<u64> {
+    let home = std::env::var("HOME").ok()?;
+    let root = match std::env::var("AGY_CONVERSATIONS_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => Path::new(&home).join(".gemini/antigravity-cli/conversations"),
+    };
+    file_mtime_ms(&root.join(format!("{conversation_id}.db")))
 }
 
 /// Tracks cost budget marks during watchdog execution: 80% and 100% warn,

@@ -291,6 +291,11 @@ fn classify_line(h: Option<Harness>, line: &str) -> Option<Decision> {
         Some(Harness::Claude) => claude(),
         Some(Harness::Omp) => omp_line(&l),
         Some(Harness::Pi) => pi_line(&l),
+        // agy: no provider-error fixture of its own yet, and porting another
+        // harness's table would classify text agy never prints (rules/_all
+        // harness adapters), so it stays unclassified until a real pane shows
+        // the shape.
+        Some(Harness::Agy) => None,
         // No kind in team.toml, and opencode (no fixture of its own yet, and it
         // had the Claude tables before #196): try each shape rather than drop
         // the error or lose a classification it used to get.
