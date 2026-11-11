@@ -29,6 +29,7 @@ pub mod source;
 pub mod state;
 pub mod status;
 pub mod taskforce;
+pub mod transcripts;
 pub mod usage;
 pub mod util;
 pub mod worker;
