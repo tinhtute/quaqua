@@ -56,8 +56,8 @@ are `~/.claude/mods/ninja-kit/.claude-plugin/types/claude-code/index.d.ts`
 | fs | `$.fs.read/write/list/exists/stat` | `:3427` |
 | session | `$.session.root() / cwd() / id() / model()` | `:2891` |
 | plugin | `$.plugin.name`, `$.plugin.root` — and nothing else: the validator rejects `$.plugin?.name` | `:2373` |
-| events | `session.start` (the first is awaited, so a `tool.register` is listed by turn one), `classic.Stop`, `prompt.submit`, `tool.call` | `:4616`, `:13413`, `:3240` |
-| `stop_hook_active` | on the `Stop` input, `:13415` | `:13413` |
+| events | `session.start` (the first is awaited, so a `tool.register` is listed by turn one), `turn.complete`, `prompt.submit`, `tool.call` | `:4616`, `:14909`, `:3240` |
+| `turn.complete` | `reason === 'answer'` and no `agentId` is the main loop's turn end; a plugin `classic.Stop` is skipped by `cc-plugin-sec-default` on Team/Enterprise | `:14909` |
 | budget | 10 s per dispatch, 1 s of `.catch` grace | `:5411` |
 
 Two of these cost real rewrites when guessed, so they are recorded here:
@@ -128,15 +128,15 @@ for a JSON array of `{op, file, …}` and no tool calls, and `src/review.js` dro
 every element that is not one of the three operations on one of the two capped
 files. What survives goes through the same gate as the tools.
 
-It fires on a `Stop` when two things hold at once:
+It fires on a main-loop `turn.complete` (`reason: 'answer'`, no `agentId`) when two things hold at once:
 
-- **due** — 10 `Stop` events or 15 tool calls since the last review;
+- **due** — 10 turn ends or 15 tool calls since the last review;
 - **spaced** — at least 10 user turns (`prompt.submit`, meta prompts excluded)
   since the last review. This is R12's "at most once per 10 turns", and it is
   what stops a burst of tool calls in one turn from pulling a second review
   forward.
 
-It never fires while `stop_hook_active` is true, and only while neither
+It fires only while neither
 `memory/rules.md` nor today's `memory/<date>.md` changed since the last review.
 
 That last guard is a window, not a latch: when a review is due but memory moved,
@@ -145,7 +145,7 @@ advances the baseline and restarts the window. Without that, one write would
 silence every later review for the life of the store.
 
 Counters reset only when the fork actually answered with an array; a fork that
-does not answer leaves them alone so a later Stop retries, and a review that
+does not answer leaves them alone so a later turn retries, and a review that
 throws releases its marker. A review that never reports back at all (the process
 died mid-fork) stops blocking after five minutes.
 

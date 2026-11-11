@@ -48,10 +48,13 @@ export const register = on => {
     return runTool($, tool.slice(prefix.length), e)
   })
 
-  // The review nudge: count the Stop, then decide. The fork itself runs after
-  // this hook returns, so a slow model never eats the hook's budget.
-  on('classic.Stop', async ($, e, next) => {
+  // The review nudge: count the main loop's turn end, then decide. The fork runs
+  // after this hook returns, so a slow model never eats the hook's budget. A
+  // plugin's `classic.Stop` is skipped under cc-plugin-sec-default; `turn.complete`
+  // is not. Subagent turns carry an `agentId`; aborted/errored turns are no answer.
+  on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    if (e?.reason !== 'answer' || e?.agentId != null) return r
     const root = await $.session.root()
     const date = today()
 
@@ -59,7 +62,6 @@ export const register = on => {
     await save($, { ...state, stops: state.stops + 1 })
 
     const { fire, vetoed, stamp } = await shouldReview($, {
-      stopHookActive: e?.stop_hook_active,
       root,
       date,
     })

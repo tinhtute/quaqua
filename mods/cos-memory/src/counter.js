@@ -1,10 +1,10 @@
 // The review trigger (R12): counters in `$.store`, a memory-unchanged guard,
-// and a `stop_hook_active` veto. Nothing here knows a memory cap — those live in
+// and a memory-changed veto. Nothing here knows a memory cap — those live in
 // the engine. The numbers below are R12's review thresholds, not caps.
 //
 // Three counters, because R12 measures two different things:
 //   prompts   — user turns since the last review: "at most once per 10 turns"
-//   stops     — Stop events since the last review: "after 10 Stop events"
+//   stops     — main-loop turn ends (`turn.complete`) since the last review: "after 10 Stop events"
 //   toolCalls — tool calls since the last review: "or 15 tool calls"
 // The rate limit is the prompt count, so a burst of tool calls in one turn
 // cannot pull a second review forward.
@@ -15,7 +15,7 @@ const STOPS_BEFORE_REVIEW = 10
 const TOOL_CALLS_BEFORE_REVIEW = 15
 
 // A review that never reported back (the process died mid-fork) must not wedge
-// the trigger: past this age its marker is stale and the next Stop may retry.
+// the trigger: past this age its marker is stale and the next turn end may retry.
 const INFLIGHT_MS = 5 * 60 * 1000
 
 const EMPTY = {
@@ -69,7 +69,7 @@ export function unchanged(before, now) {
 }
 
 /**
- * Decide whether this Stop should start a review, without changing anything.
+ * Decide whether this turn end should start a review, without changing anything.
  *
  * `vetoed` is the case R12 names and the caller must act on: the review was due
  * but memory moved, so the baseline advances and the window restarts. Without
@@ -77,18 +77,18 @@ export function unchanged(before, now) {
  *
  * @returns `{ fire, vetoed, state, stamp }` — the caller saves `state` itself.
  */
-export async function shouldReview($, { stopHookActive, root, date, now = Date.now() }) {
+export async function shouldReview($, { root, date, now = Date.now() }) {
   const state = await load($)
   const stamp = await memoryStamp($, root, date)
   const busy = state.inflightAt !== null && now - state.inflightAt < INFLIGHT_MS
   const due = state.stops >= STOPS_BEFORE_REVIEW || state.toolCalls >= TOOL_CALLS_BEFORE_REVIEW
   const spaced = state.prompts >= PROMPTS_BEFORE_REVIEW
-  const ready = !busy && stopHookActive !== true && due && spaced
+  const ready = !busy && due && spaced
   const changed = !unchanged(state.stamp, stamp)
   return { fire: ready && !changed, vetoed: ready && changed, state, stamp }
 }
 
-/** Mark a review as started, so a second Stop does not start another. */
+/** Mark a review as started, so a second turn end does not start another. */
 export async function noteAttempt($, state, now = Date.now()) {
   await save($, { ...state, inflightAt: now })
 }
