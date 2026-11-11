@@ -36,8 +36,9 @@ async function wire(made) {
 
 const answered = text => ({ isAnswered: true, text })
 
+// One main-loop turn ending: what the engine raises once per user turn.
 async function stops(hooks, $, n) {
-  for (let i = 0; i < n; i += 1) await hooks.raise('classic.Stop', $, { stop_hook_active: false })
+  for (let i = 0; i < n; i += 1) await hooks.raise('turn.complete', $, { reason: 'answer', answer: 'ok' })
 }
 
 async function prompts(hooks, $, n) {
@@ -138,14 +139,34 @@ test('unchanged memory lets the review through', async () => {
   assert.equal(made.calls.forks.length, 1)
 })
 
-test('stop_hook_active vetoes the review', async () => {
+test('only a main-loop answer counts as a turn', async () => {
   const made = engine({ prompts: 10, stops: 9, fork: answered('[]') })
   const hooks = await wire(made)
 
-  await hooks.raise('classic.Stop', made.$, { stop_hook_active: true })
+  await hooks.raise('turn.complete', made.$, { reason: 'answer', agentId: 'sub-1', answer: 'x' })
+  await hooks.raise('turn.complete', made.$, { reason: 'aborted' })
+  await hooks.raise('turn.complete', made.$, { reason: 'error' })
   await settle()
 
   assert.equal(made.calls.forks.length, 0)
+  assert.equal(made.store.review.stops, 9)
+})
+
+test('a real session turn increments the counter and reaches the review', async () => {
+  const made = engine({ prompts: 10, stops: 0, fork: answered('[]') })
+  const hooks = await wire(made)
+
+  await stops(hooks, made.$, 1)
+  assert.equal(made.store.review.stops, 1)
+
+  await stops(hooks, made.$, 9)
+  await settle()
+  assert.equal(made.calls.forks.length, 1)
+})
+
+test('the dead classic.Stop hook is not registered', async () => {
+  const hooks = await wire(engine())
+  assert.equal(hooks.handlers('classic.Stop').length, 0)
 })
 
 test('fifteen tool calls are enough on their own', async () => {
