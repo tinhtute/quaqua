@@ -123,7 +123,7 @@ enum Command {
         #[command(subcommand)]
         cmd: CosCmd,
     },
-    /// CoS memory caps and secret gate: check, hook.
+    /// CoS memory caps and secret gate: check, scan, hook.
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
@@ -275,6 +275,8 @@ enum MemoryCmd {
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
     },
+    /// Screen one line of text for a memory file (stdin → JSON verdict).
+    Scan,
     /// Claude Code hook entry points (read the hook JSON on stdin).
     Hook {
         #[command(subcommand)]
@@ -732,6 +734,7 @@ fn main() {
         },
         Some(Command::Memory { cmd }) => match cmd {
             MemoryCmd::Check { workspace } => quaqua::memory::run_check(workspace.as_deref()),
+            MemoryCmd::Scan => quaqua::memory::run_scan(),
             MemoryCmd::Hook { cmd } => match cmd {
                 MemoryHookCmd::Pre => quaqua::memory::hook_pre(),
                 MemoryHookCmd::Batch => quaqua::memory::hook_batch(),

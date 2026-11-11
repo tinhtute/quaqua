@@ -1,7 +1,7 @@
 // A stand-in for the engine, with only the surfaces the mod touches. Tests drive
 // the mod through these, never through its internals.
 
-export function fakeEngine({ root = '/ws', files = {}, stamps = {}, gate = null, fork = null, failWrite = false } = {}) {
+export function fakeEngine({ root = '/ws', files = {}, stamps = {}, gate = null, scan = null, fork = null, failWrite = false } = {}) {
   const calls = { process: [], writes: [], forks: [] }
   const store = {}
 
@@ -33,6 +33,18 @@ export function fakeEngine({ root = '/ws', files = {}, stamps = {}, gate = null,
     process: {
       run: async (argv, init) => {
         calls.process.push({ argv, init })
+        // `quaqua memory scan` echoes the text back when it has no objection,
+        // exactly as the engine does for a line it accepts.
+        if (argv.at(-1) === 'scan') {
+          if (scan instanceof Error) throw scan
+          return (
+            scan ?? {
+              exitCode: 0,
+              stdout: JSON.stringify({ ok: true, text: String(init?.stdin ?? '') }),
+              stderr: '',
+            }
+          )
+        }
         if (gate instanceof Error) throw gate
         return gate ?? { exitCode: 0, stdout: '', stderr: '' }
       },
