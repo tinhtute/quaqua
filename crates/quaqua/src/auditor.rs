@@ -1156,6 +1156,7 @@ pub fn run_deterministic_prechecks_at(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
+            let farm = crate::workspace::farm_of_runs_dir(&runs_dir);
             struct TriggerEntry {
                 id: u64,
                 ts_ms: u64,
@@ -1165,10 +1166,10 @@ pub fn run_deterministic_prechecks_at(
             }
 
             let stmt = conn.prepare(
-                "SELECT id, ts_ms, actor, kind, payload_json FROM triggers WHERE source = 'mail' ORDER BY id ASC",
+                "SELECT id, ts_ms, actor, kind, payload_json FROM triggers WHERE source = 'mail' AND (to_name = 'cos' OR thread_id = 'agent:cos') AND (farm = ?1 OR farm IS NULL) ORDER BY id ASC",
             );
             if let Ok(mut stmt) = stmt {
-                let rows = stmt.query_map([], |row| {
+                let rows = stmt.query_map([&farm], |row| {
                     let id = row.get::<_, i64>(0)? as u64;
                     let ts_ms = row.get::<_, i64>(1)? as u64;
                     let actor: String = row.get(2)?;
@@ -1863,6 +1864,12 @@ mod tests {
                 (now_secs - 100_000) as i64 * 1000,
                 serde_json::json!({ "body": "Old handoff from yesterday" }).to_string(),
             ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE triggers SET farm = ?1",
+            [crate::workspace::farm_of_runs_dir(&runs_dir)],
         )
         .unwrap();
 
