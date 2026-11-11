@@ -54,3 +54,45 @@ export async function gate($, { root, rel, content }) {
   }
   return { ok: true }
 }
+
+/**
+ * Ask the engine to screen one line for a memory file that is not itself
+ * capped (`memory/corrections.md`): it refuses a secret and cuts a long line to
+ * its own bound.
+ *
+ * @returns `{ ok: true, text }` with the engine's bounded text, else
+ *   `{ ok: false, reason }` with the engine's own reason. A screen that cannot
+ *   answer — a missing binary, a non-zero exit, an unreadable verdict — is a
+ *   refusal, never an allow: an unscreened line could carry a secret.
+ */
+export async function screen($, { root, text }) {
+  let out
+  try {
+    out = await $.process.run(['quaqua', 'memory', 'scan'], {
+      cwd: root,
+      stdin: String(text ?? ''),
+    })
+  } catch (e) {
+    return { ok: false, reason: `memory scan unavailable: ${e?.message ?? e}` }
+  }
+
+  if (out.exitCode !== 0) {
+    const why = String(out.stderr ?? '').trim()
+    return {
+      ok: false,
+      reason: `memory scan failed (exit ${out.exitCode})${why ? `: ${why}` : ''}`,
+    }
+  }
+
+  let doc
+  try {
+    doc = JSON.parse(String(out.stdout ?? '').trim())
+  } catch {
+    return { ok: false, reason: 'memory scan returned no verdict' }
+  }
+
+  if (doc?.ok === true && typeof doc.text === 'string') {
+    return { ok: true, text: doc.text }
+  }
+  return { ok: false, reason: String(doc?.reason ?? 'refused') }
+}

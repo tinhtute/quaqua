@@ -28,6 +28,11 @@ pub const RULES_CAP: usize = 2200;
 /// Cap on `USER.md`, in Unicode chars (AGENTS.md '## Memory').
 pub const USER_CAP: usize = 1375;
 
+/// Cap on one captured line for a memory file that is not itself capped, in
+/// Unicode chars — `memory/corrections.md` today. Such a line is cut, never
+/// refused: a long prompt still leaves one readable correction.
+pub const LINE_CAP: usize = 200;
+
 /// One capped file: workspace-relative path and its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -74,17 +79,24 @@ pub struct Violation {
     pub problem: Problem,
 }
 
+impl Problem {
+    /// What is wrong, without the file: shared by the check line and the
+    /// `scan` refusal, so the wording has one home.
+    fn text(&self) -> String {
+        match self {
+            Problem::OverCap { chars, cap } => {
+                format!("{chars} chars > {cap} cap — merge or drop entries")
+            }
+            Problem::Secret(name) => format!("contains a {name}"),
+        }
+    }
+}
+
 impl Violation {
     /// The one-line report, shared by `check`, the deny reason and the
     /// `additionalContext` text.
     pub fn line(&self) -> String {
-        match self.problem {
-            Problem::OverCap { chars, cap } => format!(
-                "{}: {chars} chars > {cap} cap — merge or drop entries",
-                self.file
-            ),
-            Problem::Secret(name) => format!("{}: contains a {name}", self.file),
-        }
+        format!("{}: {}", self.file, self.problem.text())
     }
 }
 
@@ -141,6 +153,31 @@ pub fn run_check(workspace: Option<&Path>) -> i32 {
     } else {
         1
     }
+}
+
+/// Screen one line for a memory file: the bounded text, or the refusal reason.
+///
+/// A secret is refused outright — cutting a key in half still leaves a key.
+/// Anything else is cut to [`LINE_CAP`] chars, so the caller cannot write an
+/// unbounded line.
+pub fn screen_line(text: &str) -> Result<String, String> {
+    if let Some(name) = scan_secrets(text).first() {
+        return Err(Problem::Secret(name).text());
+    }
+    Ok(text.chars().take(LINE_CAP).collect())
+}
+
+/// `quaqua memory scan`: screen one line of text for a memory file. Reads the
+/// text on stdin, prints `{"ok":true,"text":…}` or `{"ok":false,"reason":…}`.
+/// Always exits 0 — the verdict travels in the JSON, like the hooks.
+pub fn run_scan() -> i32 {
+    let text = read_stdin();
+    let verdict = match screen_line(&text) {
+        Ok(text) => json!({ "ok": true, "text": text }),
+        Err(reason) => json!({ "ok": false, "reason": reason }),
+    };
+    print_json(&verdict);
+    0
 }
 
 /// `quaqua memory hook pre`: the `PreToolUse` gate. Always exits 0 — the
@@ -499,6 +536,26 @@ mod tests {
         ] {
             assert!(scan_secrets(text).is_empty(), "{text:?} tripped the scan");
         }
+    }
+
+    #[test]
+    fn a_line_carrying_a_secret_is_refused() {
+        let text = "Không phải vậy, đừng dùng rm. Instead add '- key AKIAQQQQQQQQQQQQQQQQ'";
+        let reason = screen_line(text).unwrap_err();
+        assert_eq!(reason, "contains a AWS access key");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_to_the_line_cap() {
+        let text = "ế".repeat(LINE_CAP * 3);
+        let out = screen_line(&text).unwrap();
+        assert_eq!(out.chars().count(), LINE_CAP);
+        assert!(text.starts_with(&out));
+    }
+
+    #[test]
+    fn a_short_line_passes_unchanged() {
+        assert_eq!(screen_line("đừng dùng rm").unwrap(), "đừng dùng rm");
     }
 
     #[test]
