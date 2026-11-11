@@ -1784,6 +1784,20 @@ esac
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    /// A `team.toml` fixture naming the `sude` kind's harness explicitly. The
+    /// provider-error cases read the omp adapter's pane shapes, so the ambient
+    /// `$HOME/quaqua/team.toml` (which may name another harness for `sude`,
+    /// e.g. `agy`, and classify nothing) must not decide what they exercise.
+    fn provider_team_config(tmp: &std::path::Path) -> std::path::PathBuf {
+        let path = tmp.join("team.toml");
+        fs::write(
+            &path,
+            "schema_version = 2\n\n[kinds.sude]\nharness = \"omp\"\nmodel = \"test-model\"\n",
+        )
+        .unwrap();
+        path
+    }
+
     /// Stub herdr for #177: the agent sits blocked; `agent read` prints
     /// the prompts sent so far (`> <text>`, like a real echo), then `FAKE_PANE`;
     /// each `agent prompt` appends its text to `FAKE_RUNS/prompts`.
@@ -1819,7 +1833,9 @@ exit 0
         usize,
     ) {
         let tmp = temp_runs(tag);
+        let team = provider_team_config(&tmp);
         let stub = provider_stub(&tmp);
+        let _g_team = TestEnvVarGuard::set("QUAQUA_TEAM_TOML", team.to_str().unwrap());
         let _g_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", tmp.to_str().unwrap());
         let _g_fruns = TestEnvVarGuard::set("FAKE_RUNS", tmp.to_str().unwrap());
         let _g_pane = TestEnvVarGuard::set("FAKE_PANE", pane);

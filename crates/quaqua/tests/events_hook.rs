@@ -608,7 +608,13 @@ exit 0
 
 #[test]
 fn test_events_hook_drops_foreign_cos_pane_to_prevent_cross_cos_inbox_leak() {
-    let runs_dir = hermetic_temp_dir("foreign-cos-hook");
+    // The workspace root is `runs_dir`'s parent, so the "foreign" pane must sit
+    // outside it. Deriving that path from `$HOME` put it inside the workspace
+    // whenever HOME lived under the same temp root (`env -i HOME=$(mktemp -d)`,
+    // where the workspace root is /tmp), and the pane then counted as local.
+    let root = hermetic_temp_dir("foreign-cos-hook");
+    let runs_dir = root.join("ws/runs");
+    fs::create_dir_all(&runs_dir).expect("runs dir");
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let notif_log = runs_dir.join("notifications.log");
 
@@ -616,8 +622,9 @@ fn test_events_hook_drops_foreign_cos_pane_to_prevent_cross_cos_inbox_leak() {
     fs::create_dir_all(&bin_dir).expect("bin dir");
     let herdr_bin = bin_dir.join("herdr");
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let foreign_cwd = format!("{home}/Work/TTDVKH");
+    let foreign_cwd = root.join("foreign/Work/TTDVKH");
+    fs::create_dir_all(&foreign_cwd).expect("foreign workspace dir");
+    let foreign_cwd = foreign_cwd.display().to_string();
     let db_path = runs_dir.join("quaqua.db");
     let bus = FarmBus::open(&db_path).expect("open bus");
     let local_farm = bus.farm().to_string();
