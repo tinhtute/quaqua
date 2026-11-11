@@ -78,7 +78,8 @@ export function compute(kind, current, input) {
     const newText = String(input.new_text ?? '')
     if (oldText === '') return { refuse: 'old_text is empty' }
     if (!current.includes(oldText)) return { refuse: 'old_text is not in the file' }
-    return { next: current.replace(oldText, newText) }
+    // A function replacer: `$&`, `$'`, `` $` `` and `$$` in new_text stay text.
+    return { next: current.replace(oldText, () => newText) }
   }
   if (kind === 'remove') {
     const text = String(input.text ?? '')

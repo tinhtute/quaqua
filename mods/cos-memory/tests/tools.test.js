@@ -114,6 +114,19 @@ test('memory_remove drops every line holding the text', async () => {
   assert.equal(files['/ws/memory/rules.md'], 'keep\nkeep too\n')
 })
 
+test('memory_replace writes new_text literally, dollar patterns included', async () => {
+  const { $, files } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, gate: allowVerdict })
+
+  const out = await runTool($, 'memory_replace', {
+    file: 'USER.md',
+    old_text: 'a',
+    new_text: 'cost $& x',
+  })
+
+  assert.deepEqual(out, { result: 'updated USER.md' })
+  assert.equal(files['/ws/USER.md'], 'cost $& x\n')
+})
+
 test('an unknown tool name is refused', async () => {
   const { $ } = fakeEngine({ gate: allowVerdict })
   const out = await runTool($, 'memory_drop', { file: 'USER.md', text: 'x' })
