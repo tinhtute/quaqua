@@ -136,12 +136,12 @@ lane: high-risk
 ## Validation
 - 2026-11-10 CoS: code requirements R0–R8 on main `b0b630e`, main CI green; binary 2.6.0 installed from it.
 - (b) holds: no `runs/*.inbox.md`; `.tables` has no `farm_events`/`mail`. R2 `rg` gate: only legacy-schema fixtures in `tests/bus_migrate.rs`.
-- (a) and (c) not observed live: no Lead run since P5; the github-ci poll timer was removed by anh iu's choice, so the poll runs by hand.
+- 2026-11-11 live check (throwaway `livecheck-lead`, draft PR #231 closed, branches deleted): (a) 0 `pane send-text` tool calls by CoS during the run; Lead reported via bus (#3339 accept, #3348 handoff after reading #3344). (c) CI run 42941249704 failed → one `github-ci poll` wrote 1 `ci_failed` trigger #3344 on thread `quaqua/livecheck-integ`; second poll 0 new (dedup). The poll timer stays off by anh iu's choice, so (c) fires only on a manual poll.
 - Residual minor (not blocking): `threads` has no farm column.
 
 ## Current State and Next Action
 - active_phase: none
 - lifecycle_status: done (closed 2026-11-10 by CoS, anh iu approved)
 - blockers: none
-- open_items: live signals (a)/(c) unobserved; threads farm column
+- open_items: threads farm column
 - exact_next_action: none
