@@ -799,13 +799,30 @@ fn wire_hooks(root: &Path) -> Result<(), String> {
 /// The workspace settings file the memory hooks are merged into.
 const SETTINGS_REL: &str = ".claude/settings.json";
 
+/// The `PreCompact` command `quaqua init` installs (G4): the pre-compaction
+/// snapshot. Claude Code appends a PreCompact hook's stdout to the compact
+/// instructions, so this is a steer, not a block.
+///
+/// The `[ -x ]` guard keeps a workspace whose script is missing silent instead
+/// of printing an error on every compaction; `${CLAUDE_PROJECT_DIR:-.}` keeps
+/// the entry working when the variable is unset.
+pub const COMPACT_PRE_COMMAND: &str = "d=${CLAUDE_PROJECT_DIR:-.}; [ -x \"$d/scripts/hooks/memory-compact.sh\" ] || exit 0; exec \"$d/scripts/hooks/memory-compact.sh\" --pre-compact";
+
+/// The `SessionStart` command `quaqua init` installs: injects the newest
+/// pre-compaction snapshot after a compaction, silent otherwise.
+pub const COMPACT_SESSION_COMMAND: &str = "d=${CLAUDE_PROJECT_DIR:-.}; [ -x \"$d/scripts/hooks/memory-compact.sh\" ] || exit 0; exec \"$d/scripts/hooks/memory-compact.sh\" --session-start";
+
 /// Install the CoS memory hooks into `<root>/.claude/settings.json`.
 ///
-/// This is the one home for the two hook commands ([`memory::HOOK_PRE_COMMAND`],
-/// [`memory::HOOK_BATCH_COMMAND`]): the template ships the rest of the settings
+/// This is the one home for the four hook commands ([`memory::HOOK_PRE_COMMAND`],
+/// [`memory::HOOK_BATCH_COMMAND`], [`COMPACT_PRE_COMMAND`],
+/// [`COMPACT_SESSION_COMMAND`]): the template ships the rest of the settings
 /// file, and this step adds what the engine owns. Idempotent — a handler that
 /// already carries the command is left alone, so re-running `init` writes
 /// nothing and a hand-edited settings file keeps its other hooks.
+///
+/// The `SessionStart` handler joins the group the template already gives the
+/// herdr-gate hook (no matcher); the script decides on `source` itself.
 ///
 /// A settings file that is not a JSON object is reported and left untouched:
 /// `init` is a boot step, not a repair step, and the gate is a guardrail.
@@ -848,6 +865,8 @@ fn install_memory_hooks(root: &Path, lock: &mut Lock, dry_run: bool) -> Result<(
         memory::HOOK_PRE_COMMAND,
     );
     changed |= ensure_hook(&mut doc, "PostToolBatch", None, memory::HOOK_BATCH_COMMAND);
+    changed |= ensure_hook(&mut doc, "PreCompact", None, COMPACT_PRE_COMMAND);
+    changed |= ensure_hook(&mut doc, "SessionStart", None, COMPACT_SESSION_COMMAND);
     if !changed {
         return Ok(());
     }
