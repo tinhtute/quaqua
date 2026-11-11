@@ -1156,6 +1156,7 @@ pub fn run_deterministic_prechecks_at(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
+            let farm = crate::workspace::farm_of_runs_dir(&runs_dir);
             struct TriggerEntry {
                 id: u64,
                 ts_ms: u64,
@@ -1165,10 +1166,10 @@ pub fn run_deterministic_prechecks_at(
             }
 
             let stmt = conn.prepare(
-                "SELECT id, ts_ms, actor, kind, payload_json FROM triggers WHERE source = 'mail' ORDER BY id ASC",
+                "SELECT id, ts_ms, actor, kind, payload_json FROM triggers WHERE source = 'mail' AND (to_name = 'cos' OR thread_id = 'agent:cos') AND (farm = ?1 OR farm IS NULL) ORDER BY id ASC",
             );
             if let Ok(mut stmt) = stmt {
-                let rows = stmt.query_map([], |row| {
+                let rows = stmt.query_map([&farm], |row| {
                     let id = row.get::<_, i64>(0)? as u64;
                     let ts_ms = row.get::<_, i64>(1)? as u64;
                     let actor: String = row.get(2)?;
@@ -1679,6 +1680,56 @@ mod tests {
     }
 
     #[test]
+    fn lead_inbox_scan_ignores_other_farm_and_other_recipient() {
+        let root = test_temp_dir("lead-inbox-scope");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::create_dir_all(root.join("raw")).unwrap();
+        let farm = crate::workspace::farm_of_runs_dir(&runs_dir);
+        let now_secs = 1_800_000_000u64;
+        let today = days_to_ymd(now_secs / 86400);
+
+        let conn = rusqlite::Connection::open(runs_dir.join("quaqua.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL, last_trigger_ms INTEGER NOT NULL);
+             CREATE TABLE triggers (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, to_name TEXT, thread_id TEXT NOT NULL, summary TEXT NOT NULL, ref TEXT, payload_json TEXT, dedupe_key TEXT UNIQUE, farm TEXT NOT NULL);",
+        )
+        .unwrap();
+        let ins = |actor: &str, to: &str, thread: &str, farm: &str| {
+            conn.execute(
+                "INSERT INTO triggers (ts_ms, source, kind, actor, to_name, thread_id, summary, payload_json, farm) \
+                 VALUES (?1, 'mail', 'accept', ?2, ?3, ?4, 's', ?5, ?6)",
+                rusqlite::params![
+                    (now_secs - 3600) as i64 * 1000,
+                    actor,
+                    to,
+                    thread,
+                    serde_json::json!({ "body": "Accepted runs/ghost.md" }).to_string(),
+                    farm,
+                ],
+            )
+            .unwrap();
+        };
+        ins("mine-lead", "cos", "t", &farm);
+        ins("other-farm-lead", "cos", "t", "some-other-farm");
+        ins("other-rcpt-lead", "someone-else", "t", &farm);
+
+        let flags = run_deterministic_prechecks_at(&root, today, now_secs);
+        assert!(
+            flags.iter().any(|f| f.contains("mine-lead")),
+            "own-farm mail to cos must be scanned: {flags:?}"
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("other-farm-lead")),
+            "other-farm mail must not be scanned: {flags:?}"
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("other-rcpt-lead")),
+            "mail to another recipient must not be scanned: {flags:?}"
+        );
+    }
+
+    #[test]
     fn lead_inbox_precheck() {
         // Assert item 6 keywords in PROMPT_TEMPLATE
         assert!(
@@ -1813,6 +1864,12 @@ mod tests {
                 (now_secs - 100_000) as i64 * 1000,
                 serde_json::json!({ "body": "Old handoff from yesterday" }).to_string(),
             ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE triggers SET farm = ?1",
+            [crate::workspace::farm_of_runs_dir(&runs_dir)],
         )
         .unwrap();
 
