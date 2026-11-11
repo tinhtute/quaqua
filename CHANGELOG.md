@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### CoS Memory Gate
+- **`quaqua memory check [--workspace DIR]`**: counts Unicode chars (not bytes) against the AGENTS.md caps — `memory/rules.md` 2200, `USER.md` 1375 — and scans both for secrets (API keys, tokens, private keys); exit 1 with one line per violation.
+- **`quaqua init` installs the gate as hooks**: a `PreToolUse` (`Write|Edit|MultiEdit`) hook that simulates the post-edit content and denies a write that would break a cap or carry a secret, and a `PostToolBatch` hook that re-runs the check and returns `additionalContext` so a `Bash`/`sed` write is flagged in the same turn. Both merge into `.claude/settings.json` idempotently and keep the hooks already there.
+- **Caps are constants**: no config key, CLI flag or env var raises them.
+
 ## [2.6.0] - 2026-11-05
 
 ### Bus & Farm Scoping

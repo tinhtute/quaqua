@@ -20,6 +20,7 @@ pub mod launch;
 pub mod layout;
 pub mod lead;
 pub mod liveness;
+pub mod memory;
 pub mod merge;
 pub mod pipeline;
 pub mod playbook;

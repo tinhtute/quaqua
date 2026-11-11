@@ -16,6 +16,19 @@
         "hooks": [
           { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh" }
         ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "q=${QUAQUA_BIN:-$(command -v quaqua || echo \"$HOME/.cargo/bin/quaqua\")}; [ -x \"$q\" ] || exit 0; exec \"$q\" memory hook pre" }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          { "type": "command", "command": "q=${QUAQUA_BIN:-$(command -v quaqua || echo \"$HOME/.cargo/bin/quaqua\")}; [ -x \"$q\" ] || exit 0; exec \"$q\" memory hook batch" }
+        ]
       }
     ],
     "UserPromptSubmit": [

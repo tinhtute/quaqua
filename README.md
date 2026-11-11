@@ -55,6 +55,7 @@ Rules:
 | `quaqua source github-ci poll --repo <owner/name>` | GitHub CI source: one `ci_failed` trigger per failed run on a `quaqua/*` branch that has a thread; deduped by run id, read position persisted |
 | `templates/workspace/scripts/github-ci-poll/install-github-ci-poll.sh`, `templates/workspace/scripts/github-ci-poll/systemd/`, `templates/workspace/scripts/github-ci-poll/launchd/` | GitHub CI poll scheduling: systemd user unit+timer (Linux) or a rendered LaunchAgent plist (macOS), every 5 minutes |
 | `quaqua init`, `templates/workspace/`, `templates/seed/` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
+| `quaqua memory check`, `quaqua memory hook pre\|batch` | CoS memory gate: caps `memory/rules.md` at 2200 and `USER.md` at 1375 Unicode chars, scans both for secrets; `quaqua init` installs the `PreToolUse` (`Write\|Edit\|MultiEdit`) deny and the `PostToolBatch` flag |
 | `tests/` | Sandboxed test suite: `tests/run.sh` runs every `tests/test_*.sh` (the 2 slow suites only when the change touches a script they cover, or with `--slow`) and exits non-zero on any failure |
 | `templates/seed/USER.example.md` | Template for the per-workspace `USER.md` |
 | `SETUP-PROMPT.md` | Original prompt used to bootstrap this setup |
@@ -74,11 +75,25 @@ quaqua init
 ```
 
 `quaqua init` is idempotent and never overwrites an existing file, so it
-is safe to re-run after a pull. Then edit `USER.md` for the workspace, add one
+is safe to re-run after a pull. The one exception is `.claude/settings.json`,
+which it merges into: the two CoS memory hooks are added only when absent and
+every other hook in the file is left alone. Then edit `USER.md` for the workspace, add one
 row per project to `projects/INDEX.md` (copy `projects/_template.md` for the
 card), and continue with the auditor install below. Templates live in
 `templates/seed/` under depth-safe names because `.gitignore`'s `memory/` and
 `projects/` patterns match at any depth.
+
+The installed hooks enforce AGENTS.md '## Memory'. A `Write`/`Edit`/`MultiEdit`
+that would push `memory/rules.md` past 2200 chars or `USER.md` past 1375, or
+that would store a secret, is denied before it runs. After any batch that could
+have written, the check re-runs and hands a violation back to the agent, so a
+`sed`/`Bash` write is caught too. Run it by hand with:
+
+```bash
+quaqua memory check [--workspace DIR]   # exit 1, one line per violation
+```
+
+The caps are constants in the binary — no config key raises them.
 
 The same portable-paths pre-commit can be installed into another checkout
 without bootstrapping a workspace there:

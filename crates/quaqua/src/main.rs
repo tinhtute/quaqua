@@ -123,6 +123,11 @@ enum Command {
         #[command(subcommand)]
         cmd: CosCmd,
     },
+    /// CoS memory caps and secret gate: check, hook.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Identity operations: heal.
     Identity {
         #[command(subcommand)]
@@ -255,6 +260,29 @@ enum CosCmd {
         #[arg(long)]
         pane: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// Report over-cap or secret-bearing memory/rules.md and USER.md.
+    Check {
+        /// Workspace to check (default: the workspace root).
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+    },
+    /// Claude Code hook entry points (read the hook JSON on stdin).
+    Hook {
+        #[command(subcommand)]
+        cmd: MemoryHookCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryHookCmd {
+    /// PreToolUse(Write|Edit|MultiEdit): deny a write that breaks a cap.
+    Pre,
+    /// PostToolBatch: flag a violation a Bash/other write left behind.
+    Batch,
 }
 #[derive(Subcommand)]
 enum IdentityCmd {
@@ -649,6 +677,13 @@ fn main() {
                     }
                 }
             }
+        },
+        Some(Command::Memory { cmd }) => match cmd {
+            MemoryCmd::Check { workspace } => quaqua::memory::run_check(workspace.as_deref()),
+            MemoryCmd::Hook { cmd } => match cmd {
+                MemoryHookCmd::Pre => quaqua::memory::hook_pre(),
+                MemoryHookCmd::Batch => quaqua::memory::hook_batch(),
+            },
         },
         Some(Command::Cos { cmd }) => match cmd {
             CosCmd::Tag { pane } => match quaqua::cos::resolve_cos_pane(&herdr, pane.as_deref()) {
