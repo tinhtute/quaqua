@@ -6,7 +6,15 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh --session-start" }
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh --session-start" },
+          { "type": "command", "command": "d=${CLAUDE_PROJECT_DIR:-.}; [ -x \"$d/scripts/hooks/memory-compact.sh\" ] || exit 0; exec \"$d/scripts/hooks/memory-compact.sh\" --session-start" }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "d=${CLAUDE_PROJECT_DIR:-.}; [ -x \"$d/scripts/hooks/memory-compact.sh\" ] || exit 0; exec \"$d/scripts/hooks/memory-compact.sh\" --pre-compact" }
         ]
       }
     ],
