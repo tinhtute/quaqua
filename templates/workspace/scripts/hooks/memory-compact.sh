@@ -51,18 +51,35 @@ json_str() {
 # trunc <max-bytes>: copy stdin, cutting at a line boundary once the byte count
 # would pass <max-bytes>. Cutting on lines keeps multi-byte characters whole;
 # the 48 bytes reserved for the marker keep the result inside <max-bytes>.
+# LC_ALL=C pins `length` to bytes: gawk would count characters in a UTF-8
+# locale and let the file grow past the cap.
 trunc() {
-  awk -v max="$1" '
+  LC_ALL=C awk -v max="$1" '
     { n += length($0) + 1
       if (n > max - 48) { print "[memory-compact: snapshot truncated]"; exit }
       print }'
 }
 
-# json_escape: stdin to a JSON string body (no surrounding quotes).
+# json_escape: stdin to a JSON string body (no surrounding quotes). Every
+# U+0000–U+001F control becomes \u00XX — an ESC byte from a pasted ANSI log
+# would otherwise make the SessionStart output invalid JSON.
 json_escape() {
-  awk 'BEGIN { ORS = "" }
-       { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "")
-         printf "%s\\n", $0 }'
+  awk 'BEGIN {
+         ORS = ""
+         for (i = 0; i < 32; i++) ctl[sprintf("%c", i)] = sprintf("\\u%04x", i)
+       }
+       { if (NR > 1) printf "\\n"
+         s = $0
+         out = ""
+         n = length(s)
+         for (i = 1; i <= n; i++) {
+           c = substr(s, i, 1)
+           if (c == "\\") out = out "\\\\"
+           else if (c == "\"") out = out "\\\""
+           else if (c in ctl) out = out ctl[c]
+           else out = out c
+         }
+         printf "%s", out }'
 }
 
 # ── workspace root ─────────────────────────────────────────────────────────
@@ -157,12 +174,17 @@ log_section() {
 }
 
 # The last 5 user messages of this session, flattened by `transcripts tail`.
+# The per-line cut is 400 bytes (`-b`, bytes in every cut implementation), then
+# `iconv -c` drops the partial character the cut may have left. `cut -c` would
+# be implementation- and locale-dependent: on this host two `cut` binaries
+# disagree, and the byte-based one splits a Vietnamese character in half.
 prompt_section() {
   local tp
   tp=$(json_str transcript_path)
   [ -n "$tp" ] || return 0
   [ -n "$QUAQUA" ] || return 0
-  "$QUAQUA" transcripts tail --session "$tp" --last 5 2>/dev/null | cut -c1-400
+  "$QUAQUA" transcripts tail --session "$tp" --last 5 2>/dev/null \
+    | cut -b1-400 | iconv -c -f UTF-8 -t UTF-8 2>/dev/null
 }
 
 body() {

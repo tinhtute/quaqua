@@ -45,12 +45,15 @@ git -C "$ws" -c user.email=t@t -c user.name=t add -A
 git -C "$ws" -c user.email=t@t -c user.name=t commit -qm init
 git -C "$ws" worktree add -q "$T/wt2" -b side
 
-# stub quaqua: `transcripts tail` answers, anything else fails
+# stub quaqua: `transcripts tail` answers, anything else fails. The third
+# message is 500 Vietnamese characters, so the per-line cut is exercised.
+LONG=$(printf '\u1eaf%.0s' {1..500})
+export LONG
 mkdir -p "$T/bin"
 cat > "$T/bin/quaqua" <<'EOF'
 #!/bin/sh
 case "$*" in
-  "transcripts tail"*) printf 'first user message\nsecond user message\n' ;;
+  "transcripts tail"*) printf 'first user message\nsecond user message\n%s\n' "$LONG" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -89,6 +92,11 @@ grep -q 'open-proj' "$snap" || fail "the open project row is missing"
 if grep -q 'done-proj' "$snap"; then fail "a done project leaked into the snapshot"; fi
 grep -q 'memory tail line' "$snap" || fail "today's memory tail is missing"
 grep -q 'first user message' "$snap" || fail "the transcript tail is missing"
+# 500 characters in, a 400-byte excerpt out: 133 whole characters, never half of
+# one (a byte-based cut without the iconv repair would leave a broken sequence).
+[[ $(grep -o $'\u1eaf' "$snap" | wc -l) -eq 133 ]] \
+  || fail "the long message was not cut at 400 bytes"
+iconv -f UTF-8 -t UTF-8 < "$snap" > /dev/null || fail "the snapshot is not valid UTF-8"
 grep -q "$T/wt2" "$snap" || fail "the worktree list is missing"
 grep -q "$snap" <<<"$out" || fail "the steer does not name the snapshot path"
 [[ ${#out} -le 2000 ]] || fail "the steer is ${#out} chars (cap 2000)"
@@ -151,6 +159,19 @@ out=$(printf '%s' "$start_json" | CLAUDE_PROJECT_DIR=$emptysnap bash "$hook" --s
 [[ -z $out ]] || fail "an empty memory/.compact still injected context"
 echo "ok: SessionStart injects on source=compact only"
 
+# A control byte in the snapshot must not make the injection invalid JSON.
+esc=$T/esc
+mkdir -p "$esc/memory/.compact"
+printf 'plain line\n\033[31mred line\033[0m\ttabbed\n' > "$esc/memory/.compact/s3.md"
+out=$(printf '%s' "$start_json" | CLAUDE_PROJECT_DIR=$esc bash "$hook" --session-start)
+jq -e . >/dev/null <<<"$out" || fail "SessionStart output is not valid JSON with a control byte"
+ctx=$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")
+grep -q 'red line' <<<"$ctx" || fail "the control-byte line was dropped"
+if printf '%s' "$out" | LC_ALL=C grep -q $'\033'; then
+  fail "a raw ESC byte reached the JSON"
+fi
+echo "ok: control bytes are escaped as \\u00XX"
+
 # ── 6. both caps hold ─────────────────────────────────────────────────────
 big=$T/big
 mkdir -p "$big/memory/.compact"
@@ -161,13 +182,16 @@ ctx=$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")
 [[ ${#ctx} -le 9000 ]] || fail "additionalContext is ${#ctx} chars (cap 9000)"
 grep -q 'snapshot truncated' <<<"$ctx" || fail "no truncation marker at 9000 chars"
 
+# Multi-byte filler: 100 characters are 300 bytes, so a character-counting cap
+# would let the file reach ~3x the 8 KiB limit.
 cap=$T/cap
 mkdir -p "$cap/memory" "$cap/.harness/plans/active"
+viet=$(printf '\u1eaf%.0s' {1..100})
 for i in 1 2 3 4 5; do
   {
     printf '# Plan %s\n\n## Current State and Next Action\n' "$i"
     for j in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-      printf -- '- item %s: %s\n' "$j" "$(head -c 300 /dev/zero | tr '\0' y)"
+      printf -- '- item %s: %s\n' "$j" "$viet"
     done
   } > "$cap/.harness/plans/active/p$i.md"
 done
@@ -178,6 +202,8 @@ CLAUDE_PROJECT_DIR=$cap QUAQUA_BIN=$T/bin/quaqua \
 size=$(wc -c < "$cap/memory/.compact/cap.md")
 [[ $size -le 8192 ]] || fail "the snapshot is $size bytes (cap 8192)"
 grep -q 'snapshot truncated' "$cap/memory/.compact/cap.md" || fail "no truncation marker at 8 KiB"
+iconv -f UTF-8 -t UTF-8 < "$cap/memory/.compact/cap.md" > /dev/null \
+  || fail "the capped snapshot is not valid UTF-8"
 echo "ok: snapshot <= 8192 bytes and additionalContext <= 9000 chars"
 
 echo "PASS: memory-compact.sh"

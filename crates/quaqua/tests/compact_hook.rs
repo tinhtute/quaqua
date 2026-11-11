@@ -4,6 +4,10 @@
 //!
 //! What the script itself does is `tests/test_memory_compact.sh`; this file only
 //! owns the install contract (R7).
+//!
+//! Every test name carries `compact_hook`: the phase's acceptance command is
+//! `cargo test -p quaqua compact_hook`, which filters test *names*, not the
+//! test file — a name without the token would silently drop out of the gate.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -106,7 +110,7 @@ fn settings_with_herdr_gate() -> String {
 }
 
 #[test]
-fn init_installs_the_compact_hooks_beside_the_herdr_gate() {
+fn compact_hook_init_installs_beside_the_herdr_gate() {
     let ws = Ws::new("install");
     let tpl = ws.template();
     let target = ws.root.join("ws");
@@ -146,7 +150,7 @@ fn init_installs_the_compact_hooks_beside_the_herdr_gate() {
 }
 
 #[test]
-fn a_second_init_writes_nothing() {
+fn compact_hook_init_is_idempotent() {
     let ws = Ws::new("idempotent");
     let tpl = ws.template();
     let target = ws.root.join("ws");
@@ -179,7 +183,7 @@ fn a_second_init_writes_nothing() {
 }
 
 #[test]
-fn dry_run_prints_the_compact_hooks_without_writing() {
+fn compact_hook_dry_run_writes_nothing() {
     let ws = Ws::new("dry-run");
     let tpl = ws.template();
     let target = ws.root.join("ws");
@@ -198,7 +202,7 @@ fn dry_run_prints_the_compact_hooks_without_writing() {
 }
 
 #[test]
-fn a_settings_file_that_is_not_an_object_is_left_untouched() {
+fn compact_hook_leaves_a_non_object_settings_file_untouched() {
     let ws = Ws::new("not-object");
     let tpl = ws.template();
     let target = ws.root.join("ws");
@@ -224,7 +228,7 @@ fn a_settings_file_that_is_not_an_object_is_left_untouched() {
 /// template is what a fresh workspace gets, the constants are what `init` heals
 /// an existing workspace with. Drift makes `--update` rewrite a fresh file.
 #[test]
-fn the_shipped_template_carries_the_installed_commands() {
+fn compact_hook_template_matches_the_installed_commands() {
     let template = include_str!("../../../templates/workspace/.claude/settings.json");
     let pre = hook_commands(template, "PreCompact");
     let start = hook_commands(template, "SessionStart");
