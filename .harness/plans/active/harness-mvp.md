@@ -15,7 +15,7 @@ lane: normal
 
 ## Map
 - Q1: Which steps from brief to merged PR still need a manual action today? | type: research | by: AFK | blocked_by: none | status: decided → 6 steps still need a human (brief text, report acceptance, test rerun, push, PR open, merge to main) plus 4 unwired chores (worker cleanup, binary reinstall, branch delete, CI-failure watch); no `quaqua` command touches the remote | evidence: raw/2026-11-11-quaqua-q1shipflow.md @ e77b22c
-- Q2: Should the CLI open and merge PRs itself, or stop at push+PR with merge by the Principal? | type: grill | by: HITL | blocked_by: Q1 | status: open
+- Q2: Should the CLI open and merge PRs itself, or stop at push+PR with merge by the Principal? | type: grill | by: HITL | blocked_by: Q1 | status: decided → stop at push+PR: a quaqua ship command pushes and opens the PR after one Principal approval; merge to main stays manual by the Principal | evidence: user 2026-11-11
 - Q3: What session shape makes the G1 review fork fire live, and how is that recorded? | type: research | by: AFK | blocked_by: none | status: decided → one long-lived interactive (not `-p`) Claude Code session that loads the mod, does ≥10 non-meta user turns and (≥10 Stops or ≥15 tool calls) since the last review, has `stop_hook_active` false and an unchanged `memory/rules.md` + `memory/<today>.md` stamp, then stays open for the detached fork to finish; recorded today only as `review.lastReviewAt` + `stamp` in `~/.claude/plugins/store/cos-memory_<src>-<hash>.json` | evidence: raw/2026-11-11-quaqua-q3forklive.md @ e77b22c
 - Q4: Is a prompt-only tool restriction on the review fork acceptable, or must the engine enforce a tool allowlist? | type: grill | by: HITL | blocked_by: Q3 | status: open
 - Q5: Does a 4-worker mixed-kind wave run clean today (grid, reports, cleanup)? | type: task | by: AFK | blocked_by: none | status: decided → 4 mixed-kind workers (omp, claude, agy, claude) ran to COMPLETE; frictions were topology gate requiring --solo for 3rd+ worker and agy taking ~1h | evidence: raw/2026-11-11-quaqua-q*.md, memory 2026-11-11
@@ -38,5 +38,5 @@ lane: normal
 - active_phase: none
 - lifecycle_status: planned
 - blockers: none
-- open_items: 5 open of 10 map lines (Q2, Q4, Q8, Q9, Q10)
+- open_items: 4 open of 10 map lines (Q4, Q8, Q9, Q10)
 - exact_next_action: wayfinder
