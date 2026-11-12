@@ -188,7 +188,8 @@ fn recall_absolute_ref_outside_workspace_is_not_read() {
 fn recall_parent_escape_ref_is_not_read() {
     let fx = Fixture::new("dotdot");
     let bus = fx.bus();
-    bus.open_thread("quaqua/dotdot", "lead").expect("open thread");
+    bus.open_thread("quaqua/dotdot", "lead")
+        .expect("open thread");
 
     let outside = fx.outside.join("dotdot.txt");
     std::fs::write(&outside, "parent escape body\n").expect("write outside file");
@@ -231,7 +232,10 @@ fn recall_symlink_escape_ref_is_not_read() {
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
     assert_eq!(detail.kind, RefKind::Outside);
-    assert!(!detail.exists, "a symlink out of the workspace is not followed");
+    assert!(
+        !detail.exists,
+        "a symlink out of the workspace is not followed"
+    );
     assert!(detail.head.is_empty());
     assert!(!render_text(&recall).contains("symlink target body"));
 }
@@ -277,7 +281,8 @@ fn recall_symlink_escape_through_missing_component_is_not_read() {
 fn recall_scheme_refs_are_printed_verbatim() {
     let fx = Fixture::new("scheme");
     let bus = fx.bus();
-    bus.open_thread("quaqua/scheme", "lead").expect("open thread");
+    bus.open_thread("quaqua/scheme", "lead")
+        .expect("open thread");
 
     for raw in [
         "mail:12",
@@ -314,7 +319,8 @@ fn recall_scheme_refs_are_printed_verbatim() {
 fn recall_path_ref_with_colon_is_not_a_scheme() {
     let fx = Fixture::new("colon");
     let bus = fx.bus();
-    bus.open_thread("quaqua/colon", "lead").expect("open thread");
+    bus.open_thread("quaqua/colon", "lead")
+        .expect("open thread");
 
     let notes = fx.root.join("docs/notes:1.md");
     std::fs::create_dir_all(notes.parent().unwrap()).expect("create docs dir");
@@ -335,7 +341,8 @@ fn recall_path_ref_with_colon_is_not_a_scheme() {
 fn recall_parent_ref_inside_workspace_is_read() {
     let fx = Fixture::new("inside-dotdot");
     let bus = fx.bus();
-    bus.open_thread("quaqua/inside", "lead").expect("open thread");
+    bus.open_thread("quaqua/inside", "lead")
+        .expect("open thread");
 
     let notes = fx.root.join("docs/notes.txt");
     std::fs::create_dir_all(notes.parent().unwrap()).expect("create docs dir");
@@ -348,7 +355,10 @@ fn recall_parent_ref_inside_workspace_is_read() {
     let recall = load_recall(&bus, id, &fx.root).unwrap().unwrap();
     let detail = recall.ref_detail.as_ref().unwrap();
     assert_eq!(detail.kind, RefKind::Path);
-    assert!(detail.exists, "`..` that stays inside the workspace is fine");
+    assert!(
+        detail.exists,
+        "`..` that stays inside the workspace is fine"
+    );
     assert_eq!(detail.head, vec!["inside body".to_string()]);
 }
 
@@ -477,7 +487,8 @@ fn recall_is_read_only_and_repeatable() {
 fn recall_ignores_triggers_recorded_by_another_farm() {
     let fx = Fixture::new("cross-farm");
     let bus = fx.bus();
-    bus.open_thread("quaqua/shared", "lead").expect("open thread");
+    bus.open_thread("quaqua/shared", "lead")
+        .expect("open thread");
 
     let mine = record(&bus, trigger("handoff", "quaqua/shared", "this farm"));
     let theirs = record(
@@ -492,7 +503,11 @@ fn recall_ignores_triggers_recorded_by_another_farm() {
 
     let recall = load_recall(&bus, mine, &fx.root).unwrap().unwrap();
     let recent: Vec<u64> = recall.thread.recent.iter().map(|t| t.id).collect();
-    assert_eq!(recent, vec![mine], "the thread's recent list is farm-scoped");
+    assert_eq!(
+        recent,
+        vec![mine],
+        "the thread's recent list is farm-scoped"
+    );
 }
 
 /// `quaqua recall` must work on a database it cannot write: the file is

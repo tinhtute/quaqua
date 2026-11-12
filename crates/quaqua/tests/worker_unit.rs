@@ -2074,15 +2074,7 @@ fn test_launch_review_args_per_harness() {
     let runs = launch_runs_dir("review-per-harness");
     let cmd = |harness: &str, model: &str, effort: &str, review: bool| {
         let l = resolve_launch(&kind(harness, model, Some(effort)), "k").unwrap();
-        build_launch_cmd(
-            &l,
-            "rev",
-            "/r/x.rules.md",
-            &runs,
-            "/repo/.wt/rev",
-            review,
-        )
-        .unwrap()
+        build_launch_cmd(&l, "rev", "/r/x.rules.md", &runs, "/repo/.wt/rev", review).unwrap()
     };
 
     // omp: review drops edit/write, keeps read tools + bash.
@@ -2176,7 +2168,10 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
         }
         dirs.push(a.as_str());
     }
-    assert!(dirs.contains(&runs.as_str()), "runs dir not readable: {dirs:?}");
+    assert!(
+        dirs.contains(&runs.as_str()),
+        "runs dir not readable: {dirs:?}"
+    );
     assert!(
         dirs.contains(&"/repo/.wt"),
         "builder worktree not readable: {dirs:?}"
@@ -2849,9 +2844,14 @@ fn test_spawn_worker_reports_herdr_start_error() {
         repo_dir.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let (_code, msg) =
-        quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli)
-            .expect_err("a failed agent start must fail the spawn");
+    let (_code, msg) = quaqua::worker::spawn::spawn_worker(
+        opts,
+        &cfg,
+        &git,
+        &herdr,
+        quaqua::layout::SpawnOrigin::Cli,
+    )
+    .expect_err("a failed agent start must fail the spawn");
     assert!(
         msg.contains("agent_start_input_failed"),
         "herdr's error code must reach the operator: {msg}"

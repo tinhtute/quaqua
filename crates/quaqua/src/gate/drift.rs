@@ -48,7 +48,10 @@ pub fn baseline_path(root: &Path, session_id: &str) -> Option<PathBuf> {
         && session_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    ok.then(|| root.join("runs/.sessions").join(format!("{session_id}.json")))
+    ok.then(|| {
+        root.join("runs/.sessions")
+            .join(format!("{session_id}.json"))
+    })
 }
 
 fn write_baseline(path: &Path, snap: &BTreeMap<String, String>) {
@@ -86,7 +89,10 @@ fn reread_list(root: &Path) -> String {
     if let Some(audit) = newest_audit(root) {
         files.push(audit);
     }
-    let list: Vec<String> = files.iter().map(|f| format!("- {}", root.join(f).display())).collect();
+    let list: Vec<String> = files
+        .iter()
+        .map(|f| format!("- {}", root.join(f).display()))
+        .collect();
     format!(
         "Context was compacted: instructions are now a summary. Re-read before acting:\n{}",
         list.join("\n")
@@ -130,9 +136,9 @@ pub fn drift(root: &Path, session_id: &str) -> Vec<String> {
 /// True when any segment runs `quaqua worker …` or `quaqua lead …`.
 pub fn is_dispatch(segs: &[Vec<String>]) -> bool {
     segs.iter().any(|seg| {
-        seg.iter().position(|w| w == "quaqua" || w.ends_with("/quaqua")).is_some_and(|i| {
-            matches!(seg.get(i + 1).map(String::as_str), Some("worker" | "lead"))
-        })
+        seg.iter()
+            .position(|w| w == "quaqua" || w.ends_with("/quaqua"))
+            .is_some_and(|i| matches!(seg.get(i + 1).map(String::as_str), Some("worker" | "lead")))
     })
 }
 
@@ -166,7 +172,10 @@ mod tests {
         assert!(drift(&d, "s1").is_empty());
         std::fs::write(d.join("rules/_all/x.md"), "changed").unwrap();
         std::fs::write(d.join("rules/_all/new.md"), "n").unwrap();
-        assert_eq!(drift(&d, "s1"), vec!["rules/_all/new.md", "rules/_all/x.md"]);
+        assert_eq!(
+            drift(&d, "s1"),
+            vec!["rules/_all/new.md", "rules/_all/x.md"]
+        );
         assert!(drift(&d, "s1").is_empty(), "warns once per change");
         std::fs::remove_file(d.join("team.toml")).unwrap();
         assert_eq!(drift(&d, "s1"), vec!["team.toml"]);
@@ -193,7 +202,10 @@ mod tests {
         assert!(out.contains("AGENTS.md"), "{out}");
         assert!(out.contains("audit-2026-10-02-01.md"), "{out}");
         assert!(!out.contains("audit-2026-10-01-01.md"), "{out}");
-        assert!(!out.contains("memory/rules.md"), "missing files are left out: {out}");
+        assert!(
+            !out.contains("memory/rules.md"),
+            "missing files are left out: {out}"
+        );
         assert!(drift(&d, "s3").is_empty());
     }
 
@@ -209,7 +221,9 @@ mod tests {
     fn dispatch_matches_worker_and_lead_only() {
         let t = crate::gate::tokenizer::tokenize;
         assert!(is_dispatch(&t("quaqua worker spawn sude-x sude ~/r")));
-        assert!(is_dispatch(&t("cd ~/quaqua && ~/.local/bin/quaqua lead prompt baro")));
+        assert!(is_dispatch(&t(
+            "cd ~/quaqua && ~/.local/bin/quaqua lead prompt baro"
+        )));
         assert!(!is_dispatch(&t("quaqua status")));
         assert!(!is_dispatch(&t("echo quaqua")));
     }

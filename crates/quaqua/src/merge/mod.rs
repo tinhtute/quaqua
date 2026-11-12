@@ -715,7 +715,11 @@ mod tests {
             ("rework", "test ! -f b1.txt", 2),
             // Passes, but rewrites a tracked file once b1 is merged (a stale merged
             // Cargo.lock): rework for b1, never a misattributed merge conflict.
-            ("dirty", "if [ -f b1.txt ]; then echo '# x' >> Cargo.toml; fi", 2),
+            (
+                "dirty",
+                "if [ -f b1.txt ]; then echo '# x' >> Cargo.toml; fi",
+                2,
+            ),
             ("pass", "true", 0),
         ];
         for (case, fake, want) in cases {
@@ -768,11 +772,19 @@ mod tests {
                 assert!(res.is_ok(), "passing check must merge all: {res:?}");
                 assert!(merged("b1") && merged("b2"));
             } else {
-                let Err((code, msg)) = res else { panic!("{case}: failing check must fail the merge") };
+                let Err((code, msg)) = res else {
+                    panic!("{case}: failing check must fail the merge")
+                };
                 assert_eq!(code, want, "{case}: {msg}");
-                assert!(msg.contains(fake), "{case}: message must name the check: {msg}");
+                assert!(
+                    msg.contains(fake),
+                    "{case}: message must name the check: {msg}"
+                );
                 assert!(!merged("b1"), "{case}: failing branch must be undone");
-                assert!(!merged("b2"), "{case}: queue must stop before the next branch");
+                assert!(
+                    !merged("b2"),
+                    "{case}: queue must stop before the next branch"
+                );
             }
             let _ = fs::remove_dir_all(&tmp);
         }

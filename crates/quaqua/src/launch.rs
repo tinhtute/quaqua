@@ -247,8 +247,13 @@ pub fn write_claude_settings(
     read_root: Option<&str>,
 ) -> Result<String, (i32, String)> {
     let path = crate::state::WorkerMetadata::settings_path(Path::new(runs_dir), name);
-    let body = serde_json::to_string_pretty(&claude_settings(name, runs_dir, read_root))
-        .map_err(|e| (1, format!("error: cannot render claude settings for '{name}': {e}\n")))?;
+    let body =
+        serde_json::to_string_pretty(&claude_settings(name, runs_dir, read_root)).map_err(|e| {
+            (
+                1,
+                format!("error: cannot render claude settings for '{name}': {e}\n"),
+            )
+        })?;
     std::fs::write(&path, body).map_err(|e| {
         (
             1,
@@ -586,7 +591,10 @@ mod tests {
 
         // Finding 1 [major]: No --no-extensions, discovery remains enabled, exactly one -e
         assert!(!cmd.agent_args.iter().any(|a| a == "--no-extensions"));
-        assert!(!cmd.agent_args.iter().any(|a| a.contains("herdr-omp-agent-state.ts")));
+        assert!(!cmd
+            .agent_args
+            .iter()
+            .any(|a| a.contains("herdr-omp-agent-state.ts")));
         let ext_indices: Vec<usize> = cmd
             .agent_args
             .iter()
@@ -594,7 +602,11 @@ mod tests {
             .filter(|(_, a)| *a == "-e")
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(ext_indices.len(), 1, "must pass exactly one -e for worker state extension");
+        assert_eq!(
+            ext_indices.len(),
+            1,
+            "must pass exactly one -e for worker state extension"
+        );
         let worker_ext = super::omp_worker_state_hook_path("/workspace/runs");
         assert_eq!(cmd.agent_args[ext_indices[0] + 1], worker_ext);
 
@@ -725,8 +737,9 @@ mod tests {
                 .iter()
                 .position(|a| a == "--settings")
                 .expect("claude takes its settings through --settings");
-            let body = std::fs::read_to_string(&cmd.agent_args[at + 1])
-                .unwrap_or_else(|e| panic!("review={review}: --settings must name a file claude can read: {e}"));
+            let body = std::fs::read_to_string(&cmd.agent_args[at + 1]).unwrap_or_else(|e| {
+                panic!("review={review}: --settings must name a file claude can read: {e}")
+            });
             assert!(
                 body.contains(&format!("{runs}/.suhuynh-rev.state")),
                 "review={review}: hooks must record this worker's state: {body}"

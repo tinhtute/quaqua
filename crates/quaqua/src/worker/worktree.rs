@@ -153,11 +153,7 @@ pub fn validate_base_ref<G: GitOps>(
 ///
 /// Refuses if the common config has `core.bare=true` or `core.worktree` configured, as
 /// enabling `extensions.worktreeConfig` in such repos breaks all worktrees.
-pub fn apply_push_block<G: GitOps>(
-    git: &G,
-    repo: &Path,
-    wt: &Path,
-) -> Result<(), (i32, String)> {
+pub fn apply_push_block<G: GitOps>(git: &G, repo: &Path, wt: &Path) -> Result<(), (i32, String)> {
     if git.is_core_bare(repo) || git.has_core_worktree(repo) {
         return Err((
             1,
@@ -253,11 +249,7 @@ pub fn prepare_worktree<G: GitOps>(
 pub use prepare_worktree as setup_worktree;
 
 /// Remove a worker's git worktree.
-pub fn remove_worktree<G: GitOps>(
-    git: &G,
-    repo: &Path,
-    wt: &Path,
-) -> Result<(), (i32, String)> {
+pub fn remove_worktree<G: GitOps>(git: &G, repo: &Path, wt: &Path) -> Result<(), (i32, String)> {
     let rm_out = git
         .worktree_remove(repo, wt)
         .map_err(|e| (1, format!("error: worktree remove failed: {e}")))?;

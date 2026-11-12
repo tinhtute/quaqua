@@ -112,7 +112,9 @@ pub fn append_worker_telemetry(
                         && v.get("name").and_then(|n| n.as_str()) == Some(name)
                     {
                         if let Some(ts_str) = v.get("ts").and_then(|t| t.as_str()) {
-                            if let Some(ms) = crate::worker::prompt::cost::parse_iso_timestamp_ms(ts_str) {
+                            if let Some(ms) =
+                                crate::worker::prompt::cost::parse_iso_timestamp_ms(ts_str)
+                            {
                                 since_ms = Some(ms);
                             }
                         }
@@ -128,12 +130,20 @@ pub fn append_worker_telemetry(
 
         if let Some(json) = agent_info {
             if let Some(agent) = json.get("result").and_then(|r| r.get("agent")) {
-                if let Some(h) = agent.get("agent").or_else(|| agent.get("harness")).and_then(|v| v.as_str()) {
+                if let Some(h) = agent
+                    .get("agent")
+                    .or_else(|| agent.get("harness"))
+                    .and_then(|v| v.as_str())
+                {
                     if !h.is_empty() {
                         harness = Some(h.to_string());
                     }
                 }
-                if let Some(s) = agent.get("agent_session").and_then(|s| s.get("value")).and_then(|v| v.as_str()) {
+                if let Some(s) = agent
+                    .get("agent_session")
+                    .and_then(|s| s.get("value"))
+                    .and_then(|v| v.as_str())
+                {
                     session_id = s.to_string();
                 }
                 if let Some(c) = agent.get("cwd").and_then(|v| v.as_str()) {
@@ -188,7 +198,9 @@ pub fn append_worker_telemetry(
                                 last_exit = Some(out.exit);
                             }
                         } else if ev.kind == "workflow_failed" {
-                            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&ev.payload_json) {
+                            if let Ok(data) =
+                                serde_json::from_str::<serde_json::Value>(&ev.payload_json)
+                            {
                                 if let Some(code) = data.get("code").and_then(|c| c.as_i64()) {
                                     last_exit = Some(code as i32);
                                 }
@@ -206,7 +218,6 @@ pub fn append_worker_telemetry(
                             usd_budget = state.input.cost_budget;
                             if harness.is_none() {
                                 harness = state.harness.clone();
-
                             }
                         }
                     }
@@ -308,7 +319,6 @@ pub fn home_quaqua_runs() -> PathBuf {
     crate::workspace::workspace_root().join("runs")
 }
 
-
 pub fn default_runs_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("QUAQUA_RUNS_DIR") {
         return PathBuf::from(dir);
@@ -327,7 +337,9 @@ pub fn run_grid_hook(grid_tab: &str, owner: Option<&str>) -> Result<(), (i32, St
         if is_pipeline || is_test {
             return Ok(());
         }
-        eprintln!("warning: GRID_SKIP=1 ignored outside pipeline/tests (rules/_all/fanout-agent-grid.md)");
+        eprintln!(
+            "warning: GRID_SKIP=1 ignored outside pipeline/tests (rules/_all/fanout-agent-grid.md)"
+        );
     }
 
     if let Err(e) = crate::grid::run_grid_repair(grid_tab, owner) {
@@ -430,7 +442,12 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
     // record that finds the real worktree (#170 F1).
     let registered = git
         .worktree_list_porcelain(&repo)
-        .map_err(|e| (1, format!("error: git worktree list failed in {}: {e}", repo.display())))?
+        .map_err(|e| {
+            (
+                1,
+                format!("error: git worktree list failed in {}: {e}", repo.display()),
+            )
+        })?
         .iter()
         .any(|p| Path::new(p) == wt);
     let branch = format!("quaqua/{name}");
@@ -456,10 +473,7 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
     let owner = std::env::var("QUAQUA_OWNER")
         .ok()
         .unwrap_or_else(|| WorkerMetadata::load_owner(&runs_dir, name));
-    let repo_name = repo
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
+    let repo_name = repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
     let grid_tab = std::env::var("GRID_TAB")
         .ok()
         .or_else(|| WorkerMetadata::load_grid(&runs_dir, name))
@@ -605,7 +619,11 @@ pub(crate) mod metrics {
             Ok(Output {
                 status: ExitStatusExt::from_raw(code),
                 stdout: vec![],
-                stderr: if code == 0 { vec![] } else { b"failed".to_vec() },
+                stderr: if code == 0 {
+                    vec![]
+                } else {
+                    b"failed".to_vec()
+                },
             })
         }
         fn remote_list(&self, _repo: &Path) -> std::io::Result<Vec<String>> {
@@ -716,7 +734,8 @@ pub(crate) mod metrics {
     fn test_cleanup_metrics_happy_path() {
         let _lock = test_lock();
         let _env_lock = crate::test_env::lock_env();
-        let tmp = std::env::temp_dir().join(format!("cleanup-metrics-happy-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("cleanup-metrics-happy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let tmp = std::fs::canonicalize(&tmp).unwrap();
@@ -733,7 +752,10 @@ pub(crate) mod metrics {
         let _env_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
 
         // Fixture opencode DB
-        let state_dir = runs_dir.join(".opencode-state").join("tieude-clean1").join("opencode");
+        let state_dir = runs_dir
+            .join(".opencode-state")
+            .join("tieude-clean1")
+            .join("opencode");
         std::fs::create_dir_all(&state_dir).unwrap();
         let db_path = state_dir.join("opencode.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -751,7 +773,8 @@ pub(crate) mod metrics {
                 time_created INTEGER NOT NULL,
                 time_updated INTEGER NOT NULL
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO session_v2 VALUES ('ses-1', ?1, 0.0458, 94574, 16991, 0, 3754496, 0, '{\"id\":\"deepseek-v4.1-flash\"}', 1000, 2000);",
             rusqlite::params![wt.to_str().unwrap()],
@@ -981,7 +1004,9 @@ pub(crate) mod metrics {
         let _env = cleanup_env(&runs_dir);
         let git = crate::git::Git::new();
         let wt = tmp.join(".wt").join("w-gone");
-        let add = git.worktree_add(&owner, "quaqua/w-gone", &wt, None).unwrap();
+        let add = git
+            .worktree_add(&owner, "quaqua/w-gone", &wt, None)
+            .unwrap();
         assert!(
             add.status.success(),
             "{}",
@@ -1001,8 +1026,14 @@ pub(crate) mod metrics {
             "git must no longer register the deleted worktree"
         );
         // The same name can be spawned again.
-        let out = git.worktree_add_existing(&owner, "quaqua/w-gone", &wt).unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = git
+            .worktree_add_existing(&owner, "quaqua/w-gone", &wt)
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1056,7 +1087,8 @@ pub(crate) mod metrics {
     fn test_cleanup_metrics_second_lifecycle_excludes_first() {
         let _lock = test_lock();
         let _env_lock = crate::test_env::lock_env();
-        let tmp = std::env::temp_dir().join(format!("cleanup-metrics-reuse-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("cleanup-metrics-reuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let runs_dir = tmp.join("runs");
         let repo = tmp.join("repo");
@@ -1074,12 +1106,16 @@ pub(crate) mod metrics {
         let prev_line = "{\"ts\":\"2026-10-21T10:00:00Z\",\"rec\":\"worker\",\"name\":\"tieude-reused\",\"usd\":0.5}\n";
         std::fs::write(&tele_path, prev_line).unwrap();
 
-        let fence_ms = crate::worker::prompt::cost::parse_iso_timestamp_ms("2026-10-21T10:00:00Z").unwrap();
+        let fence_ms =
+            crate::worker::prompt::cost::parse_iso_timestamp_ms("2026-10-21T10:00:00Z").unwrap();
 
         // Fixture opencode DB with 2 sessions:
         // Session 1: before fence_ms
         // Session 2: after fence_ms
-        let state_dir = runs_dir.join(".opencode-state").join("tieude-reused").join("opencode");
+        let state_dir = runs_dir
+            .join(".opencode-state")
+            .join("tieude-reused")
+            .join("opencode");
         std::fs::create_dir_all(&state_dir).unwrap();
         let db_path = state_dir.join("opencode.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1097,7 +1133,8 @@ pub(crate) mod metrics {
                 time_created INTEGER NOT NULL,
                 time_updated INTEGER NOT NULL
             );",
-        ).unwrap();
+        )
+        .unwrap();
         // Session 1 (before fence)
         conn.execute(
             "INSERT INTO session_v2 VALUES ('ses-old', ?1, 0.50, 5000, 500, 0, 10000, 0, 'deepseek-v4.1-flash', ?2, ?2);",
@@ -1168,7 +1205,10 @@ pub(crate) mod metrics {
         assert!(err.is_err());
 
         let tele_path = runs_dir.join("telemetry.jsonl");
-        assert!(!tele_path.exists(), "no telemetry row must be written when cleanup fails");
+        assert!(
+            !tele_path.exists(),
+            "no telemetry row must be written when cleanup fails"
+        );
 
         // 2. Retry succeeds
         let success_git = MockGit {
@@ -1180,7 +1220,11 @@ pub(crate) mod metrics {
         assert!(tele_path.is_file());
         let content = std::fs::read_to_string(&tele_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1, "retry after failure must produce exactly 1 row");
+        assert_eq!(
+            lines.len(),
+            1,
+            "retry after failure must produce exactly 1 row"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1204,7 +1248,8 @@ pub(crate) mod metrics {
 
         let herdr = MockHerdr {
             agent_list_response: LIST_COS.to_string(),
-            agent_get_response: r#"{"result":{"agent":{"agent":"agy","pane_id":"%1","cwd":""}}}"#.to_string(),
+            agent_get_response: r#"{"result":{"agent":{"agent":"agy","pane_id":"%1","cwd":""}}}"#
+                .to_string(),
         };
 
         // The watchdog stop (exit 4) writes the row; a repeat stop adds nothing.
@@ -1212,7 +1257,10 @@ pub(crate) mod metrics {
         let tele_path = runs_dir.join("telemetry.jsonl");
         std::fs::write(&tele_path, stop_line).unwrap();
         record_stop_telemetry("agy-stopped", &repo, &herdr, &runs_dir);
-        assert_eq!(std::fs::read_to_string(&tele_path).unwrap().lines().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&tele_path).unwrap().lines().count(),
+            1
+        );
 
         let git = MockGit {
             worktree_remove_ok: true,
@@ -1327,7 +1375,8 @@ pub(crate) mod metrics {
     fn test_cleanup_metrics_failing_harness_readers() {
         let _lock = test_lock();
         let _env_lock = crate::test_env::lock_env();
-        let tmp = std::env::temp_dir().join(format!("cleanup-failing-readers-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("cleanup-failing-readers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let runs_dir = tmp.join("runs");
         let repo = tmp.join("repo");
@@ -1376,7 +1425,10 @@ pub(crate) mod metrics {
 
         let tele_path = runs_dir.join("telemetry.jsonl");
         let content = std::fs::read_to_string(&tele_path).unwrap();
-        let rows: Vec<WorkerTelemetryRow> = content.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let rows: Vec<WorkerTelemetryRow> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
         assert_eq!(rows.len(), 3);
 
         // OMP: usd null, tokens null, spend_src omp-session-not-found
@@ -1406,9 +1458,15 @@ pub(crate) mod metrics {
         let _env_lock = crate::test_env::lock_env();
         let _env_home = TestEnvVarGuard::set("HOME", "/mock/root/user");
 
-        assert_eq!(format_repo_path(Path::new("/mock/root/user/quaqua")), "~/quaqua");
+        assert_eq!(
+            format_repo_path(Path::new("/mock/root/user/quaqua")),
+            "~/quaqua"
+        );
         assert_eq!(format_repo_path(Path::new("/mock/root/user")), "~");
         // Must not strip as prefix when path boundary does not match:
-        assert_eq!(format_repo_path(Path::new("/mock/root/user2/quaqua")), "/mock/root/user2/quaqua");
+        assert_eq!(
+            format_repo_path(Path::new("/mock/root/user2/quaqua")),
+            "/mock/root/user2/quaqua"
+        );
     }
 }

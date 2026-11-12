@@ -71,7 +71,9 @@ pub fn interrupt_worker<H: HerdrOps>(name: &str, herdr: &H) -> Result<String, (i
     let harness = harness_from_info(&body).ok_or_else(|| {
         (
             1,
-            format!("error: agent '{name}' is not running or unknown to herdr — nothing was sent\n"),
+            format!(
+                "error: agent '{name}' is not running or unknown to herdr — nothing was sent\n"
+            ),
         )
     })?;
 
@@ -90,9 +92,15 @@ pub fn interrupt_worker<H: HerdrOps>(name: &str, herdr: &H) -> Result<String, (i
             .map_err(|e| (1, format!("error: failed to send '{key}' to {name}: {e}\n")))?;
         if !out.status.success() {
             let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err((1, format!("error: failed to send '{key}' to {name}: {err_text}\n")));
+            return Err((
+                1,
+                format!("error: failed to send '{key}' to {name}: {err_text}\n"),
+            ));
         }
     }
 
-    Ok(format!("stopped {name} (harness={harness}, keys={})", keys.join(" ")))
+    Ok(format!(
+        "stopped {name} (harness={harness}, keys={})",
+        keys.join(" ")
+    ))
 }

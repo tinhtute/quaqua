@@ -361,9 +361,10 @@ impl Config {
 
 /// Resolve a kind from a purpose name in config.
 pub fn resolve_purpose<'a>(cfg: &'a Config, purpose: &str) -> Result<&'a str, String> {
-    let kind = cfg.purposes.get(purpose).ok_or_else(|| {
-        format!("unknown purpose '{purpose}'")
-    })?;
+    let kind = cfg
+        .purposes
+        .get(purpose)
+        .ok_or_else(|| format!("unknown purpose '{purpose}'"))?;
     if !cfg.kinds.contains_key(kind) {
         return Err(format!("purpose '{purpose}': unknown kind '{kind}'"));
     }
@@ -388,7 +389,6 @@ pub fn kind_of_worker<'a>(cfg: &'a Config, name: &str) -> Option<&'a str> {
     }
     best
 }
-
 
 /// The variant vocabulary allowed for known opencode models.
 /// Key is the last path segment of the model ID (e.g. "deepseek-v4.1-flash").
@@ -697,7 +697,9 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     if cfg.schema_version == 3 {
         for name in cfg.layouts.keys() {
             if crate::layout::builtin::get(name).is_some() {
-                return Err(format!("user layout '{name}' collides with built-in layout"));
+                return Err(format!(
+                    "user layout '{name}' collides with built-in layout"
+                ));
             }
         }
         if let Some(layout_ref) = &cfg.layout {
@@ -780,7 +782,10 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             cfg.timers.nudge_at
         ));
     }
-    if cfg.timers.cost_buffer <= 0.0 || cfg.timers.cost_buffer > 1.0 || cfg.timers.cost_buffer.is_nan() {
+    if cfg.timers.cost_buffer <= 0.0
+        || cfg.timers.cost_buffer > 1.0
+        || cfg.timers.cost_buffer.is_nan()
+    {
         return Err(format!(
             "timers.cost_buffer {} must be in (0, 1]",
             cfg.timers.cost_buffer
@@ -896,7 +901,6 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         }
     }
 
-
     // team.toml is the only source of harness/model/effort: fail closed on a kind
     // that cannot launch, or on a fallback that names a missing kind or itself.
     for (name, kind) in &cfg.kinds {
@@ -934,8 +938,7 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 kind.harness
             ));
         }
-        if crate::harness::Harness::parse(&kind.harness)
-            == Some(crate::harness::Harness::Opencode)
+        if crate::harness::Harness::parse(&kind.harness) == Some(crate::harness::Harness::Opencode)
         {
             match cfg.opencode_model_variants(&kind.model) {
                 Some(allowed) => {
@@ -1202,7 +1205,10 @@ workers_tab = "workers"
         assert!(validate(&c).is_ok());
         c.kinds.get_mut("tieude").unwrap().effort = Some("auto".to_string());
         let err = validate(&c).unwrap_err();
-        assert!(err.contains("harness 'pi' does not take effort 'auto'"), "{err}");
+        assert!(
+            err.contains("harness 'pi' does not take effort 'auto'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1215,7 +1221,10 @@ workers_tab = "workers"
         assert!(validate(&c).is_ok());
         c.kinds.get_mut("tieude").unwrap().effort = Some("off".to_string());
         let err = validate(&c).unwrap_err();
-        assert!(err.contains("harness 'agy' does not take effort 'off'"), "{err}");
+        assert!(
+            err.contains("harness 'agy' does not take effort 'off'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1236,11 +1245,17 @@ workers_tab = "workers"
             },
         );
         let err = validate(&c).unwrap_err();
-        assert!(err.contains("roles.lead.max_peers 5 must be in 1..=4"), "{err}");
+        assert!(
+            err.contains("roles.lead.max_peers 5 must be in 1..=4"),
+            "{err}"
+        );
 
         c.roles.get_mut("lead").unwrap().max_peers = Some(0);
         let err = validate(&c).unwrap_err();
-        assert!(err.contains("roles.lead.max_peers 0 must be in 1..=4"), "{err}");
+        assert!(
+            err.contains("roles.lead.max_peers 0 must be in 1..=4"),
+            "{err}"
+        );
 
         c.roles.get_mut("lead").unwrap().max_peers = Some(4);
         assert!(validate(&c).is_ok());
@@ -1323,7 +1338,10 @@ workers_tab = "workers"
     #[test]
     fn spawn_policy_defaults_to_auto() {
         assert_eq!(base().kinds["tieude"].spawn, SPAWN_AUTO);
-        assert_eq!(get(&base(), "kinds.tieude.spawn", None).unwrap(), SPAWN_AUTO);
+        assert_eq!(
+            get(&base(), "kinds.tieude.spawn", None).unwrap(),
+            SPAWN_AUTO
+        );
     }
 
     #[test]
@@ -1336,7 +1354,10 @@ workers_tab = "workers"
         // kill needs a harness with a stop key (opencode has one).
         c.kinds.get_mut("suhuynh").unwrap().on_cost_cap = COST_CAP_KILL.to_string();
         let err = validate(&c).unwrap_err();
-        assert!(err.contains("kind 'suhuynh'") && err.contains("harness 'claude'"), "{err}");
+        assert!(
+            err.contains("kind 'suhuynh'") && err.contains("harness 'claude'"),
+            "{err}"
+        );
         c.kinds.get_mut("suhuynh").unwrap().on_cost_cap = COST_CAP_WARN.to_string();
         // a kill kind whose fallback is claude (no stop key) is refused too.
         c.kinds.get_mut("tieude").unwrap().fallback = Some("suhuynh".to_string());
@@ -1477,7 +1498,9 @@ workers_tab = "workers"
         c.kinds.get_mut("tieude").unwrap().effort = Some("max".to_string());
         let err = validate(&c).unwrap_err();
         assert!(
-            err.contains("is not in allowlist (fix: add model and variants to team.toml [opencode_models])"),
+            err.contains(
+                "is not in allowlist (fix: add model and variants to team.toml [opencode_models])"
+            ),
             "{err}"
         );
 
@@ -1505,7 +1528,9 @@ workers_tab = "workers"
         c.opencode_models.remove("my-custom-model");
         let err = validate(&c).unwrap_err();
         assert!(
-            err.contains("is not in allowlist (fix: add model and variants to team.toml [opencode_models])"),
+            err.contains(
+                "is not in allowlist (fix: add model and variants to team.toml [opencode_models])"
+            ),
             "{err}"
         );
     }
@@ -1513,7 +1538,8 @@ workers_tab = "workers"
     #[test]
     fn test_purposes_resolution_and_validation() {
         let mut c = base();
-        c.purposes.insert("review".to_string(), "suhuynh".to_string());
+        c.purposes
+            .insert("review".to_string(), "suhuynh".to_string());
         c.purposes.insert("build".to_string(), "tieude".to_string());
 
         // Valid purpose resolves to kind
@@ -1525,7 +1551,8 @@ workers_tab = "workers"
         assert!(err.contains("unknown purpose 'research'"), "{err}");
 
         // Dangling kind fails config validation with offending key
-        c.purposes.insert("design".to_string(), "ghost-kind".to_string());
+        c.purposes
+            .insert("design".to_string(), "ghost-kind".to_string());
         let err = validate(&c).unwrap_err();
         assert!(
             err.contains("purpose 'design': unknown kind 'ghost-kind'"),
@@ -1540,10 +1567,15 @@ schema_version = 2
 [opencode_models]
 "custom-model" = ["low", "high"]
 "#;
-        let cfg: Config = toml::from_str(toml_str).expect("parse config with custom opencode_models");
+        let cfg: Config =
+            toml::from_str(toml_str).expect("parse config with custom opencode_models");
         assert_eq!(
             cfg.opencode_models.get("deepseek-v4.1-flash"),
-            Some(&vec!["low".to_string(), "high".to_string(), "max".to_string()])
+            Some(&vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string()
+            ])
         );
         assert_eq!(
             cfg.opencode_models.get("custom-model"),
@@ -1555,7 +1587,8 @@ schema_version = 2
 [opencode_models]
 "deepseek-v4.1-flash" = ["max"]
 "#;
-        let cfg2: Config = toml::from_str(override_str).expect("parse config overriding default model");
+        let cfg2: Config =
+            toml::from_str(override_str).expect("parse config overriding default model");
         assert_eq!(
             cfg2.opencode_models.get("deepseek-v4.1-flash"),
             Some(&vec!["max".to_string()])

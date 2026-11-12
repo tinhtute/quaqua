@@ -60,7 +60,8 @@ pub fn scan_source_for_determinism_violations(
             }
 
             // Check for forbidden tokens (ignoring comment lines)
-            if !trimmed.starts_with("//") && !trimmed.starts_with("/*") && !trimmed.starts_with('*') {
+            if !trimmed.starts_with("//") && !trimmed.starts_with("/*") && !trimmed.starts_with('*')
+            {
                 for &pattern in &forbidden_patterns {
                     if line.contains(pattern) {
                         violations.push(DeterminismViolation {
@@ -85,14 +86,17 @@ pub fn scan_source_for_determinism_violations(
 }
 
 /// Recursively scans all `.rs` files in the given directory.
-pub fn scan_directory_for_determinism_violations(dir: &Path) -> Result<Vec<DeterminismViolation>, String> {
+pub fn scan_directory_for_determinism_violations(
+    dir: &Path,
+) -> Result<Vec<DeterminismViolation>, String> {
     let mut violations = Vec::new();
     scan_dir_recursive(dir, &mut violations)?;
     Ok(violations)
 }
 
 fn scan_dir_recursive(dir: &Path, out: &mut Vec<DeterminismViolation>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read dir {}: {e}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read dir {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
         let path = entry.path();
@@ -101,7 +105,8 @@ fn scan_dir_recursive(dir: &Path, out: &mut Vec<DeterminismViolation>) -> Result
         } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read file {}: {e}", path.display()))?;
-            let mut file_violations = scan_source_for_determinism_violations(&content, &path.to_string_lossy());
+            let mut file_violations =
+                scan_source_for_determinism_violations(&content, &path.to_string_lossy());
             out.append(&mut file_violations);
         }
     }

@@ -45,7 +45,11 @@ impl std::fmt::Display for JournalError {
         match self {
             Self::StorageError(msg) => write!(f, "journal storage error: {msg}"),
             Self::SerializationError(msg) => write!(f, "journal serialization error: {msg}"),
-            Self::SequenceConflict { workflow_id, expected_seq, actual_seq } => {
+            Self::SequenceConflict {
+                workflow_id,
+                expected_seq,
+                actual_seq,
+            } => {
                 write!(f, "journal sequence conflict for {workflow_id}: expected {expected_seq}, got {actual_seq}")
             }
         }
@@ -68,7 +72,12 @@ pub struct EventRecord {
 }
 
 impl EventRecord {
-    pub fn new(seq: u64, ts_ms: u64, kind: impl Into<String>, payload_json: impl Into<String>) -> Self {
+    pub fn new(
+        seq: u64,
+        ts_ms: u64,
+        kind: impl Into<String>,
+        payload_json: impl Into<String>,
+    ) -> Self {
         Self {
             seq,
             ts_ms,
@@ -99,14 +108,26 @@ impl SnapshotRecord {
 /// Object-safe trait for workflow event journaling and state snapshotting.
 pub trait Journal: Send + Sync {
     /// Appends an event to the workflow history and returns the assigned sequence number.
-    fn append_event(&mut self, workflow_id: &str, event: &EventRecord) -> Result<u64, JournalError>;
+    fn append_event(&mut self, workflow_id: &str, event: &EventRecord)
+        -> Result<u64, JournalError>;
 
     /// Appends a workflow state snapshot.
-    fn append_snapshot(&mut self, workflow_id: &str, snapshot: &SnapshotRecord) -> Result<(), JournalError>;
+    fn append_snapshot(
+        &mut self,
+        workflow_id: &str,
+        snapshot: &SnapshotRecord,
+    ) -> Result<(), JournalError>;
 
     /// Loads historical events for a workflow starting from sequence `since_seq` (inclusive).
-    fn load_events(&self, workflow_id: &str, since_seq: u64) -> Result<Vec<EventRecord>, JournalError>;
+    fn load_events(
+        &self,
+        workflow_id: &str,
+        since_seq: u64,
+    ) -> Result<Vec<EventRecord>, JournalError>;
 
     /// Loads the latest state snapshot for a workflow, if one exists.
-    fn load_latest_snapshot(&self, workflow_id: &str) -> Result<Option<SnapshotRecord>, JournalError>;
+    fn load_latest_snapshot(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<SnapshotRecord>, JournalError>;
 }
