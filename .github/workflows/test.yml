@@ -1,11 +1,15 @@
 name: Test
 
 # Every PR into main, and every push to main, runs the workspace test suite, the
-# workspace clippy gate, the cos-memory mod's node tests, and lints the workflow
+# workspace clippy gate, the cos-memory mod's tests, and lints the workflow
 # files. The check names are "Test / cargo test (workspace)" (which carries the
-# clippy step), "Test / cos-memory mod tests" and "Test / actionlint
-# (workflows)"; all are required status checks in branch protection, so a red
-# lint blocks a merge exactly like a red test.
+# clippy and hermetic-DB steps), "Test / cos-memory mod tests" and
+# "Test / actionlint (workflows)".
+#
+# Required today: ruleset 25703680 requires only "cargo test (workspace)" and
+# "actionlint (workflows)". "cos-memory mod tests" is NOT required yet, so a red
+# mod test shows on the PR but does not block the merge until that context is
+# added to the ruleset. Reword this to "all required" only once it is.
 on:
   pull_request:
     branches: [main]
@@ -65,7 +69,11 @@ jobs:
       # ubuntu-latest ships no strace; install it, and set
       # HERMETIC_REQUIRE_STRACE=1 so a failed install fails the step instead of
       # turning the guard into a silent skip.
+      #
+      # Both hermetic steps run even after an earlier step failed: a clippy
+      # warning must not hide the hermetic-DB result until the lint is fixed.
       - name: Install strace
+        if: success() || failure()
         run: |
           set -euo pipefail
           if ! command -v strace >/dev/null 2>&1; then
@@ -75,6 +83,7 @@ jobs:
           strace --version
 
       - name: hermetic workspace (no live workspace DB opens)
+        if: success() || failure()
         env:
           HERMETIC_REQUIRE_STRACE: '1'
         run: bash tests/test_hermetic_db.sh
@@ -98,8 +107,25 @@ jobs:
         with:
           node-version: 24
 
+      # node --test exits 0 when its glob selects no file, so a renamed or moved
+      # tests/ (or a switch to .mjs) would turn this gate into a silent green
+      # with zero tests. The guard selects the same set the node glob does — any
+      # *.test.js at any depth under tests/ — and fails the step when it is
+      # empty.
       - name: node --test mods/cos-memory/tests
-        run: node --test "mods/cos-memory/tests/**/*.test.js"
+        run: |
+          set -euo pipefail
+          if [ -z "$(find mods/cos-memory/tests -type f -name '*.test.js' -print -quit)" ]; then
+            echo "::error::no *.test.js files under mods/cos-memory/tests"
+            exit 1
+          fi
+          node --test "mods/cos-memory/tests/**/*.test.js"
+
+      # The mod's documented test set is the node tests above plus this script
+      # (mods/cos-memory/README.md). Its claude-CLI checks skip when claude is
+      # not on PATH, so it is safe on a bare runner.
+      - name: install smoke (mods/cos-memory/tests/install_smoke.sh)
+        run: bash mods/cos-memory/tests/install_smoke.sh
 
   # Lints .github/workflows/*.yml itself. Separate job so a lint failure never
   # hides the test result, and the two are required independently.
