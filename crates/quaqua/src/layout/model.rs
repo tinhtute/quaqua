@@ -89,15 +89,11 @@ impl fmt::Display for RoleClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum Naming {
     SlugLead,
+    #[default]
     KindTask,
-}
-
-impl Default for Naming {
-    fn default() -> Self {
-        Naming::KindTask
-    }
 }
 
 impl Naming {

@@ -676,7 +676,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     crate::worker::leadgate::check_spawn(
         crate::worker::leadgate::GateInput {
             root: &workspace_root,
-            runs_dir: &runs_dir,
+            runs_dir,
             repo: &repo,
             name: &opts.name,
             brief: None,
@@ -690,12 +690,12 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
 
     prepare_worktree(git, &repo, &wt, &opts.name, opts.base.as_deref())?;
     if opts.review {
-        if let Err(e) = crate::worker::prompt::readonly::record(&runs_dir, &opts.name, &wt) {
+        if let Err(e) = crate::worker::prompt::readonly::record(runs_dir, &opts.name, &wt) {
             eprintln!("warning: read-only baseline not recorded ({e}); this review will be void");
         }
     } else {
         let _ = std::fs::remove_file(crate::worker::prompt::readonly::baseline_path(
-            &runs_dir, &opts.name,
+            runs_dir, &opts.name,
         ));
     }
     crate::init::ensure_worker_push_guard(&repo).map_err(|e| (1, format!("{e}\n")))?;
@@ -715,11 +715,11 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
 
     let grid_tab =
         std::env::var("GRID_TAB").unwrap_or_else(|_| default_grid_tab(&owner, repo_name));
-    let _ = WorkerMetadata::save_owner(&runs_dir, &opts.name, &owner);
-    let _ = WorkerMetadata::save_grid(&runs_dir, &opts.name, &grid_tab);
-    let _ = WorkerMetadata::save_repo(&runs_dir, &opts.name, &repo);
+    let _ = WorkerMetadata::save_owner(runs_dir, &opts.name, &owner);
+    let _ = WorkerMetadata::save_grid(runs_dir, &opts.name, &grid_tab);
+    let _ = WorkerMetadata::save_repo(runs_dir, &opts.name, &repo);
     if let Ok(pt) = std::env::var("PIPELINE_TASK") {
-        let _ = WorkerMetadata::save_pipeline(&runs_dir, &opts.name, &pt);
+        let _ = WorkerMetadata::save_pipeline(runs_dir, &opts.name, &pt);
     }
     if let Some(base_ref) = &opts.base {
         let _ = crate::state::atomic_write(
@@ -787,7 +787,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
         // tab label, which need not equal the repo-derived group) so the planner,
         // the repair and the pre-prompt check can accept that tab by its exact
         // label instead of guessing from the group token.
-        let farm_id = crate::workspace::farm_of_runs_dir(&runs_dir);
+        let farm_id = crate::workspace::farm_of_runs_dir(runs_dir);
         let farm_tok = format!("grid_farm={farm_id}");
         let initial_tokens = [
             "grid_role=worker",
@@ -949,7 +949,7 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     role_guard.success = true;
 
     if opts.review {
-        let _ = WorkerMetadata::mark_review(&runs_dir, &opts.name);
+        let _ = WorkerMetadata::mark_review(runs_dir, &opts.name);
     }
 
     println!(

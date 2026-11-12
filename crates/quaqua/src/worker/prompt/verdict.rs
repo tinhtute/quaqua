@@ -46,7 +46,7 @@ fn last_verified_line(report_content: &str) -> Option<(&str, &str, &str)> {
                 None
             }
         })
-        .last()?;
+        .next_back()?;
     let mut parts = rest.split_whitespace();
     let level = parts.next().unwrap_or("");
     let sha = parts.next().unwrap_or("");
@@ -128,7 +128,7 @@ pub fn parse_reviewer_report(report_content: &str) -> (VerdictLevel, String) {
                 None
             }
         })
-        .last();
+        .next_back();
 
     if let Some((raw_line, rest)) = last_verdict {
         let vline = format!("Verdict: {rest}");

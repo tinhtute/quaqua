@@ -198,6 +198,7 @@ pub fn state_file_path(runs_dir: &Path, mode: &str, task: &str) -> PathBuf {
 }
 
 /// Write state file content matching legacy formats and new council fields (A1).
+#[allow(clippy::too_many_arguments)] // public state-file writer; 9 call sites
 pub fn write_state_file(
     path: &Path,
     mode: &str,
@@ -388,6 +389,7 @@ fn rebuild_state_from_events(
 }
 
 /// Generalized driver executing advisor, dual-lens, or council workflows.
+#[allow(clippy::too_many_arguments)] // public driver entry; 21 call sites
 pub fn run_taskforce_workflow<R: CouncilMemberRunner>(
     mode: &str,
     task: &str,

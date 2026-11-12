@@ -1137,31 +1137,6 @@ pub fn handle_mail<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Strin
         other => Err(format!("unknown mail verb: {other}")),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sha256_known_vectors() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn test_iso_timestamp_roundtrip() {
-        let ts = 1792800000000u64; // arbitrary ms timestamp
-        let formatted = format_iso_timestamp(ts);
-        let parsed = parse_iso_timestamp(&formatted).expect("parse iso");
-        assert_eq!(ts, parsed);
-    }
-}
 /// Decodes mail body and metadata (from_role, project, reply_to) from trigger fields.
 pub fn decode_mail_fields(
     payload_str: Option<&str>,
@@ -1200,4 +1175,29 @@ pub fn decode_mail_fields(
     }
 
     (body, from_role, project, reply_to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sha256_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_iso_timestamp_roundtrip() {
+        let ts = 1792800000000u64; // arbitrary ms timestamp
+        let formatted = format_iso_timestamp(ts);
+        let parsed = parse_iso_timestamp(&formatted).expect("parse iso");
+        assert_eq!(ts, parsed);
+    }
 }

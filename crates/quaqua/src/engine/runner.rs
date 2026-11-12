@@ -194,6 +194,7 @@ struct WorkflowFailedData {
 // Dispatch Helpers
 // ----------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // runner internals threaded explicitly; no shared context struct yet
 fn dispatch_activity(
     workflow_id: &str,
     id: &str,
@@ -451,6 +452,7 @@ enum ReplayEffect<Output> {
 }
 
 /// Executes or resumes a workflow until blocked, completed, or failed.
+#[allow(clippy::too_many_arguments)] // crate-wide entry; 53 call sites
 pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
     workflow: &W,
     workflow_id: &str,
@@ -989,7 +991,7 @@ pub(crate) fn run_until_blocked<W: Workflow, C: RunnerClock>(
                     "activity_completed",
                     serde_json::to_string(&ActivityCompletedData {
                         id: id.clone(),
-                        result: serde_json::to_value(&result).unwrap_or_default(),
+                        result: serde_json::to_value(result).unwrap_or_default(),
                     })
                     .map_err(|e| RunnerError::Serialization(e.to_string()))?,
                 )?;

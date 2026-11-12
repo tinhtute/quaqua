@@ -700,7 +700,7 @@ fn f2_default_path_with_no_workspace_dir_errors() {
 
     let bin = env!("CARGO_BIN_EXE_quaqua");
     let out = Command::new(bin)
-        .args(&["playbook", "list"])
+        .args(["playbook", "list"])
         .env("QUAQUA_HOME", &empty_home)
         .env_remove("QUAQUA_ROOT")
         .env_remove("QUAQUA_PLAYBOOKS_DIR")
@@ -727,7 +727,7 @@ fn default_path_missing_playbooks_dir_in_valid_workspace_errors() {
 
     let bin = env!("CARGO_BIN_EXE_quaqua");
     let out = Command::new(bin)
-        .args(&["playbook", "list"])
+        .args(["playbook", "list"])
         .env("QUAQUA_HOME", &ws)
         .env_remove("QUAQUA_ROOT")
         .env_remove("QUAQUA_PLAYBOOKS_DIR")
@@ -761,7 +761,7 @@ fn finding_3_default_path_pins_valid_workspace_and_rejects_non_workspace() {
 
     let bin = env!("CARGO_BIN_EXE_quaqua");
     let out = Command::new(bin)
-        .args(&["playbook", "list"])
+        .args(["playbook", "list"])
         .env("QUAQUA_HOME", &non_ws)
         .env_remove("QUAQUA_ROOT")
         .env_remove("QUAQUA_PLAYBOOKS_DIR")
@@ -794,7 +794,7 @@ fn finding_3_default_path_pins_valid_workspace_and_rejects_non_workspace() {
     );
 
     let out_valid = Command::new(bin)
-        .args(&["playbook", "list"])
+        .args(["playbook", "list"])
         .env("QUAQUA_HOME", &valid_ws)
         .env_remove("QUAQUA_ROOT")
         .env_remove("QUAQUA_PLAYBOOKS_DIR")

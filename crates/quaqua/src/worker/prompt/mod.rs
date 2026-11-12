@@ -128,10 +128,8 @@ pub fn brief_budget_sec(text: &str) -> Option<u64> {
                 Some(rem)
             } else if let Some(rem) = after_digits.strip_prefix("min") {
                 Some(rem)
-            } else if let Some(rem) = after_digits.strip_prefix('m') {
-                Some(rem)
             } else {
-                None
+                after_digits.strip_prefix('m')
             };
 
             if let Some(rem) = matched_unit {
@@ -1036,7 +1034,7 @@ fn prompt_worker_once<G: GitOps>(
     enum ExecAction {
         Run {
             wf_id: String,
-            state: SingleWorkerState,
+            state: Box<SingleWorkerState>,
             budget: u64,
         },
         Resume {
@@ -1157,7 +1155,7 @@ fn prompt_worker_once<G: GitOps>(
             .with_config(config.clone());
         exec_action = ExecAction::Run {
             wf_id,
-            state,
+            state: Box::new(state),
             budget,
         };
     } else if let Some(ext) = extend {
@@ -1213,7 +1211,7 @@ fn prompt_worker_once<G: GitOps>(
             );
         exec_action = ExecAction::Run {
             wf_id,
-            state,
+            state: Box::new(state),
             budget: new_budget,
         };
     } else {
@@ -1275,7 +1273,7 @@ fn prompt_worker_once<G: GitOps>(
                 );
             exec_action = ExecAction::Run {
                 wf_id,
-                state,
+                state: Box::new(state),
                 budget,
             };
         }
@@ -1352,7 +1350,7 @@ fn prompt_worker_once<G: GitOps>(
         ExecAction::Run { wf_id, state, .. } => crate::engine::runner::run(
             &workflow,
             &wf_id,
-            state,
+            *state,
             &mut journal,
             &mut acts,
             &mut clock,
@@ -1834,16 +1832,15 @@ exit 0
         path
     }
 
-    /// Runs `--resume` on a blocked worker whose pane shows `pane`; returns
-    /// the result, the journaled provider events, and the prompts sent.
-    fn run_provider_case(
-        tag: &str,
-        pane: &str,
-    ) -> (
+    type ProviderCase = (
         Result<(), (i32, String)>,
         Vec<(String, serde_json::Value)>,
         usize,
-    ) {
+    );
+
+    /// Runs `--resume` on a blocked worker whose pane shows `pane`; returns
+    /// the result, the journaled provider events, and the prompts sent.
+    fn run_provider_case(tag: &str, pane: &str) -> ProviderCase {
         let tmp = temp_runs(tag);
         let team = provider_team_config(&tmp);
         let stub = provider_stub(&tmp);

@@ -394,7 +394,7 @@ pub fn run_hook() -> Result<(), String> {
         if let Ok(_guard2) = acquire_lock(&lock_dir, &pid_file) {
             while pending_file.is_file() {
                 let _ = remove_file(&pending_file);
-                let _ = reconcile_step(&sdir, &mut driver, def_slices.as_deref())?;
+                reconcile_step(&sdir, &mut driver, def_slices.as_deref())?;
             }
         }
     }

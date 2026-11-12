@@ -417,7 +417,7 @@ mod tests {
         for list in [
             Ok(LIST_EMPTY.to_string()),
             Ok("garbage".to_string()),
-            Err(io::Error::new(io::ErrorKind::Other, "socket")),
+            Err(io::Error::other("socket")),
         ] {
             let f = fake(Ok((false, NOT_FOUND.into())), list);
             assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));

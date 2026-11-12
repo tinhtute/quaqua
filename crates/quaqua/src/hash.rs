@@ -15,9 +15,9 @@ pub fn md5_hex(data: &[u8]) -> String {
     }
     padded.extend_from_slice(&orig_len_bits.to_le_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (i, part) in chunk.chunks_exact(4).enumerate() {
+        for (i, part) in chunk.as_chunks::<4>().0.iter().enumerate() {
             m[i] = u32::from_le_bytes([part[0], part[1], part[2], part[3]]);
         }
 
@@ -153,11 +153,11 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     padded.extend_from_slice(&orig_len_bits.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for i in 0..16 {
+        for (i, wi) in w.iter_mut().take(16).enumerate() {
             let start = i * 4;
-            w[i] = u32::from_be_bytes([
+            *wi = u32::from_be_bytes([
                 chunk[start],
                 chunk[start + 1],
                 chunk[start + 2],

@@ -198,9 +198,7 @@ impl HerdrOps for DummyHerdr {
         if self.started_agents.borrow().contains(name) {
             Ok((
                 true,
-                format!(
-                    r#"{{"result":{{"agent":{{"agent_status":"working","pane_id":"w1:p1"}}}}}}"#
-                ),
+                r#"{"result":{"agent":{"agent_status":"working","pane_id":"w1:p1"}}}"#.to_string(),
             ))
         } else {
             Ok((false, r#"{"error":{"code":"agent_not_found"}}"#.to_string()))

@@ -395,7 +395,7 @@ pub fn validate_layout(layout: &Layout) -> Result<(), String> {
             }
         }
         if let Some(cap) = role.max_children {
-            if cap < 1 || cap > crate::config::CAP_CEILING {
+            if !(1..=crate::config::CAP_CEILING).contains(&cap) {
                 return Err(format!(
                     "layout '{}' role '{role_name}' max_children {cap} must be in 1..={}",
                     layout.name,
@@ -679,13 +679,12 @@ pub fn check_with_runs_dir(
                     || layout
                         .roles
                         .get(target_role)
-                        .map_or(false, |tr| tr.class == RoleClass::Cos);
+                        .is_some_and(|tr| tr.class == RoleClass::Cos);
                 if role.can_prompt.iter().any(|r| r == target_role) {
                     true
-                } else if role.reports_to.as_deref() == Some(target_role) {
-                    reports_to_edge = true;
-                    true
-                } else if role.reports_to.as_deref() == Some("owner") && is_cos_target {
+                } else if role.reports_to.as_deref() == Some(target_role)
+                    || (role.reports_to.as_deref() == Some("owner") && is_cos_target)
+                {
                     reports_to_edge = true;
                     true
                 } else {
@@ -904,6 +903,7 @@ pub fn is_shadow_mode() -> bool {
 /// FarmEvent in `runs_dir` and returns `Err((1, format!("error: [{}] {}\n", decision.rule_id, detail)))`.
 /// Under shadow mode (`QUAQUA_LAYOUT_SHADOW=1`): prints `would_deny` to stderr and records
 /// a `would_deny` FarmEvent, but returns `Ok(decision)` without blocking.
+#[allow(clippy::too_many_arguments)] // one per gate-input; 11 call sites, a params struct reshapes the public gate API
 pub fn gate<H: HerdrOps>(
     caller: Option<&Caller>,
     herdr: Option<&H>,
@@ -935,6 +935,7 @@ pub fn gate<H: HerdrOps>(
 ///
 /// Evaluates the decision, prints one `would_deny` stderr line and writes a
 /// `triggers` row if denied. Never blocks, never changes exit codes.
+#[allow(clippy::too_many_arguments)] // mirrors gate(); same public signature
 pub fn shadow<H: HerdrOps>(
     caller: Option<&Caller>,
     herdr: Option<&H>,
@@ -963,6 +964,7 @@ pub fn shadow<H: HerdrOps>(
     .unwrap_or_else(|_| Decision::deny("shadow.skipped.error", Vec::new()))
 }
 
+#[allow(clippy::too_many_arguments)] // gate() plus force_shadow; same signature family
 fn gate_inner<H: HerdrOps>(
     caller: Option<&Caller>,
     herdr: Option<&H>,
@@ -1002,13 +1004,13 @@ fn gate_inner<H: HerdrOps>(
                     {
                         c = crate::identity::Caller {
                             name: owner.unwrap_or("cos").to_string(),
-                            role: if owner.map(|o| crate::cap::is_lead_owner(o)).unwrap_or(false) {
+                            role: if owner.map(crate::cap::is_lead_owner).unwrap_or(false) {
                                 crate::identity::Role::Lead
                             } else {
                                 crate::identity::Role::Cos
                             },
                             depth: crate::identity::CallerDepth::Resolved(
-                                if owner.map(|o| crate::cap::is_lead_owner(o)).unwrap_or(false) {
+                                if owner.map(crate::cap::is_lead_owner).unwrap_or(false) {
                                     1
                                 } else {
                                     0

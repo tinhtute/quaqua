@@ -301,7 +301,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: b"{\"snapshot\":{\"workspaces\":[],\"tabs\":[],\"panes\":[],\"layouts\":[],\"agents\":[]}}".to_vec(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -315,10 +315,7 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.agent_list", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => Ok(content),
             Ok(_) => Ok(r#"{"result":{"agents":[]}}"#.to_string()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -332,19 +329,13 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.agent_get", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => {
                 if let Some(msg) = content.strip_prefix("io_error:") {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        msg.to_string(),
-                    ))
+                    Err(std::io::Error::other(msg.to_string()))
                 } else {
                     Ok((true, content))
                 }
             }
             Ok(_) => Ok((false, String::new())),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -358,10 +349,7 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.agent_read", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => Ok(content),
             Ok(_) => Ok(String::new()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -401,10 +389,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -432,10 +417,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: b"{\"result\":{\"pane\":{\"pane_id\":\"%1\"}}}".to_vec(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -451,10 +433,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -493,10 +472,7 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.pane_read", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => Ok(content),
             Ok(_) => Ok(String::new()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -1622,8 +1598,10 @@ fn test_pipeline_blocked_keeps_finished_zero() {
 
 #[test]
 fn test_pipeline_rounds_raise_only_on_resume() {
-    let mut state = quaqua::pipeline::PipelineState::default();
-    state.rounds = 3;
+    let mut state = quaqua::pipeline::PipelineState {
+        rounds: 3,
+        ..Default::default()
+    };
     let resume_rounds: Option<u32> = Some(2);
     if let Some(r) = resume_rounds {
         if r > state.rounds {
@@ -2280,7 +2258,7 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
     // the report is the only file it may write
     let report_rule = format!("Edit(//{}/**)", runs.trim_start_matches('/'));
     assert!(
-        allow.iter().any(|r| *r == report_rule),
+        allow.contains(&report_rule),
         "report not writable: {allow:?}"
     );
 }
@@ -5785,4 +5763,128 @@ fn test_cap_count_owner_slots_ignores_live_agent_with_pipeline_but_no_owner() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Temp repo + bare origin; `local main` is left one commit behind `origin/main`.
+fn stale_main_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    fn g(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    let root = std::env::temp_dir().join(format!("quaqua-stalebase-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (origin, repo, other) = (
+        root.join("origin.git"),
+        root.join("repo"),
+        root.join("other"),
+    );
+    std::fs::create_dir_all(&origin).unwrap();
+    g(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    g(&root, &["clone", "-q", origin.to_str().unwrap(), "repo"]);
+    g(&repo, &["checkout", "-q", "-B", "main"]);
+    g(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    g(&repo, &["push", "-q", "origin", "main"]);
+    g(&root, &["clone", "-q", origin.to_str().unwrap(), "other"]);
+    std::fs::write(other.join("origin-only.txt"), "x").unwrap();
+    g(&other, &["add", "."]);
+    g(&other, &["commit", "-q", "-m", "origin-only"]);
+    g(&other, &["push", "-q", "origin", "main"]);
+    (root, repo, origin)
+}
+
+#[test]
+fn test_spawn_without_base_uses_fetched_origin_default() {
+    use quaqua::worker::worktree::prepare_worktree;
+    let (root, repo, _origin) = stale_main_fixture("fresh");
+    let before = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "main"])
+        .output()
+        .unwrap()
+        .stdout;
+    let wt = root.join(".wt").join("sude-fresh");
+    prepare_worktree(&quaqua::git::Git::new(), &repo, &wt, "sude-fresh", None).unwrap();
+    assert!(
+        wt.join("origin-only.txt").exists(),
+        "worktree must contain the origin-only commit"
+    );
+    let after = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "main"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(before, after, "spawn must not move local main");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_spawn_explicit_base_ignores_origin() {
+    use quaqua::worker::worktree::prepare_worktree;
+    let (root, repo, _origin) = stale_main_fixture("explicit");
+    let wt = root.join(".wt").join("sude-explicit");
+    prepare_worktree(
+        &quaqua::git::Git::new(),
+        &repo,
+        &wt,
+        "sude-explicit",
+        Some("main"),
+    )
+    .unwrap();
+    assert!(
+        !wt.join("origin-only.txt").exists(),
+        "explicit --base main keeps local main"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_spawn_fetch_failure_warns_and_uses_local_default() {
+    use quaqua::worker::worktree::prepare_worktree;
+    let (root, repo, origin) = stale_main_fixture("offline");
+    std::fs::rename(&origin, root.join("gone.git")).unwrap();
+    let wt = root.join(".wt").join("sude-offline");
+    prepare_worktree(&quaqua::git::Git::new(), &repo, &wt, "sude-offline", None).unwrap();
+    assert!(wt.join(".git").exists());
+    assert!(
+        !wt.join("origin-only.txt").exists(),
+        "fell back to local main"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_spawn_without_origin_remote_uses_head() {
+    use quaqua::worker::worktree::prepare_worktree;
+    let (root, repo, _origin) = stale_main_fixture("noorigin");
+    Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["remote", "remove", "origin"])
+        .output()
+        .unwrap();
+    let wt = root.join(".wt").join("sude-noorigin");
+    prepare_worktree(&quaqua::git::Git::new(), &repo, &wt, "sude-noorigin", None).unwrap();
+    assert!(wt.join(".git").exists());
+    let _ = std::fs::remove_dir_all(&root);
 }

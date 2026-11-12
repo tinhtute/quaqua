@@ -7,6 +7,98 @@
 
 use crate::git::GitOps;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Cap on each network git call made while resolving the start point, so an
+/// offline spawn degrades to the local default instead of hanging.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run `git -C <repo> <args>` with a deadline; `Some(stdout)` only on exit 0.
+fn git_timed(repo: &Path, args: &[&str], limit: Duration) -> Option<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                let mut out = String::new();
+                if let Some(mut so) = child.stdout.take() {
+                    let _ = std::io::Read::read_to_string(&mut so, &mut out);
+                }
+                return st.success().then_some(out);
+            }
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Default start point when no `--base` is given: fetch the remote's default
+/// branch and return `refs/remotes/origin/<default>`. Fetch failure warns and
+/// falls back to the local `<default>`; no origin or unknown default → `None`
+/// (the repo's HEAD, as before). Never touches local branches.
+fn default_start_point(repo: &Path) -> Option<String> {
+    git_timed(repo, &["remote", "get-url", "origin"], FETCH_TIMEOUT)?;
+    let default = git_timed(
+        repo,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        FETCH_TIMEOUT,
+    )
+    .and_then(|s| s.trim().strip_prefix("origin/").map(str::to_string))
+    .or_else(|| {
+        let out = git_timed(
+            repo,
+            &["ls-remote", "--symref", "origin", "HEAD"],
+            FETCH_TIMEOUT,
+        )?;
+        let line = out.lines().find(|l| l.starts_with("ref: refs/heads/"))?;
+        let name = line
+            .strip_prefix("ref: refs/heads/")?
+            .split_whitespace()
+            .next()?;
+        Some(name.to_string())
+    })?;
+    let local_fallback = || {
+        let local = format!("refs/heads/{default}");
+        git_timed(
+            repo,
+            &["rev-parse", "--verify", "--quiet", &local],
+            FETCH_TIMEOUT,
+        )
+        .map(|_| local)
+    };
+    let tracking = format!("refs/remotes/origin/{default}");
+    let refspec = format!("+refs/heads/{default}:{tracking}");
+    if git_timed(
+        repo,
+        &["fetch", "--quiet", "origin", &refspec],
+        FETCH_TIMEOUT,
+    )
+    .is_some()
+    {
+        Some(tracking)
+    } else {
+        let fb = local_fallback();
+        eprintln!(
+            "warning: fetch of origin/{default} failed — basing the worktree on {}",
+            fb.as_deref().unwrap_or("HEAD")
+        );
+        fb
+    }
+}
 
 /// Canonicalize a repository path, falling back to the original path if canonicalization fails.
 pub fn canonicalize_repo_path(repo_path: &Path) -> PathBuf {
@@ -138,7 +230,12 @@ pub fn prepare_worktree<G: GitOps>(
             );
             git.worktree_add_existing(repo, &branch, wt)
         } else {
-            git.worktree_add(repo, &branch, wt, base)
+            let resolved = if base.is_none() {
+                default_start_point(repo)
+            } else {
+                None
+            };
+            git.worktree_add(repo, &branch, wt, base.or(resolved.as_deref()))
         }
         .map_err(|e| (1, format!("error: failed to add worktree: {e}\n")))?;
         if !add_out.status.success() {

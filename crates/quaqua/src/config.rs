@@ -749,7 +749,7 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
 
     let cap = cfg.limits.max_workers_per_orchestrator;
-    if cap < 1 || cap > CAP_CEILING {
+    if !(1..=CAP_CEILING).contains(&cap) {
         return Err(format!("workers over the cap: {cap} (max {CAP_CEILING})"));
     }
     for (name, w) in &cfg.limits.weights {

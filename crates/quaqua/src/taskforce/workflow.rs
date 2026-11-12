@@ -189,10 +189,12 @@ pub struct TaskforceOutput {
     pub merged_report: Option<PathBuf>,
 }
 
+type ChildCompletion = (PathBuf, Option<String>, Option<u32>, Option<bool>);
+
 fn parse_child_completion(
     slot: &MemberSlot,
     output: &serde_json::Value,
-) -> Result<(PathBuf, Option<String>, Option<u32>, Option<bool>), (i32, String)> {
+) -> Result<ChildCompletion, (i32, String)> {
     let worker_out: SingleWorkerOutput = serde_json::from_value(output.clone()).map_err(|e| {
         (
             6,

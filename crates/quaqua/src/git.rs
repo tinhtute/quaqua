@@ -68,8 +68,7 @@ impl GitOps for Git {
     fn worktree_list_porcelain(&self, repo: &Path) -> std::io::Result<Vec<String>> {
         let out = self.run_in(repo, &["worktree", "list", "--porcelain"])?;
         if !out.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 String::from_utf8_lossy(&out.stderr).to_string(),
             ));
         }

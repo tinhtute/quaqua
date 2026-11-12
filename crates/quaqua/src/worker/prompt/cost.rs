@@ -651,6 +651,7 @@ fn opencode_db_candidates(name: &str) -> Vec<PathBuf> {
 }
 
 /// Reads spend for a worker across opencode, omp, claude, or pi, accepting custom db/runs overrides.
+#[allow(clippy::too_many_arguments)] // public spend reader; 6 call sites
 pub fn read_worker_spend_with(
     name: &str,
     session_id: &str,

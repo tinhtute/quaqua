@@ -703,11 +703,7 @@ pub fn run_deterministic_prechecks_at(
                 Err(_) => continue,
             };
 
-            let sline = match content
-                .lines()
-                .filter(|l| l.starts_with("- status: "))
-                .last()
-            {
+            let sline = match content.lines().rfind(|l| l.starts_with("- status: ")) {
                 Some(l) => l,
                 None => continue,
             };
@@ -743,9 +739,9 @@ pub fn run_deterministic_prechecks_at(
                         }
                     }
 
-                    let prepo = if prepo_raw.starts_with("~/") {
+                    let prepo = if let Some(rest) = prepo_raw.strip_prefix("~/") {
                         if let Ok(home) = std::env::var("HOME") {
-                            PathBuf::from(home).join(&prepo_raw[2..])
+                            PathBuf::from(home).join(rest)
                         } else {
                             PathBuf::from(&prepo_raw)
                         }
@@ -777,7 +773,7 @@ pub fn run_deterministic_prechecks_at(
 
                     let last_rev = content
                         .lines()
-                        .filter(|l| {
+                        .rfind(|l| {
                             if let Some(idx) = l.find("review round ") {
                                 let after = &l[idx + "review round ".len()..];
                                 let digits =
@@ -787,7 +783,6 @@ pub fn run_deterministic_prechecks_at(
                                 false
                             }
                         })
-                        .last()
                         .unwrap_or("");
 
                     if !last_rev.is_empty() && !last_rev.contains("Verdict:") {

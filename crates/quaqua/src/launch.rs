@@ -58,7 +58,7 @@ pub fn resolve_launch(
     if harness == crate::harness::Harness::Opencode {
         match cfg.opencode_model_variants(&kind.model) {
             Some(allowed) => {
-                if !allowed.contains(&effort) {
+                if !allowed.contains(effort) {
                     return Err((
                         1,
                         format!(
