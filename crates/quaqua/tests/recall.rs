@@ -520,6 +520,8 @@ fn recall_reads_a_read_only_database_without_writing_it() {
 
     // Restore before asserting, so a failed assertion still leaves a deletable fixture.
     let mut perms = std::fs::metadata(&db).expect("stat db").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    // test fixture: only the write bit is restored, the pre-chmod mode is not captured
     perms.set_readonly(false);
     std::fs::set_permissions(&db, perms).expect("restore db permissions");
 

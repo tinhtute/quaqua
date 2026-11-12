@@ -186,16 +186,12 @@ pub fn count_owner_slots<H: HerdrOps>(
                         continue;
                     }
                     let p_bname = format!("{}-{}", p.builder, p.task);
-                    let mut p_alive = false;
-                    if !p.pipeline_pid.is_empty() && is_pid_alive(&p.pipeline_pid) {
-                        p_alive = true;
-                    } else if live_workers.iter().any(|a| {
-                        a == &p_bname
-                            || (!p.task.is_empty() && a.ends_with(&format!("-{}", p.task)))
-                            || matches_pipeline_reviewer(a, &p.task)
-                    }) {
-                        p_alive = true;
-                    }
+                    let p_alive = (!p.pipeline_pid.is_empty() && is_pid_alive(&p.pipeline_pid))
+                        || live_workers.iter().any(|a| {
+                            a == &p_bname
+                                || (!p.task.is_empty() && a.ends_with(&format!("-{}", p.task)))
+                                || matches_pipeline_reviewer(a, &p.task)
+                        });
 
                     if p_alive {
                         let mut p_cur_live: i64 = 0;

@@ -372,17 +372,15 @@ impl SqliteJournal {
                     }
                 };
                 let mut dup = false;
-                for row in rows {
-                    if let Ok(payload) = row {
-                        if let Ok(v) = serde_json::from_str::<VerdictRecord>(&payload) {
-                            if v.branch == verdict.branch
-                                && v.sha == verdict.sha
-                                && v.source == verdict.source
-                                && v.verifier == verdict.verifier
-                            {
-                                dup = true;
-                                break;
-                            }
+                for payload in rows.flatten() {
+                    if let Ok(v) = serde_json::from_str::<VerdictRecord>(&payload) {
+                        if v.branch == verdict.branch
+                            && v.sha == verdict.sha
+                            && v.source == verdict.source
+                            && v.verifier == verdict.verifier
+                        {
+                            dup = true;
+                            break;
                         }
                     }
                 }

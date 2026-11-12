@@ -715,8 +715,7 @@ fn test_is_pane_in_runs_workspace_treats_factory_workspace_parent_as_local() {
         "the workspace root of a .cos install belongs to the workspace"
     );
     assert!(
-        quaqua::bus::events::is_pane_in_runs_workspace("w1:p2", other.to_str(), &runs, None)
-            == false,
+        !quaqua::bus::events::is_pane_in_runs_workspace("w1:p2", other.to_str(), &runs, None),
         "a pane from another workspace is not local"
     );
 }

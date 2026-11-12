@@ -1555,11 +1555,13 @@ fn test_identity_heal_dry_run_previews_actions_without_mutation() {
     );
 }
 
+type FarmPane = (HashMap<String, String>, String);
+
 /// Pane state for the CoS farm-heal tests: like `MockMultiPaneHerdr`, but each
 /// pane also reports a `cwd`, which `heal` reads to prove a pane is local
 /// before stamping `grid_farm`.
 struct MockFarmHerdr {
-    panes: RefCell<HashMap<String, (HashMap<String, String>, String)>>,
+    panes: RefCell<HashMap<String, FarmPane>>,
     reported_tokens: RefCell<Vec<(String, Vec<String>)>>,
     agent_list_json: String,
 }

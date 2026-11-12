@@ -132,6 +132,7 @@ impl fmt::Display for Caller {
 /// - `grid_role == "orchestrator"` -> Role::Lead
 /// - `grid_role == "cos"` -> Role::Cos
 /// - absent, empty, or anything else ("none") -> Role::Unknown
+///
 /// NEVER defaults to Cos.
 pub fn resolve(tokens: &HashMap<String, String>) -> Role {
     match tokens.get("grid_role").map(|s| s.trim()) {

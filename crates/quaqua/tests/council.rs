@@ -48,12 +48,14 @@ fn hermetic_temp_dir(prefix: &str) -> PathBuf {
     tmp
 }
 
+type PromptResult = Result<SingleWorkerOutput, (i32, String)>;
+
 #[derive(Default, Clone)]
 struct MockMemberRunner {
     spawns: Arc<Mutex<Vec<String>>>,
     cleanups: Arc<Mutex<Vec<String>>>,
     prompt_counts: Arc<Mutex<HashMap<String, usize>>>,
-    prompt_results: Arc<Mutex<HashMap<String, Result<SingleWorkerOutput, (i32, String)>>>>,
+    prompt_results: Arc<Mutex<HashMap<String, PromptResult>>>,
     delays: Arc<Mutex<HashMap<String, Duration>>>,
     spawn_fail: Arc<Mutex<Option<String>>>,
 }

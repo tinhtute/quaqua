@@ -398,8 +398,8 @@ pub fn format_diff(old_text: &str, new_text: &str, file_name: &str) -> String {
         let mut hunk_old_count = 0usize;
         let mut hunk_new_count = 0usize;
 
-        for k in hunk_start..hunk_end {
-            match ops[k] {
+        for op in &ops[hunk_start..hunk_end] {
+            match op {
                 DiffOp::Equal(_) => {
                     hunk_old_count += 1;
                     hunk_new_count += 1;

@@ -1003,7 +1003,7 @@ pub fn evaluate_workspace(
     let mut report = WorkspaceDriftReport::default();
     let ws = workspace
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::workspace::workspace_root());
+        .unwrap_or_else(crate::workspace::workspace_root);
 
     report.notes.push(format!("workspace: {}", ws.display()));
 

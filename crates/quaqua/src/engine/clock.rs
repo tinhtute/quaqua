@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_system_clock_default() {
-        let clock = SystemClock::default();
+        let clock = SystemClock;
         assert!(clock.now_ms() > 0);
     }
 

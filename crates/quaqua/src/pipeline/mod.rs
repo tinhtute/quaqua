@@ -205,9 +205,11 @@ fn seed_state_from_pipeline_state(
 }
 
 fn watchdog_config_from_env(expect_verdict: bool, is_fallback_idle: bool) -> WatchdogConfig {
-    let mut config = WatchdogConfig::default();
-    config.expect_verdict = expect_verdict;
-    config.is_fallback_idle = is_fallback_idle;
+    let mut config = WatchdogConfig {
+        expect_verdict,
+        is_fallback_idle,
+        ..WatchdogConfig::default()
+    };
 
     if let Some(p) = std::env::var("PROMPT_WORKER_POLL_SEC")
         .ok()
@@ -1141,11 +1143,7 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                 let is_reviewer = matches!(kind, ChildKind::Review(_));
 
                 let el = state.start_elapsed + (now_sec() - ctx.inv_start);
-                let rem = if ctx.max_sec > el {
-                    ctx.max_sec - el
-                } else {
-                    0
-                };
+                let rem = ctx.max_sec.saturating_sub(el);
                 let mut budget = if rem < child_input.time_budget_sec {
                     rem
                 } else {
@@ -2207,13 +2205,7 @@ impl PipelineWorkflow {
             .base_sha
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if !state.input.base.is_empty() {
-                    Some(state.input.base.as_str())
-                } else {
-                    None
-                }
-            })
+            .or(Some(state.input.base.as_str()).filter(|b| !b.is_empty()))
             .unwrap_or("HEAD");
         let review_prompt = format!(
             "Goal: review changes for task '{}' (round {})\nHard constraints: review only diff between base {base_ref} and branch quaqua/{bname}; do not edit code; foreground tests only.\nCurrent design: brief in {}\nEvidence: runs file MUST end with exactly one line: 'Verdict: clean' or 'Verdict: <N> findings' (each finding under ## Findings as '- [critical|major|minor|trivial] <finding>'; findings at or above the brief's 'Must fix:' (default major) block acceptance; dispute with ## Challenge).\n{REVIEWER_METHOD}\nPipeline phase: REVIEW (round {})",
@@ -4100,9 +4092,11 @@ mod tests {
             "# Review\n1. a\n2. b\n3. c\nVerdict: 3 findings\n## Lessons\nnone\n",
         )
         .unwrap();
-        let mut ps = PipelineState::default();
-        ps.phase = "fix".to_string();
-        ps.round = 1;
+        let ps = PipelineState {
+            phase: "fix".to_string(),
+            round: 1,
+            ..PipelineState::default()
+        };
         let input = PipelineInput::new("tseed", "/repo", "sude", "suhuynh", "brief");
         let st = seed_state_from_pipeline_state(input, &ps, &runs);
         let path = st.last_review_report.clone().unwrap();
@@ -4656,7 +4650,7 @@ esac
         // 2. Setup build commit in worktree and unparseable review report
         let wt_dir = base_dir.join(".wt").join(format!("sude-{task}"));
         let _ = crate::test_env::git_hermetic()
-            .args(&["commit", "--allow-empty", "-m", "build commit"])
+            .args(["commit", "--allow-empty", "-m", "build commit"])
             .current_dir(&wt_dir)
             .output();
 
@@ -4814,7 +4808,7 @@ esac
 
         let wt_dir = base_dir.join(".wt").join(format!("sude-{task}"));
         let _ = crate::test_env::git_hermetic()
-            .args(&["commit", "--allow-empty", "-m", "build commit"])
+            .args(["commit", "--allow-empty", "-m", "build commit"])
             .current_dir(&wt_dir)
             .output();
         std::fs::write(
@@ -5196,7 +5190,7 @@ esac
         let wt_dir = base_dir.join(".wt").join(format!("sude-{task}"));
         let build_sha = String::from_utf8(
             crate::test_env::git_hermetic()
-                .args(&["rev-parse", "HEAD~1"])
+                .args(["rev-parse", "HEAD~1"])
                 .current_dir(&wt_dir)
                 .output()
                 .unwrap()
@@ -5508,11 +5502,11 @@ esac
         let fix_worker = format!("sude-{task}");
         let wt_dir = base_dir.join(".wt").join(&fix_worker);
         let _ = crate::test_env::git_hermetic()
-            .args(&["commit", "--allow-empty", "-m", "fix commit 2 at new sha"])
+            .args(["commit", "--allow-empty", "-m", "fix commit 2 at new sha"])
             .current_dir(&wt_dir)
             .output();
         let out = crate::test_env::git_hermetic()
-            .args(&["rev-parse", "HEAD"])
+            .args(["rev-parse", "HEAD"])
             .current_dir(&wt_dir)
             .output()
             .unwrap();
@@ -6100,8 +6094,7 @@ esac
         );
         let last_child_event = events_after_raised
             .iter()
-            .filter(|e| e.kind == "child_started")
-            .last()
+            .rfind(|e| e.kind == "child_started")
             .unwrap();
         assert!(last_child_event
             .payload_json
@@ -6308,11 +6301,7 @@ esac
         assert!(matches!(&out, RunnerOutcome::Blocked(r) if r.contains("no pending events")));
 
         let events = journal.load_events(wf_id, 1).unwrap();
-        let last_child_event = events
-            .iter()
-            .filter(|e| e.kind == "child_started")
-            .last()
-            .unwrap();
+        let last_child_event = events.iter().rfind(|e| e.kind == "child_started").unwrap();
         assert!(
             last_child_event
                 .payload_json

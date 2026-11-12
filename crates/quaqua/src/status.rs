@@ -804,7 +804,7 @@ pub fn format_status_report(
 
     out.push_str("=== Workflows (runs/quaqua.db) ===\n");
     match workflows {
-        Ok(wfs) if wfs.is_empty() => {
+        Ok([]) => {
             out.push_str("no workflows\n");
         }
         Ok(wfs) => {
@@ -840,7 +840,7 @@ pub fn format_status_report(
 
     out.push_str("\n=== Orchestration ===\n");
     match orchestration {
-        Ok(orch_rows) if orch_rows.is_empty() => {
+        Ok([]) => {
             out.push_str("no active agents or workers\n");
         }
         Ok(orch_rows) => {
@@ -893,7 +893,7 @@ pub fn format_status_report(
 
     out.push_str("\n=== Verdicts ===\n");
     match verdicts {
-        Ok(v_rows) if v_rows.is_empty() => {
+        Ok([]) => {
             out.push_str("no verdicts\n");
         }
         Ok(v_rows) => {
@@ -4598,7 +4598,7 @@ pub(crate) mod metrics {
             )
             .with_log("quaqua/pstack-int2", &["m3 ddd eee fff"]);
 
-        let commits = collect_merge_commits(&[repo.clone()], &git, 1_700_000_000_000);
+        let commits = collect_merge_commits(std::slice::from_ref(&repo), &git, 1_700_000_000_000);
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].repo, repo);
         assert_eq!(commits[0].target, "origin/main");
@@ -4653,7 +4653,7 @@ pub(crate) mod metrics {
             "verdict",
             &verdict_payload(VerdictLevel::UnitTestVerified, "bbbb2222"),
         );
-        let metrics = load_journal_metrics(&db, 0, &[repo.clone()], &git).unwrap();
+        let metrics = load_journal_metrics(&db, 0, std::slice::from_ref(&repo), &git).unwrap();
         assert_eq!(metrics.merges, 2);
         assert_eq!(metrics.merges_checked, 2);
         assert_eq!(metrics.merges_without_verdict, 1);
@@ -4746,7 +4746,7 @@ pub(crate) mod metrics {
         let log_501_refs: Vec<&str> = log_501.iter().map(|s| s.as_str()).collect();
 
         let git = MergeGit::new(&["main"], true).with_log("origin/main", &log_501_refs);
-        let commits = collect_merge_commits(&[repo.clone()], &git, 0);
+        let commits = collect_merge_commits(std::slice::from_ref(&repo), &git, 0);
         assert_eq!(commits.len(), 500);
         assert!(commits.iter().all(|c| c.target_truncated));
 
@@ -4793,7 +4793,7 @@ pub(crate) mod metrics {
         // When exactly at or below cap (e.g. 500 merges): truncated must be false
         let log_500_refs = &log_501_refs[..500];
         let git_500 = MergeGit::new(&["main"], true).with_log("origin/main", log_500_refs);
-        let commits_500 = collect_merge_commits(&[repo.clone()], &git_500, 0);
+        let commits_500 = collect_merge_commits(std::slice::from_ref(&repo), &git_500, 0);
         assert_eq!(commits_500.len(), 500);
         assert!(!commits_500.iter().any(|c| c.target_truncated));
 
@@ -4861,7 +4861,7 @@ pub(crate) mod metrics {
             .with_log("origin/main", &log_main_refs)
             .with_log("quaqua/pstack-int2", &log_integ_refs);
 
-        let commits = collect_merge_commits(&[repo.clone()], &git, 0);
+        let commits = collect_merge_commits(std::slice::from_ref(&repo), &git, 0);
         let tally = count_merges_without_pass(&commits, &[]);
 
         let repo_stat = &tally.repos[0];
@@ -4903,14 +4903,13 @@ pub(crate) mod metrics {
 
         let deserialized: MetricsReport = serde_json::from_str(&json_str).unwrap();
         assert!(deserialized.journal.truncated);
-        assert_eq!(
+        assert!(
             deserialized.journal.merges_per_repo[0]
                 .refs
                 .iter()
                 .find(|r| r.target == "quaqua/pstack-int2")
                 .unwrap()
-                .truncated,
-            true
+                .truncated
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

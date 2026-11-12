@@ -164,7 +164,7 @@ pub fn brief_header_warnings(text: &str) -> Vec<String> {
         None => warnings.push(
             "warning: brief has no 'Context:' header — name the files/PRs, or paste the upstream report in full (rules/_all/brief.md)".to_string(),
         ),
-        Some(value) if value.is_empty() => warnings.push(
+        Some("") => warnings.push(
             "warning: 'Context:' is empty; name the files/PRs, or paste the upstream report in full".to_string(),
         ),
         Some(value) if is_placeholder(value) => warnings.push(

@@ -162,10 +162,7 @@ pub fn has_real_blockers(content: &str) -> bool {
             }
 
             // Extract the leading sentence/declaration before sentence-ending delimiters ('.', '…')
-            let first_part = item
-                .split(|c: char| c == '.' || c == '…')
-                .next()
-                .unwrap_or(item);
+            let first_part = item.split(['.', '…']).next().unwrap_or(item);
 
             // Strip markdown emphasis (*, _, `), trailing dots/ellipsis, and whitespace
             let core = first_part.trim_matches(|c: char| {
@@ -276,6 +273,7 @@ pub struct PipelineTelemetryRow<'a> {
     pub minutes: u64,
 }
 
+#[allow(clippy::too_many_arguments)] // flat telemetry row; public signature kept
 pub fn append_telemetry(
     runs_dir: &Path,
     ts: &str,
@@ -355,7 +353,7 @@ pub fn file_mtime(path: &Path) -> u64 {
         .and_then(|m| m.modified())
         .and_then(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
         })
         .map(|d| d.as_secs())
         .unwrap_or(0)

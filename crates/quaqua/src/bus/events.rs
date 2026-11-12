@@ -863,13 +863,13 @@ impl FarmBus {
             });
         }
 
-        fn render_slice(
-            items: &[PendingItem],
-        ) -> (
+        type RenderedSlice = (
             Vec<(String, Vec<u64>)>,
             Vec<TriggerRecord>,
             Vec<FarmEventRecord>,
-        ) {
+        );
+
+        fn render_slice(items: &[PendingItem]) -> RenderedSlice {
             let mut trs = Vec::new();
             let mut incs = Vec::new();
             for item in items {
@@ -927,7 +927,7 @@ impl FarmBus {
                     break;
                 }
             }
-            let overflow = if best_k < n { n - best_k } else { 0 };
+            let overflow = n.saturating_sub(best_k);
             (best_k, overflow)
         };
 

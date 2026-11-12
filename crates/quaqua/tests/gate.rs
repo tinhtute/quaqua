@@ -811,9 +811,11 @@ impl Drop for EnvGuard {
     }
 }
 
+type SessionPane = (Option<String>, Option<String>);
+
 struct FakeSessionStartHerdr {
     current_pane: Option<String>,
-    panes: RefCell<HashMap<String, (Option<String>, Option<String>)>>,
+    panes: RefCell<HashMap<String, SessionPane>>,
     calls: RefCell<Vec<Vec<String>>>,
     fail_on: Option<String>,
 }

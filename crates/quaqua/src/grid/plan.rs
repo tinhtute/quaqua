@@ -459,7 +459,7 @@ fn plan_owner_workspace(
         .and_then(|id| snapshot.panes.iter().find(|p| &p.pane_id == id));
     let anchor_tab = anchor_pane.and_then(|p| p.tab_id.as_deref());
 
-    if total == 1 && anchor_pane.is_some() {
+    if let (1, Some(anchor_pane)) = (total, anchor_pane) {
         let w = owner_workers[0];
         // "Beside the anchor" is acceptance, not a target ratio: the pane is
         // arranged as soon as it shares the anchor's tab. The repair path
@@ -477,7 +477,7 @@ fn plan_owner_workspace(
                 deferred: is_status_deferred(w.agent_status.as_deref(), def_list),
                 target: Target::Split {
                     tab: atab.to_string(),
-                    anchor: anchor_pane.unwrap().pane_id.clone(),
+                    anchor: anchor_pane.pane_id.clone(),
                     direction: "right".to_string(),
                     ratio: 0.4,
                 },
@@ -642,7 +642,7 @@ fn plan_owner_workspace(
                                     op: "move".to_string(),
                                     pane: chunk_gws[i].pane_id.clone(),
                                     deferred: is_status_deferred(chunk_gws[i].agent_status.as_deref(), def_list),
-                                    target: split_target(pos, &order, &chunk_gws, wt_id),
+                                    target: split_target(pos, &order, chunk_gws, wt_id),
                                 });
                             }
                         } else {
@@ -693,7 +693,7 @@ fn plan_owner_workspace(
                                 op: "move".to_string(),
                                 pane: chunk_gws[i].pane_id.clone(),
                                 deferred: is_status_deferred(chunk_gws[i].agent_status.as_deref(), def_list),
-                                target: split_target(pos, &order, &chunk_gws, &tab_ref),
+                                target: split_target(pos, &order, chunk_gws, &tab_ref),
                             });
                         }
                     }

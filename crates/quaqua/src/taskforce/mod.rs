@@ -253,13 +253,9 @@ pub fn handle_taskforce(args: &[String], git: &Git, herdr: &Herdr) -> Result<(),
     let caller_role_name =
         crate::layout::gate::resolve_caller_role(&layout, &caller, Some(&runs_dir)).ok();
     let role_name =
-        crate::layout::gate::resolve_target_role(&layout, caller_role_name.as_deref(), &targs.mode)
+        crate::layout::gate::resolve_target_role(&layout, caller_role_name, &targs.mode)
             .or_else(|_| {
-                crate::layout::gate::resolve_target_role(
-                    &layout,
-                    caller_role_name.as_deref(),
-                    "taskforce",
-                )
+                crate::layout::gate::resolve_target_role(&layout, caller_role_name, "taskforce")
             })
             .unwrap_or(targs.mode.as_str());
 

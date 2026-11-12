@@ -2129,10 +2129,9 @@ fn test_single_set_cursor_caller_in_src() {
                         || upper.contains("DELETE FROM CURSORS")
                         || upper.contains("REPLACE INTO CURSORS"))
                         && !trimmed.starts_with("//")
+                        && !is_migrate
                     {
-                        if !is_migrate {
-                            raw_sqls.push((path.clone(), idx + 1, line.to_string()));
-                        }
+                        raw_sqls.push((path.clone(), idx + 1, line.to_string()));
                     }
                 }
             }
@@ -2442,10 +2441,8 @@ fn prop_inbox_delivery_never_skips_and_always_drains() {
 
             // Safety check: every pending id with prev < id <= cur MUST be in rendered_ids
             for &id in &pending {
-                if id > prev && id <= cur {
-                    if !rendered_ids.contains(&id) {
-                        seed_lost.push(id);
-                    }
+                if id > prev && id <= cur && !rendered_ids.contains(&id) {
+                    seed_lost.push(id);
                 }
             }
 

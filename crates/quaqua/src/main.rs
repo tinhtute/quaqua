@@ -684,7 +684,7 @@ fn do_grid_reconcile(
 
     let opts = quaqua::grid::ReconcileOptions {
         check,
-        repair: if check { false } else { true },
+        repair: !check,
         tab,
         only,
         owner,

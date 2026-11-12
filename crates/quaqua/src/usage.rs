@@ -285,9 +285,9 @@ fn now_ms() -> i64 {
 }
 
 fn expand_path(p: &str) -> PathBuf {
-    if p.starts_with("~/") {
+    if let Some(rest) = p.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(&p[2..]);
+            return PathBuf::from(home).join(rest);
         }
     }
     PathBuf::from(p)
@@ -492,9 +492,8 @@ pub fn fetch_request_logs(
 ) -> Result<(Vec<serde_json::Value>, Option<String>), SourceUnavailable> {
     let mut rows = Vec::new();
     let mut cursor: Option<String> = None;
-    let mut pages = 0;
 
-    for _ in 0..200 {
+    for pages in 0..200 {
         let mut url = format!(
             "{}/api/request-logs?category=inference&limit={}&until={}",
             CONSOLE_BASE, PAGE_LIMIT, until_ms
@@ -515,7 +514,6 @@ pub fn fetch_request_logs(
                 ));
             }
         };
-        pages += 1;
         let items = d.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let oldest = items.iter().filter_map(|i| i.get("startedAt").and_then(|v| v.as_i64())).min();
         let next_cursor = d.get("nextCursor").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -724,8 +722,7 @@ pub fn is_product_cmd(target: &str) -> bool {
         }
     }
     for &prefix in &["bash", "sh"] {
-        if s.starts_with(prefix) {
-            let rem = &s[prefix.len()..];
+        if let Some(rem) = s.strip_prefix(prefix) {
             if rem.starts_with(char::is_whitespace) {
                 let rem_trim = rem.trim_start();
                 if rem_trim.starts_with("tests/") {
@@ -856,24 +853,21 @@ pub fn read_sessions(db_path: &Path) -> Result<BTreeMap<String, SessionInfo>, St
         .map_err(|e| format!("db query failed: {e}"))?;
 
     let mut sessions = BTreeMap::new();
-    for r in rows {
-        if let Ok((id, info)) = r {
-            sessions.insert(id, info);
-        }
+    for (id, info) in rows.flatten() {
+        sessions.insert(id, info);
     }
     Ok(sessions)
 }
 
+type SessionMessages = (
+    BTreeMap<String, Vec<(String, serde_json::Value)>>,
+    BTreeMap<String, Vec<i64>>,
+);
+
 pub fn read_messages(
     db_path: &Path,
     session_ids: &std::collections::HashSet<String>,
-) -> Result<
-    (
-        BTreeMap<String, Vec<(String, serde_json::Value)>>,
-        BTreeMap<String, Vec<i64>>,
-    ),
-    String,
-> {
+) -> Result<SessionMessages, String> {
     let mut tools: BTreeMap<String, Vec<(String, serde_json::Value)>> = BTreeMap::new();
     let mut times: BTreeMap<String, Vec<i64>> = BTreeMap::new();
 
@@ -1007,14 +1001,11 @@ pub fn runs_outcome(runs_dir: Option<&Path>, task: &str) -> (Vec<String>, Option
                     if let Some(pos) = stem.find(&needle) {
                         if pos > 0 {
                             let after = &stem[pos + needle.len()..];
-                            if after.starts_with('r') {
-                                let num_str = &after[1..];
+                            if let Some(num_str) = after.strip_prefix('r') {
                                 let r = if num_str.is_empty() {
                                     1
-                                } else if let Ok(n) = num_str.parse::<u64>() {
-                                    n
                                 } else {
-                                    0
+                                    num_str.parse::<u64>().unwrap_or_default()
                                 };
                                 if r > 0 {
                                     rounds = rounds.max(r);
@@ -1269,16 +1260,14 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
                     .filter_map(|s| sessions.get(s).and_then(|info| info.idle_outcome.clone()))
                     .map(Some)
                     .collect();
-                for idl in &idles {
-                    if let Some(bad) = idl {
-                        if bad == "failed" || bad == "interrupted" {
-                            toks.push(format!("killed({})", bad));
-                            waste.killed.push(WasteKilled {
-                                task: key.clone(),
-                                idle_outcome: bad.clone(),
-                            });
-                            break;
-                        }
+                for bad in idles.iter().flatten() {
+                    if bad == "failed" || bad == "interrupted" {
+                        toks.push(format!("killed({})", bad));
+                        waste.killed.push(WasteKilled {
+                            task: key.clone(),
+                            idle_outcome: bad.clone(),
+                        });
+                        break;
                     }
                 }
             }
@@ -1667,7 +1656,7 @@ pub fn render_text(rep: &UsageReport) -> Result<String, String> {
     ));
     for d in &rep.days_table {
         let wall = if let Some(f) = d.first {
-            ((d.last.unwrap_or(f) - f) / 60000) as i64
+            (d.last.unwrap_or(f) - f) / 60000
         } else {
             0
         };

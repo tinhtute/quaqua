@@ -3,7 +3,7 @@
 use quaqua::bus::FarmBus;
 use quaqua::herdr::Herdr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -19,7 +19,7 @@ fn tmp(prefix: &str) -> PathBuf {
     d
 }
 
-fn stub(runs: &PathBuf, pane_get_body: &str) -> Herdr {
+fn stub(runs: &Path, pane_get_body: &str) -> Herdr {
     let bin = runs.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let p = bin.join("herdr");
@@ -30,7 +30,7 @@ fn stub(runs: &PathBuf, pane_get_body: &str) -> Herdr {
     Herdr::new()
 }
 
-fn stub_herdr(runs: &PathBuf, body: &str) -> Herdr {
+fn stub_herdr(runs: &Path, body: &str) -> Herdr {
     let bin = runs.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let p = bin.join("herdr");
@@ -41,7 +41,7 @@ fn stub_herdr(runs: &PathBuf, body: &str) -> Herdr {
     Herdr::new()
 }
 
-fn count(runs: &PathBuf, typ: &str) -> i64 {
+fn count(runs: &Path, typ: &str) -> i64 {
     let bus = FarmBus::open(&runs.join("quaqua.db")).unwrap();
     let c = bus.conn_for_test();
     c.query_row(

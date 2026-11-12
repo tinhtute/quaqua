@@ -475,7 +475,7 @@ pub fn scan_secrets(text: &str) -> Vec<&'static str> {
                 Some(rest) => rest.trim_start_matches(is_blank),
                 None => continue,
             };
-            let after = after.trim_start_matches(|c| c == '"' || c == '\'' || c == '`');
+            let after = after.trim_start_matches(['"', '\'', '`']);
             if after.chars().take_while(|c| is_token_char(*c)).count() >= SECRET_VALUE_MIN {
                 push(&mut found, "credential value");
             }

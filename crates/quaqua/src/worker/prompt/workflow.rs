@@ -149,9 +149,11 @@ impl SingleWorkerState {
         let expect_verdict = input.brief.contains("Pipeline phase: REVIEW");
         let is_fallback_idle = crate::harness::mentions_fallback_idle(&input.kind);
 
-        let mut config = WatchdogConfig::default();
-        config.expect_verdict = expect_verdict;
-        config.is_fallback_idle = is_fallback_idle;
+        let config = WatchdogConfig {
+            expect_verdict,
+            is_fallback_idle,
+            ..WatchdogConfig::default()
+        };
 
         Self {
             input,

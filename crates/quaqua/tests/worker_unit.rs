@@ -301,7 +301,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: b"{\"snapshot\":{\"workspaces\":[],\"tabs\":[],\"panes\":[],\"layouts\":[],\"agents\":[]}}".to_vec(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -315,10 +315,7 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.agent_list", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => Ok(content),
             Ok(_) => Ok(r#"{"result":{"agents":[]}}"#.to_string()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -332,19 +329,13 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.agent_get", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => {
                 if let Some(msg) = content.strip_prefix("io_error:") {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        msg.to_string(),
-                    ))
+                    Err(std::io::Error::other(msg.to_string()))
                 } else {
                     Ok((true, content))
                 }
             }
             Ok(_) => Ok((false, String::new())),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -358,10 +349,7 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.agent_read", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => Ok(content),
             Ok(_) => Ok(String::new()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -401,10 +389,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -432,10 +417,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: b"{\"result\":{\"pane\":{\"pane_id\":\"%1\"}}}".to_vec(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -451,10 +433,7 @@ impl HerdrOps for MockActivitiesHerdr {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             }),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -493,10 +472,7 @@ impl HerdrOps for MockActivitiesHerdr {
         match acts.execute("herdr.pane_read", &req) {
             Ok(ActivityResult::Herdr(HerdrResult::AgentOutput { content })) => Ok(content),
             Ok(_) => Ok(String::new()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                err.to_string(),
-            )),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
         }
     }
 
@@ -1622,8 +1598,10 @@ fn test_pipeline_blocked_keeps_finished_zero() {
 
 #[test]
 fn test_pipeline_rounds_raise_only_on_resume() {
-    let mut state = quaqua::pipeline::PipelineState::default();
-    state.rounds = 3;
+    let mut state = quaqua::pipeline::PipelineState {
+        rounds: 3,
+        ..Default::default()
+    };
     let resume_rounds: Option<u32> = Some(2);
     if let Some(r) = resume_rounds {
         if r > state.rounds {
@@ -2280,7 +2258,7 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
     // the report is the only file it may write
     let report_rule = format!("Edit(//{}/**)", runs.trim_start_matches('/'));
     assert!(
-        allow.iter().any(|r| *r == report_rule),
+        allow.contains(&report_rule),
         "report not writable: {allow:?}"
     );
 }

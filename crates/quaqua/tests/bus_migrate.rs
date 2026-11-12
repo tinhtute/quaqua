@@ -1637,7 +1637,7 @@ fn test_finding_r3_defect3_migrate_cursor_and_acks_share_id_source() {
         conn.execute(
             &sql_insert_mail(
                 "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body, acked_ms, acked_by",
-                &format!("1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done', ?2, 'cos'"),
+                "1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done', ?2, 'cos'",
             ),
             rusqlite::params![now as i64, now as i64 + 50],
         )
@@ -1825,7 +1825,7 @@ fn test_finding_r3_followup_dry_run_matches_real_run_under_sqlite_sequence_offse
         conn.execute(
             &sql_insert_mail(
                 "id, msg_key, ts_ms, from_name, from_role, to_name, kind, body",
-                &format!("1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done'"),
+                "1, 'm1', ?1, 'w1', 'worker', 'cos', 'report', 'done'",
             ),
             rusqlite::params![now as i64],
         )

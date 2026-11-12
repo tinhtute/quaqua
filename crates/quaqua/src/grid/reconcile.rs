@@ -279,7 +279,7 @@ pub fn is_project_owner(owner: &str) -> bool {
 
 /// The pane that invoked this process. herdr exports `HERDR_PANE_ID` to every
 /// process it starts; only the snapshot knows that pane's tokens.
-fn caller_pane<'a>(snap: &'a Snapshot) -> Option<&'a super::types::Pane> {
+fn caller_pane(snap: &Snapshot) -> Option<&super::types::Pane> {
     let id = std::env::var("HERDR_PANE_ID")
         .ok()
         .filter(|s| !s.is_empty())?;
@@ -638,7 +638,7 @@ pub fn reconcile_core<D: HerdrDriver + 'static>(
                 .find(|a| a.pane_id.as_deref() == Some(&w.pane_id))
                 .and_then(|a| a.name.as_deref())
                 .or_else(|| w.tokens.as_ref().and_then(|t| t.grid_name.as_deref()))
-                .or_else(|| w.label.as_deref())
+                .or(w.label.as_deref())
                 .unwrap_or("");
             if let Some(set) = &only_set {
                 if !set.is_empty() && !set.contains(name) {
@@ -819,10 +819,9 @@ pub fn reconcile_core<D: HerdrDriver + 'static>(
                         if valid_tab
                             .map(|vt| w.tab_id.as_deref() == Some(&vt.tab_id))
                             .unwrap_or(false)
+                            && !present.contains(&w.pane_id)
                         {
-                            if !present.contains(&w.pane_id) {
-                                present.push(w.pane_id.clone());
-                            }
+                            present.push(w.pane_id.clone());
                         }
                         continue;
                     }
