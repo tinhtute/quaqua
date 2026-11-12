@@ -283,6 +283,9 @@ fn config_invalid_fixtures_are_rejected() {
         ("bad-timer-nudge.toml", "timers.nudge_at"),
         ("bad-timer-grace.toml", "timers.grace"),
         ("unknown-spawn.toml", "unknown spawn policy 'sometimes'"),
+        ("kill-on-claude.toml", "kind 'ni': on_cost_cap = \"kill\" is not allowed on harness 'claude'"),
+        ("kill-on-pi.toml", "kind 'ni': on_cost_cap = \"kill\" is not allowed on harness 'pi'"),
+        ("kill-fallback-claude.toml", "kind 'ni': on_cost_cap = \"kill\" is not allowed on fallback 'rv'"),
     ];
 
     for (name, needle) in cases {
@@ -335,4 +338,53 @@ fn config_opencode_models_table_merges_over_defaults() {
     assert!(stdout(&out2).contains("low"));
 
     let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// R2: `on_cost_cap = "kill"` needs a stop key on the kind's harness and on its
+/// one-hop fallback's. `worker spawn` refuses such a kind itself (the load path
+/// is a bare parse), before any worktree or pane exists; an omp kind with kill
+/// still spawns past the guard.
+#[test]
+fn config_kill_refused_at_spawn() {
+    let repo = std::env::temp_dir().join(format!("quaqua-kill-spawn-{}", std::process::id()));
+    for (name, needle) in [
+        ("kill-on-claude.toml", "harness 'claude'"),
+        ("kill-on-pi.toml", "harness 'pi'"),
+        ("kill-fallback-claude.toml", "fallback 'rv'"),
+    ] {
+        let path = fixtures_dir().join("invalid").join(name);
+        let out = Command::new(env!("CARGO_BIN_EXE_quaqua"))
+            .env("QUAQUA_TEAM_TOML", &path)
+            .env("QUAQUA_TEST", "1")
+            .env("QUAQUA_LAYOUT_SHADOW", "1")
+            .env("QUAQUA_OWNER", "cos")
+            .env("QUAQUA_RUNS_DIR", std::env::temp_dir().join("quaqua-kill-runs"))
+            .args(["worker", "spawn", "ni-kill", "ni", &repo.to_string_lossy()])
+            .output()
+            .expect("spawn quaqua");
+        let err = stderr(&out);
+        assert!(!out.status.success(), "{name}: spawn must be refused");
+        assert!(
+            err.contains("kind 'ni'") && err.contains("on_cost_cap") && err.contains(needle),
+            "{name}: {err:?}"
+        );
+        assert!(!repo.exists(), "{name}: refusal must precede any worktree work");
+    }
+}
+
+/// kill on omp with a stop-key fallback stays valid.
+#[test]
+fn config_kill_on_omp_validates() {
+    let body = std::fs::read_to_string(repo_team()).expect("read team.toml");
+    let ok = body.replacen(
+        "[kinds.tieude]\nharness = \"omp\"\n",
+        "[kinds.tieude]\nharness = \"omp\"\non_cost_cap = \"kill\"\n",
+        1,
+    );
+    assert_ne!(ok, body, "fixture edit did not apply");
+    let tmp = std::env::temp_dir().join(format!("quaqua-kill-omp-{}.toml", std::process::id()));
+    std::fs::write(&tmp, ok).unwrap();
+    let out = run(&["config", "validate", "--file", &tmp.to_string_lossy()]);
+    let _ = std::fs::remove_file(&tmp);
+    assert!(out.status.success(), "kill on omp must load: {}", stderr(&out));
 }

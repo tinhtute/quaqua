@@ -1,0 +1,20 @@
+schema_version = 2
+
+[strategy]
+default_kind = "ni"
+default_reviewer = ["rv"]
+
+[kinds.ni]
+harness = "claude"
+model = "m"
+effort = "high"
+on_cost_cap = "kill"
+
+[kinds.rv]
+harness = "opencode"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "max"
+can_review = true
+
+[merge]
+integ_branch = "quaqua/{slug}-integ"

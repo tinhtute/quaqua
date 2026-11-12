@@ -1,0 +1,21 @@
+schema_version = 2
+
+[strategy]
+default_kind = "ni"
+default_reviewer = ["rv"]
+
+[kinds.ni]
+harness = "omp"
+model = "m"
+effort = "high"
+on_cost_cap = "kill"
+fallback = "rv"
+
+[kinds.rv]
+harness = "claude"
+model = "m"
+effort = "high"
+can_review = true
+
+[merge]
+integ_branch = "quaqua/{slug}-integ"

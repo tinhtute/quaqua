@@ -555,6 +555,9 @@ fn spawn_worker_inner<G: GitOps, H: HerdrOps>(
     // `spawn = "approve"` needs its own --approve-kind from the Principal.
     crate::config::check_spawn_policy(&kind, kind_info, &opts.approve_kinds)?;
 
+    // Config load is a bare parse: refuse a kill-on-no-stop-key kind here.
+    crate::config::kill_cap_supported(cfg, &kind).map_err(|e| (1, format!("error: {e}\n")))?;
+
     if opts.review && !kind_info.can_review {
         eprintln!(
             "error: --review requires a kind with can_review = true in team.toml, not {}",

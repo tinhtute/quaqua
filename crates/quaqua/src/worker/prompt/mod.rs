@@ -1306,9 +1306,19 @@ fn prompt_worker_once<G: GitOps>(
         .as_ref()
         .and_then(|cfg| {
             let kind = crate::config::kind_of_worker(cfg, name)?.to_string();
-            cfg.kinds
+            let kill = cfg
+                .kinds
                 .get(&kind)
-                .map(|k| k.on_cost_cap == crate::config::COST_CAP_KILL)
+                .is_some_and(|k| k.on_cost_cap == crate::config::COST_CAP_KILL);
+            // A kill kind without a stop key (own or fallback) cannot be
+            // interrupted: warn instead of claiming an interrupt.
+            match crate::config::kill_cap_supported(cfg, &kind) {
+                Err(e) if kill => {
+                    eprintln!("WATCHDOG on_cost_cap=kill ignored: {e}");
+                    Some(false)
+                }
+                _ => Some(kill),
+            }
         })
         .unwrap_or(false);
     let cost_buffer = team_cfg.map_or(0.2, |cfg| cfg.timers.cost_buffer);
