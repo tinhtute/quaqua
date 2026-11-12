@@ -1036,6 +1036,106 @@ fn worker_push_guard_installs_pre_push_only() {
     let _ = std::fs::remove_dir_all(&sb.root);
 }
 
+/// The guard as installed before the "Installed by" comment was added: same
+/// behaviour, different bytes. A comment edit must not make an older install
+/// look foreign.
+const OLD_PRE_PUSH: &str = r#"#!/usr/bin/env bash
+# pre-push — a worker must never push: pushes and merges belong to the
+# Principal (issue #4). `quaqua worker spawn` exports QUAQUA_OWNER into the
+# pane, so every process the worker starts carries it, git included. Run the
+# push from a shell without QUAQUA_OWNER (the Lead/CoS) and it passes.
+if [[ -n "${QUAQUA_OWNER-}" ]]; then
+  echo "pre-push: refused — QUAQUA_OWNER='$QUAQUA_OWNER' marks a worker; workers never push." >&2
+  echo "Hand the branch to the Lead; it merges via the queue." >&2
+  exit 1
+fi
+exit 0
+"#;
+
+/// An older revision of the quaqua guard is quaqua's own: it is recognised and
+/// refreshed to the current one, and still guards. The current revision is left
+/// as it is.
+#[test]
+fn worker_push_guard_refreshes_an_older_revision() {
+    let Some(_git) = find_git() else {
+        return;
+    };
+    let sb = Sandbox::new("pushguard-old");
+    let init_repo = |name: &str| {
+        let repo = sb.target(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(gitfix::cmd("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success());
+        repo
+    };
+
+    // A fresh install is the refresh target: the current revision.
+    let fresh = init_repo("fresh");
+    quaqua::init::ensure_worker_push_guard(&fresh).expect("fresh install");
+    let fresh_hook = fresh.join(".git/hooks/pre-push");
+    let current = read(&fresh_hook);
+
+    // An older revision of the same guard: refreshed, never called foreign.
+    let old = init_repo("old");
+    let hook = old.join(".git/hooks/pre-push");
+    write_file(&hook, OLD_PRE_PUSH, 0o755);
+    quaqua::init::ensure_worker_push_guard(&old).expect("an older revision is refreshed");
+    let refreshed = read(&hook);
+    assert_ne!(
+        refreshed, OLD_PRE_PUSH,
+        "the older revision was left in place",
+    );
+    assert_eq!(
+        refreshed, current,
+        "the older revision was not refreshed to the current one",
+    );
+    assert_eq!(
+        path_mode(&hook) & 0o111,
+        0o111,
+        "the refreshed guard is not executable",
+    );
+
+    // ... and it still guards: a worker is refused, the principal passes.
+    let run = |owner: Option<&str>| {
+        let mut cmd = Command::new(&hook);
+        cmd.current_dir(&old)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match owner {
+            Some(v) => {
+                cmd.env("QUAQUA_OWNER", v);
+            }
+            None => {
+                cmd.env_remove("QUAQUA_OWNER");
+            }
+        }
+        cmd.status().unwrap()
+    };
+    assert!(
+        !run(Some("tieude-x")).success(),
+        "worker push must fail after the refresh",
+    );
+    assert!(
+        run(None).success(),
+        "principal push must pass after the refresh",
+    );
+
+    // The current revision is already right: a second call changes nothing.
+    quaqua::init::ensure_worker_push_guard(&fresh).expect("a current guard is a no-op");
+    assert_eq!(
+        read(&fresh_hook),
+        current,
+        "the current guard was rewritten",
+    );
+
+    let _ = std::fs::remove_dir_all(&sb.root);
+}
+
 /// A worker pane carries `QUAQUA_OWNER`; the pre-push hook must reject that and
 /// pass a plain shell. Runs the installed hook directly — no remote needed.
 #[test]
