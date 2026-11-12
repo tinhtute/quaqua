@@ -433,35 +433,48 @@ for k in ni suhuynh truonglao; do
     || fail "--review $k: no dontAsk permission mode: $(cat "$T/calls")"
   grep -qF -- "--add-dir $T/home/quaqua/runs $T/.wt --settings" "$T/calls" \
     || fail "--review $k: runs+worktree-family not working directories: $(cat "$T/calls")"
-  grep -qF -- "Edit(//${T#/}/home/quaqua/runs/**)" "$T/calls" \
-    || fail "--review $k: runs not writable (no Edit allow rule): $(cat "$T/calls")"
-  grep -qF -- "Edit(//${T#/}/.wt/**)" "$T/calls" \
-    || fail "--review $k: worktree not read-only (no Edit deny rule): $(cat "$T/calls")"
+  # The permission boundary travels in the settings file claude is pointed at,
+  # never on the launch line (herdr types that line into a 1024-byte tty), so
+  # the rules are asserted where claude reads them: the parsed JSON.
+  settings="$T/home/quaqua/runs/.$k-revread.settings.json"
+  [[ -f $settings ]] || fail "--review $k: no settings file at $settings"
+  grep -qF -- "--settings $settings" "$T/calls" \
+    || fail "--review $k: launch line does not load $settings: $(cat "$T/calls")"
+  ! grep -qF -- '"permissions"' "$T/calls" \
+    || fail "--review $k: permissions inlined on the launch line: $(cat "$T/calls")"
+  allow=$(jq -r '.permissions.allow[]' "$settings") \
+    || fail "--review $k: settings carry no permissions.allow: $(cat "$settings")"
+  deny=$(jq -r '.permissions.deny[]' "$settings") \
+    || fail "--review $k: settings carry no permissions.deny: $(cat "$settings")"
+  grep -qxF -- "Edit(//${T#/}/home/quaqua/runs/**)" <<<"$allow" \
+    || fail "--review $k: runs not writable (no Edit allow rule): $(cat "$settings")"
+  grep -qxF -- "Edit(//${T#/}/.wt/**)" <<<"$deny" \
+    || fail "--review $k: worktree not read-only (no Edit deny rule): $(cat "$settings")"
   # read-only evidence gathering: the review cannot run without it
   for rule in 'git diff' 'git log' 'git show' 'git status' 'git rev-parse' \
               'git merge-base' 'git grep'; do
-    grep -qF -- "Bash($rule:*)" "$T/calls" \
-      || fail "--review $k: $rule not allowed: $(cat "$T/calls")"
+    grep -qxF -- "Bash($rule:*)" <<<"$allow" \
+      || fail "--review $k: $rule not allowed: $(cat "$settings")"
   done
   for rule in 'cargo test' 'cargo build' 'cargo clippy' 'cargo fmt --check' \
               'rg' 'grep' 'cat' 'sed -n' 'ls' 'cd'; do
-    grep -qF -- "Bash($rule:*)" "$T/calls" \
-      || fail "--review $k: $rule not allowed: $(cat "$T/calls")"
+    grep -qxF -- "Bash($rule:*)" <<<"$allow" \
+      || fail "--review $k: $rule not allowed: $(cat "$settings")"
   done
-  grep -qF -- 'Bash(mv *runs/.*.tmp *runs/*.md)' "$T/calls" \
-    || fail "--review $k: atomic report mv not allowed: $(cat "$T/calls")"
+  grep -qxF -- 'Bash(mv *runs/.*.tmp *runs/*.md)' <<<"$allow" \
+    || fail "--review $k: atomic report mv not allowed: $(cat "$settings")"
   # ...and it still cannot write the worktree or the history
   for rule in 'git commit' 'git push' 'git checkout' 'git reset' 'git switch' \
               'git restore' 'git clean'; do
-    grep -qF -- "Bash($rule:*)" "$T/calls" \
-      || fail "--review $k: $rule not denied: $(cat "$T/calls")"
+    grep -qxF -- "Bash($rule:*)" <<<"$deny" \
+      || fail "--review $k: $rule not denied: $(cat "$settings")"
   done
-  ! grep -qF -- '"Bash"' "$T/calls" || fail "--review $k: bare Bash allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- 'Bash(*)' "$T/calls" || fail "--review $k: Bash(*) allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- 'Bash(git:*)' "$T/calls" || fail "--review $k: blanket git allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- 'Bash(mv:*' "$T/calls" || fail "--review $k: unbounded mv allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- '"allow":["Bash(git commit' "$T/calls" \
-    || fail "--review $k: git commit allowed: $(cat "$T/calls")"
+  ! grep -qxF -- 'Bash' <<<"$allow" || fail "--review $k: bare Bash allow leaked: $(cat "$settings")"
+  ! grep -qxF -- 'Bash(*)' <<<"$allow" || fail "--review $k: Bash(*) allow leaked: $(cat "$settings")"
+  ! grep -qxF -- 'Bash(git:*)' <<<"$allow" || fail "--review $k: blanket git allow leaked: $(cat "$settings")"
+  ! grep -qF -- 'Bash(mv:*' <<<"$allow" || fail "--review $k: unbounded mv allow leaked: $(cat "$settings")"
+  ! grep -qF -- 'Bash(git commit' <<<"$allow" \
+    || fail "--review $k: git commit allowed: $(cat "$settings")"
   grep -qF -- '--model claude-opus-5-5' "$T/calls" || fail "--review $k: model changed: $(cat "$T/calls")"
   grep -qF -- "--effort $eff" "$T/calls" || fail "--review $k: effort not $eff: $(cat "$T/calls")"
   [[ -e "$T/home/quaqua/runs/$k-revread.review" ]] \
@@ -476,10 +489,13 @@ done
 spawn ni-plain ni
 [[ $rc -eq 0 ]] || fail "plain ni: exit $rc, want 0: $(cat "$T/err")"
 ! grep -qF -- '--permission-mode dontAsk' "$T/calls" || fail "plain ni: review mode leaked: $(cat "$T/calls")"
-! grep -qF -- 'Bash(cargo test:*)' "$T/calls" || fail "plain ni: review cargo rule leaked: $(cat "$T/calls")"
-! grep -qF -- 'Bash(git diff:*)' "$T/calls" || fail "plain ni: review git rule leaked: $(cat "$T/calls")"
-! grep -qF -- 'Bash(mv *runs/.*.tmp *runs/*.md)' "$T/calls" || fail "plain ni: review mv rule leaked: $(cat "$T/calls")"
-echo "ok: plain ni (no --review) -> ambient settings, no review mode/Bash rules"
+plain_settings="$T/home/quaqua/runs/.ni-plain.settings.json"
+[[ -f $plain_settings ]] || fail "plain ni: no settings file at $plain_settings"
+! jq -e '.permissions' "$plain_settings" >/dev/null \
+  || fail "plain ni: review permission boundary leaked: $(cat "$plain_settings")"
+jq -e '.hooks.PreToolUse' "$plain_settings" >/dev/null \
+  || fail "plain ni: liveness hooks missing: $(cat "$plain_settings")"
+echo "ok: plain ni (no --review) -> ambient settings (hooks only), no review mode/permission boundary"
 
 # ── claude workspace-trust dialog: accept it, then let it clear ──────────────
 # Claude Code's first session in a repo it has not been trusted in shows a
