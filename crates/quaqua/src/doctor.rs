@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::config::Config;
+
 /// Interactive shells can be slow with a large rc; never let the probe (or a
 /// check command) hang `quaqua doctor`.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -53,7 +55,7 @@ pub fn run() -> i32 {
         if report.warnings.is_empty() {
             println!("{ok}");
         } else {
-            println!("{ok} (layout warnings above)");
+            println!("{ok} (warnings above)");
         }
         0
     } else {
@@ -331,6 +333,96 @@ pub fn check_github_ci_poll_units(home: Option<&Path>, report: &mut Report) {
     check_github_ci_poll_units_with(home, is_macos, &RealSystemd, report);
 }
 
+/// The `provider/model` ids a `pi --list-models` table lists.
+///
+/// The table is one header line (`provider  model  context  max-out  thinking
+/// images`) then one row per model, whitespace-separated; pi prints extension
+/// warnings on stderr, so stdout is the table alone. pi resolves a kind's
+/// `model` against exactly `provider/model`.
+pub fn pi_model_ids(list_output: &str) -> Vec<String> {
+    list_output
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let provider = cols.next()?;
+            let model = cols.next()?;
+            (provider != "provider").then(|| format!("{provider}/{model}"))
+        })
+        .collect()
+}
+
+/// Warn for every kind that runs on pi with a `model` the table does not list.
+///
+/// Such a kind fails only when a worker launches, so `quaqua doctor` names it
+/// first. `list` is `None` when pi is not on PATH: the check is skipped with
+/// one note rather than guessed at. A warning, never a problem: a model pi
+/// cannot run is a workspace config mistake, not a broken install.
+pub fn check_pi_models_with(cfg: &Config, list: Option<&str>, report: &mut Report) {
+    let pi_kinds: Vec<_> = cfg
+        .kinds
+        .iter()
+        .filter(|(_, k)| k.harness == "pi")
+        .collect();
+    if pi_kinds.is_empty() {
+        return;
+    }
+    let Some(list) = list else {
+        report
+            .notes
+            .push("pi models: pi is not on PATH — the pi model check was skipped".to_string());
+        return;
+    };
+    let listed = pi_model_ids(list);
+    for (name, kind) in pi_kinds {
+        if listed.contains(&kind.model) {
+            continue;
+        }
+        let provider = kind
+            .model
+            .split_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or(kind.model.as_str());
+        report.warnings.push(format!(
+            "kind '{name}' runs on pi with model '{}', which `pi --list-models` does not list — install the pi provider package for '{provider}' (or fix kinds.{name}.model in team.toml)",
+            kind.model
+        ));
+    }
+}
+
+/// The real pi model check: resolve team.toml, find `pi` on PATH, read its
+/// model table, and warn about the kinds it cannot run.
+fn check_pi_models(report: &mut Report) {
+    let cfg = match crate::config::load_team_config() {
+        Ok(cfg) => cfg,
+        Err((_, e)) => {
+            report
+                .notes
+                .push(format!("pi models: check skipped — {}", e.trim()));
+            return;
+        }
+    };
+    if !cfg.kinds.values().any(|k| k.harness == "pi") {
+        return;
+    }
+    let path = std::env::var_os("PATH");
+    let Some(pi) = find_on_path("pi", path.as_deref()) else {
+        check_pi_models_with(&cfg, None, report);
+        return;
+    };
+    let mut cmd = Command::new(&pi);
+    cmd.arg("--list-models");
+    match run_with_timeout(cmd, PROBE_TIMEOUT) {
+        Ok(out) if out.status.success() => {
+            check_pi_models_with(&cfg, Some(&String::from_utf8_lossy(&out.stdout)), report);
+        }
+        Ok(out) => report.notes.push(format!(
+            "pi models: check skipped — `pi --list-models` exited {}",
+            out.status
+        )),
+        Err(e) => report.notes.push(format!("pi models: check skipped — {e}")),
+    }
+}
+
 /// The real checks: PATH lookup, checkout discovery, and `$SHELL`.
 pub fn diagnose() -> Report {
     let path = std::env::var_os("PATH");
@@ -347,6 +439,7 @@ pub fn diagnose() -> Report {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     check_auditor_units(home.as_deref(), &mut report);
     check_github_ci_poll_units(home.as_deref(), &mut report);
+    check_pi_models(&mut report);
     report
 }
 
@@ -1881,6 +1974,134 @@ command = ["quaqua", "events", "hook"]
             report_macos.notes
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn empty_report() -> Report {
+        Report {
+            problems: Vec::new(),
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            checkout_checked: false,
+        }
+    }
+
+    /// A real `pi --list-models` table (stdout only; extension
+    /// warnings go to stderr): the header names the columns, every row is
+    /// `provider  model  context  max-out  thinking  images`.
+    const PI_TABLE: &str = "\
+provider  model                                 context  max-out  thinking  images
+mistral   deepseek-v4-1-flash-1017              1.0M     128K     yes       yes
+mistral   codestral-2508                        256K     8.2K     no        no
+hive      deepseek-ai/deepseek-v4.1-flash-1017  1M       32.8K    yes       yes
+";
+
+    fn team_toml(dir: &Path, kinds: &str) -> PathBuf {
+        let path = dir.join("team.toml");
+        fs::write(&path, format!("schema_version = 3\n\n{kinds}")).unwrap();
+        path
+    }
+
+    /// A `pi` stub on PATH that prints `table` for `--list-models`.
+    fn pi_stub(dir: &Path, table: &str) -> PathBuf {
+        let table_file = dir.join("table");
+        fs::write(&table_file, table).unwrap();
+        let path = dir.join("pi");
+        fs::write(
+            &path,
+            format!("#!/bin/sh\ncat '{}'\n", table_file.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn a_pi_kind_is_warned_about_only_when_pi_does_not_list_its_model() {
+        let dir = temp_dir("pimodels");
+        let cfg = crate::config::load(&team_toml(
+            &dir,
+            "[kinds.tieude]\nharness = \"pi\"\nmodel = \"mistral/deepseek-v4-1-flash-1017\"\n\n\
+             [kinds.sude]\nharness = \"omp\"\nmodel = \"antigravity/not-a-model\"\n",
+        ))
+        .unwrap();
+
+        // Listed: quiet. The omp kind is never pi's business.
+        let mut report = empty_report();
+        check_pi_models_with(&cfg, Some(PI_TABLE), &mut report);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // Not listed: one warning naming the kind, the model and the fix.
+        let cfg = crate::config::load(&team_toml(
+            &dir,
+            "[kinds.tieude]\nharness = \"pi\"\nmodel = \"mistral/not-a-model\"\n",
+        ))
+        .unwrap();
+        let mut report = empty_report();
+        check_pi_models_with(&cfg, Some(PI_TABLE), &mut report);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("kind 'tieude'")
+                && report.warnings[0].contains("mistral/not-a-model")
+                && report.warnings[0].contains("kinds.tieude.model"),
+            "{:?}",
+            report.warnings
+        );
+
+        // pi absent: one note, no warning, and never a problem.
+        let mut report = empty_report();
+        check_pi_models_with(&cfg, None, &mut report);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(
+            report.notes.iter().any(|n| n.contains("pi is not on PATH")),
+            "{:?}",
+            report.notes
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pi_kind_is_checked_against_the_pi_on_path() {
+        let _lock = crate::test_env::lock_env();
+        let dir = temp_dir("pistub");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let toml = team_toml(
+            &dir,
+            "[kinds.tieude]\nharness = \"pi\"\nmodel = \"mistral/deepseek-v4-1-flash-1017\"\n",
+        );
+        let _toml = crate::test_env::TestEnvVarGuard::set("QUAQUA_TEAM_TOML", &toml);
+        // Prepended, not replaced: other tests keep the tools they spawn.
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        let _path =
+            crate::test_env::TestEnvVarGuard::set("PATH", format!("{}:{prev_path}", bin.display()));
+
+        // The stub pi lists the kind's model: the check is quiet.
+        pi_stub(&bin, PI_TABLE);
+        let mut report = empty_report();
+        check_pi_models(&mut report);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // The same pi without that model: one warning.
+        pi_stub(
+            &bin,
+            "provider  model   context\nmistral   codestral-2508  256K\n",
+        );
+        let mut report = empty_report();
+        check_pi_models(&mut report);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("mistral/deepseek-v4-1-flash-1017"),
+            "{:?}",
+            report.warnings
+        );
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
         let _ = fs::remove_dir_all(&dir);
     }
 }
