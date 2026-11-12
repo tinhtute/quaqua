@@ -25,6 +25,7 @@ pub mod merge;
 pub mod pipeline;
 pub mod playbook;
 pub mod rules;
+pub mod ship;
 pub mod source;
 pub mod state;
 pub mod status;
