@@ -9,9 +9,15 @@ lane: normal
 - success_signal: one recorded run where CoS takes a task from brief to merged PR via quaqua CLI only, with a ≥4 mixed-kind wave, the review fork firing live, and a cost cap or watchdog stop observed on an agy worker.
 - actors: Principal, CoS, Leads, workers.
 - authority: Principal 2026-11-11 + raw/2026-11-11-quaqua-cmval.md.
-- requirements: none until the map is decided
+- requirements:
+  - R1: the G1 review fork can only Read/Write/Edit under `memory/`; a fork attempt to touch any other path or tool is denied by the engine, not by the prompt | acceptance: `cargo test -p quaqua fork_allowlist` `node --test mods/cos-memory/tests/` | source: Q4
+  - R2: `quaqua` refuses at config load (`load_team_config`) any kind on a claude or pi harness with `on_cost_cap = "kill"`, naming the kind and harness; kill on opencode/omp/agy still loads | acceptance: `cargo test -p quaqua config_kill_refused` | source: Q10, Q7
+  - R3: the cos-memory mod is loaded in the real CoS session and the review fork has fired there (`review.lastReviewAt` set in the plugin store); `mods/cos-memory/tsconfig.json` is either committed or deliberately left out, with `git status` clean for `mods/cos-memory` | acceptance: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty) | source: Q3, Q8
+  - R4: a `quaqua ship` command pushes the worker branch and opens the PR after one Principal approval, and never merges | acceptance: `cargo test -p quaqua ship` | source: Q1, Q2
+  - R5: one recorded run takes a task from brief to merged PR through the quaqua CLI only, with a ≥4 mixed-kind wave, the review fork firing live, and a cost cap or watchdog stop observed on an agy worker; the Principal does the final merge | acceptance: `gh pr view <pr> --json mergedAt` `quaqua status --metrics` (4+ kinds, agy stop line) `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json` | source: Q2, Q3, Q5, Q6, Q7
 - non-goals:
   - NG1: GUI series #214–#224 (deferred by Principal).
+  - NG2: agy usage parsing (Q6) and the agy provider-error classifier (Q9) are not built here; the agy stop in R5 may be the time-budget watchdog, which already covers agy (Q7).
 
 ## Map
 - Q1: Which steps from brief to merged PR still need a manual action today? | type: research | by: AFK | blocked_by: none | status: decided → 6 steps still need a human (brief text, report acceptance, test rerun, push, PR open, merge to main) plus 4 unwired chores (worker cleanup, binary reinstall, branch delete, CI-failure watch); no `quaqua` command touches the remote | evidence: raw/2026-11-11-quaqua-q1shipflow.md @ e77b22c
@@ -27,16 +33,42 @@ lane: normal
 - fog: when work spans days, should a long-lived quaqua-rs Lead own MVP execution instead of CoS?
 
 ## Phases and Verification
-- approach: not-planned
+- approach: five worker-sized phases; Q4 and Q10 are independent engine changes that run in parallel, then the mod goes live under the allowlist, then `quaqua ship`, then the recorded run. Rejected: prompt-only fork restriction (Q4) and run-time-only kill refusal (Q10).
+- phase_slug: `fork-allowlist`
+  status: planned
+  - goal: R1 | depends_on: none
+  - surfaces: crates/quaqua/src/ (engine-side tool allowlist for the review fork), mods/cos-memory/src/review.js, crates/quaqua/tests/ | avoided: worker/, merge/, grid/
+  - phase check: `cargo test -p quaqua fork_allowlist` `node --test mods/cos-memory/tests/`
+- phase_slug: `kill-refusal`
+  status: planned
+  - goal: R2 | depends_on: none (parallel with `fork-allowlist`)
+  - surfaces: crates/quaqua/src/config.rs, crates/quaqua/tests/config.rs | avoided: worker/stop.rs run-time refusal stays as a second guard
+  - phase check: `cargo test -p quaqua config_kill_refused` `cargo test -p quaqua config`
+- phase_slug: `cos-mod-live`
+  status: planned
+  - goal: R3 | depends_on: `fork-allowlist`
+  - surfaces: mods/cos-memory/ (tsconfig.json decision), the real CoS plugin store | avoided: crates/
+  - phase check: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty); live fork per Q3 session shape (≥10 user turns, ≥10 Stops or ≥15 tool calls, then stay open) and `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
+- phase_slug: `ship`
+  status: planned
+  - goal: R4 | depends_on: none
+  - surfaces: crates/quaqua/src/ (new ship command, main.rs CLI), crates/quaqua/tests/ | avoided: merge to main (stays manual)
+  - phase check: `cargo test -p quaqua ship`
+- phase_slug: `mvp-run`
+  status: planned
+  - goal: R5 | depends_on: `fork-allowlist`, `kill-refusal`, `cos-mod-live`, `ship`
+  - surfaces: runs/ report only, no code | avoided: any engine change (a gap found goes back as a new phase)
+  - phase check: `gh pr view <pr> --json mergedAt` `quaqua status --metrics` `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
 
 ## Log
 - 2026-11-11 — map opened from the Principal's destination; 8 lines, no decisions yet.
+- 2026-11-12 — map decided (10 of 10); locked: R1–R5, five phases. Lane kept `normal` though there are several phases, because each is one reviewable unit; `fork-allowlist` mechanism is unknown (`$.model.fork` takes only `{ prompt, effort }`), the worker must verify it before building.
 
 ## Validation
 
 ## Current State and Next Action
 - active_phase: none
-- lifecycle_status: planned
+- lifecycle_status: locked
 - blockers: none
 - open_items: 0 open of 10 map lines
-- exact_next_action: wayfinder
+- exact_next_action: work full phase fork-allowlist (kill-refusal may run in parallel)
