@@ -21,8 +21,8 @@ lane: normal
 - Q5: Does a 4-worker mixed-kind wave run clean today (grid, reports, cleanup)? | type: task | by: AFK | blocked_by: none | status: decided → 4 mixed-kind workers (omp, claude, agy, claude) ran to COMPLETE; frictions were topology gate requiring --solo for 3rd+ worker and agy taking ~1h | evidence: raw/2026-11-11-quaqua-q*.md, memory 2026-11-11
 - Q6: How can quaqua measure usage for agy workers (log parsing, API, or a time-based cap)? | type: research | by: AFK | blocked_by: none | status: decided → log parsing via ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl mapped by conversation_summaries.db; time-based cap remains the runaway backstop | evidence: raw/2026-11-11-quaqua-q6agyusage.md @ e77b22c
 - Q7: Which harnesses lack stall/timeout detection in the watchdog? | type: research | by: AFK | blocked_by: none | status: decided → None: all 5 harnesses (claude, opencode, omp, pi, agy) get stall, idle, budget and hard-cap detection; the per-harness gaps are elsewhere — agy has no cost tracking and no provider-error classification (exit 7), and claude/pi have no stop keys, so on_cost_cap=kill cannot interrupt them | evidence: raw/2026-11-11-quaqua-q7watchdog.md @ e77b22c
-- Q8: Why does the cos-memory Stop counter persist stops:0 in live -p sessions, and how is the mod loaded into the real CoS session? | type: research | by: AFK | blocked_by: Q3 | status: open
-- Q9: What error text does an agy pane print on a provider error, so retry.rs can classify it for exit 7? | type: research | by: AFK | blocked_by: Q7 | status: open
+- Q8: Why does the cos-memory Stop counter persist stops:0 in live -p sessions, and how is the mod loaded into the real CoS session? | type: research | by: AFK | blocked_by: Q3 | status: decided → cos-memory turn.complete trigger (2fdda74) counts live in interactive and -p; old stops:0 came from classic.Stop being skipped under cc-plugin-sec-default (inferred); follow-up: load the mod in the real CoS, and decide on the untracked mods/cos-memory/tsconfig.json | evidence: raw/2026-11-12-mvp-sude-q8live.md, raw/2026-11-12-mvp-sude-q8fix.md @ 2fdda74
+- Q9: What error text does an agy pane print on a provider error, so retry.rs can classify it for exit 7? | type: research | by: AFK | blocked_by: Q7 | status: decided → agy error line is `⚠ <STATUS> (code NNN): msg` then `Error ID: <uuid>` (or generic "Agent execution terminated due to error."); retry.rs classifies by status: retry RESOURCE_EXHAUSTED/UNAVAILABLE/DEADLINE_EXCEEDED/INTERNAL/ABORTED; fatal PERMISSION_DENIED/UNAUTHENTICATED/INVALID_ARGUMENT/NOT_FOUND/FAILED_PRECONDITION/UNKNOWN; 429/5xx → exhausted=true; "AI credits balance is too low" → fatal billing | evidence: raw/2026-11-12-mvp-tieude-q9agyerr.md
 - Q10: Should kinds on claude/pi be refused on_cost_cap="kill" at config load, since no interrupt is possible (stop.rs:78 refuses at run time)? | type: grill | by: HITL | blocked_by: Q7 | status: open
 - fog: when work spans days, should a long-lived quaqua-rs Lead own MVP execution instead of CoS?
 
@@ -38,5 +38,5 @@ lane: normal
 - active_phase: none
 - lifecycle_status: planned
 - blockers: none
-- open_items: 4 open of 10 map lines (Q4, Q8, Q9, Q10)
+- open_items: 2 open of 10 map lines (Q4, Q10)
 - exact_next_action: wayfinder
