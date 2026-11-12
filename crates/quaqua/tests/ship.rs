@@ -131,6 +131,47 @@ fn ship_rerun_reuses_open_pr() {
     assert_eq!(ops.calls(), vec!["push quaqua/w1"]);
 }
 
+/// One `runs/telemetry.jsonl` worker row, as `worker cleanup` appends it.
+fn telemetry_row(worker: &str, repo: &str) -> String {
+    format!(
+        "{{\"ts\":\"2026-11-12T15:06:40+07:00\",\"rec\":\"worker\",\"name\":\"{worker}\",\
+         \"kind\":\"sude\",\"harness\":\"claude\",\"owner\":\"cos\",\"pipeline\":null,\
+         \"repo\":\"{repo}\",\"prompts\":1,\"exit\":null,\"wall_sec\":217,\
+         \"budget_sec\":2700,\"usd\":null,\"usd_budget\":null,\"tokens\":null,\
+         \"spend_src\":\"claude-tokens\",\"model\":null}}\n"
+    )
+}
+
+/// `worker cleanup` deletes `runs/<w>.repo`, so a ship after cleanup must find
+/// the repo in the durable telemetry row instead of demanding `--repo`.
+#[test]
+fn ship_after_cleanup_resolves_repo_without_repo_flag() {
+    let runs = std::env::temp_dir().join(format!("quaqua-ship-postcleanup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runs);
+    std::fs::create_dir_all(&runs).unwrap();
+    std::fs::write(runs.join("w1.md"), COMPLETE).unwrap();
+    std::fs::write(runs.join("telemetry.jsonl"), telemetry_row("w1", "~/Lab/quaqua")).unwrap();
+    assert!(!runs.join("w1.repo").exists(), "cleanup removed the spawn record");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"))
+        .args(["ship", "w1"])
+        .env("QUAQUA_RUNS_DIR", &runs)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        !stderr.contains(".repo"),
+        "the repo must resolve without --repo: {stderr}"
+    );
+    assert!(
+        stderr.contains("no TTY"),
+        "ship must reach the approval gate: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&runs);
+}
+
 #[test]
 fn ship_cli_refuses_without_tty_or_yes() {
     let runs = std::env::temp_dir().join(format!("quaqua-ship-cli-{}", std::process::id()));
