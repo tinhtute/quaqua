@@ -200,6 +200,7 @@ pub fn do_check_brief_with_owner(
     // does not say solo or lead cannot be checked against AGENTS.md '## Roles (SLP)'.
     crate::worker::leadgate::topology(task).map_err(|msg| (1, msg))?;
     brief::warn_brief_headers(task);
+    brief::warn_main_checkout_path(task);
     // #178: a stated review rule must be valid; an absent one takes the defaults.
     brief::review_policy(task).map_err(|e| (1, e))?;
     brief::warn_lead_routing(task, owner, runs_dir);
