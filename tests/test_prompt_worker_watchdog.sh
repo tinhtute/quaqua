@@ -55,7 +55,7 @@ advance() {
   fi
 }
 write_report() {
-  printf 'fake summary\n\n## Lessons\n- none\n' > "$HOME/quaqua/runs/$FAKE_NAME.md"
+  printf 'Outcome: COMPLETE\nfake summary\n\n## Lessons\n- none\n' > "$HOME/quaqua/runs/$FAKE_NAME.md"
 }
 touch_session() {
   [ -z "${FAKE_SESSION_FILE:-}" ] && return 0
@@ -103,7 +103,7 @@ case "${1:-} ${2:-}" in
       ( sleep "$FAKE_DELAY"; write_report ) &
     elif [ "${FAKE_PARTS:-0}" = 1 ]; then
       printf 'part1\n' > "$HOME/quaqua/runs/$FAKE_NAME.md"
-      ( sleep 0.3; printf 'part2\n\n## Lessons\n- none\n' >> "$HOME/quaqua/runs/$FAKE_NAME.md" ) &
+      ( sleep 0.3; printf 'Outcome: COMPLETE\npart2\n\n## Lessons\n- none\n' >> "$HOME/quaqua/runs/$FAKE_NAME.md" ) &
     elif [ "${FAKE_WRITE:-0}" = 1 ]; then
       write_report
     fi
@@ -183,7 +183,7 @@ done
 echo "ok: --resume arg validation -> exit 1, usage on stderr"
 
 # ── resume happy path: file already there, no prompt ever sent ──────────────
-printf 'done\n\n## Lessons\n- none\n' > "$T/home/quaqua/runs/sude-rdone.md"
+printf 'Outcome: COMPLETE\ndone\n\n## Lessons\n- none\n' > "$T/home/quaqua/runs/sude-rdone.md"
 resume sude-rdone
 [[ $rc -eq 0 ]] || fail "sude-rdone: exit $rc: $(cat "$T/err")"
 [[ "$(cat "$T/out")" == "$T/home/quaqua/runs/sude-rdone.md" ]] \
@@ -221,6 +221,15 @@ run sude-budget PROMPT_WORKER_POLL_SEC=1 PROMPT_WORKER_STALL_SEC=9999 \
 [[ $(nudges) -eq 1 ]] || fail "sude-budget: $(nudges) nudges, want 1: $(cat "$T/calls")"
 grep -q 'WATCHDOG nudge sent' "$T/err" || fail "sude-budget: no nudge notice"
 echo "ok: budget -> one nudge past the pct mark, exit 4"
+
+# A watchdog stop is a worker lifecycle end: `status --metrics` must show it
+# without waiting for a cleanup (exit 4 left no row before).
+tele="$T/home/quaqua/runs/telemetry.jsonl"
+rows=$(grep -c '"rec":"worker".*"name":"sude-budget".*"exit":4' "$tele" 2>/dev/null || true)
+[[ $rows -eq 1 ]] || fail "sude-budget: $rows exit-4 telemetry rows after the stop, want 1"
+QUAQUA_RUNS_DIR="$T/home/quaqua/runs" HOME="$T/home" "${QUAQUA_BIN:-quaqua}" status --metrics --since 24h 2>/dev/null \
+  | grep -Eq '^sude-budget .* 4 ' || fail "sude-budget: stopped worker missing from status --metrics"
+echo "ok: exit 4 -> worker row in status --metrics"
 
 resume sude-budget PROMPT_WORKER_POLL_SEC=1 PROMPT_WORKER_STALL_SEC=9999 \
   PROMPT_WORKER_BUDGET_SEC=2 PROMPT_WORKER_NUDGE_PCT=30 PROMPT_WORKER_MAX_SEC=60
