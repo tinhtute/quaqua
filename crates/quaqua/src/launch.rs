@@ -337,9 +337,11 @@ pub fn build_launch_cmd(
             args
         }
         "pi" => {
-            // Isolated: only herdr's state extension loads, so personal
-            // subagent/memory extensions cannot spawn outside the grid.
-            let home = std::env::var("HOME").unwrap_or_default();
+            // Default extension discovery (owner decision 2026-11-12): the
+            // model provider (e.g. mistral) comes from a pi package extension,
+            // so `--no-extensions` fails with "No API key found". herdr's
+            // state extension is auto-discovered from ~/.pi/agent/extensions,
+            // so it is not passed with `-e`.
             let mut args = vec![
                 "--".to_string(),
                 "--model".to_string(),
@@ -350,9 +352,6 @@ pub fn build_launch_cmd(
                 rules_file.to_string(),
                 "--session-dir".to_string(),
                 format!("{runs_dir}/.pi-sessions/{name}"),
-                "--no-extensions".to_string(),
-                "-e".to_string(),
-                format!("{home}/.pi/agent/extensions/herdr-agent-state.ts"),
                 "--no-approve".to_string(),
             ];
             if review {

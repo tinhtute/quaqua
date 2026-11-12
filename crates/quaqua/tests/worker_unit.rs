@@ -1958,8 +1958,6 @@ fn test_launch_args_pi_exact_and_isolated() {
         "tieude",
     )
     .unwrap();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let ext = format!("{home}/.pi/agent/extensions/herdr-agent-state.ts");
     let build = build_launch_cmd(
         &pi,
         "tieude-x",
@@ -1982,9 +1980,6 @@ fn test_launch_args_pi_exact_and_isolated() {
             "/r/x.rules.md",
             "--session-dir",
             "/runs/.pi-sessions/tieude-x",
-            "--no-extensions",
-            "-e",
-            ext.as_str(),
             "--no-approve",
         ]
     );
