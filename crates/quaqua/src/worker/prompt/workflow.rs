@@ -6,7 +6,10 @@
 //! - Exit 3: Stall (no worktree diff and no harness session write for 600 s) /
 //!   idle (120 s, 300 s fallback) / agent gone (60 s) / prompt never landed
 //! - Exit 4: Time budget exceeded (after one +25% grace and bounded auto-extensions up to +50% total)
-//! - Exit 5: Blocked on question / permission
+//! - Exit 5: Blocked on question / permission. A hook-reported `blocked` ends
+//!   the wait at once; a screen-inferred one is a hypothesis (a non-modal choice
+//!   banner has a dialog's footer shape) and must persist for a poll with no
+//!   progress behind it.
 //! - Exit 6: Malformed report (stable, non-empty report missing `## Lessons` or
 //!   `Verdict:`) or a builder report that does not account for a pinned
 //!   `## Playbook` step
