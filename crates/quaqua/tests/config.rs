@@ -336,3 +336,33 @@ fn config_opencode_models_table_merges_over_defaults() {
 
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+/// R2: `on_cost_cap = "kill"` needs a harness with a stop key. claude and pi
+/// have none, so config load refuses them naming kind and harness; omp keeps
+/// loading with kill.
+#[test]
+fn config_kill_refused() {
+    for (name, harness) in [("kill-on-claude.toml", "claude"), ("kill-on-pi.toml", "pi")] {
+        let path = fixtures_dir().join("invalid").join(name);
+        let out = run(&["config", "validate", "--file", &path.to_string_lossy()]);
+        let err = stderr(&out);
+        assert!(!out.status.success(), "{name}: kill on {harness} must be refused");
+        assert!(
+            err.contains("kind 'ni'") && err.contains(&format!("harness '{harness}'")),
+            "{name}: {err:?}"
+        );
+    }
+
+    let body = std::fs::read_to_string(repo_team()).expect("read team.toml");
+    let ok = body.replacen(
+        "[kinds.tieude]\nharness = \"omp\"\n",
+        "[kinds.tieude]\nharness = \"omp\"\non_cost_cap = \"kill\"\n",
+        1,
+    );
+    assert_ne!(ok, body, "fixture edit did not apply");
+    let tmp = std::env::temp_dir().join(format!("quaqua-kill-omp-{}.toml", std::process::id()));
+    std::fs::write(&tmp, ok).unwrap();
+    let out = run(&["config", "validate", "--file", &tmp.to_string_lossy()]);
+    let _ = std::fs::remove_file(&tmp);
+    assert!(out.status.success(), "kill on omp must load: {}", stderr(&out));
+}

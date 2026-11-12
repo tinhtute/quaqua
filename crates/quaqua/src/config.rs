@@ -880,9 +880,17 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 kind.on_cost_cap
             ));
         }
-        if crate::harness::Harness::parse(&kind.harness).is_none() {
+        let Some(harness) = crate::harness::Harness::parse(&kind.harness) else {
             return Err(format!(
                 "kind '{name}': unsupported harness '{}'",
+                kind.harness
+            ));
+        };
+        // kill needs a stop key; the run-time refusal in worker/stop.rs stays as
+        // the second guard.
+        if kind.on_cost_cap == COST_CAP_KILL && harness.stop_keys().is_none() {
+            return Err(format!(
+                "kind '{name}': on_cost_cap = \"kill\" is not allowed on harness '{}' (no stop key; use \"warn\")",
                 kind.harness
             ));
         }
@@ -1297,6 +1305,11 @@ workers_tab = "workers"
         let mut c = base();
         c.kinds.get_mut("tieude").unwrap().on_cost_cap = COST_CAP_KILL.to_string();
         validate(&c).unwrap();
+        // kill needs a harness with a stop key (opencode has one).
+        c.kinds.get_mut("suhuynh").unwrap().on_cost_cap = COST_CAP_KILL.to_string();
+        let err = validate(&c).unwrap_err();
+        assert!(err.contains("kind 'suhuynh'") && err.contains("harness 'claude'"), "{err}");
+        c.kinds.get_mut("suhuynh").unwrap().on_cost_cap = COST_CAP_WARN.to_string();
         c.kinds.get_mut("tieude").unwrap().on_cost_cap = "pause".to_string();
         let err = validate(&c).unwrap_err();
         assert!(err.contains("unknown on_cost_cap 'pause'"), "{err}");

@@ -1,0 +1,104 @@
+# Runtime v2 config; layout is synthesized from these role limits.
+schema_version = 2
+
+[limits]
+depth = 2
+max_workers_per_orchestrator = 8
+weights = { default = 1, pipeline = 2, "dual-lens" = 2 }
+
+[timers]
+budget_default = "45m"
+hard_cap = "120m"
+stall = "10m"
+idle = "2m"
+nudge_at = 0.8
+grace = 0.25
+pilot_budget = "30m"
+cost_buffer = 0.2
+mail_ack = "30m"
+
+[roles.cos]
+can_spawn = ["lead", "peer", "taskforce"]
+can_prompt = ["lead", "peer"]
+
+[roles.lead]
+can_spawn = ["peer", "taskforce"]
+can_prompt = ["lead", "peer"]
+reports_to = "cos"
+max_peers = 4
+
+[roles.peer]
+can_spawn = []
+can_prompt = []
+reports_to = "owner"
+
+[strategy]
+default_kind = "tieude"
+lead_kind = "ni"
+default_reviewer = ["suhuynh"]
+# Kinds whose live workers hold a build slot in the Lead gate (`quaqua worker spawn`).
+build_kinds = ["tieude", "sude", "ni"]
+builder_reviewer_differ = "harness"
+
+[purposes]
+build = "sude"
+review = "suhuynh"
+research = "tieude"
+quick = "tieude"
+design = "truonglao"
+
+[opencode_models]
+"deepseek-v4.1-flash" = ["low", "high", "max"]
+
+# Set harness, model, and effort for every kind; fallback is one hop on agent-start failure only.
+[kinds.tieude]
+harness = "omp"
+model = "opencode-go/deepseek-v4.1-flash"
+effort = "high"
+fallback = "sude"
+can_review = false
+
+[kinds.sude]
+harness = "omp"
+model = "google-antigravity/gemini-3.8-flash"
+effort = "high"
+fallback = "suhuynh"
+can_review = true
+
+[kinds.ni]
+harness = "pi"
+on_cost_cap = "kill"
+model = "opus-5.5"
+effort = "low"
+can_review = true
+
+[kinds.suhuynh]
+harness = "claude"
+model = "opus-5.5"
+effort = "medium"
+can_review = true
+
+[kinds.truonglao]
+harness = "claude"
+model = "opus-5.5"
+effort = "high"
+can_review = true
+spawn = "auto" # "approve" requires Principal approval.
+
+[taskforce.advisor]
+members = ["suhuynh"]
+read_only = true
+
+[taskforce.dual-lens]
+members = ["truonglao", "suhuynh"]
+read_only = true
+
+[merge]
+integ_branch = "quaqua/{slug}-integ"
+
+[grid]
+workers_tab = "workers"
+deferred_statuses = ["working"]
+
+[projects.zimage]
+max_workers_per_orchestrator = 3
