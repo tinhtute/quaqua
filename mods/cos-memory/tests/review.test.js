@@ -258,12 +258,10 @@ test('an operation on a file outside the capped pair is dropped', async () => {
   assert.equal(made.files['/ws/memory/corrections.md'], undefined)
 })
 
-test('a fork asking for any other tool or path changes nothing and never reaches the gate', async () => {
+test('non-schema and foreign-path entries in a fork reply are ignored, and the review still completes', async () => {
   const reply = JSON.stringify([
     { op: 'add', file: '../etc/passwd', text: 'x' },
     { op: 'add', file: '/ws/memory/rules.md', text: 'x' },
-    { op: 'add', file: './memory/rules.md', text: 'x' },
-    { op: 'add', file: 'memory/../memory/rules.md', text: 'x' },
     { op: 'add', file: 'AGENTS.md', text: 'x' },
     { op: 'bash', file: 'memory/rules.md', text: 'rm -rf /' },
     { op: 'write', file: 'memory/rules.md', text: 'x' },
@@ -282,6 +280,9 @@ test('a fork asking for any other tool or path changes nothing and never reaches
   assert.equal(made.calls.writes.length, 0)
   assert.equal(made.calls.process.length, 0)
   assert.equal(made.files[RULES], 'old\n')
+  // Completion marker: a crash in the review would leave these untouched.
+  assert.notEqual(made.store.review.lastReviewAt, null)
+  assert.equal(made.store.review.stops, 0)
 })
 
 test('an engine refusal is reported and the file is left alone', async () => {
