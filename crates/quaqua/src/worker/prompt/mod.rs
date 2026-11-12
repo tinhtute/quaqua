@@ -1596,6 +1596,7 @@ fn prompt_worker_once<G: GitOps>(
                 Some(format!("budget_exceeded:{name}:{start_sec}")),
                 serde_json::json!({ "reason": reason }),
             );
+            crate::worker::cleanup::record_stop_telemetry(name, &repo_dir, herdr, &runs_dir);
             Err(watchdog_exit(4, &reason))
         }
         5 if *acts.cost_stopped.lock().unwrap() => {

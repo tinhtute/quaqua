@@ -58,6 +58,32 @@ pub fn format_repo_path(repo: &Path) -> String {
     repo.to_string_lossy().into_owned()
 }
 
+/// `worker prompt` exit code for a spent time budget.
+pub const WATCHDOG_BUDGET_EXIT: i32 = 4;
+
+/// Records the telemetry row of a worker the watchdog stopped (exit 4), so
+/// `status --metrics` shows it before any cleanup. Best effort, like cleanup's.
+pub fn record_stop_telemetry<H: HerdrOps>(name: &str, repo: &Path, herdr: &H, runs_dir: &Path) {
+    let wt = match repo.parent() {
+        Some(parent) => parent.join(".wt").join(name),
+        None => PathBuf::from(".wt").join(name),
+    };
+    let agent_info = match liveness(herdr, name) {
+        Liveness::Alive(body) => serde_json::from_str::<Value>(&body).ok(),
+        _ => None,
+    };
+    let owner = WorkerMetadata::load_owner(runs_dir, name);
+    let owner = (!owner.is_empty()).then_some(owner);
+    append_worker_telemetry(
+        name,
+        repo,
+        &wt,
+        agent_info.as_ref(),
+        owner.as_deref(),
+        runs_dir,
+    );
+}
+
 /// Appends one worker telemetry row to `runs/telemetry.jsonl`.
 ///
 /// Never fails or blocks cleanup: all errors are handled gracefully and missing
@@ -73,6 +99,8 @@ pub fn append_worker_telemetry(
     let _ = (|| -> Result<(), ()> {
         let tele_path = runs_dir.join("telemetry.jsonl");
         let mut since_ms: Option<u64> = None;
+        // Exit of the newest earlier row for this worker (a watchdog stop row).
+        let mut prev_exit: Option<i32> = None;
         if let Ok(file) = std::fs::File::open(&tele_path) {
             use std::io::BufRead;
             for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
@@ -88,6 +116,7 @@ pub fn append_worker_telemetry(
                                 since_ms = Some(ms);
                             }
                         }
+                        prev_exit = v.get("exit").and_then(|e| e.as_i64()).map(|e| e as i32);
                     }
                 }
             }
@@ -183,6 +212,12 @@ pub fn append_worker_telemetry(
                     }
                 }
             }
+        }
+
+        // A watchdog stop (exit 4) already recorded this lifecycle; cleanup with
+        // no later prompt would only count the same worker twice.
+        if prompts == 0 && prev_exit == Some(WATCHDOG_BUDGET_EXIT) {
+            return Ok(());
         }
 
         if kind.is_none() {
@@ -1146,6 +1181,48 @@ pub(crate) mod metrics {
         let content = std::fs::read_to_string(&tele_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 1, "retry after failure must produce exactly 1 row");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_stop_row_then_cleanup_counts_worker_once() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let tmp = std::env::temp_dir().join(format!("cleanup-stop-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let runs_dir = tmp.join("runs");
+        let repo = tmp.join("repo");
+        let wt = tmp.join(".wt").join("agy-stopped");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let _env_runs = TestEnvVarGuard::set("QUAQUA_RUNS_DIR", &runs_dir);
+        let _env_skip = TestEnvVarGuard::set("GRID_SKIP", "1");
+        let _env_test = TestEnvVarGuard::set("QUAQUA_TEST", "1");
+
+        let herdr = MockHerdr {
+            agent_list_response: LIST_COS.to_string(),
+            agent_get_response: r#"{"result":{"agent":{"agent":"agy","pane_id":"%1","cwd":""}}}"#.to_string(),
+        };
+
+        // The watchdog stop (exit 4) writes the row; a repeat stop adds nothing.
+        let stop_line = "{\"ts\":\"2026-11-12T15:00:00Z\",\"rec\":\"worker\",\"name\":\"agy-stopped\",\"exit\":4}\n";
+        let tele_path = runs_dir.join("telemetry.jsonl");
+        std::fs::write(&tele_path, stop_line).unwrap();
+        record_stop_telemetry("agy-stopped", &repo, &herdr, &runs_dir);
+        assert_eq!(std::fs::read_to_string(&tele_path).unwrap().lines().count(), 1);
+
+        let git = MockGit {
+            worktree_remove_ok: true,
+        };
+        cleanup_worker_in("agy-stopped", &repo, &git, &herdr, Some(&runs_dir)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&tele_path).unwrap().lines().count(),
+            1,
+            "cleanup after a stop row must not count the worker twice"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
