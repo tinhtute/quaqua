@@ -105,6 +105,11 @@ pub struct SingleWorkerState {
     pub hook_active: bool,
     #[serde(default)]
     pub idle_since_ms: u64,
+    /// When a screen-inferred `blocked` was first seen, 0 when none is pending.
+    /// herdr's screen detection reads a non-modal choice banner as a dialog, so
+    /// that reading is a hypothesis until it persists with no progress behind it.
+    #[serde(default)]
+    pub blocked_since_ms: u64,
     #[serde(default)]
     pub gone_since_ms: u64,
     #[serde(default, alias = "grace_used")]
@@ -161,6 +166,7 @@ impl SingleWorkerState {
             harness: None,
             hook_active: true,
             idle_since_ms: 0,
+            blocked_since_ms: 0,
             gone_since_ms: 0,
             overrun_granted: false,
             extension_total_ms: 0,
@@ -531,7 +537,20 @@ fn parse_index(id: &str, prefix: &str) -> Option<u64> {
 }
 
 fn default_until(state: &SingleWorkerState) -> Vec<String> {
-    if state.agent_status == "idle" || state.agent_status == "done" {
+    if state.agent_status == "blocked" {
+        if state.blocked_since_ms > 0 {
+            // An unconfirmed screen-inferred blocked: wait for the pane to
+            // leave it. The default set contains `blocked`, so it would return
+            // at once and decide on the same frame.
+            vec![
+                "working".to_string(),
+                "idle".to_string(),
+                "done".to_string(),
+            ]
+        } else {
+            Vec::new()
+        }
+    } else if state.agent_status == "idle" || state.agent_status == "done" {
         // The current state already matches the default set; flip so the wait
         // returns only when the agent starts working again (U1a spin).
         vec!["working".to_string(), "blocked".to_string()]
@@ -581,7 +600,23 @@ fn evaluate(
 
     // 3. Blocked on a question/permission.
     if state.agent_status == "blocked" {
-        return complete_step(state, now, 5);
+        // A hook-reported blocked is the agent's own word: end the wait now.
+        // A screen-inferred one is a single pane frame, and a non-modal choice
+        // banner ("⚠ Warning: change effort … compact first? [Compact][Skip]")
+        // has the footer shape of a dialog while the turn keeps running. When
+        // there is a progress source to check it against, that reading is a
+        // hypothesis until it persists for a poll with no progress behind it.
+        if state.hook_active || !state.has_progress_source() {
+            return complete_step(state, now, 5);
+        }
+        let progressed = state.last_progress_ms > state.blocked_since_ms;
+        if state.blocked_since_ms == 0 || progressed {
+            state.blocked_since_ms = now;
+        } else if now.saturating_sub(state.blocked_since_ms) >= state.config.poll_sec * 1000 {
+            return complete_step(state, now, 5);
+        }
+    } else {
+        state.blocked_since_ms = 0;
     }
 
     // 4. Budget, with one grace and bounded diff auto-extensions.
@@ -683,6 +718,8 @@ fn evaluate(
         if !state.lead_waiting {
             deadline = deadline.min(state.idle_since_ms + state.idle_limit_ms() * 1000);
         }
+    } else if state.agent_status == "blocked" && state.blocked_since_ms > 0 {
+        deadline = deadline.min(state.blocked_since_ms + state.config.poll_sec * 1000);
     } else if state.agent_status == "working" && !state.lead_waiting && state.has_progress_source()
     {
         let baseline = if state.last_progress_ms > 0 {
