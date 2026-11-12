@@ -28,10 +28,42 @@ fn default_spawn() -> String {
 }
 /// `[kinds.<k>].on_cost_cap` values: what the watchdog does at 100% of the
 /// cost budget (issue #48). `warn` only logs; `kill` interrupts the worker
-/// once and stops waiting, keeping pane, worktree and journal.
+/// once and stops waiting, keeping pane, worktree and journal. `kill` needs a
+/// stop key (see `kill_cap_supported`): the kind's harness and its one-hop
+/// fallback's must both have one (opencode, omp, agy; not claude or pi).
 pub const COST_CAP_WARN: &str = "warn";
 pub const COST_CAP_KILL: &str = "kill";
 pub const COST_CAP_ACTIONS: [&str; 2] = [COST_CAP_WARN, COST_CAP_KILL];
+
+/// `on_cost_cap = "kill"` is only honest when every harness the kind can run on
+/// (its own, and its one-hop fallback's) has a stop key. Shared by `validate`,
+/// `worker spawn` and the watchdog, because the load path is a bare parse.
+/// Unknown kinds or harnesses are not this rule's business: other checks own them.
+pub fn kill_cap_supported(cfg: &Config, kind_name: &str) -> Result<(), String> {
+    let Some(kind) = cfg.kinds.get(kind_name) else {
+        return Ok(());
+    };
+    if kind.on_cost_cap != COST_CAP_KILL {
+        return Ok(());
+    }
+    let no_key =
+        |h: &str| crate::harness::Harness::parse(h).is_some_and(|h| h.stop_keys().is_none());
+    if no_key(&kind.harness) {
+        return Err(format!(
+            "kind '{kind_name}': on_cost_cap = \"kill\" is not allowed on harness '{}' (no stop key; use \"warn\")",
+            kind.harness
+        ));
+    }
+    if let Some(fb) = kind.fallback.as_deref() {
+        if let Some(fb_kind) = cfg.kinds.get(fb).filter(|k| no_key(&k.harness)) {
+            return Err(format!(
+                "kind '{kind_name}': on_cost_cap = \"kill\" is not allowed on fallback '{fb}' (harness '{}' has no stop key; use \"warn\")",
+                fb_kind.harness
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn default_on_cost_cap() -> String {
     COST_CAP_WARN.to_string()
@@ -880,20 +912,15 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 kind.on_cost_cap
             ));
         }
-        let Some(harness) = crate::harness::Harness::parse(&kind.harness) else {
+        if crate::harness::Harness::parse(&kind.harness).is_none() {
             return Err(format!(
                 "kind '{name}': unsupported harness '{}'",
                 kind.harness
             ));
-        };
+        }
         // kill needs a stop key; the run-time refusal in worker/stop.rs stays as
         // the second guard.
-        if kind.on_cost_cap == COST_CAP_KILL && harness.stop_keys().is_none() {
-            return Err(format!(
-                "kind '{name}': on_cost_cap = \"kill\" is not allowed on harness '{}' (no stop key; use \"warn\")",
-                kind.harness
-            ));
-        }
+        kill_cap_supported(cfg, name)?;
         if kind.model.trim().is_empty() {
             return Err(format!("kind '{name}': model is empty"));
         }
@@ -1300,16 +1327,22 @@ workers_tab = "workers"
     }
 
     #[test]
-    fn on_cost_cap_defaults_to_warn_and_rejects_unknown() {
+    fn on_cost_cap_defaults_to_warn_and_kill_needs_stop_key_on_kind_and_fallback() {
         assert_eq!(base().kinds["tieude"].on_cost_cap, COST_CAP_WARN);
         let mut c = base();
         c.kinds.get_mut("tieude").unwrap().on_cost_cap = COST_CAP_KILL.to_string();
+        c.kinds.get_mut("tieude").unwrap().fallback = None;
         validate(&c).unwrap();
         // kill needs a harness with a stop key (opencode has one).
         c.kinds.get_mut("suhuynh").unwrap().on_cost_cap = COST_CAP_KILL.to_string();
         let err = validate(&c).unwrap_err();
         assert!(err.contains("kind 'suhuynh'") && err.contains("harness 'claude'"), "{err}");
         c.kinds.get_mut("suhuynh").unwrap().on_cost_cap = COST_CAP_WARN.to_string();
+        // a kill kind whose fallback is claude (no stop key) is refused too.
+        c.kinds.get_mut("tieude").unwrap().fallback = Some("suhuynh".to_string());
+        let err = validate(&c).unwrap_err();
+        assert!(err.contains("fallback 'suhuynh'"), "{err}");
+        c.kinds.get_mut("tieude").unwrap().fallback = None;
         c.kinds.get_mut("tieude").unwrap().on_cost_cap = "pause".to_string();
         let err = validate(&c).unwrap_err();
         assert!(err.contains("unknown on_cost_cap 'pause'"), "{err}");

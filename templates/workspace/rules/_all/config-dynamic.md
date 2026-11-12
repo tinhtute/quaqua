@@ -13,7 +13,7 @@ Cấu hình đổi **không cần sửa code**: mọi giá trị nằm trong `te
 - Một cổng duy nhất cho mọi đường spawn (worker, pipeline, taskforce): `cap::check_owner_cap` — owner `<slug>-lead` bị chặn ở `max_peers`, owner khác ở `[limits]`. Pipeline nặng 2 slot (`[limits.weights]`).
 
 ## Kind = một profile
-`[kinds.<name>]` gói `harness` (opencode/omp/claude) · `model` · `effort` (bắt buộc; opencode: variant `#effort`) · `fallback` (1 hop khi start fail) · `can_review`.
+`[kinds.<name>]` gói `harness` (opencode/omp/claude) · `model` · `effort` (bắt buộc; opencode: variant `#effort`) · `fallback` (1 hop khi start fail) · `can_review` · `on_cost_cap` (`warn` mặc định | `kill`: watchdog interrupt 1 lần ở 100% cost budget; `kill` cần stop key trên harness của kind **và** của fallback — opencode/omp/agy có, claude/pi không; `config validate` và `worker spawn` từ chối, watchdog hạ xuống warn).
 - Đổi model/effort của một kind = sửa 1 dòng trong team.toml; spawn kế tiếp dùng giá trị mới.
 - Reviewer: bất kỳ kind `can_review = true` — pipeline không còn allowlist cứng (2026-10-17, runs/sude-guard.md); fallback của reviewer cũng phải `can_review = true`.
 - Builder/reviewer khác harness: `strategy.builder_reviewer_differ = "harness"` (mặc định) — `config validate` so cặp mặc định (`purposes.build`, không có thì `default_kind`, với `default_reviewer`); pipeline còn từ chối mọi cặp trùng harness lúc chạy (kể cả `--builder`/`--reviewer` chỉ định). `"kind"` và `"none"` chỉ tắt kiểm tra lúc validate, không tắt kiểm tra lúc chạy.
