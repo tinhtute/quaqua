@@ -66,6 +66,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Push a worker branch and open its PR after Principal approval (never merges).
+    Ship {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Pipeline orchestration: build -> review -> fix.
     Pipeline {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -863,6 +868,13 @@ fn main() {
                 if !err.is_empty() {
                     eprint!("{err}");
                 }
+                rc
+            }
+        },
+        Some(Command::Ship { args }) => match quaqua::ship::handle_ship(&args) {
+            Ok(()) => 0,
+            Err((rc, err)) => {
+                eprint!("{err}");
                 rc
             }
         },
