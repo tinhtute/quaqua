@@ -254,6 +254,48 @@ fn pi_line(l: &str) -> Option<Decision> {
     })
 }
 
+/// agy's canonical status names → verdict. Classify on the name: for a gRPC
+/// error the `(code N)` is the gRPC code (2 = UNKNOWN), not an HTTP status.
+const AGY_STATUS: &[(&str, ProviderError)] = &[
+    ("RESOURCE_EXHAUSTED", ProviderError::Retryable("rate-limit")),
+    ("UNAVAILABLE", ProviderError::Retryable("5xx")),
+    ("DEADLINE_EXCEEDED", ProviderError::Retryable("timeout")),
+    ("INTERNAL", ProviderError::Retryable("5xx")),
+    ("ABORTED", ProviderError::Retryable("conflict")),
+    ("PERMISSION_DENIED", ProviderError::Fatal("signed-out")),
+    ("UNAUTHENTICATED", ProviderError::Fatal("signed-out")),
+    ("INVALID_ARGUMENT", ProviderError::Fatal("http-error")),
+    ("NOT_FOUND", ProviderError::Fatal("http-error")),
+    ("FAILED_PRECONDITION", ProviderError::Fatal("http-error")),
+    ("UNKNOWN", ProviderError::Fatal("http-error")),
+];
+
+/// agy: `⚠ <STATUS> (code NNN): <msg>` (the `Error ID:` line under it never
+/// matches), or the credits line. The generic `Agent execution terminated due
+/// to error.` carries no status, so it stays unclassified (`None`). A 429 or
+/// 5xx code means agy already spent its own retry ladder.
+fn agy_line(l: &str) -> Option<Decision> {
+    let l = l.trim_start_matches(|c: char| c.is_whitespace() || c == '⚠');
+    if l.starts_with("your ai credits balance is too low") {
+        return Some(Decision {
+            error: ProviderError::Fatal("billing"),
+            exhausted: false,
+        });
+    }
+    let (name, after) = l.split_once(" (code ")?;
+    let name = name.to_ascii_uppercase();
+    let error = AGY_STATUS.iter().find(|(s, _)| *s == name)?.1;
+    let digits = after.find(|c: char| !c.is_ascii_digit())?;
+    if digits == 0 || !after[digits..].starts_with("):") {
+        return None;
+    }
+    let code: u16 = after[..digits].parse().ok()?;
+    Some(Decision {
+        error,
+        exhausted: matches!(code, 429 | 500..=599),
+    })
+}
+
 /// One Claude Code pane line → its provider error, if the line has the shape.
 fn claude_line(l: &str) -> Option<ProviderError> {
     if l.starts_with("request timed out") {
@@ -291,11 +333,7 @@ fn classify_line(h: Option<Harness>, line: &str) -> Option<Decision> {
         Some(Harness::Claude) => claude(),
         Some(Harness::Omp) => omp_line(&l),
         Some(Harness::Pi) => pi_line(&l),
-        // agy: no provider-error fixture of its own yet, and porting another
-        // harness's table would classify text agy never prints (rules/_all
-        // harness adapters), so it stays unclassified until a real pane shows
-        // the shape.
-        Some(Harness::Agy) => None,
+        Some(Harness::Agy) => agy_line(&l),
         // No kind in team.toml, and opencode (no fixture of its own yet, and it
         // had the Claude tables before #196): try each shape rather than drop
         // the error or lose a classification it used to get.
@@ -536,6 +574,76 @@ mod tests {
         ] {
             assert_eq!(classify(Some(Harness::Pi), text), hit(want), "{text}");
         }
+    }
+
+    /// agy pane shapes from the Q9 capture (the 403 is real; the 429/503 lines
+    /// follow its `%s (code %d): %s` format).
+    #[test]
+    fn classify_agy_lines_by_status() {
+        let h = Some(Harness::Agy);
+        for (status, want) in [
+            ("RESOURCE_EXHAUSTED", ProviderError::Retryable("rate-limit")),
+            ("UNAVAILABLE", ProviderError::Retryable("5xx")),
+            ("DEADLINE_EXCEEDED", ProviderError::Retryable("timeout")),
+            ("INTERNAL", ProviderError::Retryable("5xx")),
+            ("ABORTED", ProviderError::Retryable("conflict")),
+            ("PERMISSION_DENIED", ProviderError::Fatal("signed-out")),
+            ("UNAUTHENTICATED", ProviderError::Fatal("signed-out")),
+            ("INVALID_ARGUMENT", ProviderError::Fatal("http-error")),
+            ("NOT_FOUND", ProviderError::Fatal("http-error")),
+            ("FAILED_PRECONDITION", ProviderError::Fatal("http-error")),
+            ("UNKNOWN", ProviderError::Fatal("http-error")),
+        ] {
+            // gRPC-style code (not an HTTP status): never exhausted.
+            let pane = format!(
+                "⚠ {status} (code 2): boom\nError ID: d6284983-eda7-4e75-a09b-863be22bf8ce-1"
+            );
+            assert_eq!(classify(h, &pane), hit(want), "{status}");
+        }
+        let real = "⚠ PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service.\nError ID: 728f6e86-1";
+        assert_eq!(classify(h, real), hit(ProviderError::Fatal("signed-out")));
+    }
+
+    #[test]
+    fn classify_agy_429_and_5xx_mark_the_ladder_spent() {
+        let h = Some(Harness::Agy);
+        for (pane, error) in [
+            (
+                "⚠ RESOURCE_EXHAUSTED (code 429): quota exceeded\nError ID: a-1",
+                ProviderError::Retryable("rate-limit"),
+            ),
+            (
+                "⚠ UNAVAILABLE (code 503): the model is overloaded\nError ID: a-2",
+                ProviderError::Retryable("5xx"),
+            ),
+        ] {
+            let d = classify(h, pane).unwrap();
+            assert_eq!(
+                d,
+                Decision {
+                    error,
+                    exhausted: true
+                },
+                "{pane}"
+            );
+            assert_eq!(retry_cap(&d), 1);
+        }
+    }
+
+    #[test]
+    fn classify_agy_billing_and_generic_lines() {
+        let h = Some(Harness::Agy);
+        assert_eq!(
+            classify(h, "Your AI credits balance is too low to continue."),
+            hit(ProviderError::Fatal("billing"))
+        );
+        // Generic banner has no status: unchanged behaviour, unclassified.
+        assert_eq!(
+            classify(h, "Agent execution terminated due to error.\nError ID: x-1"),
+            None
+        );
+        // A bare status-like sentence in worker output is not a provider error.
+        assert_eq!(classify(h, "UNAVAILABLE services listed above"), None);
     }
 
     /// The harness's own terminal line means its retries are spent: still
