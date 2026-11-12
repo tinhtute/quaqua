@@ -11,7 +11,9 @@ pub const USAGE: &str = "\
 # Usage: quaqua ship <worker> [--yes] [--repo <dir>] [--base <branch>]
 #   Push quaqua/<worker> to origin and open a PR against <branch> (default main).
 #   Needs runs/<worker>.md with `Outcome: COMPLETE` and at least one commit ahead of
-#   origin/<branch>. Asks y/N on a TTY; without a TTY it refuses unless --yes is given.
+#   origin/<branch>. --repo defaults to the repo recorded at spawn (runs/<worker>.repo),
+#   else the last worker row of runs/telemetry.jsonl (survives `worker cleanup`).
+#   Asks y/N on a TTY; without a TTY it refuses unless --yes is given.
 #   --yes is the Principal's recorded approval: never pass it on your own. Never merges.
 #   Re-running converges: the push is a no-op when current and an open PR is reused.
 #
@@ -121,6 +123,37 @@ pub fn ship<O: ShipOps, A: Approval>(
         .map_err(fail)
 }
 
+/// The repo to ship from when `--repo` is absent: the spawn record
+/// `runs/<worker>.repo` while the worker is live, else the last
+/// `runs/telemetry.jsonl` worker row for it — `worker cleanup` deletes the
+/// spawn record but appends that row, and the branch it ships survives.
+pub fn resolve_ship_repo(runs: &Path, worker: &str, home: &str) -> Result<PathBuf, String> {
+    if let Some(repo) = crate::state::WorkerMetadata::load_repo(runs, worker) {
+        return Ok(repo);
+    }
+    telemetry_repo(runs, worker, home).ok_or_else(|| {
+        format!(
+            "no repo recorded for {worker}: no runs/{worker}.repo and no runs/telemetry.jsonl \
+             worker row (pass --repo)"
+        )
+    })
+}
+
+/// Repo of the newest `rec: "worker"` telemetry row for `worker`, home-expanded.
+fn telemetry_repo(runs: &Path, worker: &str, home: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(runs.join("telemetry.jsonl")).ok()?;
+    text.lines().rev().find_map(|line| {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("rec").and_then(|r| r.as_str()) != Some("worker")
+            || v.get("name").and_then(|n| n.as_str()) != Some(worker)
+        {
+            return None;
+        }
+        let repo = v.get("repo").and_then(|r| r.as_str())?.trim();
+        (!repo.is_empty()).then(|| crate::worker::leadgate::expand_home(repo, home))
+    })
+}
+
 /// Real git + gh. Runs in the worker's repo (never the worktree: its push URL is blocked).
 pub struct RealShipOps;
 
@@ -209,14 +242,11 @@ pub fn handle_ship(args: &[String]) -> Result<(), (i32, String)> {
     })?;
     let repo = match repo {
         Some(r) => r,
-        None => std::fs::read_to_string(crate::state::WorkerMetadata::repo_path(&runs, &worker))
-            .map(|s| PathBuf::from(s.trim()))
-            .map_err(|e| {
-                (
-                    1,
-                    format!("ship refused: no runs/{worker}.repo (pass --repo): {e}\n"),
-                )
-            })?,
+        None => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            resolve_ship_repo(&runs, &worker, &home)
+                .map_err(|e| (1, format!("ship refused: {e}\n")))?
+        }
     };
     let req = ShipRequest {
         worker: &worker,

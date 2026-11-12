@@ -128,6 +128,13 @@ fi
 exit 0
 "#;
 
+/// Identity of the quaqua push guard, present in every revision ever installed
+/// (it predates the "Installed by" block). A hook carrying this line is ours
+/// and gets refreshed; whole-body equality would call every older revision
+/// foreign. NEVER change this line — it is the only thing that recognises an
+/// install from before a template edit.
+const PRE_PUSH_MARKER: &str = "# pre-push — a worker must never push";
+
 /// One embedded template file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -649,7 +656,9 @@ fn install_hook(hooks_dir: &Path, name: &str, template: &str) -> Result<(), Stri
 ///
 /// A foreign `core.hooksPath` and an existing non-quaqua `pre-push` are left
 /// untouched with a warning: spawn never redirects or overwrites a hook setup
-/// it did not create. `Ok(())` when there is nothing safe to do.
+/// it did not create. A quaqua guard from an older revision — recognised by
+/// its marker line, not by whole-body equality — is refreshed in place.
+/// `Ok(())` when there is nothing safe to do.
 pub fn ensure_worker_push_guard(root: &Path) -> Result<(), String> {
     if !git_ok(root, &["rev-parse", "--git-dir"]) {
         return Ok(());
@@ -660,19 +669,9 @@ pub fn ensure_worker_push_guard(root: &Path) -> Result<(), String> {
     };
 
     let hook_file = hooks_dir.join("pre-push");
-    match std::fs::read_to_string(&hook_file) {
-        Ok(body) if body == PRE_PUSH_TEMPLATE => {
-            apply_mode(&hook_file, 0o755)?;
-            return Ok(());
-        }
-        Ok(_) => {
-            eprintln!(
-                "worker: {} already exists and is not the quaqua push guard — left unchanged",
-                hook_file.display()
-            );
-            return Ok(());
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    let existing = match std::fs::read_to_string(&hook_file) {
+        Ok(body) => Some(body),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             eprintln!(
                 "worker: cannot read {}: {e} — push guard not installed",
@@ -680,6 +679,27 @@ pub fn ensure_worker_push_guard(root: &Path) -> Result<(), String> {
             );
             return Ok(());
         }
+    };
+    match existing.as_deref() {
+        Some(body) if body == PRE_PUSH_TEMPLATE => {
+            apply_mode(&hook_file, 0o755)?;
+            return Ok(());
+        }
+        // A revision from before a template edit is still ours: refresh it.
+        Some(body) if body.contains(PRE_PUSH_MARKER) => {
+            write_file(&hook_file, PRE_PUSH_TEMPLATE.as_bytes(), 0o755)
+                .map_err(|e| format!("worker: cannot refresh the push guard: {e}"))?;
+            println!("worker: push guard refreshed at {}", hook_file.display());
+            return Ok(());
+        }
+        Some(_) => {
+            eprintln!(
+                "worker: {} already exists and is not the quaqua push guard — left unchanged",
+                hook_file.display()
+            );
+            return Ok(());
+        }
+        None => {}
     }
 
     write_file(&hook_file, PRE_PUSH_TEMPLATE.as_bytes(), 0o755)
@@ -1155,4 +1175,15 @@ fn herdr_available() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn push_guard_template_carries_the_marker() {
+        assert!(
+            super::PRE_PUSH_TEMPLATE.contains(super::PRE_PUSH_MARKER),
+            "the template lost its identity marker: every install would read as foreign",
+        );
+    }
 }

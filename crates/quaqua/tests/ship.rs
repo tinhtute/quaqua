@@ -1,4 +1,6 @@
-use quaqua::ship::{ship, Approval, AssumeYes, ShipOps, ShipRequest, PR_SIGNATURE};
+use quaqua::ship::{
+    resolve_ship_repo, ship, Approval, AssumeYes, ShipOps, ShipRequest, PR_SIGNATURE,
+};
 use std::cell::RefCell;
 use std::path::Path;
 
@@ -129,6 +131,111 @@ fn ship_rerun_reuses_open_pr() {
         "https://example.test/pr/9"
     );
     assert_eq!(ops.calls(), vec!["push quaqua/w1"]);
+}
+
+/// One `runs/telemetry.jsonl` worker row, as `worker cleanup` appends it.
+fn telemetry_row(worker: &str, repo: &str) -> String {
+    format!(
+        "{{\"ts\":\"2026-11-12T15:06:40+07:00\",\"rec\":\"worker\",\"name\":\"{worker}\",\
+         \"kind\":\"sude\",\"harness\":\"claude\",\"owner\":\"cos\",\"pipeline\":null,\
+         \"repo\":\"{repo}\",\"prompts\":1,\"exit\":null,\"wall_sec\":217,\
+         \"budget_sec\":2700,\"usd\":null,\"usd_budget\":null,\"tokens\":null,\
+         \"spend_src\":\"claude-tokens\",\"model\":null}}\n"
+    )
+}
+
+/// `worker cleanup` deletes `runs/<w>.repo`, so a ship after cleanup must find
+/// the repo in the durable telemetry row instead of demanding `--repo`.
+#[test]
+fn ship_after_cleanup_resolves_repo_without_repo_flag() {
+    let runs = std::env::temp_dir().join(format!("quaqua-ship-postcleanup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runs);
+    std::fs::create_dir_all(&runs).unwrap();
+    std::fs::write(runs.join("w1.md"), COMPLETE).unwrap();
+    std::fs::write(
+        runs.join("telemetry.jsonl"),
+        telemetry_row("w1", "~/Lab/quaqua"),
+    )
+    .unwrap();
+    assert!(
+        !runs.join("w1.repo").exists(),
+        "cleanup removed the spawn record"
+    );
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"))
+        .args(["ship", "w1"])
+        .env("QUAQUA_RUNS_DIR", &runs)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        !stderr.contains(".repo"),
+        "the repo must resolve without --repo: {stderr}"
+    );
+    assert!(
+        stderr.contains("no TTY"),
+        "ship must reach the approval gate: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&runs);
+}
+
+/// The resolved path must be the repo itself, not just "some path": the spawn
+/// record wins while live, the newest telemetry row answers after cleanup.
+#[test]
+fn resolve_ship_repo_prefers_spawn_record_then_newest_telemetry_row() {
+    let runs = std::env::temp_dir().join(format!("quaqua-ship-resolve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runs);
+    std::fs::create_dir_all(&runs).unwrap();
+    let home = "/srv/worker";
+
+    // No evidence at all, and a row for another worker, both refuse.
+    std::fs::write(
+        runs.join("telemetry.jsonl"),
+        telemetry_row("w2", "~/Lab/other"),
+    )
+    .unwrap();
+    let err = resolve_ship_repo(&runs, "w1", home).expect_err("no evidence must refuse");
+    assert!(
+        err.contains("w1.repo") && err.contains("telemetry.jsonl"),
+        "{err}"
+    );
+
+    // Cleanup appended the row: the repo survives the spawn record.
+    std::fs::write(
+        runs.join("telemetry.jsonl"),
+        telemetry_row("w2", "~/Lab/other") + &telemetry_row("w1", "~/Lab/quaqua"),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_ship_repo(&runs, "w1", home).unwrap(),
+        std::path::PathBuf::from("/srv/worker/Lab/quaqua")
+    );
+
+    // A reused worker name: the newest cleanup is the current repo.
+    std::fs::write(
+        runs.join("telemetry.jsonl"),
+        telemetry_row("w1", "~/Lab/quaqua") + &telemetry_row("w1", "~/Work/newer"),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_ship_repo(&runs, "w1", home).unwrap(),
+        std::path::PathBuf::from("/srv/worker/Work/newer")
+    );
+
+    // A live worker's spawn record outranks any older telemetry row.
+    std::fs::write(runs.join("w1.repo"), "/repo/live\n").unwrap();
+    assert_eq!(
+        resolve_ship_repo(&runs, "w1", home).unwrap(),
+        std::path::PathBuf::from("/repo/live")
+    );
+
+    // A row without a repo is not evidence.
+    std::fs::remove_file(runs.join("w1.repo")).unwrap();
+    std::fs::write(runs.join("telemetry.jsonl"), telemetry_row("w1", "")).unwrap();
+    assert!(resolve_ship_repo(&runs, "w1", home).is_err());
+    let _ = std::fs::remove_dir_all(&runs);
 }
 
 #[test]
