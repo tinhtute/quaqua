@@ -10,7 +10,7 @@ lane: normal
 - actors: Principal, CoS, Leads, workers.
 - authority: Principal 2026-11-11 + raw/2026-11-11-quaqua-cmval.md.
 - requirements:
-  - R1: the G1 review fork can only Read/Write/Edit under `memory/`; a fork attempt to touch any other path or tool is denied by the engine, not by the prompt | acceptance: `node --test mods/cos-memory/tests/` (the engine denies every `$.model.fork` tool, index.d.ts:6686; there is no Rust fork_allowlist test) | source: Q4
+  - R1: the G1 review fork can only Read/Write/Edit under `memory/`; a fork attempt to touch any other path or tool is denied by the engine, not by the prompt | acceptance: `node --test "mods/cos-memory/tests/**/*.test.js"` (the engine denies every `$.model.fork` tool, index.d.ts:6686; there is no Rust fork_allowlist test) | source: Q4
   - R2: `quaqua` refuses at config load (`load_team_config`) any kind on a claude or pi harness with `on_cost_cap = "kill"`, naming the kind and harness; kill on opencode/omp/agy still loads | acceptance: `cargo test -p quaqua config_kill_refused` | source: Q10, Q7
   - R3: the cos-memory mod is loaded in the real CoS session and the review fork has fired there (`review.lastReviewAt` set in the plugin store); `mods/cos-memory/tsconfig.json` is either committed or deliberately left out, with `git status` clean for `mods/cos-memory` | acceptance: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty) | source: Q3, Q8
   - R4: a `quaqua ship` command pushes the worker branch and opens the PR after one Principal approval, and never merges | acceptance: `cargo test -p quaqua ship` | source: Q1, Q2
@@ -33,19 +33,19 @@ lane: normal
 - fog: when work spans days, should a long-lived quaqua-rs Lead own MVP execution instead of CoS?
 
 ## Phases and Verification
-- approach: five worker-sized phases; Q4 and Q10 are independent engine changes that run in parallel, then the mod goes live under the allowlist, then `quaqua ship`, then the recorded run. Rejected: prompt-only fork restriction (Q4) and run-time-only kill refusal (Q10).
+- approach: five worker-sized phases; Q4 and Q10 are independent engine changes that run in parallel, then the mod goes live under the allowlist, then `quaqua ship`, then the recorded run. Rejected: prompt-only fork restriction (Q4) and run-time-only kill refusal (Q10). The four phases after `mvp-run` are candidates the recorded run produced, not part of R1–R5.
 - phase_slug: `fork-allowlist`
   status: done (#249)
   - goal: R1 | depends_on: none
   - surfaces: crates/quaqua/src/ (engine-side tool allowlist for the review fork), mods/cos-memory/src/review.js, crates/quaqua/tests/ | avoided: worker/, merge/, grid/
-  - phase check: `node --test mods/cos-memory/tests/`
+  - phase check: `node --test "mods/cos-memory/tests/**/*.test.js"`
 - phase_slug: `kill-refusal`
   status: done (#250)
   - goal: R2 | depends_on: none (parallel with `fork-allowlist`)
   - surfaces: crates/quaqua/src/config.rs, crates/quaqua/tests/config.rs | avoided: worker/stop.rs run-time refusal stays as a second guard
   - phase check: `cargo test -p quaqua config_kill_refused` `cargo test -p quaqua config`
 - phase_slug: `cos-mod-live`
-  status: done (#252; live fork: `cos-memory_quaqua-*.json` review.lastReviewAt=1794472950808, inflightAt null)
+  status: done (#252; live fork: `cos-memory_quaqua-*.json` review.lastReviewAt=1794472950808, then 1794492448941 on this Mac 2026-11-12 21:07 +07, inflightAt null)
   - goal: R3 | depends_on: `fork-allowlist`
   - surfaces: mods/cos-memory/ (tsconfig.json decision: gitignored, `tsc -p` finds no inputs for a plain-.js mod), the real CoS plugin store | avoided: crates/
   - phase check: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty); live fork per Q3 session shape (≥10 user turns, ≥10 Stops or ≥15 tool calls, then stay open) and `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
@@ -55,10 +55,30 @@ lane: normal
   - surfaces: crates/quaqua/src/ (new ship command, main.rs CLI), crates/quaqua/tests/ | avoided: merge to main (stays manual)
   - phase check: `cargo test -p quaqua ship`
 - phase_slug: `mvp-run`
-  status: planned
+  status: done (#258 d51d2d9; 4+ kinds, agy-pilot/agy-wave exit 4 at 2m/2m, live fork lastReviewAt=1794492448941)
   - goal: R5 | depends_on: `fork-allowlist`, `kill-refusal`, `cos-mod-live`, `ship`
   - surfaces: runs/ report only, no code | avoided: any engine change (a gap found goes back as a new phase)
   - phase check: `gh pr view <pr> --json mergedAt` `quaqua status --metrics` `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
+- phase_slug: `agy-progress`
+  status: planned (candidate from `mvp-run`; raw/2026-11-12-quaqua-rs-agyprobe.md Q1)
+  - goal: a working agy worker is not killed at its budget — agy reports no session id (`~/.gemini/config/hooks/herdr-agent-state.sh` absent, harness/mod.rs:79-82), so `session_seen` stays false, `last_progress_ms` stays 0 and the 25% grace never applies (workflow.rs budget block) | depends_on: none
+  - surfaces: crates/quaqua/src/launch.rs (ship/install the hook), crates/quaqua/src/worker/prompt/{workflow,cost}.rs (`agy_session_mtime` fallback) | avoided: a pane-text progress source (spinners animate, it would mask real stalls)
+  - phase check: a live agy worker past its budget with a moving conversation store gets grace, not exit 4
+- phase_slug: `agy-nudge`
+  status: planned (candidate from `mvp-run`; raw/2026-11-12-quaqua-rs-agyprobe.md Q2)
+  - goal: the 80% nudge reaches an agy worker mid-turn — agy queues a prompt until the running turn ends, so the send path does `esc` (HerdrRequest::SendKeys, `Harness::Agy.stop_keys`) then the Prompt for agy only; if that aborts real work, agy kinds get no nudge and the brief's Time budget is the only stop | depends_on: none
+  - surfaces: crates/quaqua/src/worker/prompt/workflow.rs (nudge send), crates/quaqua/src/harness/mod.rs | avoided: every other harness's send path
+  - phase check: a live agy worker at 80% of budget reacts to the nudge before its turn ends
+- phase_slug: `agy-effort`
+  status: planned (candidate from `mvp-run`)
+  - goal: `--effort` is not passed to a model that rejects it (agy logs `--effort is not supported for model "gemini-3.8-flash"`), and an agy metrics row carries dollars from the Q6 transcript parse instead of blank | depends_on: Q6
+  - surfaces: crates/quaqua/src/launch.rs (effort per harness/model), crates/quaqua/src/worker/ (cost parse) | avoided: a cost cap for agy (NG2 keeps the time cap as the runaway backstop)
+  - phase check: `quaqua status --metrics` shows a $ figure on an agy row; an agy launch log has no "effort is not supported"
+- phase_slug: `merge-verdict`
+  status: planned (candidate from `mvp-run`; G1 in docs/research/plans/pstack-integration.md § Pilot)
+  - goal: a merge to main carries a verifier verdict at the head SHA — 19 of 19 merges in the mvp-run window had none, because no merge event is journaled; record the verdict at merge so `status --metrics` counts G1 from it | depends_on: none
+  - surfaces: crates/quaqua/src/status.rs (G1 counting, :1102-1136), crates/quaqua/src/{verify,ship}.rs, crates/quaqua/src/merge/ | avoided: a merge gate (warning first, the count is the evidence)
+  - phase check: `quaqua status --metrics` G1 numerator falls below 19/19 over the next merges
 
 ## Log
 - 2026-11-11 — map opened from the Principal's destination; 8 lines, no decisions yet.
@@ -68,13 +88,16 @@ lane: normal
 - 2026-11-12 — #255 merged (mvp wave 2, db985d5): watchdog exit-4 telemetry row, Budget lint, `ship` without --repo, pre-push marker, `cos-mod-live` marked done.
 - 2026-11-12 — #256 merged (retro wave 3, 35b9edf): spawn bases on origin/<default>, `quaqua verify record`, watchdog blocked corroboration + Compact banner, clippy clean; 1217 tests pass.
 - 2026-11-12 — #244 merged (73ee97e): docs/audit/2026-11-12 intent audit at 41a5327, 3/5; no requirement changed.
+- 2026-11-12 — `mvp-run` done (R5): #258 merged d51d2d9 (brief → PR via `quaqua ship`, Principal squash-merge); 4+ mixed kinds (omp, claude, agy) with agy-pilot and agy-wave exit 4 at 2m/2m; live review fork fired on this Mac — `cos-memory_quaqua-4f9b87b55123.json` review.lastReviewAt=1794492448941 (21:07 +07) with `memory/rules.md` written at that instant; #259 adda975 fixed the mod test command to the glob form. Four follow-up candidates recorded from the run's gaps.
 
 ## Validation
+- 2026-11-12 CoS: R5 on main adda975 — PR #258 merged d51d2d9; `quaqua status --metrics` shows 4+ kinds and agy-pilot/agy-wave exit 4 at 2m/2m; live fork `jq -c .review ~/.claude/plugins/store/cos-memory_quaqua-4f9b87b55123.json` → `lastReviewAt:1794492448941` (2026-11-12 21:07:28 +07), `memory/rules.md` mtime 21:07 size 2402 matching the stamp. R2/R4 ride on main adda975 CI `Test` = success (workspace `cargo test`, mod tests, actionlint).
+- 2026-11-12 R1: `node --test "mods/cos-memory/tests/**/*.test.js"` on adda975 → 38 pass, 0 fail (Node 24.21.0); the directory form fails on Node 22+, which is why #259 changed it.
 
 ## Current State and Next Action
 - active_phase: none
-- lifecycle_status: locked
+- lifecycle_status: locked (R1–R5 met on main adda975; the four phases after `mvp-run` are candidates, not yet locked)
 - blockers: none
-- open_items: 0 open of 10 map lines
-- unknowns: (1) the live review fork (`lastReviewAt`) was recorded only in the Linux box plugin store; this Mac's inline `cos-memory_*.json` still has `review.lastReviewAt` null, so R5's `jq` line passes only against the Linux store until a live fork fires here. (2) `quaqua status --metrics` lists per-worker kind/harness, exit, wall/budget and $/budget rows, and #255 records watchdog exit-4 stops, so the 4+ kinds and an agy stop line are measurable; agy rows carry no dollars, so an agy cost cap is not (R5 allows a watchdog stop, NG2).
-- exact_next_action: work full phase mvp-run (R5, runs/ report only, no code): CoS takes one task from brief to PR via quaqua CLI only, spawns a ≥4 mixed-kind wave including an agy worker with a short time budget so the watchdog stops it, runs `quaqua ship`, and records `gh pr view <pr> --json mergedAt`, `quaqua status --metrics`, and `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`; the Principal does the final merge.
+- open_items: 0 open of 10 map lines; 4 follow-up phase candidates (`agy-progress`, `agy-nudge`, `agy-effort`, `merge-verdict`)
+- unknowns: (1) `quaqua status --metrics` lists per-worker kind/harness, exit, wall/budget and $/budget rows, and #255 records watchdog exit-4 stops, so the 4+ kinds and an agy stop line are measurable; agy rows carry no dollars, so an agy cost cap is not (R5 allows a watchdog stop, NG2).
+- exact_next_action: lock and work phase `agy-progress` (a working agy worker must not be killed at its budget): agy reports no session id because `~/.gemini/config/hooks/herdr-agent-state.sh` is absent, so `last_progress_ms` never moves and the 25% grace never applies; fix is to ship the hook or fall back in `agy_session_mtime`, then prove it on a live agy worker past its budget. `agy-nudge`, `agy-effort` and `merge-verdict` follow from the same run's gaps.
