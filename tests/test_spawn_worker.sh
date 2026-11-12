@@ -212,22 +212,26 @@ mkdir -p "$T/clean-cwd"
   || fail "spawn wrote into the caller's cwd: $(find "$T/clean-cwd")"
 echo "ok: unresolvable hooks dir -> nothing written under the caller's cwd"
 
-# ── tieude: omp with deepseek-v4.1-flash at effort high on the command line ──
-# (team.toml) — omp takes the model, the thinking level and the rules file as
-# args, never the opencode pane env
+# ── tieude: pi with mistral deepseek-v4-1-flash-1017 at effort high ─────────
+# (team.toml) — pi takes the model, the thinking level, the rules file and a
+# per-name session dir on the command line, never the opencode pane env
 spawn "tieude-model" "tieude"
 [[ $rc -eq 0 ]] || fail "tieude: exit $rc, want 0: $(cat "$T/err")"
-grep -qF -- '--kind omp' "$T/calls" \
-  || fail "tieude: not an omp start: $(cat "$T/calls")"
-grep -qF -- '--model opencode-go/deepseek-v4.1-flash' "$T/calls" \
-  || fail "tieude: model not opencode-go/deepseek-v4.1-flash: $(cat "$T/calls")"
+grep -qF -- '--kind pi' "$T/calls" \
+  || fail "tieude: not a pi start: $(cat "$T/calls")"
+grep -qF -- '--model mistral/deepseek-v4-1-flash-1017' "$T/calls" \
+  || fail "tieude: model not mistral/deepseek-v4-1-flash-1017: $(cat "$T/calls")"
 grep -qF -- '--thinking high' "$T/calls" || fail "tieude: thinking level not high: $(cat "$T/calls")"
-grep -qF -- '--auto-approve' "$T/calls" \
-  || fail "tieude: no --auto-approve (unattended spawn): $(cat "$T/calls")"
+grep -qF -- "--append-system-prompt $T/home/quaqua/runs/tieude-model.rules.md" "$T/calls" \
+  || fail "tieude: worker rules file not appended: $(cat "$T/calls")"
+grep -qF -- "--session-dir $T/home/quaqua/runs/.pi-sessions/tieude-model" "$T/calls" \
+  || fail "tieude: no per-name pi session dir: $(cat "$T/calls")"
+grep -qF -- '--no-approve' "$T/calls" \
+  || fail "tieude: no --no-approve (unattended spawn): $(cat "$T/calls")"
 ! grep -q 'OPENCODE_CONFIG_CONTENT' "$T/calls" \
-  || fail "tieude: opencode pane env leaked into an omp start: $(cat "$T/calls")"
+  || fail "tieude: opencode pane env leaked into a pi start: $(cat "$T/calls")"
 ! grep -q 'gemini' "$T/calls" || fail "tieude: gemini model leaked: $(cat "$T/calls")"
-echo "ok: tieude -> --kind omp, model opencode-go/deepseek-v4.1-flash, thinking high"
+echo "ok: tieude -> --kind pi, model mistral/deepseek-v4-1-flash-1017, thinking high"
 
 # ── sude: omp with antigravity gemini-3.8-flash high, worker rules appended ──
 # (team.toml) — omp takes the model, the thinking level and the rules file on
@@ -262,7 +266,7 @@ grep -qF 'WARN: fallback: sude→suhuynh (agent_not_ready)' "$T/err" \
 grep -q "worker=sude-fb" "$T/out" || fail "fallback: no success line"
 echo "ok: fallback -> omp failed, claude (suhuynh) started, WARN recorded"
 
-# one hop max: tieude (omp) falls back to sude (omp); when both attempts
+# one hop max: tieude (pi) falls back to sude (omp); when both attempts
 # fail -> hard error after exactly two attempts, never a third hop
 spawn tieude-fb2 tieude START_FAIL=1
 [[ $rc -ne 0 ]] || fail "one-hop: exit $rc, want non-zero: $(cat "$T/err")"

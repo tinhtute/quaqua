@@ -375,9 +375,12 @@ fn config_kill_refused_at_spawn() {
 /// kill on omp with a stop-key fallback stays valid.
 #[test]
 fn config_kill_on_omp_validates() {
+    // The shipped template has no omp -> omp pair left (tieude is pi, which has
+    // no stop key), so this case writes the pair it needs: tieude back on omp
+    // keeps its sude (omp) fallback, and both ends carry a stop key.
     let body = std::fs::read_to_string(repo_team()).expect("read team.toml");
     let ok = body.replacen(
-        "[kinds.tieude]\nharness = \"omp\"\n",
+        "[kinds.tieude]\nharness = \"pi\"\n",
         "[kinds.tieude]\nharness = \"omp\"\non_cost_cap = \"kill\"\n",
         1,
     );
