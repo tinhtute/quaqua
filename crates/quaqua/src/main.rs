@@ -118,6 +118,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Record a coordinator's own test rerun as a verifier verdict: `verify record`.
+    Verify {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Playbook operations: list, show.
     Playbook {
         #[command(subcommand)]
@@ -977,6 +982,13 @@ fn main() {
                 if !e.is_empty() {
                     eprintln!("{e}");
                 }
+                1
+            }
+        },
+        Some(Command::Verify { args }) => match quaqua::verify::handle_verify(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("{e}");
                 1
             }
         },

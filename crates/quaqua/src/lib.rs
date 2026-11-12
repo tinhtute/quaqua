@@ -33,6 +33,7 @@ pub mod taskforce;
 pub mod transcripts;
 pub mod usage;
 pub mod util;
+pub mod verify;
 pub mod worker;
 pub mod workspace;
 
