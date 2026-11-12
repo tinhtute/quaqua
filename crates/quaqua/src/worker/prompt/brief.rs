@@ -177,6 +177,84 @@ pub fn brief_header_warnings(text: &str) -> Vec<String> {
     warnings
 }
 
+/// Forms a brief can spell the main checkout `root` in: the absolute path,
+/// `~/…` and `$HOME/…` when `root` sits under `home`.
+fn checkout_spellings(root: &str, home: Option<&str>) -> Vec<String> {
+    let root = root.trim_end_matches('/');
+    let mut forms = vec![root.to_string()];
+    if let Some(rel) = home
+        .map(|h| h.trim_end_matches('/'))
+        .and_then(|h| root.strip_prefix(h))
+        .filter(|r| r.starts_with('/'))
+    {
+        forms.push(format!("~{rel}"));
+        forms.push(format!("$HOME{rel}"));
+    }
+    forms
+}
+
+/// Warn when the brief names the absolute path of the repo's main checkout: a
+/// worker that follows it edits the main checkout, not its worktree (case
+/// 2026-11-12). Worktree paths (`<root>/../.wt/…`) and sibling dirs sharing the
+/// prefix (`quaqua-foo`) do not match; the path must end at a path boundary.
+pub fn main_checkout_path_warnings(
+    text: &str,
+    main_root: &Path,
+    home: Option<&Path>,
+) -> Vec<String> {
+    let (Some(root), home) = (main_root.to_str(), home.and_then(Path::to_str)) else {
+        return Vec::new();
+    };
+    let is_path_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    for form in checkout_spellings(root, home) {
+        for (at, _) in text.match_indices(&form) {
+            let before = text[..at].chars().next_back();
+            let mut rest = text[at + form.len()..].chars();
+            let after = rest.next();
+            // A '.' ends the path only as sentence punctuation (`…quaqua.`).
+            let ends_clean = match after {
+                None => true,
+                Some('.') => rest.next().is_none_or(|c| !is_path_char(c)),
+                Some(c) => c == '/' || !is_path_char(c),
+            };
+            let starts_clean = before.is_none_or(|c| !is_path_char(c));
+            if starts_clean && ends_clean {
+                return vec![format!(
+                    "warning: brief names the main checkout path '{form}' — a worker may edit it instead of its worktree; use worktree-relative paths (e.g. `crates/…`)"
+                )];
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Main checkout of the repo containing `cwd` (the parent of the shared git
+/// dir), or `None` outside a repo.
+fn main_checkout_root(cwd: &Path) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let dir = std::path::PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    dir.parent().map(Path::to_path_buf)
+}
+
+/// Print the main-checkout path warning for a brief on stderr.
+pub fn warn_main_checkout_path(task: &str) {
+    let Some(root) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| main_checkout_root(&cwd))
+    else {
+        return;
+    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    for warning in main_checkout_path_warnings(task, &root, home.as_deref()) {
+        eprintln!("{warning}");
+    }
+}
+
 /// The text appended to a submitted prompt for one playbook: the `## Worker`
 /// steps, each cited leaf once, and the pre-filled `## Playbook` block. The
 /// `## Orchestrator` text is never included — that is the coordinator's.
@@ -570,5 +648,36 @@ mod review_severity_tests {
         // Tags outside `## Findings` do not count against a clean verdict.
         let clean = "## Resolved\n- [major] X — fixed\n## Findings\nnone\nVerdict: clean\n";
         assert_eq!(blocking_findings(clean, Severity::Major, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod main_checkout_path_tests {
+    use super::*;
+
+    const ROOT: &str = "/h/u/Lab/quaqua";
+    const HOME: &str = "/h/u";
+
+    fn warns(text: &str) -> bool {
+        !main_checkout_path_warnings(text, Path::new(ROOT), Some(Path::new(HOME))).is_empty()
+    }
+
+    #[test]
+    fn warns_on_absolute_tilde_and_home_spellings() {
+        assert!(warns("edit /h/u/Lab/quaqua/crates/x.rs please"));
+        assert!(warns("Context: ~/Lab/quaqua/crates"));
+        assert!(warns("see $HOME/Lab/quaqua/src"));
+        assert!(warns("repo is /h/u/Lab/quaqua."));
+        assert!(warns("(~/Lab/quaqua)"));
+    }
+
+    #[test]
+    fn no_warning_for_worktree_siblings_and_relative_paths() {
+        assert!(!warns("edit /h/u/Lab/.wt/sude-x/crates/x.rs"));
+        assert!(!warns("edit ~/Lab/.wt/sude-x/crates/x.rs"));
+        assert!(!warns("see /h/u/Lab/quaqua-other/src and ~/Lab/quaquax"));
+        assert!(!warns("see /other/h/u/Lab/quaqua/src"));
+        assert!(!warns("edit crates/quaqua/src/main.rs"));
+        assert!(!warns("Goal: g\nHard constraints: crates/ only"));
     }
 }
