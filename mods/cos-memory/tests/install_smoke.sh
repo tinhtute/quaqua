@@ -90,6 +90,25 @@ else
   printf 'skip claude plugin validate/test (claude not on PATH)\n'
 fi
 
+# 7. Installed the way the live CoS will: add the marketplace, install, list it enabled.
+# Runs in a throwaway HOME so the live ~/.claude is never read or written.
+if command -v claude >/dev/null 2>&1; then
+  iso=$(mktemp -d)
+  if (
+    export HOME="$iso" CLAUDE_CONFIG_DIR="$iso/.claude" XDG_CONFIG_HOME="$iso/.config"
+    unset CLAUDE_CODE_PLUGIN_DIRS
+    claude plugin marketplace add "$market" >/dev/null 2>&1 \
+      && claude plugin install cos-memory@quaqua >/dev/null 2>&1 \
+      && claude plugin list 2>&1 | grep -q 'cos-memory@quaqua' \
+      && claude plugin list 2>&1 | grep -q 'enabled'
+  ); then
+    ok 'marketplace add + install: cos-memory@quaqua installs enabled (throwaway HOME)'
+  else
+    bad 'marketplace add + install in a throwaway HOME'
+  fi
+  if command -v trash >/dev/null 2>&1; then trash "$iso"; fi
+fi
+
 if [ "$fails" -ne 0 ]; then
   printf '\n%d check(s) failed\n' "$fails"
   exit 1

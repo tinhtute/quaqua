@@ -45,9 +45,9 @@ lane: normal
   - surfaces: crates/quaqua/src/config.rs, crates/quaqua/tests/config.rs | avoided: worker/stop.rs run-time refusal stays as a second guard
   - phase check: `cargo test -p quaqua config_kill_refused` `cargo test -p quaqua config`
 - phase_slug: `cos-mod-live`
-  status: planned
+  status: in-progress (build done; pending live fork)
   - goal: R3 | depends_on: `fork-allowlist`
-  - surfaces: mods/cos-memory/ (tsconfig.json decision), the real CoS plugin store | avoided: crates/
+  - surfaces: mods/cos-memory/ (tsconfig.json decision: gitignored, `tsc -p` finds no inputs for a plain-.js mod), the real CoS plugin store | avoided: crates/
   - phase check: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty); live fork per Q3 session shape (≥10 user turns, ≥10 Stops or ≥15 tool calls, then stay open) and `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
 - phase_slug: `ship`
   status: planned
