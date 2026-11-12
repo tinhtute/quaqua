@@ -1,0 +1,3 @@
+# Machine-local tsc config extending the generated, gitignored .claude-plugin/types;
+# the mod is plain .js with no allowJs, so `tsc -p` finds no inputs (TS18003) and checks nothing.
+tsconfig.json
