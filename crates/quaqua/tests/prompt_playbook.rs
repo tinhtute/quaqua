@@ -160,6 +160,24 @@ fn prompt_brief_header_warnings_are_advisory() {
         "Playbook: none, one-command unit\nContext: none, single file already read",
     ));
     assert!(reasoned.is_empty(), "{reasoned:?}");
+
+    // `Budget:` is not the machine-read header: it warns, `Time budget:` does not.
+    let headers = "Topology: solo — one engine task\nPlaybook: feature\nContext: crates/quaqua/src/worker/prompt/brief.rs\nGoal: g\nHard constraints: none\nCurrent design: d\n";
+    let bare_budget = format!("{headers}Budget: 30 min\n");
+    let warned = brief_header_warnings(&bare_budget);
+    assert_eq!(warned.len(), 1, "only the budget header warns: {warned:?}");
+    assert!(warned[0].contains("'Budget:'"), "{warned:?}");
+    assert!(warned[0].contains("'Time budget: <N> min'"), "{warned:?}");
+
+    let with_time = format!("{headers}Time budget: 30 min\n");
+    assert!(
+        brief_header_warnings(&with_time).is_empty(),
+        "Time budget is the right spelling"
+    );
+
+    // `Cost budget:` is its own header and must not be read as `Budget:`.
+    let cost_only = format!("{headers}Cost budget: $2\n");
+    assert!(brief_header_warnings(&cost_only).is_empty(), "{cost_only}");
 }
 
 // ─── 3+4. Worker text only, each leaf once, pre-filled block ────────────────

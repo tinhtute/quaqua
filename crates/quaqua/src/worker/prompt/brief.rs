@@ -142,8 +142,10 @@ pub fn named_playbook_with_reason(text: &str) -> Option<(String, Option<String>)
     Some((name, reason))
 }
 
-/// Warnings for the two advisory headers. Empty when both are present and a
-/// `none` carries a reason. Never an error: briefs without them pass as before.
+/// Warnings for the advisory headers. Empty when `Playbook:` and `Context:`
+/// are present, a `none` carries a reason, and no `Budget:` line stands in for
+/// the machine-read `Time budget:`. Never an error: briefs without them pass as
+/// before.
 pub fn brief_header_warnings(text: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     match playbook_header(text) {
@@ -173,6 +175,14 @@ pub fn brief_header_warnings(text: &str) -> Vec<String> {
                 .to_string(),
         ),
         Some(_) => {}
+    }
+    // `Budget:` is not the machine-read header: only `Time budget:` sets the
+    // watchdog allowance, so a brief that writes `Budget:` silently runs on the
+    // default. Warn without changing the exit code — the brief still runs.
+    if header_value(text, "Budget").is_some() && super::brief_budget_sec(text).is_none() {
+        warnings.push(
+            "warning: 'Budget:' is not the brief's time header — write 'Time budget: <N> min' (machine-read; rules/_all/brief.md), or the worker falls back to the default budget".to_string(),
+        );
     }
     warnings
 }
