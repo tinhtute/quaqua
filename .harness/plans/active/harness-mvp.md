@@ -65,6 +65,9 @@ lane: normal
 - 2026-11-12 — map decided (10 of 10); locked: R1–R5, five phases. Lane kept `normal` though there are several phases, because each is one reviewable unit; `fork-allowlist` mechanism is unknown (`$.model.fork` takes only `{ prompt, effort }`), the worker must verify it before building.
 - 2026-11-12 — #249–#252 merged (fork-allowlist, kill-refusal, ship, cos-mod-live build); R5 started with this pilot, the first unit through `quaqua ship`.
 - 2026-11-12 — `cos-mod-live` done: live review fork wrote lastReviewAt=1794472950808 in the installed store `~/.claude/plugins/store/cos-memory_quaqua-*.json` (inline copy still null); #253, #254 merged.
+- 2026-11-12 — #255 merged (mvp wave 2, db985d5): watchdog exit-4 telemetry row, Budget lint, `ship` without --repo, pre-push marker, `cos-mod-live` marked done.
+- 2026-11-12 — #256 merged (retro wave 3, 35b9edf): spawn bases on origin/<default>, `quaqua verify record`, watchdog blocked corroboration + Compact banner, clippy clean; 1217 tests pass.
+- 2026-11-12 — #244 merged (73ee97e): docs/audit/2026-11-12 intent audit at 41a5327, 3/5; no requirement changed.
 
 ## Validation
 
@@ -73,4 +76,5 @@ lane: normal
 - lifecycle_status: locked
 - blockers: none
 - open_items: 0 open of 10 map lines
-- exact_next_action: work full phase fork-allowlist (kill-refusal may run in parallel)
+- unknowns: (1) the live review fork (`lastReviewAt`) was recorded only in the Linux box plugin store; this Mac's inline `cos-memory_*.json` still has `review.lastReviewAt` null, so R5's `jq` line passes only against the Linux store until a live fork fires here. (2) `quaqua status --metrics` lists per-worker kind/harness, exit, wall/budget and $/budget rows, and #255 records watchdog exit-4 stops, so the 4+ kinds and an agy stop line are measurable; agy rows carry no dollars, so an agy cost cap is not (R5 allows a watchdog stop, NG2).
+- exact_next_action: work full phase mvp-run (R5, runs/ report only, no code): CoS takes one task from brief to PR via quaqua CLI only, spawns a ≥4 mixed-kind wave including an agy worker with a short time budget so the watchdog stops it, runs `quaqua ship`, and records `gh pr view <pr> --json mergedAt`, `quaqua status --metrics`, and `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`; the Principal does the final merge.
