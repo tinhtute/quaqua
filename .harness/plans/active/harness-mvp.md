@@ -45,7 +45,7 @@ lane: normal
   - surfaces: crates/quaqua/src/config.rs, crates/quaqua/tests/config.rs | avoided: worker/stop.rs run-time refusal stays as a second guard
   - phase check: `cargo test -p quaqua config_kill_refused` `cargo test -p quaqua config`
 - phase_slug: `cos-mod-live`
-  status: in-progress (build done; pending live fork)
+  status: done (#252; live fork: `cos-memory_quaqua-*.json` review.lastReviewAt=1794472950808, inflightAt null)
   - goal: R3 | depends_on: `fork-allowlist`
   - surfaces: mods/cos-memory/ (tsconfig.json decision: gitignored, `tsc -p` finds no inputs for a plain-.js mod), the real CoS plugin store | avoided: crates/
   - phase check: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty); live fork per Q3 session shape (≥10 user turns, ≥10 Stops or ≥15 tool calls, then stay open) and `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
@@ -64,6 +64,7 @@ lane: normal
 - 2026-11-11 — map opened from the Principal's destination; 8 lines, no decisions yet.
 - 2026-11-12 — map decided (10 of 10); locked: R1–R5, five phases. Lane kept `normal` though there are several phases, because each is one reviewable unit; `fork-allowlist` mechanism is unknown (`$.model.fork` takes only `{ prompt, effort }`), the worker must verify it before building.
 - 2026-11-12 — #249–#252 merged (fork-allowlist, kill-refusal, ship, cos-mod-live build); R5 started with this pilot, the first unit through `quaqua ship`.
+- 2026-11-12 — `cos-mod-live` done: live review fork wrote lastReviewAt=1794472950808 in the installed store `~/.claude/plugins/store/cos-memory_quaqua-*.json` (inline copy still null); #253, #254 merged.
 
 ## Validation
 
