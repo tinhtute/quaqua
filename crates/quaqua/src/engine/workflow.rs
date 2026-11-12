@@ -5,9 +5,9 @@
 //! (`std::fs`, `std::process`, `std::net`). All interaction with external systems
 //! occurs through scheduled activities or timers.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::engine::activity::{ActivityRequest, ActivityResult};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Pure workflow context passed to [`Workflow::step`].
 ///
@@ -108,14 +108,9 @@ impl WorkflowContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowEvent {
     /// An activity previously scheduled has completed.
-    ActivityCompleted {
-        id: String,
-        result: ActivityResult,
-    },
+    ActivityCompleted { id: String, result: ActivityResult },
     /// A timer previously scheduled has fired.
-    TimerFired {
-        id: String,
-    },
+    TimerFired { id: String },
     /// A child workflow has completed successfully.
     ChildCompleted {
         id: String,
@@ -145,10 +140,7 @@ pub enum StepDecision<Output> {
         activity: ActivityRequest,
     },
     /// Schedule a timer for future execution.
-    ScheduleTimer {
-        id: String,
-        duration: Duration,
-    },
+    ScheduleTimer { id: String, duration: Duration },
     /// Start a child workflow.
     StartChild {
         id: String,
@@ -156,16 +148,11 @@ pub enum StepDecision<Output> {
         input: serde_json::Value,
     },
     /// Pause workflow execution waiting for operator/user approval.
-    PauseForApproval {
-        reason: String,
-    },
+    PauseForApproval { reason: String },
     /// Complete the workflow with final output.
     Complete(Output),
     /// Terminate the workflow with failure.
-    Fail {
-        code: i32,
-        reason: String,
-    },
+    Fail { code: i32, reason: String },
 }
 
 /// Deterministic, event-driven workflow definition.

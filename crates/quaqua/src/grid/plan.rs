@@ -46,8 +46,16 @@ pub fn is_candidate_worker(pane: &Pane) -> bool {
         return false;
     }
     tokens.grid_role.as_deref() == Some("worker")
-        && tokens.grid_owner.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
-        && tokens.grid_group.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        && tokens
+            .grid_owner
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        && tokens
+            .grid_group
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
 }
 
 fn is_status_deferred(status: Option<&str>, deferred_list: &[&str]) -> bool {
@@ -63,12 +71,14 @@ pub fn is_group_tab(group: &str, label: Option<&str>) -> bool {
         || l == format!("{group}-workers")
         || l == group.strip_suffix("-workers").unwrap_or(group)
         || l == "workers"
-        || l.strip_suffix("-2").map(|base| {
-            base == group
-                || base == format!("{group}-workers")
-                || base == group.strip_suffix("-workers").unwrap_or(group)
-                || base == "workers"
-        }).unwrap_or(false)
+        || l.strip_suffix("-2")
+            .map(|base| {
+                base == group
+                    || base == format!("{group}-workers")
+                    || base == group.strip_suffix("-workers").unwrap_or(group)
+                    || base == "workers"
+            })
+            .unwrap_or(false)
 }
 
 /// The one acceptance predicate for a group's workers tab, shared by the
@@ -171,21 +181,71 @@ pub fn cells(n: usize, a: &Rect) -> Vec<Rect> {
     let hw = w / 2;
     let hh = h / 2;
     match n {
-        1 => vec![Rect { x, y, width: w, height: h }],
+        1 => vec![Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }],
         2 => vec![
-            Rect { x, y, width: hw, height: h },
-            Rect { x: x + hw, y, width: w - hw, height: h },
+            Rect {
+                x,
+                y,
+                width: hw,
+                height: h,
+            },
+            Rect {
+                x: x + hw,
+                y,
+                width: w - hw,
+                height: h,
+            },
         ],
         3 => vec![
-            Rect { x, y, width: hw, height: h },
-            Rect { x: x + hw, y, width: w - hw, height: hh },
-            Rect { x: x + hw, y: y + hh, width: w - hw, height: h - hh },
+            Rect {
+                x,
+                y,
+                width: hw,
+                height: h,
+            },
+            Rect {
+                x: x + hw,
+                y,
+                width: w - hw,
+                height: hh,
+            },
+            Rect {
+                x: x + hw,
+                y: y + hh,
+                width: w - hw,
+                height: h - hh,
+            },
         ],
         4 => vec![
-            Rect { x, y, width: hw, height: hh },
-            Rect { x: x + hw, y, width: w - hw, height: hh },
-            Rect { x: x + hw, y: y + hh, width: w - hw, height: h - hh },
-            Rect { x, y: y + hh, width: hw, height: h - hh },
+            Rect {
+                x,
+                y,
+                width: hw,
+                height: hh,
+            },
+            Rect {
+                x: x + hw,
+                y,
+                width: w - hw,
+                height: hh,
+            },
+            Rect {
+                x: x + hw,
+                y: y + hh,
+                width: w - hw,
+                height: h - hh,
+            },
+            Rect {
+                x,
+                y: y + hh,
+                width: hw,
+                height: h - hh,
+            },
         ],
         _ => vec![],
     }
@@ -551,10 +611,15 @@ fn plan_owner_workspace(
                     .tabs
                     .iter()
                     .filter(|tab| {
-                        let ws_ok = tab.workspace_id.as_deref() == Some(owner_ws) || owner_ws.is_empty();
+                        let ws_ok =
+                            tab.workspace_id.as_deref() == Some(owner_ws) || owner_ws.is_empty();
                         let anchor_ok = anchor_tab.map(|at| tab.tab_id != at).unwrap_or(true);
-                        let label_ok =
-                            accepts_chunk_tab(group, expected_tab.as_deref(), chunk_idx, tab.label.as_deref());
+                        let label_ok = accepts_chunk_tab(
+                            group,
+                            expected_tab.as_deref(),
+                            chunk_idx,
+                            tab.label.as_deref(),
+                        );
                         if !(ws_ok && anchor_ok && label_ok) {
                             return false;
                         }
@@ -566,7 +631,8 @@ fn plan_owner_workspace(
                         if occ.is_empty() {
                             return false;
                         }
-                        occ.iter().all(|p| gws.iter().any(|gw| gw.pane_id == p.pane_id))
+                        occ.iter()
+                            .all(|p| gws.iter().any(|gw| gw.pane_id == p.pane_id))
                     })
                     .collect();
 
@@ -585,28 +651,32 @@ fn plan_owner_workspace(
                 if let Some(vt) = valid_tab {
                     let wt_id = &vt.tab_id;
                     let wt_layout = snapshot.layouts.iter().find(|l| &l.tab_id == wt_id);
-                    let wt_area = wt_layout
-                        .and_then(|l| l.area)
-                        .unwrap_or(Rect { x: 0, y: 0, width: 200, height: 50 });
+                    let wt_area = wt_layout.and_then(|l| l.area).unwrap_or(Rect {
+                        x: 0,
+                        y: 0,
+                        width: 200,
+                        height: 50,
+                    });
                     let occ_count = snapshot
                         .panes
                         .iter()
                         .filter(|p| p.tab_id.as_deref() == Some(wt_id.as_str()))
                         .count();
-                    let all_present = chunk_gws.iter().all(|w| w.tab_id.as_deref() == Some(wt_id.as_str()))
+                    let all_present = chunk_gws
+                        .iter()
+                        .all(|w| w.tab_id.as_deref() == Some(wt_id.as_str()))
                         && occ_count == m;
 
                     let in_place = if all_present {
                         let rects: Vec<Option<Rect>> = chunk_gws
                             .iter()
                             .map(|w| {
-                                wt_layout
-                                    .and_then(|l| {
-                                        l.panes
-                                            .iter()
-                                            .find(|p| p.pane_id == w.pane_id)
-                                            .and_then(|p| p.rect)
-                                    })
+                                wt_layout.and_then(|l| {
+                                    l.panes
+                                        .iter()
+                                        .find(|p| p.pane_id == w.pane_id)
+                                        .and_then(|p| p.rect)
+                                })
                             })
                             .collect();
                         // Unknown layout data must not read as "wrong" (a
@@ -626,7 +696,9 @@ fn plan_owner_workspace(
                         // in cell order. `apply_ops` parks each pane in a scratch
                         // tab first, so the split lands on the parent cell.
                         let rebuild = all_present;
-                        if in_tab_count > 0 && chunk_gws[0].tab_id.as_deref() == Some(wt_id.as_str()) {
+                        if in_tab_count > 0
+                            && chunk_gws[0].tab_id.as_deref() == Some(wt_id.as_str())
+                        {
                             // Worker 0 is already in tab; place missing workers,
                             // or re-place every pane when rebuilding the shape.
                             let order = build_order(m);
@@ -641,7 +713,10 @@ fn plan_owner_workspace(
                                 ops.push(Op {
                                     op: "move".to_string(),
                                     pane: chunk_gws[i].pane_id.clone(),
-                                    deferred: is_status_deferred(chunk_gws[i].agent_status.as_deref(), def_list),
+                                    deferred: is_status_deferred(
+                                        chunk_gws[i].agent_status.as_deref(),
+                                        def_list,
+                                    ),
                                     target: split_target(pos, &order, chunk_gws, wt_id),
                                 });
                             }
@@ -661,7 +736,10 @@ fn plan_owner_workspace(
                                 ops.push(Op {
                                     op: "move".to_string(),
                                     pane: chunk_gws[i].pane_id.clone(),
-                                    deferred: is_status_deferred(chunk_gws[i].agent_status.as_deref(), def_list),
+                                    deferred: is_status_deferred(
+                                        chunk_gws[i].agent_status.as_deref(),
+                                        def_list,
+                                    ),
                                     target: Target::Split {
                                         tab: wt_id.to_string(),
                                         anchor: anchor.clone(),
@@ -683,7 +761,10 @@ fn plan_owner_workspace(
                             ops.push(Op {
                                 op: "move".to_string(),
                                 pane: chunk_gws[i].pane_id.clone(),
-                                deferred: is_status_deferred(chunk_gws[i].agent_status.as_deref(), def_list),
+                                deferred: is_status_deferred(
+                                    chunk_gws[i].agent_status.as_deref(),
+                                    def_list,
+                                ),
                                 target: Target::NewTab {
                                     label: chunk_label.clone(),
                                 },
@@ -692,7 +773,10 @@ fn plan_owner_workspace(
                             ops.push(Op {
                                 op: "move".to_string(),
                                 pane: chunk_gws[i].pane_id.clone(),
-                                deferred: is_status_deferred(chunk_gws[i].agent_status.as_deref(), def_list),
+                                deferred: is_status_deferred(
+                                    chunk_gws[i].agent_status.as_deref(),
+                                    def_list,
+                                ),
                                 target: split_target(pos, &order, chunk_gws, &tab_ref),
                             });
                         }
@@ -710,7 +794,12 @@ mod tests {
     use super::*;
     use crate::grid::types::{Layout, PaneLayout, Tab, Tokens};
 
-    const AREA: Rect = Rect { x: 0, y: 0, width: 200, height: 100 };
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 100,
+    };
 
     /// A binary split tree with herdr's `pane move --split` semantics: a split
     /// puts the moved pane below/right of the anchor leaf, and removing a leaf
@@ -880,7 +969,15 @@ mod tests {
             Target::Split {
                 anchor, direction, ..
             } => assert!(
-                tree.split(anchor, if direction == "right" { "right" } else { "down" }, &op.pane),
+                tree.split(
+                    anchor,
+                    if direction == "right" {
+                        "right"
+                    } else {
+                        "down"
+                    },
+                    &op.pane
+                ),
                 "anchor {anchor} missing for {}",
                 op.pane
             ),
@@ -919,10 +1016,17 @@ mod tests {
                 other => panic!("spawn {n}: expected a split, got {other:?}"),
             }
             apply(&mut tree, op);
-            assert!(matches(&tree, n), "spawn {n}: not the target shape: {tree:?}");
+            assert!(
+                matches(&tree, n),
+                "spawn {n}: not the target shape: {tree:?}"
+            );
             // The repaired tab is converged: a second pass plans nothing.
             let after = snapshot(&tree, &[]);
-            assert_eq!(plan(&after).unwrap(), vec![], "spawn {n}: replan must converge");
+            assert_eq!(
+                plan(&after).unwrap(),
+                vec![],
+                "spawn {n}: replan must converge"
+            );
         }
 
         let mut all = Vec::new();
@@ -955,21 +1059,34 @@ mod tests {
             tree.remove(removed);
             let snap = snapshot(&tree, &[]);
             let ops = plan(&snap).unwrap();
-            assert_eq!(ops, vec![], "4->3 removing left pane {removed} needs no fix: {ops:?}");
+            assert_eq!(
+                ops,
+                vec![],
+                "4->3 removing left pane {removed} needs no fix: {ops:?}"
+            );
             assert!(matches(&tree, 3));
         }
 
         for removed in ["w1:p3", "w1:p4"] {
             let mut tree = four_pane_tree();
             tree.remove(removed);
-            assert!(!matches(&tree, 3), "4->3 removing right pane {removed} starts mirrored");
+            assert!(
+                !matches(&tree, 3),
+                "4->3 removing right pane {removed} starts mirrored"
+            );
             let snap = snapshot(&tree, &[]);
             let ops = plan(&snap).unwrap();
-            assert!(!ops.is_empty(), "4->3 removing {removed}: expected a swap/rebuild");
+            assert!(
+                !ops.is_empty(),
+                "4->3 removing {removed}: expected a swap/rebuild"
+            );
             for op in &ops {
                 apply(&mut tree, op);
             }
-            assert!(matches(&tree, 3), "4->3 removing {removed}: not repaired: {tree:?}");
+            assert!(
+                matches(&tree, 3),
+                "4->3 removing {removed}: not repaired: {tree:?}"
+            );
         }
     }
 

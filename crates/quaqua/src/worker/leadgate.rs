@@ -843,7 +843,8 @@ mod tests {
 
     #[test]
     fn gate_row_gates_lead_on_foreign_cos_repo() {
-        let tmp = std::env::temp_dir().join(format!("quaqua-leadgate-foreign-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("quaqua-leadgate-foreign-{}", std::process::id()));
         let repo = tmp.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let content = format!(
@@ -869,7 +870,8 @@ mod tests {
 
     #[test]
     fn gate_row_skips_when_non_lead_owns_repo_row() {
-        let tmp = std::env::temp_dir().join(format!("quaqua-leadgate-nonlead-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("quaqua-leadgate-nonlead-{}", std::process::id()));
         let repo = tmp.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let content = format!(
@@ -886,10 +888,7 @@ mod tests {
             depth: crate::identity::CallerDepth::Unknown,
             source: crate::identity::IdentitySource::Unknown,
         };
-        assert_eq!(
-            gate_row(&rows, &repo, "/tmp/home", &non_lead),
-            None
-        );
+        assert_eq!(gate_row(&rows, &repo, "/tmp/home", &non_lead), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

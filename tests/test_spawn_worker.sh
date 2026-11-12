@@ -212,22 +212,26 @@ mkdir -p "$T/clean-cwd"
   || fail "spawn wrote into the caller's cwd: $(find "$T/clean-cwd")"
 echo "ok: unresolvable hooks dir -> nothing written under the caller's cwd"
 
-# ── tieude: omp with deepseek-v4.1-flash at effort high on the command line ──
-# (team.toml) — omp takes the model, the thinking level and the rules file as
-# args, never the opencode pane env
+# ── tieude: pi with mistral deepseek-v4-1-flash-1017 at effort high ─────────
+# (team.toml) — pi takes the model, the thinking level, the rules file and a
+# per-name session dir on the command line, never the opencode pane env
 spawn "tieude-model" "tieude"
 [[ $rc -eq 0 ]] || fail "tieude: exit $rc, want 0: $(cat "$T/err")"
-grep -qF -- '--kind omp' "$T/calls" \
-  || fail "tieude: not an omp start: $(cat "$T/calls")"
-grep -qF -- '--model opencode-go/deepseek-v4.1-flash' "$T/calls" \
-  || fail "tieude: model not opencode-go/deepseek-v4.1-flash: $(cat "$T/calls")"
+grep -qF -- '--kind pi' "$T/calls" \
+  || fail "tieude: not a pi start: $(cat "$T/calls")"
+grep -qF -- '--model mistral/deepseek-v4-1-flash-1017' "$T/calls" \
+  || fail "tieude: model not mistral/deepseek-v4-1-flash-1017: $(cat "$T/calls")"
 grep -qF -- '--thinking high' "$T/calls" || fail "tieude: thinking level not high: $(cat "$T/calls")"
-grep -qF -- '--auto-approve' "$T/calls" \
-  || fail "tieude: no --auto-approve (unattended spawn): $(cat "$T/calls")"
+grep -qF -- "--append-system-prompt $T/home/quaqua/runs/tieude-model.rules.md" "$T/calls" \
+  || fail "tieude: worker rules file not appended: $(cat "$T/calls")"
+grep -qF -- "--session-dir $T/home/quaqua/runs/.pi-sessions/tieude-model" "$T/calls" \
+  || fail "tieude: no per-name pi session dir: $(cat "$T/calls")"
+grep -qF -- '--no-approve' "$T/calls" \
+  || fail "tieude: no --no-approve (unattended spawn): $(cat "$T/calls")"
 ! grep -q 'OPENCODE_CONFIG_CONTENT' "$T/calls" \
-  || fail "tieude: opencode pane env leaked into an omp start: $(cat "$T/calls")"
+  || fail "tieude: opencode pane env leaked into a pi start: $(cat "$T/calls")"
 ! grep -q 'gemini' "$T/calls" || fail "tieude: gemini model leaked: $(cat "$T/calls")"
-echo "ok: tieude -> --kind omp, model opencode-go/deepseek-v4.1-flash, thinking high"
+echo "ok: tieude -> --kind pi, model mistral/deepseek-v4-1-flash-1017, thinking high"
 
 # ── sude: omp with antigravity gemini-3.8-flash high, worker rules appended ──
 # (team.toml) — omp takes the model, the thinking level and the rules file on
@@ -262,7 +266,7 @@ grep -qF 'WARN: fallback: sude→suhuynh (agent_not_ready)' "$T/err" \
 grep -q "worker=sude-fb" "$T/out" || fail "fallback: no success line"
 echo "ok: fallback -> omp failed, claude (suhuynh) started, WARN recorded"
 
-# one hop max: tieude (omp) falls back to sude (omp); when both attempts
+# one hop max: tieude (pi) falls back to sude (omp); when both attempts
 # fail -> hard error after exactly two attempts, never a third hop
 spawn tieude-fb2 tieude START_FAIL=1
 [[ $rc -ne 0 ]] || fail "one-hop: exit $rc, want non-zero: $(cat "$T/err")"
@@ -429,35 +433,48 @@ for k in ni suhuynh truonglao; do
     || fail "--review $k: no dontAsk permission mode: $(cat "$T/calls")"
   grep -qF -- "--add-dir $T/home/quaqua/runs $T/.wt --settings" "$T/calls" \
     || fail "--review $k: runs+worktree-family not working directories: $(cat "$T/calls")"
-  grep -qF -- "Edit(//${T#/}/home/quaqua/runs/**)" "$T/calls" \
-    || fail "--review $k: runs not writable (no Edit allow rule): $(cat "$T/calls")"
-  grep -qF -- "Edit(//${T#/}/.wt/**)" "$T/calls" \
-    || fail "--review $k: worktree not read-only (no Edit deny rule): $(cat "$T/calls")"
+  # The permission boundary travels in the settings file claude is pointed at,
+  # never on the launch line (herdr types that line into a 1024-byte tty), so
+  # the rules are asserted where claude reads them: the parsed JSON.
+  settings="$T/home/quaqua/runs/.$k-revread.settings.json"
+  [[ -f $settings ]] || fail "--review $k: no settings file at $settings"
+  grep -qF -- "--settings $settings" "$T/calls" \
+    || fail "--review $k: launch line does not load $settings: $(cat "$T/calls")"
+  ! grep -qF -- '"permissions"' "$T/calls" \
+    || fail "--review $k: permissions inlined on the launch line: $(cat "$T/calls")"
+  allow=$(jq -r '.permissions.allow[]' "$settings") \
+    || fail "--review $k: settings carry no permissions.allow: $(cat "$settings")"
+  deny=$(jq -r '.permissions.deny[]' "$settings") \
+    || fail "--review $k: settings carry no permissions.deny: $(cat "$settings")"
+  grep -qxF -- "Edit(//${T#/}/home/quaqua/runs/**)" <<<"$allow" \
+    || fail "--review $k: runs not writable (no Edit allow rule): $(cat "$settings")"
+  grep -qxF -- "Edit(//${T#/}/.wt/**)" <<<"$deny" \
+    || fail "--review $k: worktree not read-only (no Edit deny rule): $(cat "$settings")"
   # read-only evidence gathering: the review cannot run without it
   for rule in 'git diff' 'git log' 'git show' 'git status' 'git rev-parse' \
               'git merge-base' 'git grep'; do
-    grep -qF -- "Bash($rule:*)" "$T/calls" \
-      || fail "--review $k: $rule not allowed: $(cat "$T/calls")"
+    grep -qxF -- "Bash($rule:*)" <<<"$allow" \
+      || fail "--review $k: $rule not allowed: $(cat "$settings")"
   done
   for rule in 'cargo test' 'cargo build' 'cargo clippy' 'cargo fmt --check' \
               'rg' 'grep' 'cat' 'sed -n' 'ls' 'cd'; do
-    grep -qF -- "Bash($rule:*)" "$T/calls" \
-      || fail "--review $k: $rule not allowed: $(cat "$T/calls")"
+    grep -qxF -- "Bash($rule:*)" <<<"$allow" \
+      || fail "--review $k: $rule not allowed: $(cat "$settings")"
   done
-  grep -qF -- 'Bash(mv *runs/.*.tmp *runs/*.md)' "$T/calls" \
-    || fail "--review $k: atomic report mv not allowed: $(cat "$T/calls")"
+  grep -qxF -- 'Bash(mv *runs/.*.tmp *runs/*.md)' <<<"$allow" \
+    || fail "--review $k: atomic report mv not allowed: $(cat "$settings")"
   # ...and it still cannot write the worktree or the history
   for rule in 'git commit' 'git push' 'git checkout' 'git reset' 'git switch' \
               'git restore' 'git clean'; do
-    grep -qF -- "Bash($rule:*)" "$T/calls" \
-      || fail "--review $k: $rule not denied: $(cat "$T/calls")"
+    grep -qxF -- "Bash($rule:*)" <<<"$deny" \
+      || fail "--review $k: $rule not denied: $(cat "$settings")"
   done
-  ! grep -qF -- '"Bash"' "$T/calls" || fail "--review $k: bare Bash allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- 'Bash(*)' "$T/calls" || fail "--review $k: Bash(*) allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- 'Bash(git:*)' "$T/calls" || fail "--review $k: blanket git allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- 'Bash(mv:*' "$T/calls" || fail "--review $k: unbounded mv allow leaked: $(cat "$T/calls")"
-  ! grep -qF -- '"allow":["Bash(git commit' "$T/calls" \
-    || fail "--review $k: git commit allowed: $(cat "$T/calls")"
+  ! grep -qxF -- 'Bash' <<<"$allow" || fail "--review $k: bare Bash allow leaked: $(cat "$settings")"
+  ! grep -qxF -- 'Bash(*)' <<<"$allow" || fail "--review $k: Bash(*) allow leaked: $(cat "$settings")"
+  ! grep -qxF -- 'Bash(git:*)' <<<"$allow" || fail "--review $k: blanket git allow leaked: $(cat "$settings")"
+  ! grep -qF -- 'Bash(mv:*' <<<"$allow" || fail "--review $k: unbounded mv allow leaked: $(cat "$settings")"
+  ! grep -qF -- 'Bash(git commit' <<<"$allow" \
+    || fail "--review $k: git commit allowed: $(cat "$settings")"
   grep -qF -- '--model claude-opus-5-5' "$T/calls" || fail "--review $k: model changed: $(cat "$T/calls")"
   grep -qF -- "--effort $eff" "$T/calls" || fail "--review $k: effort not $eff: $(cat "$T/calls")"
   [[ -e "$T/home/quaqua/runs/$k-revread.review" ]] \
@@ -472,10 +489,13 @@ done
 spawn ni-plain ni
 [[ $rc -eq 0 ]] || fail "plain ni: exit $rc, want 0: $(cat "$T/err")"
 ! grep -qF -- '--permission-mode dontAsk' "$T/calls" || fail "plain ni: review mode leaked: $(cat "$T/calls")"
-! grep -qF -- 'Bash(cargo test:*)' "$T/calls" || fail "plain ni: review cargo rule leaked: $(cat "$T/calls")"
-! grep -qF -- 'Bash(git diff:*)' "$T/calls" || fail "plain ni: review git rule leaked: $(cat "$T/calls")"
-! grep -qF -- 'Bash(mv *runs/.*.tmp *runs/*.md)' "$T/calls" || fail "plain ni: review mv rule leaked: $(cat "$T/calls")"
-echo "ok: plain ni (no --review) -> ambient settings, no review mode/Bash rules"
+plain_settings="$T/home/quaqua/runs/.ni-plain.settings.json"
+[[ -f $plain_settings ]] || fail "plain ni: no settings file at $plain_settings"
+! jq -e '.permissions' "$plain_settings" >/dev/null \
+  || fail "plain ni: review permission boundary leaked: $(cat "$plain_settings")"
+jq -e '.hooks.PreToolUse' "$plain_settings" >/dev/null \
+  || fail "plain ni: liveness hooks missing: $(cat "$plain_settings")"
+echo "ok: plain ni (no --review) -> ambient settings (hooks only), no review mode/permission boundary"
 
 # ── claude workspace-trust dialog: accept it, then let it clear ──────────────
 # Claude Code's first session in a repo it has not been trusted in shows a

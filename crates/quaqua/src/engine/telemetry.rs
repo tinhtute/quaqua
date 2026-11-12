@@ -1,7 +1,7 @@
 //! Telemetry traits and OpenTelemetry GenAI semantic conventions.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ----------------------------------------------------------------------------
 // OpenTelemetry GenAI Semantic Attribute Names
@@ -96,15 +96,22 @@ impl GenAiSpan {
     /// Sets model and updates attributes.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         let m = model.into();
-        self.attributes.insert(GEN_AI_REQUEST_MODEL.to_string(), m.clone());
+        self.attributes
+            .insert(GEN_AI_REQUEST_MODEL.to_string(), m.clone());
         self.request_model = Some(m);
         self
     }
 
     /// Sets token usage and updates attributes.
     pub fn with_usage(mut self, input_tokens: u64, output_tokens: u64) -> Self {
-        self.attributes.insert(GEN_AI_USAGE_INPUT_TOKENS.to_string(), input_tokens.to_string());
-        self.attributes.insert(GEN_AI_USAGE_OUTPUT_TOKENS.to_string(), output_tokens.to_string());
+        self.attributes.insert(
+            GEN_AI_USAGE_INPUT_TOKENS.to_string(),
+            input_tokens.to_string(),
+        );
+        self.attributes.insert(
+            GEN_AI_USAGE_OUTPUT_TOKENS.to_string(),
+            output_tokens.to_string(),
+        );
         self.input_tokens = Some(input_tokens);
         self.output_tokens = Some(output_tokens);
         self
@@ -114,8 +121,10 @@ impl GenAiSpan {
     pub fn with_agent(mut self, name: impl Into<String>, role: impl Into<String>) -> Self {
         let n = name.into();
         let r = role.into();
-        self.attributes.insert(GEN_AI_AGENT_NAME.to_string(), n.clone());
-        self.attributes.insert(GEN_AI_AGENT_ROLE.to_string(), r.clone());
+        self.attributes
+            .insert(GEN_AI_AGENT_NAME.to_string(), n.clone());
+        self.attributes
+            .insert(GEN_AI_AGENT_ROLE.to_string(), r.clone());
         self.agent_name = Some(n);
         self.agent_role = Some(r);
         self

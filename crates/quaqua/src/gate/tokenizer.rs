@@ -322,10 +322,7 @@ fn tok(out: &mut Vec<Vec<String>>, s: &[char]) {
             }
             '>' | '<' => {
                 // a bare fd number before the operator belongs to it (2>file)
-                if f.have
-                    && !f.word.is_empty()
-                    && f.word.chars().all(|x| x.is_ascii_digit())
-                {
+                if f.have && !f.word.is_empty() && f.word.chars().all(|x| x.is_ascii_digit()) {
                     f.word.clear();
                     f.have = false;
                 } else {

@@ -20,7 +20,10 @@ pub fn parse_move_response(val: &serde_json::Value, orig_pane: &str) -> Result<M
         .unwrap_or(val);
 
     let changed = mr.get("changed").and_then(|v| v.as_bool()).unwrap_or(false);
-    let reason = mr.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let reason = mr
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
 
     if !changed {
         return Err(format!(
@@ -52,7 +55,6 @@ pub fn parse_move_response(val: &serde_json::Value, orig_pane: &str) -> Result<M
         previous_pane_id: prev_pane,
     })
 }
-
 
 /// Execute layout ops via a HerdrDriver, verifying fresh snapshots before each move,
 /// propagating deferrals, parking panes if in-tab repositioning, and returning
@@ -117,7 +119,10 @@ pub fn apply_ops<D: HerdrDriver>(
             }
         }
 
-        let actual_pane = pane_map.get(&op.pane).cloned().unwrap_or_else(|| op.pane.clone());
+        let actual_pane = pane_map
+            .get(&op.pane)
+            .cloned()
+            .unwrap_or_else(|| op.pane.clone());
 
         // Finding 5: Fetch fresh snapshot before each move to verify pane state
         let fresh_snap = driver.snapshot()?;
@@ -134,12 +139,16 @@ pub fn apply_ops<D: HerdrDriver>(
                 .map(crate::cos::is_cos_pane_token)
                 .unwrap_or(false)
             {
-                return Err(format!("refusing to move CoS pane '{actual_pane}' (grid_role=cos)"));
+                return Err(format!(
+                    "refusing to move CoS pane '{actual_pane}' (grid_role=cos)"
+                ));
             }
         }
 
         if !is_candidate_worker(pane_obj) {
-            return Err(format!("apply: pane {actual_pane} is not a candidate worker"));
+            return Err(format!(
+                "apply: pane {actual_pane} is not a candidate worker"
+            ));
         }
 
         // Finding 2: Recheck idle status before each move
@@ -182,11 +191,15 @@ pub fn apply_ops<D: HerdrDriver>(
                     .panes
                     .iter()
                     .find(|p| p.pane_id == actual_anchor)
-                    .ok_or_else(|| format!("apply: anchor {actual_anchor} missing from snapshot"))?;
+                    .ok_or_else(|| {
+                        format!("apply: anchor {actual_anchor} missing from snapshot")
+                    })?;
 
                 // Finding 5 & N1: Resolve @workers to the workers tab, NEVER the orchestrator tab
                 let actual_tab = if tab == "@workers" || tab.starts_with("@workers-") {
-                    let resolved = latest_tabs.get(&(worker_group.to_string(), tab.clone())).cloned();
+                    let resolved = latest_tabs
+                        .get(&(worker_group.to_string(), tab.clone()))
+                        .cloned();
 
                     if let Some(r) = resolved {
                         r
@@ -196,18 +209,27 @@ pub fn apply_ops<D: HerdrDriver>(
                         // repair use: the group tab, or the exact label the pane
                         // was spawned into (`grid_tab`).
                         let anchor_tid = anchor_pane.tab_id.as_deref().unwrap_or("");
-                        let worker_gtab = pane_obj
-                            .tokens
-                            .as_ref()
-                            .and_then(|t| t.grid_tab.as_deref());
-                        let is_workers_tab = fresh_snap.tabs.iter().find(|t| t.tab_id == anchor_tid).map(|t| {
-                            super::plan::accepts_workers_tab(worker_group, worker_gtab, t.label.as_deref())
-                        }).unwrap_or(false);
+                        let worker_gtab =
+                            pane_obj.tokens.as_ref().and_then(|t| t.grid_tab.as_deref());
+                        let is_workers_tab = fresh_snap
+                            .tabs
+                            .iter()
+                            .find(|t| t.tab_id == anchor_tid)
+                            .map(|t| {
+                                super::plan::accepts_workers_tab(
+                                    worker_group,
+                                    worker_gtab,
+                                    t.label.as_deref(),
+                                )
+                            })
+                            .unwrap_or(false);
 
                         if is_workers_tab {
                             anchor_tid.to_string()
                         } else {
-                            return Err(format!("apply: cannot resolve {tab} tab for group {worker_group}"));
+                            return Err(format!(
+                                "apply: cannot resolve {tab} tab for group {worker_group}"
+                            ));
                         }
                     }
                 } else {
@@ -232,9 +254,15 @@ pub fn apply_ops<D: HerdrDriver>(
                 if let Some(atokens) = &anchor_pane.tokens {
                     if atokens.grid_role.as_deref() == Some("worker") {
                         let anchor_owner = atokens.grid_owner.as_deref().unwrap_or("");
-                        let pane_owner = pane_obj.tokens.as_ref().and_then(|t| t.grid_owner.as_deref()).unwrap_or("");
+                        let pane_owner = pane_obj
+                            .tokens
+                            .as_ref()
+                            .and_then(|t| t.grid_owner.as_deref())
+                            .unwrap_or("");
                         if anchor_owner != pane_owner {
-                            return Err(format!("apply: anchor owner {anchor_owner} != pane owner {pane_owner}"));
+                            return Err(format!(
+                                "apply: anchor owner {anchor_owner} != pane owner {pane_owner}"
+                            ));
                         }
                     }
                 }
@@ -250,10 +278,18 @@ pub fn apply_ops<D: HerdrDriver>(
 
         // Findings 1, 5, 9: If current_tab == target_tab during split, park in scratch tab first
         let mut parked_pane: Option<String> = None;
-        let effective_pane = if let Target::Split { tab: target_tab, .. } = &remapped_target {
+        let effective_pane = if let Target::Split {
+            tab: target_tab, ..
+        } = &remapped_target
+        {
             if current_tab.as_deref() == Some(target_tab.as_str()) {
                 scratch_counter += 1;
-                let scratch_label = format!("grid-scratch-{}-{}-{}", worker_group, std::process::id(), scratch_counter);
+                let scratch_label = format!(
+                    "grid-scratch-{}-{}-{}",
+                    worker_group,
+                    std::process::id(),
+                    scratch_counter
+                );
                 let park_res = driver.move_pane(
                     &actual_pane,
                     &Target::NewTab {
@@ -283,9 +319,14 @@ pub fn apply_ops<D: HerdrDriver>(
         }
 
         if !res.tab_id.is_empty() && matches!(op.target, Target::NewTab { .. }) {
-            let cnt = group_created_new_tab_count.entry(worker_group.to_string()).or_insert(0);
+            let cnt = group_created_new_tab_count
+                .entry(worker_group.to_string())
+                .or_insert(0);
             let tab_ref = if *cnt == 0 { "@workers" } else { "@workers-2" };
-            latest_tabs.insert((worker_group.to_string(), tab_ref.to_string()), res.tab_id.clone());
+            latest_tabs.insert(
+                (worker_group.to_string(), tab_ref.to_string()),
+                res.tab_id.clone(),
+            );
             *cnt += 1;
         }
     }

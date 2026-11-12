@@ -126,19 +126,31 @@ fn test_text_report() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    assert!(stdout.contains("5 requests"), "expected 5 requests in: {stdout}");
+    assert!(
+        stdout.contains("5 requests"),
+        "expected 5 requests in: {stdout}"
+    );
     assert!(stdout.contains("$0.7000"), "expected $0.7000 in: {stdout}");
     assert!(stdout.contains("14/10"), "expected 14/10 in: {stdout}");
     assert!(stdout.contains("16/10"), "expected 16/10 in: {stdout}");
     assert!(stdout.contains("[WARN]"), "expected [WARN] in: {stdout}");
     assert!(stdout.contains("9.9.9"), "expected 9.9.9 in: {stdout}");
-    assert!(stdout.contains("tieude-alpha"), "expected tieude-alpha in: {stdout}");
-    assert!(stdout.contains("tieude-beta"), "expected tieude-beta in: {stdout}");
+    assert!(
+        stdout.contains("tieude-alpha"),
+        "expected tieude-alpha in: {stdout}"
+    );
+    assert!(
+        stdout.contains("tieude-beta"),
+        "expected tieude-beta in: {stdout}"
+    );
     assert!(
         stdout.contains("respawn     tieude-beta → tieude-beta2"),
         "expected respawn flag in: {stdout}"
     );
-    assert!(stdout.contains("killed      tieude-beta"), "expected killed flag in: {stdout}");
+    assert!(
+        stdout.contains("killed      tieude-beta"),
+        "expected killed flag in: {stdout}"
+    );
     assert!(
         stdout.contains("idle>30m    tieude-alpha (40m)"),
         "expected idle>30m in: {stdout}"
@@ -147,9 +159,15 @@ fn test_text_report() {
         stdout.contains("review      tieude-alpha (1 round(s))"),
         "expected review in: {stdout}"
     );
-    assert!(stdout.contains("40% calls"), "expected 40% calls in: {stdout}");
+    assert!(
+        stdout.contains("40% calls"),
+        "expected 40% calls in: {stdout}"
+    );
     assert!(stdout.contains("$0.3333"), "expected $0.3333 in: {stdout}");
-    assert!(stdout.contains("rolling  7%"), "expected rolling 7% in: {stdout}");
+    assert!(
+        stdout.contains("rolling  7%"),
+        "expected rolling 7% in: {stdout}"
+    );
     assert!(
         stdout.contains("log $ in window: $0.0300"),
         "expected log $ in window in: {stdout}"
@@ -250,9 +268,18 @@ fn test_days_window() {
 
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("2 requests"), "expected 2 requests in: {stdout}");
-    assert!(stdout.contains("16/10       2    0.0500"), "expected day row $0.0500 in: {stdout}");
-    assert!(stdout.contains("$0.7000"), "expected whole-session task total $0.7000 in: {stdout}");
+    assert!(
+        stdout.contains("2 requests"),
+        "expected 2 requests in: {stdout}"
+    );
+    assert!(
+        stdout.contains("16/10       2    0.0500"),
+        "expected day row $0.0500 in: {stdout}"
+    );
+    assert!(
+        stdout.contains("$0.7000"),
+        "expected whole-session task total $0.7000 in: {stdout}"
+    );
 }
 
 #[test]
@@ -368,9 +395,15 @@ fn test_retry_semantics() {
 
 #[test]
 fn test_token_tripwire_and_matching() {
-    assert!(quaqua::usage::contains_token("my_token: st_81980e6d-2382-4800-a2d3-dd65d3442eed"));
-    assert!(quaqua::usage::contains_token("rt_20cfc6a6-3c0b-4f6a-aeaf-ab9a83bfc9c2"));
-    assert!(!quaqua::usage::contains_token("regular text without tokens"));
+    assert!(quaqua::usage::contains_token(
+        "my_token: st_81980e6d-2382-4800-a2d3-dd65d3442eed"
+    ));
+    assert!(quaqua::usage::contains_token(
+        "rt_20cfc6a6-3c0b-4f6a-aeaf-ab9a83bfc9c2"
+    ));
+    assert!(!quaqua::usage::contains_token(
+        "regular text without tokens"
+    ));
     assert!(!quaqua::usage::contains_token("st_short")); // length < 10
 
     // Civil date round-trip

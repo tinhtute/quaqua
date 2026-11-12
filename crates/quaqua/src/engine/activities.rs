@@ -8,8 +8,8 @@ use std::time::UNIX_EPOCH;
 
 use crate::engine::activity::{
     Activity, ActivityError, ActivityRequest, ActivityResult, CostRequest, CostResult, GitRequest,
-    GitResult, GridRequest, HerdrRequest, HerdrResult, ReportFileRequest,
-    ReportFileResult, SessionRequest, SessionResult,
+    GitResult, GridRequest, HerdrRequest, HerdrResult, ReportFileRequest, ReportFileResult,
+    SessionRequest, SessionResult,
 };
 use crate::git::{Git, GitOps};
 use crate::herdr::{Herdr, HerdrOps};
@@ -319,11 +319,16 @@ impl SystemActivities {
                     solo: None,
                 };
 
-                crate::worker::spawn::spawn_worker(opts, &cfg, &self.git, &self.herdr, crate::layout::SpawnOrigin::Activity).map_err(
-                    |(code, msg)| {
-                        ActivityError::ExecutionFailed(format!("spawn failed (exit {code}): {msg}"))
-                    },
-                )?;
+                crate::worker::spawn::spawn_worker(
+                    opts,
+                    &cfg,
+                    &self.git,
+                    &self.herdr,
+                    crate::layout::SpawnOrigin::Activity,
+                )
+                .map_err(|(code, msg)| {
+                    ActivityError::ExecutionFailed(format!("spawn failed (exit {code}): {msg}"))
+                })?;
 
                 Ok(ActivityResult::Herdr(HerdrResult::Spawned {
                     name: name.clone(),

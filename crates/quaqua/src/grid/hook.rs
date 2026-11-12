@@ -1,6 +1,6 @@
 use super::apply::{apply_ops, CliHerdrDriver, HerdrDriver};
-use super::reconcile::filter_ops_for_check;
 use super::plan::{is_candidate_worker, plan_with_deferred};
+use super::reconcile::filter_ops_for_check;
 use super::types::{Op, Snapshot};
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, OpenOptions};
@@ -23,7 +23,9 @@ pub fn state_dir() -> PathBuf {
 
 pub fn is_shadow_mode(state_dir: &Path) -> bool {
     let mut shadow_mode = true;
-    if let Ok(v) = std::env::var("HERDR_QUAQUA_SHADOW").or_else(|_| std::env::var("HERDR_GRID_SHADOW")) {
+    if let Ok(v) =
+        std::env::var("HERDR_QUAQUA_SHADOW").or_else(|_| std::env::var("HERDR_GRID_SHADOW"))
+    {
         let lower = v.trim().to_lowercase();
         if lower == "0" || lower == "false" || lower == "off" {
             shadow_mode = false;
@@ -54,7 +56,11 @@ pub fn acquire_lock(lock_dir: &Path, pid_file: &Path) -> Result<LockGuard, Strin
 }
 
 /// Early exit check on pane.agent_status_changed events that change nothing
-pub fn should_early_exit(event_name: Option<&str>, event_json: Option<&str>, last_snap_file: &Path) -> bool {
+pub fn should_early_exit(
+    event_name: Option<&str>,
+    event_json: Option<&str>,
+    last_snap_file: &Path,
+) -> bool {
     if event_name != Some("pane.agent_status_changed") {
         return false;
     }
@@ -98,7 +104,11 @@ pub fn should_early_exit(event_name: Option<&str>, event_json: Option<&str>, las
         None => return true, // Foreign/untracked pane
     };
 
-    let role = p.tokens.as_ref().and_then(|t| t.grid_role.as_deref()).unwrap_or("");
+    let role = p
+        .tokens
+        .as_ref()
+        .and_then(|t| t.grid_role.as_deref())
+        .unwrap_or("");
     if role != "worker" {
         return true; // Not a worker pane
     }
@@ -120,7 +130,11 @@ pub fn compute_snapshot_signature(snap: &Snapshot) -> String {
         .collect();
 
     for p in &snap.panes {
-        let role = p.tokens.as_ref().and_then(|t| t.grid_role.as_deref()).unwrap_or("");
+        let role = p
+            .tokens
+            .as_ref()
+            .and_then(|t| t.grid_role.as_deref())
+            .unwrap_or("");
         // Finding 4: All workers with grid_role == "worker"
         if role == "worker" {
             let tid = p.tab_id.as_deref().unwrap_or("");
@@ -136,15 +150,26 @@ pub fn compute_snapshot_signature(snap: &Snapshot) -> String {
             } else {
                 "idle"
             };
-            let owner = p.tokens.as_ref().and_then(|t| t.grid_owner.as_deref()).unwrap_or("");
-            let group = p.tokens.as_ref().and_then(|t| t.grid_group.as_deref()).unwrap_or("");
+            let owner = p
+                .tokens
+                .as_ref()
+                .and_then(|t| t.grid_owner.as_deref())
+                .unwrap_or("");
+            let group = p
+                .tokens
+                .as_ref()
+                .and_then(|t| t.grid_group.as_deref())
+                .unwrap_or("");
             let ready = p
                 .tokens
                 .as_ref()
                 .and_then(|t| t.grid_ready.as_ref())
                 .map(|v| v.to_string())
                 .unwrap_or_default();
-            sigs.push(format!("{}:{}:{}:{}:{}:{}:{}", p.pane_id, tab_repr, status, role, owner, group, ready));
+            sigs.push(format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                p.pane_id, tab_repr, status, role, owner, group, ready
+            ));
         }
     }
     sigs.sort();
@@ -205,7 +230,10 @@ pub fn reconcile_step<D: HerdrDriver>(
                         .map(|p| p.pane_id.clone())
                         .collect();
                     for closed in old_workers.difference(&cur_workers) {
-                        log_line(&shadow_log, &format!("closed pane detected via snapshot diff: {closed}"));
+                        log_line(
+                            &shadow_log,
+                            &format!("closed pane detected via snapshot diff: {closed}"),
+                        );
                     }
                 }
             }
@@ -263,17 +291,10 @@ pub fn reconcile_step<D: HerdrDriver>(
     // Owner/workspace stay unscoped here (the hook has no caller pane and must
     // repair every owner's layout); the planner already arranges one workspace
     // at a time, so no op can cross a workspace boundary.
-    let mut non_deferred: Vec<Op> = filter_ops_for_check(
-        &ops,
-        &snap,
-        None,
-        None,
-        None,
-        None,
-    )
-    .into_iter()
-    .cloned()
-    .collect();
+    let mut non_deferred: Vec<Op> = filter_ops_for_check(&ops, &snap, None, None, None, None)
+        .into_iter()
+        .cloned()
+        .collect();
 
     if non_deferred.is_empty() {
         return Ok(());
@@ -287,7 +308,9 @@ pub fn reconcile_step<D: HerdrDriver>(
             if let Ok(failed_ops) = serde_json::from_str::<Vec<Op>>(&failed_text) {
                 let prev_len = non_deferred.len();
                 non_deferred.retain(|op| {
-                    !failed_ops.iter().any(|f| f.pane == op.pane && f.target == op.target)
+                    !failed_ops
+                        .iter()
+                        .any(|f| f.pane == op.pane && f.target == op.target)
                 });
                 if non_deferred.len() < prev_len {
                     log_line(&shadow_log, "backoff: skipping previously failed ops");
@@ -343,14 +366,19 @@ pub fn reconcile_step<D: HerdrDriver>(
 
 pub fn run_hook() -> Result<(), String> {
     let sdir = state_dir();
-    create_dir_all(&sdir).map_err(|e| format!("cannot create state dir {}: {e}", sdir.display()))?;
+    create_dir_all(&sdir)
+        .map_err(|e| format!("cannot create state dir {}: {e}", sdir.display()))?;
 
     let event_name = std::env::var("HERDR_PLUGIN_EVENT").ok();
     let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").ok();
     let last_snap_file = sdir.join("last_snapshot.json");
 
     // Finding 4: Early exit on irrelevant status events without acquiring lock
-    if should_early_exit(event_name.as_deref(), event_json.as_deref(), &last_snap_file) {
+    if should_early_exit(
+        event_name.as_deref(),
+        event_json.as_deref(),
+        &last_snap_file,
+    ) {
         return Ok(());
     }
 
@@ -367,7 +395,11 @@ pub fn run_hook() -> Result<(), String> {
 
     let pending_file = sdir.join("pending");
     let pid_str = std::process::id().to_string();
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&pending_file) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&pending_file)
+    {
         let _ = writeln!(f, "{pid_str}");
     }
 

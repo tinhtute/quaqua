@@ -1184,9 +1184,12 @@ fn test_team_toml_harness_routing() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml");
     let cfg = config::load(&team_path).expect("valid team.toml");
 
-    // tieude is omp with the opencode-go model at effort high
-    assert_eq!(cfg.kinds["tieude"].harness, "omp");
-    assert_eq!(cfg.kinds["tieude"].model, "opencode-go/deepseek-v4.1-flash");
+    // tieude is pi with the mistral model at effort high
+    assert_eq!(cfg.kinds["tieude"].harness, "pi");
+    assert_eq!(
+        cfg.kinds["tieude"].model,
+        "mistral/deepseek-v4-1-flash-1017"
+    );
     assert_eq!(cfg.kinds["tieude"].effort.as_deref(), Some("high"));
     assert!(!cfg.kinds["tieude"].can_review);
     // fallback seeds: tieude->sude, sude->suhuynh; claude kinds none
@@ -1218,14 +1221,14 @@ fn test_team_toml_harness_routing() {
     assert_eq!(cfg.kinds["suhuynh"].effort.as_deref(), Some("medium"));
     assert!(cfg.kinds["suhuynh"].can_review);
 
-    // truonglao is claude with can_review=true; every kind is omp/claude
+    // truonglao is claude with can_review=true; every kind is pi/omp/claude
     assert_eq!(cfg.kinds["truonglao"].harness, "claude");
     assert!(cfg.kinds["truonglao"].can_review);
     assert_eq!(cfg.kinds.len(), 5, "only the five surviving kinds");
     assert!(cfg
         .kinds
         .values()
-        .all(|k| ["omp", "claude"].contains(&k.harness.as_str())));
+        .all(|k| ["pi", "omp", "claude"].contains(&k.harness.as_str())));
 
     // every purpose resolves to a surviving kind (research left detu behind)
     assert_eq!(cfg.purposes["research"], "tieude");
@@ -1318,12 +1321,12 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
         .iter()
         .any(|a| a.ends_with("omp-worker-state.ts")));
 
-    // 3. LEAD_KIND env override switches lead back to tieude (omp)
+    // 3. LEAD_KIND env override switches lead to tieude (pi)
     let (kind_tieude, launch_tieude) =
         quaqua::lead::spawn::resolve_lead_launch(&cfg, Some("tieude")).expect("tieude lead");
     assert_eq!(kind_tieude, "tieude");
-    assert_eq!(launch_tieude.harness, "omp");
-    assert_eq!(launch_tieude.model, "opencode-go/deepseek-v4.1-flash");
+    assert_eq!(launch_tieude.harness, "pi");
+    assert_eq!(launch_tieude.model, "mistral/deepseek-v4-1-flash-1017");
     assert_eq!(launch_tieude.effort, "high");
 
     let cmd_tieude = build_launch_cmd(
@@ -1335,20 +1338,13 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
         false,
     )
     .unwrap();
-    assert_eq!(cmd_tieude.split_envs.len(), 2);
-    assert_eq!(cmd_tieude.split_envs[0].0, "QUAQUA_STATE_FILE");
-    assert_eq!(cmd_tieude.split_envs[1].0, "QUAQUA_ERROR_FILE");
     assert!(!cmd_tieude.agent_args.iter().any(|a| a == "--no-extensions"));
-    assert!(cmd_tieude
-        .agent_args
-        .iter()
-        .any(|a| a.ends_with("omp-worker-state.ts")));
 
     // 4. Unknown LEAD_KIND falls back to tieude
     let (kind_fallback, launch_fallback) =
         quaqua::lead::spawn::resolve_lead_launch(&cfg, Some("nonexistent_kind")).expect("fallback");
     assert_eq!(kind_fallback, "tieude");
-    assert_eq!(launch_fallback.harness, "omp");
+    assert_eq!(launch_fallback.harness, "pi");
 
     // 5. Missing lead_kind in Strategy defaults to tieude
     let mut cfg_no_lead = cfg.clone();
@@ -1356,7 +1352,7 @@ fn test_lead_launch_uses_strategy_lead_kind_and_override() {
     let (kind_default, launch_default) =
         quaqua::lead::spawn::resolve_lead_launch(&cfg_no_lead, None).expect("default");
     assert_eq!(kind_default, "tieude");
-    assert_eq!(launch_default.harness, "omp");
+    assert_eq!(launch_default.harness, "pi");
 }
 
 #[test]
@@ -1958,8 +1954,6 @@ fn test_launch_args_pi_exact_and_isolated() {
         "tieude",
     )
     .unwrap();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let ext = format!("{home}/.pi/agent/extensions/herdr-agent-state.ts");
     let build = build_launch_cmd(
         &pi,
         "tieude-x",
@@ -1982,9 +1976,6 @@ fn test_launch_args_pi_exact_and_isolated() {
             "/r/x.rules.md",
             "--session-dir",
             "/runs/.pi-sessions/tieude-x",
-            "--no-extensions",
-            "-e",
-            ext.as_str(),
             "--no-approve",
         ]
     );
@@ -2079,15 +2070,7 @@ fn test_launch_review_args_per_harness() {
     let runs = launch_runs_dir("review-per-harness");
     let cmd = |harness: &str, model: &str, effort: &str, review: bool| {
         let l = resolve_launch(&kind(harness, model, Some(effort)), "k").unwrap();
-        build_launch_cmd(
-            &l,
-            "rev",
-            "/r/x.rules.md",
-            &runs,
-            "/repo/.wt/rev",
-            review,
-        )
-        .unwrap()
+        build_launch_cmd(&l, "rev", "/r/x.rules.md", &runs, "/repo/.wt/rev", review).unwrap()
     };
 
     // omp: review drops edit/write, keeps read tools + bash.
@@ -2181,7 +2164,10 @@ fn test_claude_review_settings_allow_readonly_evidence_deny_writes() {
         }
         dirs.push(a.as_str());
     }
-    assert!(dirs.contains(&runs.as_str()), "runs dir not readable: {dirs:?}");
+    assert!(
+        dirs.contains(&runs.as_str()),
+        "runs dir not readable: {dirs:?}"
+    );
     assert!(
         dirs.contains(&"/repo/.wt"),
         "builder worktree not readable: {dirs:?}"
@@ -2854,9 +2840,14 @@ fn test_spawn_worker_reports_herdr_start_error() {
         repo_dir.to_str().unwrap().to_string(),
     ])
     .unwrap();
-    let (_code, msg) =
-        quaqua::worker::spawn::spawn_worker(opts, &cfg, &git, &herdr, quaqua::layout::SpawnOrigin::Cli)
-            .expect_err("a failed agent start must fail the spawn");
+    let (_code, msg) = quaqua::worker::spawn::spawn_worker(
+        opts,
+        &cfg,
+        &git,
+        &herdr,
+        quaqua::layout::SpawnOrigin::Cli,
+    )
+    .expect_err("a failed agent start must fail the spawn");
     assert!(
         msg.contains("agent_start_input_failed"),
         "herdr's error code must reach the operator: {msg}"

@@ -3,14 +3,16 @@
 //! Provides virtual clock control, mock activity execution, an in-memory journal,
 //! and the `run_to_completion` execution driver.
 
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 
 use crate::engine::activity::{ActivityError, ActivityRequest, ActivityResult};
 use crate::engine::journal::{EventRecord, Journal, JournalError, SnapshotRecord};
-use crate::engine::workflow::{ScheduledAction, StepDecision, Workflow, WorkflowContext, WorkflowEvent};
+use crate::engine::workflow::{
+    ScheduledAction, StepDecision, Workflow, WorkflowContext, WorkflowEvent,
+};
 
 /// Error returned by the testkit driver.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,7 +39,9 @@ impl From<JournalError> for TestkitError {
 impl std::fmt::Display for TestkitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WorkflowFailed { code, reason } => write!(f, "workflow failed (code {code}): {reason}"),
+            Self::WorkflowFailed { code, reason } => {
+                write!(f, "workflow failed (code {code}): {reason}")
+            }
             Self::ActivityError(err) => write!(f, "activity execution failed: {err}"),
             Self::JournalError(err) => write!(f, "journal operation failed: {err}"),
             Self::StepLimitExceeded(limit) => write!(f, "step limit exceeded ({limit} steps)"),
@@ -154,7 +158,11 @@ impl MockActivities {
     }
 
     /// Executes the activity by recording the call and returning the canned response.
-    pub fn execute(&mut self, id: &str, req: &ActivityRequest) -> Result<ActivityResult, ActivityError> {
+    pub fn execute(
+        &mut self,
+        id: &str,
+        req: &ActivityRequest,
+    ) -> Result<ActivityResult, ActivityError> {
         self.call_log.push((id.to_string(), req.clone()));
         if let Some(res) = self.canned_by_id.get(id) {
             return Ok(res.clone());
@@ -162,7 +170,9 @@ impl MockActivities {
         if let Some(def) = &self.default_result {
             return Ok(def.clone());
         }
-        Err(ActivityError::NotFound(format!("no mock result registered for activity ID: {id}")))
+        Err(ActivityError::NotFound(format!(
+            "no mock result registered for activity ID: {id}"
+        )))
     }
 
     /// Returns the sequence of all recorded activity calls `(id, request)`.
@@ -189,19 +199,33 @@ impl InMemoryJournal {
     }
 
     pub fn all_events(&self, workflow_id: &str) -> &[EventRecord] {
-        self.events.get(workflow_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.events
+            .get(workflow_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn all_snapshots(&self, workflow_id: &str) -> &[SnapshotRecord] {
-        self.snapshots.get(workflow_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.snapshots
+            .get(workflow_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
 impl Journal for InMemoryJournal {
-    fn append_event(&mut self, workflow_id: &str, event: &EventRecord) -> Result<u64, JournalError> {
+    fn append_event(
+        &mut self,
+        workflow_id: &str,
+        event: &EventRecord,
+    ) -> Result<u64, JournalError> {
         let list = self.events.entry(workflow_id.to_string()).or_default();
         let expected_seq = (list.len() + 1) as u64;
-        let assigned_seq = if event.seq == 0 { expected_seq } else { event.seq };
+        let assigned_seq = if event.seq == 0 {
+            expected_seq
+        } else {
+            event.seq
+        };
 
         let mut rec = event.clone();
         rec.seq = assigned_seq;
@@ -209,20 +233,38 @@ impl Journal for InMemoryJournal {
         Ok(assigned_seq)
     }
 
-    fn append_snapshot(&mut self, workflow_id: &str, snapshot: &SnapshotRecord) -> Result<(), JournalError> {
+    fn append_snapshot(
+        &mut self,
+        workflow_id: &str,
+        snapshot: &SnapshotRecord,
+    ) -> Result<(), JournalError> {
         let list = self.snapshots.entry(workflow_id.to_string()).or_default();
         list.push(snapshot.clone());
         Ok(())
     }
 
-    fn load_events(&self, workflow_id: &str, since_seq: u64) -> Result<Vec<EventRecord>, JournalError> {
+    fn load_events(
+        &self,
+        workflow_id: &str,
+        since_seq: u64,
+    ) -> Result<Vec<EventRecord>, JournalError> {
         let empty = Vec::new();
         let list = self.events.get(workflow_id).unwrap_or(&empty);
-        Ok(list.iter().filter(|e| e.seq >= since_seq).cloned().collect())
+        Ok(list
+            .iter()
+            .filter(|e| e.seq >= since_seq)
+            .cloned()
+            .collect())
     }
 
-    fn load_latest_snapshot(&self, workflow_id: &str) -> Result<Option<SnapshotRecord>, JournalError> {
-        Ok(self.snapshots.get(workflow_id).and_then(|list| list.last().cloned()))
+    fn load_latest_snapshot(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<SnapshotRecord>, JournalError> {
+        Ok(self
+            .snapshots
+            .get(workflow_id)
+            .and_then(|list| list.last().cloned()))
     }
 }
 
@@ -354,7 +396,11 @@ pub fn run_to_completion<W: Workflow>(
 
                     clock.schedule_timer(id, duration);
                 }
-                ScheduledAction::Child { id, workflow_type, input } => {
+                ScheduledAction::Child {
+                    id,
+                    workflow_type,
+                    input,
+                } => {
                     seq += 1;
                     journal.append_event(
                         workflow_id,
@@ -395,10 +441,7 @@ pub fn run_to_completion<W: Workflow>(
                 )?;
                 journal.append_snapshot(
                     workflow_id,
-                    &SnapshotRecord::new(
-                        seq,
-                        serde_json::to_string(&state).unwrap_or_default(),
-                    ),
+                    &SnapshotRecord::new(seq, serde_json::to_string(&state).unwrap_or_default()),
                 )?;
                 return Ok(output);
             }
@@ -485,7 +528,11 @@ pub fn run_to_completion<W: Workflow>(
                     reason: None,
                 });
             }
-            StepDecision::StartChild { id, workflow_type, input } => {
+            StepDecision::StartChild {
+                id,
+                workflow_type,
+                input,
+            } => {
                 seq += 1;
                 journal.append_event(
                     workflow_id,

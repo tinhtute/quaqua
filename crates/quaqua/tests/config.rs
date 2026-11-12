@@ -49,11 +49,29 @@ fn config_repo_kinds_carry_model_and_effort() {
     // validate on its own (no models.md drift check anymore).
     let out = run(&["config", "validate", "--file", &repo_team()]);
     assert!(out.status.success(), "validate failed: {}", stderr(&out));
-    let effort = run(&["config", "get", "kinds.tieude.effort", "--file", &repo_team()]);
+    let effort = run(&[
+        "config",
+        "get",
+        "kinds.tieude.effort",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&effort).trim(), "high");
-    let fallback = run(&["config", "get", "kinds.tieude.fallback", "--file", &repo_team()]);
+    let fallback = run(&[
+        "config",
+        "get",
+        "kinds.tieude.fallback",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&fallback).trim(), "sude");
-    let sude_fallback = run(&["config", "get", "kinds.sude.fallback", "--file", &repo_team()]);
+    let sude_fallback = run(&[
+        "config",
+        "get",
+        "kinds.sude.fallback",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&sude_fallback).trim(), "suhuynh");
 }
 
@@ -81,7 +99,7 @@ fn config_rule_key_table_covers_every_source_rule() {
     );
 
     for (source, want) in [
-        ("| AGENTS.md", 13),           // 7 Rules + 6 Protocol
+        ("| AGENTS.md", 13), // 7 Rules + 6 Protocol
         ("| `worker-cap.sh`", 4),
         ("| `worker-timebox.md`", 11), // one per bullet
         ("| `models.md`", 10),
@@ -106,7 +124,11 @@ fn config_rule_key_table_covers_every_source_rule() {
 fn config_base_fixture_validates_ok() {
     let base = fixtures_dir().join("base.toml");
     let out = run(&["config", "validate", "--file", &base.to_string_lossy()]);
-    assert!(out.status.success(), "base fixture rejected: {}", stderr(&out));
+    assert!(
+        out.status.success(),
+        "base fixture rejected: {}",
+        stderr(&out)
+    );
 }
 
 /// Review round 2, finding 1: `--project X` must not re-check the other projects
@@ -124,19 +146,17 @@ fn config_validate_project_does_not_recheck_other_projects() {
         vec!["config", "validate", "--file", f.as_str(), "--project", "c"],
     ] {
         let out = run(&args);
-        assert!(
-            out.status.success(),
-            "{args:?} rejected: {}",
-            stderr(&out)
-        );
+        assert!(out.status.success(), "{args:?} rejected: {}", stderr(&out));
     }
 
     // an unknown project is still an error
-    let ghost = run(&[
-        "config", "validate", "--file", &f, "--project", "ghost",
-    ]);
+    let ghost = run(&["config", "validate", "--file", &f, "--project", "ghost"]);
     assert!(!ghost.status.success());
-    assert!(stderr(&ghost).contains("unknown project 'ghost'"), "{}", stderr(&ghost));
+    assert!(
+        stderr(&ghost).contains("unknown project 'ghost'"),
+        "{}",
+        stderr(&ghost)
+    );
 }
 
 #[test]
@@ -172,7 +192,11 @@ fn config_get_cap_applies_project_override() {
         "--project",
         "zimage",
     ]);
-    assert!(zimage.status.success(), "override get failed: {}", stderr(&zimage));
+    assert!(
+        zimage.status.success(),
+        "override get failed: {}",
+        stderr(&zimage)
+    );
     assert_eq!(stdout(&zimage).trim(), "3");
 }
 
@@ -181,7 +205,13 @@ fn config_lead_peer_cap_matches_the_slp() {
     let file = repo_team();
 
     // the SLP pair: builder sude (omp) and reviewer suhuynh (pi) differ by harness
-    let differ = run(&["config", "get", "strategy.builder_reviewer_differ", "--file", &file]);
+    let differ = run(&[
+        "config",
+        "get",
+        "strategy.builder_reviewer_differ",
+        "--file",
+        &file,
+    ]);
     assert_eq!(stdout(&differ).trim(), "harness");
 
     // a Lead spawns at most 4 Peers ...
@@ -214,15 +244,39 @@ fn config_lead_peer_cap_matches_the_slp() {
 
 #[test]
 fn config_get_can_review_and_kind_fields() {
-    let can = run(&["config", "get", "kinds.suhuynh.can_review", "--file", &repo_team()]);
+    let can = run(&[
+        "config",
+        "get",
+        "kinds.suhuynh.can_review",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&can).trim(), "true");
-    let cannot = run(&["config", "get", "kinds.tieude.can_review", "--file", &repo_team()]);
+    let cannot = run(&[
+        "config",
+        "get",
+        "kinds.tieude.can_review",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&cannot).trim(), "false");
-    let harness = run(&["config", "get", "kinds.sude.harness", "--file", &repo_team()]);
+    let harness = run(&[
+        "config",
+        "get",
+        "kinds.sude.harness",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&harness).trim(), "omp");
     let effort = run(&["config", "get", "kinds.sude.effort", "--file", &repo_team()]);
     assert_eq!(stdout(&effort).trim(), "high");
-    let spawn = run(&["config", "get", "kinds.truonglao.spawn", "--file", &repo_team()]);
+    let spawn = run(&[
+        "config",
+        "get",
+        "kinds.truonglao.spawn",
+        "--file",
+        &repo_team(),
+    ]);
     assert_eq!(stdout(&spawn).trim(), "auto");
 }
 
@@ -230,7 +284,11 @@ fn config_get_can_review_and_kind_fields() {
 fn config_get_unknown_key_fails_clearly() {
     let out = run(&["config", "get", "nope.nope", "--file", &repo_team()]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("unknown key 'nope.nope'"), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown key 'nope.nope'"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -245,7 +303,11 @@ fn config_get_unknown_project_fails_clearly() {
         "ghost",
     ]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("unknown project 'ghost'"), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown project 'ghost'"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
 
 /// Each invalid fixture is rejected, exits non-zero, and the message names the
@@ -264,8 +326,14 @@ fn config_invalid_fixtures_are_rejected() {
         ("missing-effort.toml", "effort is missing"),
         ("bad-effort.toml", "does not take effort 'banana'"),
         ("bad-opencode-variant.toml", "does not take effort 'medium'"),
-        ("bad-opencode-openrouter-variant.toml", "does not take effort 'medium'"),
-        ("unknown-opencode-model.toml", "is not in allowlist (fix: add model and variants to team.toml [opencode_models])"),
+        (
+            "bad-opencode-openrouter-variant.toml",
+            "does not take effort 'medium'",
+        ),
+        (
+            "unknown-opencode-model.toml",
+            "is not in allowlist (fix: add model and variants to team.toml [opencode_models])",
+        ),
         ("fallback-missing.toml", "fallback 'ghost' is not a kind"),
         ("fallback-self.toml", "fallback names itself"),
         ("fallback-cannot-review.toml", "cannot review"),
@@ -276,16 +344,31 @@ fn config_invalid_fixtures_are_rejected() {
         ("typo-section.toml", "unknown field `project`"),
         ("empty-reviewer.toml", "default_reviewer is empty"),
         ("project-cap-zero.toml", "is below 1"),
-        ("lead-max-peers-over.toml", "roles.lead.max_peers 9 must be in 1..=8"),
-        ("lead-max-peers-zero.toml", "roles.lead.max_peers 0 must be in 1..=8"),
+        (
+            "lead-max-peers-over.toml",
+            "roles.lead.max_peers 9 must be in 1..=8",
+        ),
+        (
+            "lead-max-peers-zero.toml",
+            "roles.lead.max_peers 0 must be in 1..=8",
+        ),
         ("cos-max-peers.toml", "role 'cos' takes no max_peers"),
         ("bad-timer-duration.toml", "timers.budget_default"),
         ("bad-timer-nudge.toml", "timers.nudge_at"),
         ("bad-timer-grace.toml", "timers.grace"),
         ("unknown-spawn.toml", "unknown spawn policy 'sometimes'"),
-        ("kill-on-claude.toml", "kind 'ni': on_cost_cap = \"kill\" is not allowed on harness 'claude'"),
-        ("kill-on-pi.toml", "kind 'ni': on_cost_cap = \"kill\" is not allowed on harness 'pi'"),
-        ("kill-fallback-claude.toml", "kind 'ni': on_cost_cap = \"kill\" is not allowed on fallback 'rv'"),
+        (
+            "kill-on-claude.toml",
+            "kind 'ni': on_cost_cap = \"kill\" is not allowed on harness 'claude'",
+        ),
+        (
+            "kill-on-pi.toml",
+            "kind 'ni': on_cost_cap = \"kill\" is not allowed on harness 'pi'",
+        ),
+        (
+            "kill-fallback-claude.toml",
+            "kind 'ni': on_cost_cap = \"kill\" is not allowed on fallback 'rv'",
+        ),
     ];
 
     for (name, needle) in cases {
@@ -314,14 +397,21 @@ fn config_get_purposes() {
 
 #[test]
 fn config_get_opencode_models() {
-    let out = run(&["config", "get", "opencode_models.deepseek-v4.1-flash", "--file", &repo_team()]);
+    let out = run(&[
+        "config",
+        "get",
+        "opencode_models.deepseek-v4.1-flash",
+        "--file",
+        &repo_team(),
+    ]);
     assert!(out.status.success(), "get failed: {}", stderr(&out));
     assert!(stdout(&out).contains("max"));
 }
 
 #[test]
 fn config_opencode_models_table_merges_over_defaults() {
-    let temp = std::env::temp_dir().join(format!("quaqua-test-models-merge-{}", std::process::id()));
+    let temp =
+        std::env::temp_dir().join(format!("quaqua-test-models-merge-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp);
     let toml_path = temp.join("team.toml");
     let content = r#"schema_version = 2
@@ -329,12 +419,32 @@ fn config_opencode_models_table_merges_over_defaults() {
 "custom-model" = ["low"]
 "#;
     std::fs::write(&toml_path, content).unwrap();
-    let out = run(&["config", "get", "opencode_models.deepseek-v4.1-flash", "--file", toml_path.to_str().unwrap()]);
-    assert!(out.status.success(), "get deepseek failed: {}", stderr(&out));
+    let out = run(&[
+        "config",
+        "get",
+        "opencode_models.deepseek-v4.1-flash",
+        "--file",
+        toml_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "get deepseek failed: {}",
+        stderr(&out)
+    );
     assert!(stdout(&out).contains("max"));
 
-    let out2 = run(&["config", "get", "opencode_models.custom-model", "--file", toml_path.to_str().unwrap()]);
-    assert!(out2.status.success(), "get custom failed: {}", stderr(&out2));
+    let out2 = run(&[
+        "config",
+        "get",
+        "opencode_models.custom-model",
+        "--file",
+        toml_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out2.status.success(),
+        "get custom failed: {}",
+        stderr(&out2)
+    );
     assert!(stdout(&out2).contains("low"));
 
     let _ = std::fs::remove_dir_all(&temp);
@@ -358,7 +468,10 @@ fn config_kill_refused_at_spawn() {
             .env("QUAQUA_TEST", "1")
             .env("QUAQUA_LAYOUT_SHADOW", "1")
             .env("QUAQUA_OWNER", "cos")
-            .env("QUAQUA_RUNS_DIR", std::env::temp_dir().join("quaqua-kill-runs"))
+            .env(
+                "QUAQUA_RUNS_DIR",
+                std::env::temp_dir().join("quaqua-kill-runs"),
+            )
             .args(["worker", "spawn", "ni-kill", "ni", &repo.to_string_lossy()])
             .output()
             .expect("spawn quaqua");
@@ -368,16 +481,22 @@ fn config_kill_refused_at_spawn() {
             err.contains("kind 'ni'") && err.contains("on_cost_cap") && err.contains(needle),
             "{name}: {err:?}"
         );
-        assert!(!repo.exists(), "{name}: refusal must precede any worktree work");
+        assert!(
+            !repo.exists(),
+            "{name}: refusal must precede any worktree work"
+        );
     }
 }
 
 /// kill on omp with a stop-key fallback stays valid.
 #[test]
 fn config_kill_on_omp_validates() {
+    // The shipped template has no omp -> omp pair left (tieude is pi, which has
+    // no stop key), so this case writes the pair it needs: tieude back on omp
+    // keeps its sude (omp) fallback, and both ends carry a stop key.
     let body = std::fs::read_to_string(repo_team()).expect("read team.toml");
     let ok = body.replacen(
-        "[kinds.tieude]\nharness = \"omp\"\n",
+        "[kinds.tieude]\nharness = \"pi\"\n",
         "[kinds.tieude]\nharness = \"omp\"\non_cost_cap = \"kill\"\n",
         1,
     );
@@ -386,5 +505,9 @@ fn config_kill_on_omp_validates() {
     std::fs::write(&tmp, ok).unwrap();
     let out = run(&["config", "validate", "--file", &tmp.to_string_lossy()]);
     let _ = std::fs::remove_file(&tmp);
-    assert!(out.status.success(), "kill on omp must load: {}", stderr(&out));
+    assert!(
+        out.status.success(),
+        "kill on omp must load: {}",
+        stderr(&out)
+    );
 }

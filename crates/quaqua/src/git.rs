@@ -43,11 +43,7 @@ impl Git {
 
 impl GitOps for Git {
     fn run_in(&self, dir: &Path, args: &[&str]) -> std::io::Result<Output> {
-        Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
+        Command::new("git").arg("-C").arg(dir).args(args).output()
     }
 
     fn run(&self, args: &[&str]) -> std::io::Result<Output> {
@@ -58,7 +54,13 @@ impl GitOps for Git {
         let commit_ref = format!("{}^{{commit}}", base);
         match self.run_in(
             repo,
-            &["rev-parse", "--verify", "--quiet", "--end-of-options", &commit_ref],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &commit_ref,
+            ],
         ) {
             Ok(out) => out.status.success(),
             Err(_) => false,
@@ -218,10 +220,7 @@ impl GitOps for Git {
             .as_ref()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        let untracked = st_text
-            .lines()
-            .filter(|l| l.starts_with("??"))
-            .count();
+        let untracked = st_text.lines().filter(|l| l.starts_with("??")).count();
 
         let mut diffstat = if short.is_empty() {
             "clean".to_string()

@@ -18,7 +18,11 @@ const VN_OFFSET_MS: i64 = 7 * 3600 * 1000;
     about = "OpenCode usage audit (text-only) — task cost = whole session (matches watchdog), day rows = window"
 )]
 pub struct UsageArgs {
-    #[arg(long, default_value_t = 7, help = "number of VN calendar days (default 7)")]
+    #[arg(
+        long,
+        default_value_t = 7,
+        help = "number of VN calendar days (default 7)"
+    )]
     pub days: u32,
 
     #[arg(long, help = "emit JSON instead of text")]
@@ -33,7 +37,10 @@ pub struct UsageArgs {
     #[arg(long, help = "override local opencode version (offline)")]
     pub local_version: Option<String>,
 
-    #[arg(long, help = "path to opencode.db (default ~/.local/share/opencode/opencode.db)")]
+    #[arg(
+        long,
+        help = "path to opencode.db (default ~/.local/share/opencode/opencode.db)"
+    )]
     pub db: Option<PathBuf>,
 
     #[arg(long, help = "repo for git outcomes (default ~/quaqua)")]
@@ -254,11 +261,7 @@ pub fn parse_iso_utc(s: &str) -> Option<i64> {
 
     let mut millis = 0i64;
     if !frac.is_empty() {
-        let frac_3 = if frac.len() >= 3 {
-            &frac[..3]
-        } else {
-            frac
-        };
+        let frac_3 = if frac.len() >= 3 { &frac[..3] } else { frac };
         if let Ok(v) = frac_3.parse::<i64>() {
             millis = match frac_3.len() {
                 1 => v * 100,
@@ -514,9 +517,19 @@ pub fn fetch_request_logs(
                 ));
             }
         };
-        let items = d.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let oldest = items.iter().filter_map(|i| i.get("startedAt").and_then(|v| v.as_i64())).min();
-        let next_cursor = d.get("nextCursor").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let items = d
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let oldest = items
+            .iter()
+            .filter_map(|i| i.get("startedAt").and_then(|v| v.as_i64()))
+            .min();
+        let next_cursor = d
+            .get("nextCursor")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let has_items = !items.is_empty();
         rows.extend(items);
         cursor = next_cursor;
@@ -559,11 +572,10 @@ pub fn fixture_logs(dirpath: &Path) -> Result<Vec<serde_json::Value>, SourceUnav
         source: "request-logs fixture".to_string(),
         reason: format!("missing {}", path.display()),
     })?;
-    let val: serde_json::Value =
-        serde_json::from_str(&content).map_err(|_| SourceUnavailable {
-            source: "request-logs fixture".to_string(),
-            reason: format!("bad JSON in {}", path.display()),
-        })?;
+    let val: serde_json::Value = serde_json::from_str(&content).map_err(|_| SourceUnavailable {
+        source: "request-logs fixture".to_string(),
+        reason: format!("bad JSON in {}", path.display()),
+    })?;
     let mut rows = Vec::new();
     if let Some(pages) = val.get("pages").and_then(|v| v.as_array()) {
         for page in pages {
@@ -668,8 +680,16 @@ pub fn is_process_cmd(target: &str) -> bool {
                     sub_start += 1;
                 }
                 for &sub in &[
-                    "worker", "pipeline", "lead", "config", "merge", "grid", "gate", "taskforce",
-                    "advisor", "usage",
+                    "worker",
+                    "pipeline",
+                    "lead",
+                    "config",
+                    "merge",
+                    "grid",
+                    "gate",
+                    "taskforce",
+                    "advisor",
+                    "usage",
                 ] {
                     if target[sub_start..].starts_with(sub) {
                         let after = sub_start + sub.len();
@@ -712,7 +732,15 @@ pub fn is_product_cmd(target: &str) -> bool {
     let s = target.trim_start();
     let n = s.len();
     for &cmd in &[
-        "cargo-nextest", "rustc", "pytest", "python3", "python", "npm", "node", "zkill", "cargo",
+        "cargo-nextest",
+        "rustc",
+        "pytest",
+        "python3",
+        "python",
+        "npm",
+        "node",
+        "zkill",
+        "cargo",
     ] {
         if s.starts_with(cmd) {
             let after = cmd.len();
@@ -739,8 +767,7 @@ pub fn is_product_cmd(target: &str) -> bool {
             let end_idx = actual_idx + 5;
             if end_idx < target.len() && target.as_bytes()[end_idx].is_ascii_whitespace() {
                 let mut sub_start = end_idx;
-                while sub_start < target.len()
-                    && target.as_bytes()[sub_start].is_ascii_whitespace()
+                while sub_start < target.len() && target.as_bytes()[sub_start].is_ascii_whitespace()
                 {
                     sub_start += 1;
                 }
@@ -919,7 +946,10 @@ pub fn read_messages(
                             .or_else(|| c.get("input"))
                             .cloned()
                             .unwrap_or_else(|| serde_json::json!({}));
-                        tools.entry(sid.clone()).or_default().push((name.to_string(), inp));
+                        tools
+                            .entry(sid.clone())
+                            .or_default()
+                            .push((name.to_string(), inp));
                     }
                 }
             }
@@ -1101,10 +1131,7 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
         } else {
             None
         };
-        let db = args
-            .db
-            .clone()
-            .unwrap_or_else(|| expand_path(DB_DEFAULT));
+        let db = args.db.clone().unwrap_or_else(|| expand_path(DB_DEFAULT));
         let rep = args
             .repo
             .clone()
@@ -1164,18 +1191,20 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
         if !tasks.contains_key(&key) {
             task_order.push(key.clone());
         }
-        let e = tasks.entry(key.clone()).or_insert_with(|| InternalTaskEntry {
-            task: key.clone(),
-            spend_src: "requests".to_string(),
-            sessions: std::collections::BTreeSet::new(),
-            requests: 0,
-            cost: 0.0,
-            tokens: Tokens::default(),
-            first: None,
-            last: None,
-            outcome: Vec::new(),
-            idle_min: 0,
-        });
+        let e = tasks
+            .entry(key.clone())
+            .or_insert_with(|| InternalTaskEntry {
+                task: key.clone(),
+                spend_src: "requests".to_string(),
+                sessions: std::collections::BTreeSet::new(),
+                requests: 0,
+                cost: 0.0,
+                tokens: Tokens::default(),
+                first: None,
+                last: None,
+                outcome: Vec::new(),
+                idle_min: 0,
+            });
         if let Some(s) = &sid {
             e.sessions.insert(s.clone());
         }
@@ -1185,8 +1214,14 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
         e.tokens.add(&Tokens {
             input: r.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
             output: r.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            reasoning: r.get("reasoningTokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_read: r.get("cacheReadTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            reasoning: r
+                .get("reasoningTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read: r
+                .get("cacheReadTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         });
         let start = r.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
         let end = r
@@ -1214,8 +1249,14 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
         d.tokens.add(&Tokens {
             input: r.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
             output: r.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            reasoning: r.get("reasoningTokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_read: r.get("cacheReadTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            reasoning: r
+                .get("reasoningTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read: r
+                .get("cacheReadTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         });
         d.first = Some(d.first.map_or(start, |f| f.min(start)));
         d.last = Some(d.last.map_or(end, |l| l.max(end)));
@@ -1422,9 +1463,16 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
     }
 
     let mut meter = BTreeMap::new();
-    if let Some(m_obj) = meter_raw.as_ref().and_then(|v| v.get("usage")).and_then(|v| v.as_object()) {
+    if let Some(m_obj) = meter_raw
+        .as_ref()
+        .and_then(|v| v.get("usage"))
+        .and_then(|v| v.as_object())
+    {
         for (win, w) in m_obj {
-            let resets = w.get("resetsAt").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let resets = w
+                .get("resetsAt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let mut start_ms: Option<i64> = None;
             if let Some(r_str) = &resets {
                 if let Some(rdt_ms) = parse_iso_utc(r_str) {
@@ -1436,11 +1484,7 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
                         let days = rdt_ms.div_euclid(86_400_000);
                         let rem = rdt_ms.rem_euclid(86_400_000);
                         let (y, m, d) = civil_from_days(days);
-                        let (prev_y, prev_m) = if m == 1 {
-                            (y - 1, 12)
-                        } else {
-                            (y, m - 1)
-                        };
+                        let (prev_y, prev_m) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
                         let prev_days = days_from_civil(prev_y, prev_m, d);
                         prev_days * 86_400_000 + rem
                     } else {
@@ -1450,7 +1494,10 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
                 }
             }
             let percent = w.get("percent").and_then(|v| v.as_i64());
-            let status = w.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let status = w
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let mut entry = MeterWindow {
                 percent,
                 status,
@@ -1479,7 +1526,11 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
 
     let mut machines = Vec::new();
     let mut sorted_machines: Vec<MachineStat> = machine_stats.into_values().collect();
-    sorted_machines.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_machines.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for mut m in sorted_machines {
         let ver = extract_version(&m.ua);
         let is_local = local_ver.is_some() && ver.as_deref() == local_ver.as_deref();
@@ -1532,7 +1583,11 @@ pub fn build_report(args: &UsageArgs) -> UsageReport {
             outcome: t.outcome.join("; "),
         })
         .collect();
-    final_tasks.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    final_tasks.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let days_table: Vec<DayStat> = day_order
         .into_iter()
@@ -1643,7 +1698,10 @@ pub fn render_text(rep: &UsageReport) -> Result<String, String> {
         ));
         for m in &rep.machines {
             if !m.local {
-                lines.push(format!("       {}: {} req · ${:.4}", m.ua, m.requests, m.cost));
+                lines.push(format!(
+                    "       {}: {} req · ${:.4}",
+                    m.ua, m.requests, m.cost
+                ));
             }
         }
     }
@@ -1674,7 +1732,10 @@ pub fn render_text(rep: &UsageReport) -> Result<String, String> {
     }
 
     lines.push(String::new());
-    lines.push("== Per task (task cost = whole session, matching watchdog; day rows = window) ==".to_string());
+    lines.push(
+        "== Per task (task cost = whole session, matching watchdog; day rows = window) =="
+            .to_string(),
+    );
     lines.push(format!(
         "{:<26} {:<8} {:>5} {:>9} {:>7} {:>7} {:>6} {:>9} {:>6} {:<34} {}",
         "task", "src", "req", "$", "in", "out", "rsn", "cacheRead", "wall", "outcome", "flags"

@@ -247,8 +247,13 @@ pub fn write_claude_settings(
     read_root: Option<&str>,
 ) -> Result<String, (i32, String)> {
     let path = crate::state::WorkerMetadata::settings_path(Path::new(runs_dir), name);
-    let body = serde_json::to_string_pretty(&claude_settings(name, runs_dir, read_root))
-        .map_err(|e| (1, format!("error: cannot render claude settings for '{name}': {e}\n")))?;
+    let body =
+        serde_json::to_string_pretty(&claude_settings(name, runs_dir, read_root)).map_err(|e| {
+            (
+                1,
+                format!("error: cannot render claude settings for '{name}': {e}\n"),
+            )
+        })?;
     std::fs::write(&path, body).map_err(|e| {
         (
             1,
@@ -337,9 +342,11 @@ pub fn build_launch_cmd(
             args
         }
         "pi" => {
-            // Isolated: only herdr's state extension loads, so personal
-            // subagent/memory extensions cannot spawn outside the grid.
-            let home = std::env::var("HOME").unwrap_or_default();
+            // Default extension discovery (owner decision 2026-11-12): the
+            // model provider (e.g. mistral) comes from a pi package extension,
+            // so `--no-extensions` fails with "No API key found". herdr's
+            // state extension is auto-discovered from ~/.pi/agent/extensions,
+            // so it is not passed with `-e`.
             let mut args = vec![
                 "--".to_string(),
                 "--model".to_string(),
@@ -350,9 +357,6 @@ pub fn build_launch_cmd(
                 rules_file.to_string(),
                 "--session-dir".to_string(),
                 format!("{runs_dir}/.pi-sessions/{name}"),
-                "--no-extensions".to_string(),
-                "-e".to_string(),
-                format!("{home}/.pi/agent/extensions/herdr-agent-state.ts"),
                 "--no-approve".to_string(),
             ];
             if review {
@@ -587,7 +591,10 @@ mod tests {
 
         // Finding 1 [major]: No --no-extensions, discovery remains enabled, exactly one -e
         assert!(!cmd.agent_args.iter().any(|a| a == "--no-extensions"));
-        assert!(!cmd.agent_args.iter().any(|a| a.contains("herdr-omp-agent-state.ts")));
+        assert!(!cmd
+            .agent_args
+            .iter()
+            .any(|a| a.contains("herdr-omp-agent-state.ts")));
         let ext_indices: Vec<usize> = cmd
             .agent_args
             .iter()
@@ -595,7 +602,11 @@ mod tests {
             .filter(|(_, a)| *a == "-e")
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(ext_indices.len(), 1, "must pass exactly one -e for worker state extension");
+        assert_eq!(
+            ext_indices.len(),
+            1,
+            "must pass exactly one -e for worker state extension"
+        );
         let worker_ext = super::omp_worker_state_hook_path("/workspace/runs");
         assert_eq!(cmd.agent_args[ext_indices[0] + 1], worker_ext);
 
@@ -726,8 +737,9 @@ mod tests {
                 .iter()
                 .position(|a| a == "--settings")
                 .expect("claude takes its settings through --settings");
-            let body = std::fs::read_to_string(&cmd.agent_args[at + 1])
-                .unwrap_or_else(|e| panic!("review={review}: --settings must name a file claude can read: {e}"));
+            let body = std::fs::read_to_string(&cmd.agent_args[at + 1]).unwrap_or_else(|e| {
+                panic!("review={review}: --settings must name a file claude can read: {e}")
+            });
             assert!(
                 body.contains(&format!("{runs}/.suhuynh-rev.state")),
                 "review={review}: hooks must record this worker's state: {body}"

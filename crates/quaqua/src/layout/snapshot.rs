@@ -31,9 +31,7 @@ pub enum LayoutOrigin {
         path: PathBuf,
     },
     /// Live configuration (resolved from `team.toml` or synthesized legacy).
-    Live {
-        source: &'static str,
-    },
+    Live { source: &'static str },
 }
 
 impl LayoutOrigin {
@@ -44,7 +42,10 @@ impl LayoutOrigin {
     pub fn source_desc(&self) -> String {
         match self {
             LayoutOrigin::Snapshot { slug, path, .. } => {
-                format!("snapshot {}", path.file_name().and_then(|n| n.to_str()).unwrap_or(slug))
+                format!(
+                    "snapshot {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or(slug)
+                )
             }
             LayoutOrigin::Live { source } => source.to_string(),
         }
@@ -78,11 +79,7 @@ pub fn snapshot_source_tag() -> String {
 }
 
 /// Write a resolved project layout snapshot to `runs/<slug>.layout.toml` via `state::atomic_write`.
-pub fn write_layout_snapshot(
-    runs_dir: &Path,
-    slug: &str,
-    cfg: &Config,
-) -> Result<PathBuf, String> {
+pub fn write_layout_snapshot(runs_dir: &Path, slug: &str, cfg: &Config) -> Result<PathBuf, String> {
     let layout = crate::layout::resolve_layout(cfg)?;
     let sha256 = layout_sha256(&layout)?;
     let source = snapshot_source_tag();
@@ -100,10 +97,7 @@ pub fn write_layout_snapshot(
 }
 
 /// Read and deserialize `runs/<slug>.layout.toml` if it exists.
-pub fn read_layout_snapshot(
-    runs_dir: &Path,
-    slug: &str,
-) -> Result<Option<LayoutSnapshot>, String> {
+pub fn read_layout_snapshot(runs_dir: &Path, slug: &str) -> Result<Option<LayoutSnapshot>, String> {
     let path = crate::state::WorkerMetadata::layout_path(runs_dir, slug);
     if !path.is_file() {
         return Ok(None);
@@ -118,8 +112,7 @@ pub fn read_layout_snapshot(
 /// Refreeze the project snapshot in `runs/<slug>.layout.toml` from the live `team.toml`.
 pub fn run_refreeze(slug: &str) -> Result<String, String> {
     let runs_dir = crate::worker::cleanup::default_runs_dir();
-    let base_cfg = crate::config::load_team_config()
-        .map_err(|(_, msg)| msg.trim().to_string())?;
+    let base_cfg = crate::config::load_team_config().map_err(|(_, msg)| msg.trim().to_string())?;
     let cfg = crate::config::resolve(base_cfg.clone(), Some(slug)).unwrap_or(base_cfg);
     crate::config::validate(&cfg)?;
     let path = write_layout_snapshot(&runs_dir, slug, &cfg)?;

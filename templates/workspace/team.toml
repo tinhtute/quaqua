@@ -52,8 +52,8 @@ design = "truonglao"
 
 # Set harness, model, and effort for every kind; fallback is one hop on agent-start failure only.
 [kinds.tieude]
-harness = "omp"
-model = "opencode-go/deepseek-v4.1-flash"
+harness = "pi"
+model = "mistral/deepseek-v4-1-flash-1017"
 effort = "high"
 fallback = "sude"
 can_review = false
