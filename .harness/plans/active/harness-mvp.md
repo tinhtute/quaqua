@@ -10,7 +10,7 @@ lane: normal
 - actors: Principal, CoS, Leads, workers.
 - authority: Principal 2026-11-11 + raw/2026-11-11-quaqua-cmval.md.
 - requirements:
-  - R1: the G1 review fork can only Read/Write/Edit under `memory/`; a fork attempt to touch any other path or tool is denied by the engine, not by the prompt | acceptance: `cargo test -p quaqua fork_allowlist` `node --test mods/cos-memory/tests/` | source: Q4
+  - R1: the G1 review fork can only Read/Write/Edit under `memory/`; a fork attempt to touch any other path or tool is denied by the engine, not by the prompt | acceptance: `node --test mods/cos-memory/tests/` (the engine denies every `$.model.fork` tool, index.d.ts:6686; there is no Rust fork_allowlist test) | source: Q4
   - R2: `quaqua` refuses at config load (`load_team_config`) any kind on a claude or pi harness with `on_cost_cap = "kill"`, naming the kind and harness; kill on opencode/omp/agy still loads | acceptance: `cargo test -p quaqua config_kill_refused` | source: Q10, Q7
   - R3: the cos-memory mod is loaded in the real CoS session and the review fork has fired there (`review.lastReviewAt` set in the plugin store); `mods/cos-memory/tsconfig.json` is either committed or deliberately left out, with `git status` clean for `mods/cos-memory` | acceptance: `bash mods/cos-memory/tests/install_smoke.sh` `git status --porcelain mods/cos-memory` (empty) | source: Q3, Q8
   - R4: a `quaqua ship` command pushes the worker branch and opens the PR after one Principal approval, and never merges | acceptance: `cargo test -p quaqua ship` | source: Q1, Q2
@@ -35,12 +35,12 @@ lane: normal
 ## Phases and Verification
 - approach: five worker-sized phases; Q4 and Q10 are independent engine changes that run in parallel, then the mod goes live under the allowlist, then `quaqua ship`, then the recorded run. Rejected: prompt-only fork restriction (Q4) and run-time-only kill refusal (Q10).
 - phase_slug: `fork-allowlist`
-  status: planned
+  status: done (#249)
   - goal: R1 | depends_on: none
   - surfaces: crates/quaqua/src/ (engine-side tool allowlist for the review fork), mods/cos-memory/src/review.js, crates/quaqua/tests/ | avoided: worker/, merge/, grid/
-  - phase check: `cargo test -p quaqua fork_allowlist` `node --test mods/cos-memory/tests/`
+  - phase check: `node --test mods/cos-memory/tests/`
 - phase_slug: `kill-refusal`
-  status: planned
+  status: done (#250)
   - goal: R2 | depends_on: none (parallel with `fork-allowlist`)
   - surfaces: crates/quaqua/src/config.rs, crates/quaqua/tests/config.rs | avoided: worker/stop.rs run-time refusal stays as a second guard
   - phase check: `cargo test -p quaqua config_kill_refused` `cargo test -p quaqua config`
