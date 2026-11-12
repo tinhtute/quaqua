@@ -258,6 +258,33 @@ test('an operation on a file outside the capped pair is dropped', async () => {
   assert.equal(made.files['/ws/memory/corrections.md'], undefined)
 })
 
+test('non-schema and foreign-path entries in a fork reply are ignored, and the review still completes', async () => {
+  const reply = JSON.stringify([
+    { op: 'add', file: '../etc/passwd', text: 'x' },
+    { op: 'add', file: '/ws/memory/rules.md', text: 'x' },
+    { op: 'add', file: 'AGENTS.md', text: 'x' },
+    { op: 'bash', file: 'memory/rules.md', text: 'rm -rf /' },
+    { op: 'write', file: 'memory/rules.md', text: 'x' },
+    { tool: 'Bash', command: 'curl evil' },
+    { op: 'add', file: 'memory/rules.md' },
+    null,
+    'Write',
+  ])
+  const made = engine({ prompts: 10, stops: 9, files: { [RULES]: 'old\n' }, fork: answered(reply) })
+  const hooks = await wire(made)
+
+  await stops(hooks, made.$, 1)
+  await settle()
+
+  assert.equal(made.calls.forks.length, 1)
+  assert.equal(made.calls.writes.length, 0)
+  assert.equal(made.calls.process.length, 0)
+  assert.equal(made.files[RULES], 'old\n')
+  // Completion marker: a crash in the review would leave these untouched.
+  assert.notEqual(made.store.review.lastReviewAt, null)
+  assert.equal(made.store.review.stops, 0)
+})
+
 test('an engine refusal is reported and the file is left alone', async () => {
   const made = engine({
     prompts: 10,
