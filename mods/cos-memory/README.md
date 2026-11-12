@@ -152,7 +152,7 @@ died mid-fork) stops blocking after five minutes.
 ## Tests
 
 ```
-node --test mods/cos-memory/tests/     # 32 tests, no network, no engine
+node --test "mods/cos-memory/tests/**/*.test.js"   # no network, no engine
 bash mods/cos-memory/tests/install_smoke.sh
 ```
 
