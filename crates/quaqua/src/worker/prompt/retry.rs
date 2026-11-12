@@ -270,26 +270,40 @@ const AGY_STATUS: &[(&str, ProviderError)] = &[
     ("UNKNOWN", ProviderError::Fatal("http-error")),
 ];
 
+/// agy lines with no status: the credits notice and the signed-out chip.
+const AGY_LITERALS: &[(&str, ProviderError)] = &[
+    (
+        "your ai credits balance is too low",
+        ProviderError::Fatal("billing"),
+    ),
+    ("needs sign-in", ProviderError::Fatal("signed-out")),
+];
+
 /// agy: `⚠ <STATUS> (code NNN): <msg>` (the `Error ID:` line under it never
 /// matches), or the credits line. The generic `Agent execution terminated due
 /// to error.` carries no status, so it stays unclassified (`None`). A 429 or
 /// 5xx code means agy already spent its own retry ladder.
 fn agy_line(l: &str) -> Option<Decision> {
     let l = l.trim_start_matches(|c: char| c.is_whitespace() || c == '⚠');
-    if l.starts_with("your ai credits balance is too low") {
+    if let Some((_, error)) = AGY_LITERALS.iter().find(|(p, _)| l.starts_with(p)) {
         return Some(Decision {
-            error: ProviderError::Fatal("billing"),
+            error: *error,
             exhausted: false,
         });
     }
     let (name, after) = l.split_once(" (code ")?;
     let name = name.to_ascii_uppercase();
-    let error = AGY_STATUS.iter().find(|(s, _)| *s == name)?.1;
+    let mut error = AGY_STATUS.iter().find(|(s, _)| *s == name)?.1;
     let digits = after.find(|c: char| !c.is_ascii_digit())?;
-    if digits == 0 || !after[digits..].starts_with("):") {
+    if !(1..=3).contains(&digits) || !after[digits..].starts_with("):") {
         return None;
     }
     let code: u16 = after[..digits].parse().ok()?;
+    // Out of credits is a billing stop, not a rate limit to wait out.
+    if name == "RESOURCE_EXHAUSTED" && (after.contains("credit") || after.contains("quota balance"))
+    {
+        error = ProviderError::Fatal("quota");
+    }
     Some(Decision {
         error,
         exhausted: matches!(code, 429 | 500..=599),
@@ -644,6 +658,43 @@ mod tests {
         );
         // A bare status-like sentence in worker output is not a provider error.
         assert_eq!(classify(h, "UNAVAILABLE services listed above"), None);
+    }
+
+    #[test]
+    fn classify_agy_signed_out_chip_and_credit_exhaustion_are_fatal() {
+        let h = Some(Harness::Agy);
+        assert_eq!(
+            classify(h, "⚠ needs sign-in"),
+            hit(ProviderError::Fatal("signed-out"))
+        );
+        assert_eq!(
+            classify(
+                h,
+                "⚠ RESOURCE_EXHAUSTED (code 8): Your credit balance is too low"
+            ),
+            hit(ProviderError::Fatal("quota"))
+        );
+        // Without credit wording it is still a wait-it-out rate limit.
+        assert_eq!(
+            classify(h, "⚠ RESOURCE_EXHAUSTED (code 8): rate limited"),
+            hit(ProviderError::Retryable("rate-limit"))
+        );
+    }
+
+    #[test]
+    fn classify_agy_malformed_lines_return_none_without_panic() {
+        let h = Some(Harness::Agy);
+        for pane in [
+            "⚠ UNAVAILABLE: no code",
+            "⚠ UNAVAILABLE (code ): empty",
+            "⚠ UNAVAILABLE (code 12345): five digits",
+            "⚠ UNAVAILABLE (code 503) missing colon",
+            "⚠ UNAVAILABLE  (code 503): two spaces",
+            "⚠ ÜNAVAILABLE (code 503): ünïcode — 💥",
+            "⚠ 💥 (code 5é3): ✓",
+        ] {
+            assert_eq!(classify(h, pane), None, "{pane}");
+        }
     }
 
     /// The harness's own terminal line means its retries are spent: still
