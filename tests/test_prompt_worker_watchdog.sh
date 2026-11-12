@@ -227,7 +227,7 @@ echo "ok: budget -> one nudge past the pct mark, exit 4"
 tele="$T/home/quaqua/runs/telemetry.jsonl"
 rows=$(grep -c '"rec":"worker".*"name":"sude-budget".*"exit":4' "$tele" 2>/dev/null || true)
 [[ $rows -eq 1 ]] || fail "sude-budget: $rows exit-4 telemetry rows after the stop, want 1"
-QUAQUA_RUNS_DIR="$T/home/quaqua/runs" HOME="$T/home" "${QUAQUA_BIN:-quaqua}" status --metrics --since 24h 2>/dev/null \
+QUAQUA_RUNS_DIR="$T/home/quaqua/runs" HOME="$T/home" "${QUAQUA_BIN:-quaqua}" status --metrics --since 2020-01-01T00:00:00Z 2>/dev/null \
   | grep -Eq '^sude-budget .* 4 ' || fail "sude-budget: stopped worker missing from status --metrics"
 echo "ok: exit 4 -> worker row in status --metrics"
 
