@@ -6,7 +6,10 @@
 //! - Exit 3: Stall (no worktree diff and no harness session write for 600 s) /
 //!   idle (120 s, 300 s fallback) / agent gone (60 s) / prompt never landed
 //! - Exit 4: Time budget exceeded (after one +25% grace and bounded auto-extensions up to +50% total)
-//! - Exit 5: Blocked on question / permission
+//! - Exit 5: Blocked on question / permission. A hook-reported `blocked` ends
+//!   the wait at once; a screen-inferred one is a hypothesis (a non-modal choice
+//!   banner has a dialog's footer shape) and must persist for a poll with no
+//!   progress behind it.
 //! - Exit 6: Malformed report (stable, non-empty report missing `## Lessons` or
 //!   `Verdict:`) or a builder report that does not account for a pinned
 //!   `## Playbook` step
@@ -105,6 +108,11 @@ pub struct SingleWorkerState {
     pub hook_active: bool,
     #[serde(default)]
     pub idle_since_ms: u64,
+    /// When a screen-inferred `blocked` was first seen, 0 when none is pending.
+    /// herdr's screen detection reads a non-modal choice banner as a dialog, so
+    /// that reading is a hypothesis until it persists with no progress behind it.
+    #[serde(default)]
+    pub blocked_since_ms: u64,
     #[serde(default)]
     pub gone_since_ms: u64,
     #[serde(default, alias = "grace_used")]
@@ -161,6 +169,7 @@ impl SingleWorkerState {
             harness: None,
             hook_active: true,
             idle_since_ms: 0,
+            blocked_since_ms: 0,
             gone_since_ms: 0,
             overrun_granted: false,
             extension_total_ms: 0,
@@ -531,7 +540,20 @@ fn parse_index(id: &str, prefix: &str) -> Option<u64> {
 }
 
 fn default_until(state: &SingleWorkerState) -> Vec<String> {
-    if state.agent_status == "idle" || state.agent_status == "done" {
+    if state.agent_status == "blocked" {
+        if state.blocked_since_ms > 0 {
+            // An unconfirmed screen-inferred blocked: wait for the pane to
+            // leave it. The default set contains `blocked`, so it would return
+            // at once and decide on the same frame.
+            vec![
+                "working".to_string(),
+                "idle".to_string(),
+                "done".to_string(),
+            ]
+        } else {
+            Vec::new()
+        }
+    } else if state.agent_status == "idle" || state.agent_status == "done" {
         // The current state already matches the default set; flip so the wait
         // returns only when the agent starts working again (U1a spin).
         vec!["working".to_string(), "blocked".to_string()]
@@ -581,7 +603,23 @@ fn evaluate(
 
     // 3. Blocked on a question/permission.
     if state.agent_status == "blocked" {
-        return complete_step(state, now, 5);
+        // A hook-reported blocked is the agent's own word: end the wait now.
+        // A screen-inferred one is a single pane frame, and a non-modal choice
+        // banner ("⚠ Warning: change effort … compact first? [Compact][Skip]")
+        // has the footer shape of a dialog while the turn keeps running. When
+        // there is a progress source to check it against, that reading is a
+        // hypothesis until it persists for a poll with no progress behind it.
+        if state.hook_active || !state.has_progress_source() {
+            return complete_step(state, now, 5);
+        }
+        let progressed = state.last_progress_ms > state.blocked_since_ms;
+        if state.blocked_since_ms == 0 || progressed {
+            state.blocked_since_ms = now;
+        } else if now.saturating_sub(state.blocked_since_ms) >= state.config.poll_sec * 1000 {
+            return complete_step(state, now, 5);
+        }
+    } else {
+        state.blocked_since_ms = 0;
     }
 
     // 4. Budget, with one grace and bounded diff auto-extensions.
@@ -683,6 +721,8 @@ fn evaluate(
         if !state.lead_waiting {
             deadline = deadline.min(state.idle_since_ms + state.idle_limit_ms() * 1000);
         }
+    } else if state.agent_status == "blocked" && state.blocked_since_ms > 0 {
+        deadline = deadline.min(state.blocked_since_ms + state.config.poll_sec * 1000);
     } else if state.agent_status == "working" && !state.lead_waiting && state.has_progress_source()
     {
         let baseline = if state.last_progress_ms > 0 {
@@ -1049,6 +1089,73 @@ mod tests {
             }],
         );
         assert_eq!(out.exit, 5);
+    }
+
+    /// herdr's screen detection reads a non-modal choice banner
+    /// (`⚠ Warning: change effort … compact first? [Compact][Skip]`) as a
+    /// pending question while the turn keeps running: the agent's session store
+    /// advances under the banner. That is not a blocked worker, and the wait
+    /// must not end at exit 5 on it.
+    #[test]
+    fn screen_inferred_blocked_banner_does_not_end_the_wait_while_the_agent_progresses() {
+        let polls = vec![
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(1000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(2000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "working",
+                hook_active: false,
+                session_mtime: Some(3000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "done",
+                hook_active: false,
+                session_mtime: Some(4000),
+                report_mtime: 1000,
+                report: Some("Outcome: COMPLETE\n# Report\n\n## Lessons\n- none\n"),
+                ..Poll::default()
+            },
+        ];
+        let (out, _, _) = run("worker-banner", 1800, config(30, 1800), polls);
+        assert_eq!(
+            out.exit, 0,
+            "a banner over a progressing turn must not end the wait as blocked"
+        );
+    }
+
+    /// The same screen reading with no progress behind it is a real question:
+    /// it persists and the wait still ends at exit 5.
+    #[test]
+    fn screen_inferred_blocked_with_no_progress_still_ends_the_wait_as_blocked() {
+        let polls = vec![
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(1000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(1000),
+                ..Poll::default()
+            },
+        ];
+        let (out, _, _) = run("worker-question", 1800, config(30, 1800), polls);
+        assert_eq!(
+            out.exit, 5,
+            "a question that persists with no progress must end the wait as blocked"
+        );
     }
 
     #[test]
