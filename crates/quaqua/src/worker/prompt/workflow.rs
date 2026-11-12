@@ -1051,6 +1051,73 @@ mod tests {
         assert_eq!(out.exit, 5);
     }
 
+    /// herdr's screen detection reads a non-modal choice banner
+    /// (`⚠ Warning: change effort … compact first? [Compact][Skip]`) as a
+    /// pending question while the turn keeps running: the agent's session store
+    /// advances under the banner. That is not a blocked worker, and the wait
+    /// must not end at exit 5 on it.
+    #[test]
+    fn screen_inferred_blocked_banner_does_not_end_the_wait_while_the_agent_progresses() {
+        let polls = vec![
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(1000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(2000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "working",
+                hook_active: false,
+                session_mtime: Some(3000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "done",
+                hook_active: false,
+                session_mtime: Some(4000),
+                report_mtime: 1000,
+                report: Some("Outcome: COMPLETE\n# Report\n\n## Lessons\n- none\n"),
+                ..Poll::default()
+            },
+        ];
+        let (out, _, _) = run("worker-banner", 1800, config(30, 1800), polls);
+        assert_eq!(
+            out.exit, 0,
+            "a banner over a progressing turn must not end the wait as blocked"
+        );
+    }
+
+    /// The same screen reading with no progress behind it is a real question:
+    /// it persists and the wait still ends at exit 5.
+    #[test]
+    fn screen_inferred_blocked_with_no_progress_still_ends_the_wait_as_blocked() {
+        let polls = vec![
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(1000),
+                ..Poll::default()
+            },
+            Poll {
+                status: "blocked",
+                hook_active: false,
+                session_mtime: Some(1000),
+                ..Poll::default()
+            },
+        ];
+        let (out, _, _) = run("worker-question", 1800, config(30, 1800), polls);
+        assert_eq!(
+            out.exit, 5,
+            "a question that persists with no progress must end the wait as blocked"
+        );
+    }
+
     #[test]
     fn exit_5_latency_under_5s_on_working_to_blocked_transition() {
         let (out, now, events) = run(
