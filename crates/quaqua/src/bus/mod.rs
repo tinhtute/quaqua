@@ -4,6 +4,7 @@
 //! Uses shared SQLite connection opener with WAL mode, busy timeout, and retry_while_busy.
 
 pub mod events;
+pub mod gui;
 pub mod mail;
 pub mod migrate;
 pub mod recall;
@@ -271,6 +272,13 @@ impl FarmBus {
                 "#,
             )?;
             Ok(())
+        })?;
+
+        // GUI read contract (R1): the views read both the bus and the journal
+        // tables, so the journal tables are ensured here, after the legacy check.
+        crate::engine::sqlite::retry_while_busy(|| {
+            conn.execute_batch(crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL)?;
+            crate::bus::gui::ensure_gui_views(&conn)
         })?;
 
         let events_watermark: u64 = crate::bus::migrate::legacy_events_watermark(&conn);
