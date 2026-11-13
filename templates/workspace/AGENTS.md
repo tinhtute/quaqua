@@ -62,6 +62,7 @@ These rules bind CoS and Leads.
 - **Background wait and drain points (binds CoS and Lead)**: Run `quaqua worker prompt` in the background; run `quaqua status` on wake. Drain after critical decisions, at wave boundaries, on wake, and before reporting. Review diffs in a separate worker task.
 - **Budget (binds CoS and Lead)**: Every brief carries time and cost budgets; at about 70% of either, stop spawning and land only verified work.
 - **Pilot and liveness (binds CoS and Lead)**: Liveness and timebox rules live in `rules/_all/worker-timebox.md`. Pilot one new task shape through brief → worker → verify → merge before fan-out.
+- **Session per wave (binds CoS)**: After each wave lands, run `handoff` and start a fresh session; do not run a whole day in one session.
 - Encode repeated instructions as lint, metadata, runtime checks, or scripts.
 - Bound retries by failure mode: cap/OOM gets smaller scope; network drops retry as-is; tool errors use another model. Retry at most twice, then replan. If more spawns would spread a systemic failure, write a stop line, finish in-flight work, and fix the root cause.
 - At each wave boundary, account for every worker as arrived, respawned, or scope absorbed. Never silently redo missing scope.
