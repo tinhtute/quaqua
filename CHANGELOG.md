@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-11-13
+
+### Superagent Bus
+- **Trigger digest and `quaqua mail inbox`**: unified inbox delivery on `deliver_page` with one cursor writer, removed the legacy `inbox.md`, `mail ack` and ack columns, and fixed cursor advance, legacy `msg_key`/`reply_to` migration and dry-run trigger ids (#225, #226).
+- **`quaqua recall <id>`**: resolves threads and refs, confined to the workspace and read-only on the caller's farm (#228, #229, #230).
+- **Idle nudges and Lead-on-Peer watching**: nudges idle agents once per batch of unread triggers (R3); the watchdog keeps watching a Lead that waits on a live Peer (R8).
+- **`quaqua source github-ci`**: 5-minute poll timer for systemd and launchd, checked by `quaqua doctor` (an absent timer is silent, not a warning).
+- **GUI read contract (R1)**: views `v_gui_workflows`, `v_gui_inbox`, `v_gui_workers` and `gui_schema_version` (#214, #270).
+
+### Watchdog, Prompt & Pipeline
+- **Detached prompt core**: `worker prompt` waits in its own session, the pipeline runs in the detached core so it outlives its coordinator, `--resume` joins the live core, and Ctrl-C leaves the core running and says how to re-attach (#266, #267).
+- **Resume lock and exit 8**: the core start is locked so simultaneous resumes join one core; a core that dies without an exit record reports exit 8; the lock proceeds unlocked where flock is unsupported, with platform-correct lock errnos (#270).
+- **Exit 5 corroboration**: a screen-inferred `blocked` is corroborated before exit 5; exit 4 records a `status --metrics` row (#256, #255).
+- **`strategy.builder_reviewer_differ`**: `pipeline` follows it at run time — `"harness"` keeps the same-harness rule and error text, `"kind"` refuses only builder == reviewer, `"none"` refuses nothing; the explicit `--reviewer` check and the default reviewer pick share one helper (#273).
+- **Spawn and cost caps**: a worktree without `--base` starts from the fetched origin default; `on_cost_cap = "kill"` is refused on harnesses without a stop key (#250).
+
+### Status, Cleanup & Auditor
+- **`quaqua status`**: hides terminal workflows and resolved verdicts by default, adds `--all` and `--help`, exits 2 on an unknown argument; `playbook_gap` and disputed stay visible (#270).
+- **`quaqua cleanup`**: cleans dead worker and Lead orphans (#270).
+- **`quaqua ship`**: pushes the worker branch and opens a PR after approval, resolving the repo from telemetry after cleanup (#251).
+- **`quaqua verify`**: records a coordinator test rerun as a verifier verdict.
+- **Auditor**: git discovery for recorded repos, collapsed historical noise, mail scan scoped to the cos recipient and current farm, Linux service rendered with the install-time PATH (#242, #263, #268, #269).
+- **`--check-brief`**: warns on `Budget:` instead of `Time budget:` and on a brief naming the main checkout path (#253, #254).
+
+### Harness (Pi)
+- **Pi workers**: workers launch on pi with default extensions (#261).
+- **Claude-out suhuynh fallback**: `models.md` and `rules/_all/config-dynamic.md` name `mistral/deepseek-v4-1-flash-1017`, a pi model that launches, instead of an opencode provider id pi has no credential for (#271).
+
+### CI & Tests
+- **macOS type-check**: `cargo check` of the workspace on `macos-latest` (aarch64-apple-darwin), not a required check.
+- **qq-core crate skeleton**: the `crates/qq-core` workspace member landed (engine port, herdr seam, db schema ladder); it is not shipped as a binary. The legacy-role guard test skips it, where the word names a new role (#274, #275).
+- **Clippy gate**: `clippy -D warnings` and cos-memory mod tests run in CI; cleared 96 clippy errors (#256, #258, #259).
+
 ### CoS Memory Gate
 - **`quaqua memory check [--workspace DIR]`**: counts Unicode chars (not bytes) against the AGENTS.md caps — `memory/rules.md` 2200, `USER.md` 1375 — and scans both for secrets (API keys, tokens, private keys); exit 1 with one line per violation.
 - **`quaqua init` installs the gate as hooks**: a `PreToolUse` (`Write|Edit|MultiEdit`) hook that simulates the post-edit content and denies a write that would break a cap or carry a secret, and a `PostToolBatch` hook that re-runs the check and returns `additionalContext` so a `Bash`/`sed` write is flagged in the same turn. Both merge into `.claude/settings.json` idempotently and keep the hooks already there.
@@ -17,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Antigravity CLI joins the registry**: `harness = "agy"` validates in `team.toml`, and `quaqua worker spawn` launches `agy` with `--model`/`--effort` (agy's `low|medium|high|xhigh|max`), `--dangerously-skip-permissions`, and a per-worker `--settings` file that pre-trusts the worktree, so the first-run "do you trust the contents of this project?" dialog never takes the brief. agy has no system-prompt flag, so the worker rules land as the `AGENTS.md` of an `--add-dir` directory (`runs/.agy/<name>/`), which agy loads as context.
 - **Idle detection and stop**: herdr's built-in `agy` kind reports working/idle/done through screen detection (its antigravity-cli integration only records the conversation), so the watchdog uses the longer fallback idle limit; `esc` interrupts a running turn, so `quaqua worker stop` works. agy spend is reported as `agy-usage-unavailable`: usage is printed only in headless print mode, and the interactive conversation store is an opaque sqlite blob.
 - **Auditor**: `quaqua auditor run --harness agy` runs `agy -p` headless, and `agy` is the last autodetect fallback after `claude` and `opencode`.
+
+### Known issues
+- The watchdog can exit 3 on a journal "database is locked" error when an unknown holder keeps the lock for more than 5 s. It predates 2.6.0 and is under investigation.
+- `tests/run.sh --slow` has stale harness failures (stub reports lack `Outcome:`, missing `QUAQUA_OWNER`, a same-harness pair). No CI job runs it and no product bug was found.
 
 ## [2.6.0] - 2026-11-05
 
@@ -78,5 +115,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Council runtime, identity heal, and role/depth gate (#156).
 
+[2.7.0]: https://github.com/tinhtute/quaqua/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/tinhtute/quaqua/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/tinhtute/quaqua/releases/tag/v2.5.0
