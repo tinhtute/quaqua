@@ -865,11 +865,7 @@ pub fn is_legacy_db_conn(conn: &rusqlite::Connection) -> rusqlite::Result<bool> 
         )
         .map(|c| c > 0)
         .unwrap_or(false);
-    if has_cursors && table_has_column(conn, "cursors", "seq") {
-        return Ok(true);
-    }
-
-    Ok(false)
+    Ok(has_cursors && table_has_column(conn, "cursors", "seq"))
 }
 
 /// Probes a path before opening with WAL mode.
