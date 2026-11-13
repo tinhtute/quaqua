@@ -256,7 +256,54 @@ fn watchdog_config_from_env(expect_verdict: bool, is_fallback_idle: bool) -> Wat
     config
 }
 
+/// Run the rest of the pipeline in a session of its own, so it outlives the
+/// coordinator that launched it (the same mechanism as `worker prompt`). `None`
+/// means this process is the detached core, or could not detach, and carries on.
+fn detach_pipeline(
+    detach: bool,
+    runs_dir: &Path,
+    task: &str,
+    repo: &Path,
+    is_resume: bool,
+) -> Option<Result<(), (i32, String)>> {
+    let name = format!("pipeline-{task}");
+    if !detach {
+        return None;
+    }
+    if std::env::var_os(crate::worker::prompt::detach::ENV).is_some() {
+        crate::worker::prompt::detach::core_begin(runs_dir, &name);
+        return None;
+    }
+    // A resume joins a core that is still running instead of racing it.
+    let reattach = format!("quaqua pipeline --resume {task} {}", repo.display());
+    match crate::worker::prompt::detach::run(runs_dir, &name, &reattach, is_resume) {
+        Ok(0) => Some(Ok(())),
+        Ok(code) => Some(Err((code, String::new()))),
+        Err(e) => {
+            eprintln!("WATCHDOG detach-failed | pipeline={task} {e} — running in-process");
+            None
+        }
+    }
+}
+
+/// The pipeline in this process, as the unit tests drive it.
 pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
+    run_pipeline(args, git, herdr, false)
+}
+
+/// CLI entry: the pipeline run in a session of its own (see [`detach_pipeline`]).
+pub fn handle_pipeline_cli(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
+    let res = run_pipeline(args, git, herdr, true);
+    crate::worker::prompt::detach::core_end(&res);
+    res
+}
+
+fn run_pipeline(
+    args: &[String],
+    git: &Git,
+    herdr: &Herdr,
+    detach: bool,
+) -> Result<(), (i32, String)> {
     let inv_start = now_sec();
     let runs_dir = default_runs_dir();
     let _ = std::fs::create_dir_all(&runs_dir);
@@ -435,6 +482,10 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                 )
             };
             return Err((1, msg));
+        }
+
+        if let Some(res) = detach_pipeline(detach, &runs_dir, &task, &state_repo, true) {
+            return res;
         }
 
         state.pipeline_pid = std::process::id();
@@ -686,6 +737,10 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                 1,
                 format!("pipeline '{task}' already has state — use --resume or a new task slug\n"),
             ));
+        }
+
+        if let Some(res) = detach_pipeline(detach, &runs_dir, &task, &repo_path, false) {
+            return res;
         }
 
         let parent_wt = repo_path.parent().unwrap_or(Path::new("."));

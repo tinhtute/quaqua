@@ -884,7 +884,7 @@ fn main() {
             }
         },
         Some(Command::Pipeline { args }) => {
-            match quaqua::pipeline::handle_pipeline(&args, &git, &herdr) {
+            match quaqua::pipeline::handle_pipeline_cli(&args, &git, &herdr) {
                 Ok(()) => 0,
                 Err((rc, err)) => {
                     if !err.is_empty() {

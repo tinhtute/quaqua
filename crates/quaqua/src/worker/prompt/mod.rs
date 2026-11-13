@@ -850,14 +850,20 @@ pub fn prompt_worker_cli<G: GitOps>(
     herdr: &Herdr,
 ) -> Result<(), (i32, String)> {
     if std::env::var_os(detach::ENV).is_none() {
-        match detach::run(&default_runs_dir(), name) {
+        // A resume joins a core that is still running instead of racing it.
+        let reattach = format!("quaqua worker prompt --resume {name}");
+        match detach::run(&default_runs_dir(), name, &reattach, resume) {
             Ok(0) => return Ok(()),
             Ok(code) => return Err((code, String::new())),
             // Could not detach: wait in this process, as before.
             Err(e) => eprintln!("WATCHDOG detach-failed | name={name} {e} — waiting in-process"),
         }
+        return prompt_worker(name, task, resume, extend, git, herdr);
     }
-    prompt_worker(name, task, resume, extend, git, herdr)
+    detach::core_begin(&default_runs_dir(), name);
+    let res = prompt_worker(name, task, resume, extend, git, herdr);
+    detach::core_end(&res);
+    res
 }
 
 fn prompt_worker_once<G: GitOps>(
