@@ -54,8 +54,9 @@ Audit six things:
      copied into a pipeline file's `## Challenge (from <file>)` section is
      covered by that file's flag — do not report it twice.
    Pipeline runs that started more than 14 days ago are history: the pre-check
-   skips them and reports only a count line (plus any blocked/disputed one with
-   no handling note). Do not list old runs one per line. A recorded repo that is
+   skips them; the pre-check prints one count line only when some of them are
+   blocked/disputed with no handling note, otherwise old runs are silent. Do not
+   list old runs one per line. A recorded repo that is
    missing or not a git repo is ONE line per repo, never one per SHA.
 5. Live workers. Flag any live task worker in herdr that is stalled, untracked,
    or in an unhandled error state.
@@ -545,6 +546,16 @@ fn mem_mentions(root: &Path, needles: &[&str]) -> bool {
     false
 }
 
+/// True when `dir` is inside a git work tree (git discovery, so a repo subdirectory counts).
+fn git_is_repo(dir: &Path) -> bool {
+    let res = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--git-dir"])
+        .output();
+    matches!(res, Ok(output) if output.status.success())
+}
+
 fn git_verify_commit(repo: &Path, sha: &str) -> bool {
     let arg = format!("{sha}^{{commit}}");
     let res = Command::new("git")
@@ -737,13 +748,21 @@ pub fn run_deterministic_prechecks_at(
                 .find_map(|l| l.strip_prefix("- started: "))
                 .and_then(|v| v.get(..10))
                 .and_then(parse_ymd)
-                .map(|(y, m, d)| ymd_to_days(y, m, d))
-                .or_else(|| {
-                    let m = std::fs::metadata(&f).and_then(|m| m.modified()).ok()?;
-                    let secs = m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-                    Some(secs / 86_400)
-                });
-            if started_days.is_some_and(|d| today_days.saturating_sub(d) > PIPELINE_CUTOFF_DAYS) {
+                .map(|(y, m, d)| ymd_to_days(y, m, d));
+            let mtime_days = std::fs::metadata(&f)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() / 86_400);
+            // Old = every date the file carries is old: a late resume that appends to an
+            // old run touches its mtime, and that run stays listed per file.
+            let is_old = |d: Option<u64>| {
+                d.is_none_or(|d| today_days.saturating_sub(d) > PIPELINE_CUTOFF_DAYS)
+            };
+            if (started_days.is_some() || mtime_days.is_some())
+                && is_old(started_days)
+                && is_old(mtime_days)
+            {
                 old_skipped += 1;
                 if matches!(st, "disputed" | "blocked") && !mem_mentions(root, &[base]) {
                     old_unhandled.push(base.to_string());
@@ -794,7 +813,7 @@ pub fn run_deterministic_prechecks_at(
                     };
 
                     // `.git` must be in the repo itself: git discovery would walk up to a parent repo.
-                    if !prepo.is_dir() || !prepo.join(".git").exists() {
+                    if !prepo.is_dir() || !git_is_repo(&prepo) {
                         let why = if prepo.is_dir() {
                             "not a git repo"
                         } else {
@@ -881,8 +900,13 @@ pub fn run_deterministic_prechecks_at(
         }
     }
     if !old_unhandled.is_empty() {
+        let who = if old_unhandled.len() <= 5 {
+            format!(": {}", old_unhandled.join(", "))
+        } else {
+            String::new()
+        };
         flags.push(format!(
-            "- runs/pipeline-*.md: {old_skipped} pipeline runs older than {PIPELINE_CUTOFF_DAYS} days are not checked; {} of them blocked/disputed with no memory line naming them (not listed; `grep -l 'status: blocked\\|status: disputed' runs/pipeline-*.md`)",
+            "- runs/pipeline-*.md: {old_skipped} pipeline runs older than {PIPELINE_CUTOFF_DAYS} days are not checked; {} of them blocked/disputed with no memory line naming them{who}",
             old_unhandled.len()
         ));
     }
