@@ -1001,6 +1001,9 @@ mod tests {
     fn test_resolve_caller_with_pane_tokens() {
         let _lock = crate::test_env::lock_env();
         let _pane_guard = crate::test_env::TestEnvVarGuard::set("HERDR_PANE_ID", "w1:p1");
+        // The FailingHerdr case below must reach "no identity"; an inherited
+        // QUAQUA_OWNER (set in a CoS pane) would resolve through the env fallback.
+        let _owner_guard = crate::test_env::TestEnvVarGuard::remove("QUAQUA_OWNER");
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
