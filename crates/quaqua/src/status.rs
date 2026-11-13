@@ -803,6 +803,22 @@ pub fn format_status_report(
     format_status_report_opts(workflows, orchestration, verdicts, true)
 }
 
+/// A workflow whose last event ends it: nobody can act on the row.
+/// `workflow_completed` with phase `disputed` stays (it needs a decision).
+fn is_terminal_workflow(w: &WorkflowStatusRow) -> bool {
+    match w.last_event_kind.as_deref() {
+        Some("workflow_completed") => w.phase.as_deref() != Some("disputed"),
+        Some("workflow_cancelled" | "verdict" | "playbook_gap") => true,
+        _ => false,
+    }
+}
+
+fn push_hidden_line(out: &mut String, hidden: usize) {
+    if hidden > 0 {
+        out.push_str(&format!("{hidden} hidden (quaqua status --all)\n"));
+    }
+}
+
 /// Status report; `all == false` hides rows nobody can act on (see `StatusArgs`).
 pub fn format_status_report_opts(
     workflows: Result<&[WorkflowStatusRow], &str>,
@@ -810,7 +826,6 @@ pub fn format_status_report_opts(
     verdicts: Result<&[BranchVerdictRow], &str>,
     all: bool,
 ) -> String {
-    let _ = all;
     let mut out = String::new();
 
     out.push_str("=== Workflows (runs/quaqua.db) ===\n");
@@ -818,11 +833,20 @@ pub fn format_status_report_opts(
         Ok([]) => {
             out.push_str("no workflows\n");
         }
-        Ok(wfs) => {
-            out.push_str(&format!(
-                "{:<20} {:<10} {:<20} {:<10} {:<12} {:<10}\n",
-                "WORKFLOW_ID", "SNAP_SEQ", "LAST_EVENT", "EVENT_SEQ", "LAST_TS", "PHASE"
-            ));
+        Ok(all_wfs) => {
+            let wfs: Vec<&WorkflowStatusRow> = all_wfs
+                .iter()
+                .filter(|w| all || !is_terminal_workflow(w))
+                .collect();
+            let hidden = all_wfs.len() - wfs.len();
+            if wfs.is_empty() {
+                out.push_str("no workflows\n");
+            } else {
+                out.push_str(&format!(
+                    "{:<20} {:<10} {:<20} {:<10} {:<12} {:<10}\n",
+                    "WORKFLOW_ID", "SNAP_SEQ", "LAST_EVENT", "EVENT_SEQ", "LAST_TS", "PHASE"
+                ));
+            }
             for wf in wfs {
                 let snap = wf
                     .snap_seq
@@ -843,6 +867,7 @@ pub fn format_status_report_opts(
                     wf.workflow_id, snap, ev_kind, ev_seq, ev_ts, phase
                 ));
             }
+            push_hidden_line(&mut out, hidden);
         }
         Err(err) => {
             out.push_str(&format!("{err}\n"));
@@ -907,11 +932,18 @@ pub fn format_status_report_opts(
         Ok([]) => {
             out.push_str("no verdicts\n");
         }
-        Ok(v_rows) => {
-            out.push_str(&format!(
-                "{:<24} {:<12} {:<20} {}\n",
-                "BRANCH", "HEAD", "VERDICT", "FLAGS"
-            ));
+        Ok(all_rows) => {
+            let v_rows: Vec<&BranchVerdictRow> =
+                all_rows.iter().filter(|r| all || !r.unresolved).collect();
+            let hidden = all_rows.len() - v_rows.len();
+            if v_rows.is_empty() {
+                out.push_str("no verdicts\n");
+            } else {
+                out.push_str(&format!(
+                    "{:<24} {:<12} {:<20} {}\n",
+                    "BRANCH", "HEAD", "VERDICT", "FLAGS"
+                ));
+            }
             for r in v_rows {
                 let mut flags = Vec::new();
                 if r.unresolved {
@@ -924,7 +956,7 @@ pub fn format_status_report_opts(
                     flags.push("same-harness");
                 }
                 let flags_str = if flags.is_empty() {
-                    "-".to_string()
+                    "ok".to_string()
                 } else {
                     flags.join(", ")
                 };
@@ -943,6 +975,7 @@ pub fn format_status_report_opts(
                     flags_str
                 ));
             }
+            push_hidden_line(&mut out, hidden);
         }
         Err(err) => {
             out.push_str(&format!("{err}\n"));
@@ -953,6 +986,7 @@ pub fn format_status_report_opts(
 }
 
 /// Render full status from explicit DB and runs directory paths.
+/// Unfiltered (`--all`) report.
 pub fn render_status<H: HerdrOps>(
     db_path: &Path,
     runs_dir: &Path,
@@ -962,12 +996,23 @@ pub fn render_status<H: HerdrOps>(
     render_status_with_git(db_path, runs_dir, herdr, &git)
 }
 
-/// Render status with explicit Git implementation.
+/// Unfiltered (`--all`) report with explicit Git implementation.
 pub fn render_status_with_git<H: HerdrOps, G: GitOps>(
     db_path: &Path,
     runs_dir: &Path,
     herdr: &H,
     git: &G,
+) -> Result<String, String> {
+    render_status_opts(db_path, runs_dir, herdr, git, true)
+}
+
+/// Render status; `all == false` hides rows nobody can act on.
+pub fn render_status_opts<H: HerdrOps, G: GitOps>(
+    db_path: &Path,
+    runs_dir: &Path,
+    herdr: &H,
+    git: &G,
+    all: bool,
 ) -> Result<String, String> {
     let wf_res = query_workflows(db_path);
     let orch_res = load_team_config()
@@ -975,10 +1020,11 @@ pub fn render_status_with_git<H: HerdrOps, G: GitOps>(
         .and_then(|cfg| scan_orchestration(runs_dir, herdr, &cfg));
     let repo = runs_dir.parent().unwrap_or_else(|| Path::new("."));
     let verdicts_res = query_branch_verdicts(db_path, repo, git);
-    Ok(format_status_report(
+    Ok(format_status_report_opts(
         wf_res.as_deref().map_err(|e| e.as_str()),
         orch_res.as_deref().map_err(|e| e.as_str()),
         verdicts_res.as_deref().map_err(|e| e.as_str()),
+        all,
     ))
 }
 
@@ -990,12 +1036,33 @@ pub struct StatusArgs {
 }
 
 pub fn parse_status_args(args: &[String]) -> Result<StatusArgs, String> {
-    let _ = args;
-    Ok(StatusArgs::default())
+    let mut parsed = StatusArgs::default();
+    for a in args {
+        match a.as_str() {
+            "--all" => parsed.all = true,
+            "--help" | "-h" => parsed.help = true,
+            other => return Err(format!("unknown argument to status: {other}")),
+        }
+    }
+    Ok(parsed)
 }
 
 pub fn status_help() -> String {
-    String::new()
+    "Usage: quaqua status [--all | --metrics[=<since>] [--since <dur>] [--owner <name>] [--json]]\n\
+\n\
+By default only rows someone can act on are shown. A section that hid rows ends\n\
+with `N hidden (quaqua status --all)`.\n\
+\n\
+  --all    show every Workflows and Verdicts row\n\
+\n\
+Workflows hides rows whose last event is terminal: workflow_completed (except\n\
+phase disputed), workflow_cancelled, verdict, playbook_gap.\n\
+\n\
+Verdicts FLAGS (`ok` = none set):\n\
+  stale         the branch head moved after the verdict\n\
+  unresolved    the branch resolves in no repo (hidden by default)\n\
+  same-harness  verifier and builder run the same harness\n"
+        .to_string()
 }
 
 /// CLI entrypoint for `quaqua status`.
@@ -1015,13 +1082,26 @@ pub fn handle_status<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Str
         return Ok(0);
     }
 
+    let status_args = match parse_status_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}\n\n{}", status_help());
+            return Ok(2);
+        }
+    };
+    if status_args.help {
+        print!("{}", status_help());
+        return Ok(0);
+    }
+
     let runs_dir = if let Ok(dir) = std::env::var("QUAQUA_RUNS_DIR") {
         PathBuf::from(dir)
     } else {
         crate::workspace::workspace_root().join("runs")
     };
     let db_path = runs_dir.join("quaqua.db");
-    let report = render_status(&db_path, &runs_dir, herdr)?;
+    let git = Git::new();
+    let report = render_status_opts(&db_path, &runs_dir, herdr, &git, status_args.all)?;
     print!("{report}");
     Ok(0)
 }
@@ -2310,7 +2390,7 @@ mod tests {
         }
         assert_eq!(
             out.matches("5 hidden (quaqua status --all)").count(),
-            2,
+            1,
             "{out}"
         );
         assert!(out.contains("2 hidden (quaqua status --all)"), "{out}");
