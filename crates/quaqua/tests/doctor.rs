@@ -395,11 +395,11 @@ fn a_dangling_github_ci_poll_timer_fails_the_run() {
     assert!(stderr.contains(&timer.display().to_string()), "{stderr}");
 }
 
-/// Installing the poll timer is a choice (it needs a per-workspace `--repo`),
-/// so a workstation that never installed it gets a warning, not a failure.
+/// Installing the poll timer is optional by design (it needs a per-workspace
+/// `--repo`), so a workstation that never installed it gets no output about it.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_never_installed_github_ci_poll_timer_warns_and_still_exits_zero() {
+fn a_never_installed_github_ci_poll_timer_is_silent_and_exits_zero() {
     let f = Fixture::new("poll-absent", "quaqua is /tmp/bin/quaqua");
     f.install_binary();
     let user_dir = f.home.join(".config/systemd/user");
@@ -409,13 +409,8 @@ fn a_never_installed_github_ci_poll_timer_warns_and_still_exits_zero() {
     let out = f.run(&f.bin_dir);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("warning:"), "{stderr}");
-    assert!(
-        stderr.contains("github-ci poll timer is not installed"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("install-github-ci-poll.sh"), "{stderr}");
-    assert!(stderr.contains("--repo"), "{stderr}");
+    assert!(!stderr.contains("github-ci"), "{stderr}");
+    assert!(!stderr.contains("warning:"), "{stderr}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ok:"), "{stdout}");
 }

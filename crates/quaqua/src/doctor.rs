@@ -118,10 +118,9 @@ struct TimerUnits {
     pattern: &'static str,
     /// Activation command printed after a problem.
     fix: &'static str,
-    /// Whether a timer that was never installed is a warning instead of a
-    /// problem: the github-ci poll timer takes a per-workspace `--repo` at
-    /// install time, so never installing it is a legal state.
-    absent_is_warning: bool,
+    /// Whether never installing the timer is a legal, silent state: the
+    /// github-ci poll timer takes a per-workspace `--repo` at install time.
+    optional: bool,
 }
 
 const AUDITOR_TIMER: TimerUnits = TimerUnits {
@@ -130,7 +129,7 @@ const AUDITOR_TIMER: TimerUnits = TimerUnits {
     timer: "quaqua-auditor.timer",
     pattern: "quaqua-auditor*",
     fix: AUDITOR_FIX_CMD,
-    absent_is_warning: false,
+    optional: false,
 };
 
 const GITHUB_CI_POLL_TIMER: TimerUnits = TimerUnits {
@@ -139,7 +138,7 @@ const GITHUB_CI_POLL_TIMER: TimerUnits = TimerUnits {
     timer: "quaqua-github-ci-poll.timer",
     pattern: "quaqua-github-ci-poll*",
     fix: GITHUB_CI_POLL_FIX_CMD,
-    absent_is_warning: true,
+    optional: true,
 };
 
 pub trait SystemdRunner {
@@ -175,9 +174,10 @@ impl SystemdRunner for RealSystemd {
 /// - Fails if unit symlinks are dangling
 /// - Fails if `systemctl --user list-unit-files` reports `bad`
 /// - Fails if `systemctl --user is-active <timer>` is not active
-/// - Warns instead of failing when no unit is installed at all and
-///   [`TimerUnits::absent_is_warning`] is set: such a timer needs a
-///   per-workspace value at install time, so its absence is legal.
+/// - Says nothing when no unit is installed at all and
+///   [`TimerUnits::optional`] is set: such a timer needs a per-workspace
+///   value at install time, so its absence is legal. A partial install is
+///   still reported.
 ///
 /// Each failure records a problem with the spec's fix line.
 ///
@@ -211,14 +211,7 @@ fn check_timer_units_with<S: SystemdRunner>(
         .iter()
         .filter(|unit| std::fs::symlink_metadata(user_dir.join(unit)).is_ok())
         .count();
-    if installed == 0 && spec.absent_is_warning {
-        report.warnings.push(format!(
-            "{} timer is not installed ({} absent from {}) — install with: {}",
-            spec.label,
-            spec.timer,
-            user_dir.display(),
-            spec.fix
-        ));
+    if installed == 0 && spec.optional {
         return;
     }
 
@@ -317,8 +310,9 @@ pub fn check_auditor_units(home: Option<&Path>, report: &mut Report) {
 
 /// Check the github-ci poll timer
 /// (`$HOME/.config/systemd/user/quaqua-github-ci-poll.{timer,service}`).
-/// Never installing it is a warning, not a problem: the unit carries a
-/// per-workspace `--repo`, so the install is a choice.
+/// Never installing it is silent: the unit carries a per-workspace
+/// `--repo`, so the install is a choice. An install that is present but
+/// broken is still a problem.
 pub fn check_github_ci_poll_units_with<S: SystemdRunner>(
     home: Option<&Path>,
     is_macos: bool,
