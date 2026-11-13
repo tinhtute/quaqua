@@ -35,6 +35,9 @@ const LOCK_EX: i32 = 2;
 /// Exit code of a follower whose core died without leaving an exit record
 /// (SIGKILL, OOM, panic): distinct from 0 and from the 1 of a failed prompt.
 pub const EXIT_CORE_DIED: i32 = 8;
+/// The status a Rust process exits with when it panics: it leaves no exit
+/// record, so a parent that reaps it reports it like any other dead core.
+const EXIT_PANIC: i32 = 101;
 
 const SIGINT: i32 = 2;
 /// The conventional exit code of a process ended by Ctrl-C.
@@ -85,9 +88,16 @@ fn lock_path(runs_dir: &Path, name: &str) -> PathBuf {
 
 /// Holds the exclusive lock that makes "is a core live? else start one" atomic
 /// between processes. Released when dropped (the fd closes).
-struct StartLock(#[allow(dead_code)] File);
+struct StartLock(#[allow(dead_code)] Option<File>);
+
+/// A filesystem that cannot lock (NFS without lockd: ENOLCK; no flock: EOPNOTSUPP).
+fn lock_unsupported(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(37) | Some(95))
+}
 
 impl StartLock {
+    /// Blocks until held. Where locking is unsupported it warns and proceeds
+    /// unlocked: still detached, only the simultaneous-resume race is open.
     fn take(runs_dir: &Path, name: &str) -> std::io::Result<StartLock> {
         use std::os::fd::AsRawFd;
         let f = OpenOptions::new()
@@ -97,9 +107,14 @@ impl StartLock {
             .open(lock_path(runs_dir, name))?;
         // SAFETY: the fd is open for the lifetime of `f`.
         if unsafe { flock(f.as_raw_fd(), LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            if lock_unsupported(&e) {
+                eprintln!("WATCHDOG start-lock-unsupported | name={name} {e} — starting unlocked");
+                return Ok(StartLock(None));
+            }
+            return Err(e);
         }
-        Ok(StartLock(f))
+        Ok(StartLock(Some(f)))
     }
 }
 
@@ -187,7 +202,10 @@ fn follow(
         }
         let done = match child.as_mut() {
             // A core killed by a signal never recorded a result.
-            Some(c) => c.try_wait()?.map(|s| s.code().map(Ok).unwrap_or(Err(()))),
+            Some(c) => c.try_wait()?.map(|s| match s.code() {
+                Some(EXIT_PANIC) | None => Err(()),
+                Some(code) => Ok(code),
+            }),
             None if pid_alive(pid) => None,
             None => Some(
                 std::fs::read_to_string(exit_path(runs_dir, name))
@@ -264,4 +282,31 @@ pub fn run(
     let _ = std::fs::write(pid_path(runs_dir, name), format!("{pid}\n"));
     drop(lock);
     follow(runs_dir, name, pid, reattach, Some(child))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detach_lock_unsupported_errnos_proceed_unlocked() {
+        // ENOLCK and EOPNOTSUPP mean "cannot lock here"; anything else is a real error.
+        assert!(lock_unsupported(&std::io::Error::from_raw_os_error(37)));
+        assert!(lock_unsupported(&std::io::Error::from_raw_os_error(95)));
+        assert!(!lock_unsupported(&std::io::Error::from_raw_os_error(9)));
+    }
+
+    #[test]
+    fn test_detach_parent_reports_a_panicking_core_as_died() {
+        let dir = std::env::temp_dir().join(format!("qq-detach-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for s in ["out", "err"] {
+            std::fs::write(log_path(&dir, "w", s), "").unwrap();
+        }
+        let child = Command::new("sh").args(["-c", "exit 101"]).spawn().unwrap();
+        let pid = child.id() as i32;
+        let code = follow(&dir, "w", pid, "re", Some(child)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(code, EXIT_CORE_DIED);
+    }
 }
