@@ -30,7 +30,10 @@ Audit six things:
    `- [audit] <report file>:` line in any memory/YYYY-MM-DD.md (the
    handled marker CoS writes, see AGENTS.md); `## Lessons` lines (other than
    `none`) in runs/*.md from the last 7 days that no rules/ file cites as
-   `runs/<name>.md`.
+   `runs/<name>.md` — the pre-check below already counts these in ONE line;
+   copy it as is, never expand it per file (CoS promotes at most one lesson
+   per cleanup, so most are never promoted by design). Add a Lessons finding
+   only when the same lesson recurs across runs/*.md with no rule covering it.
 4. Pipeline runs (runs/pipeline-*.md, written by `quaqua pipeline`; the
    last `- status:` line is the outcome). Flag:
    - `status: disputed|blocked` with no memory/YYYY-MM-DD.md line naming
@@ -50,6 +53,10 @@ Audit six things:
      before acceptance; no handling line = still open. A Challenge already
      copied into a pipeline file's `## Challenge (from <file>)` section is
      covered by that file's flag — do not report it twice.
+   Pipeline runs that started more than 14 days ago are history: the pre-check
+   skips them and reports only a count line (plus any blocked/disputed one with
+   no handling note). Do not list old runs one per line. A recorded repo that is
+   missing or not a git repo is ONE line per repo, never one per SHA.
 5. Live workers. Flag any live task worker in herdr that is stalled, untracked,
    or in an unhandled error state.
 6. Lead inbox timeline review. Inspect Lead-to-CoS inbox
@@ -548,6 +555,8 @@ fn git_verify_commit(repo: &Path, sha: &str) -> bool {
     matches!(res, Ok(output) if output.status.success())
 }
 
+const PIPELINE_CUTOFF_DAYS: u64 = 14;
+
 pub fn run_deterministic_prechecks(root: &Path) -> Vec<String> {
     let now_secs = crate::util::now_sec();
     let today = days_to_ymd(now_secs / 86400);
@@ -683,6 +692,14 @@ pub fn run_deterministic_prechecks_at(
     let mut flags: Vec<String> = Vec::new();
     // ── 1. pipeline-run pre-checks (runs/pipeline-*.md) ──────────────────────
     let runs_dir = root.join("runs");
+    let today_days = ymd_to_days(today.0, today.1, today.2);
+    // Runs that started more than PIPELINE_CUTOFF_DAYS ago are history: counted,
+    // never checked one per line. Dated by the in-file `- started:` line, else mtime.
+    let mut old_skipped = 0usize;
+    let mut old_unhandled: Vec<String> = Vec::new();
+    // recorded repo -> (first run, run count, why it cannot verify commits): one line per repo.
+    let mut dead_repos: std::collections::BTreeMap<String, (String, usize, &str)> =
+        std::collections::BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(&runs_dir) {
         let mut p_files: Vec<PathBuf> = entries
             .flatten()
@@ -714,6 +731,25 @@ pub fn run_deterministic_prechecks_at(
                 .take_while(|c| c.is_ascii_lowercase() || *c == '-')
                 .count();
             let st = &rest[..st_len];
+
+            let started_days = content
+                .lines()
+                .find_map(|l| l.strip_prefix("- started: "))
+                .and_then(|v| v.get(..10))
+                .and_then(parse_ymd)
+                .map(|(y, m, d)| ymd_to_days(y, m, d))
+                .or_else(|| {
+                    let m = std::fs::metadata(&f).and_then(|m| m.modified()).ok()?;
+                    let secs = m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+                    Some(secs / 86_400)
+                });
+            if started_days.is_some_and(|d| today_days.saturating_sub(d) > PIPELINE_CUTOFF_DAYS) {
+                old_skipped += 1;
+                if matches!(st, "disputed" | "blocked") && !mem_mentions(root, &[base]) {
+                    old_unhandled.push(base.to_string());
+                }
+                continue;
+            }
 
             match st {
                 "disputed" | "blocked" => {
@@ -757,11 +793,17 @@ pub fn run_deterministic_prechecks_at(
                         root.to_path_buf()
                     };
 
-                    if !prepo.is_dir() {
-                        flags.push(format!(
-                            "- runs/{base}.md: status clean but recorded repo '{}' is missing",
-                            prepo.display()
-                        ));
+                    // `.git` must be in the repo itself: git discovery would walk up to a parent repo.
+                    if !prepo.is_dir() || !prepo.join(".git").exists() {
+                        let why = if prepo.is_dir() {
+                            "not a git repo"
+                        } else {
+                            "missing"
+                        };
+                        let e = dead_repos
+                            .entry(prepo.display().to_string())
+                            .or_insert_with(|| (base.to_string(), 0, why));
+                        e.1 += 1;
                     } else if sha.is_empty()
                         || sha == "none"
                         || sha == "?"
@@ -826,6 +868,23 @@ pub fn run_deterministic_prechecks_at(
                 _ => {}
             }
         }
+    }
+    for (repo, (first, n, why)) in dead_repos {
+        if n == 1 {
+            flags.push(format!(
+                "- runs/{first}.md: status clean but recorded repo '{repo}' is {why}"
+            ));
+        } else {
+            flags.push(format!(
+                "- runs/{first}.md ({n} runs, first listed): status clean but recorded repo '{repo}' is {why}; their commits cannot be checked"
+            ));
+        }
+    }
+    if !old_unhandled.is_empty() {
+        flags.push(format!(
+            "- runs/pipeline-*.md: {old_skipped} pipeline runs older than {PIPELINE_CUTOFF_DAYS} days are not checked; {} of them blocked/disputed with no memory line naming them (not listed; `grep -l 'status: blocked\\|status: disputed' runs/pipeline-*.md`)",
+            old_unhandled.len()
+        ));
     }
 
     // ── 2. challenge pre-checks (runs/*.md) ───────────────────────────────────
@@ -1001,6 +1060,7 @@ pub fn run_deterministic_prechecks_at(
     }
 
     // ── 5. unpromoted lessons pre-checks (runs/*.md) ─────────────────────────
+    let mut unpromoted = 0usize;
     if let Ok(entries) = std::fs::read_dir(&runs_dir) {
         let mut r_files: Vec<PathBuf> = entries
             .flatten()
@@ -1061,11 +1121,15 @@ pub fn run_deterministic_prechecks_at(
                 let needle = format!("runs/{base}.md");
                 let cited = rules_contents.iter().any(|c| c.contains(&needle));
                 if !cited {
-                    flags.push(format!(
-                        "- runs/{base}.md: '## Lessons' unpromoted from the last 7 days — no rules/ file cites runs/{base}.md"
-                    ));
+                    unpromoted += 1;
                 }
             }
+        }
+        if unpromoted > 0 {
+            flags.push(format!(
+                "- runs/*.md: {} unpromoted '## Lessons' from the last 7 days (CoS promotes at most one per cleanup; not listed per file)",
+                if unpromoted == 1 { "1 run has".to_string() } else { format!("{unpromoted} runs have") }
+            ));
         }
     }
 
@@ -1086,7 +1150,6 @@ pub fn run_deterministic_prechecks_at(
         }
     }
 
-    let today_days = ymd_to_days(today.0, today.1, today.2);
     let mut cause_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for (f_days, path) in mem_files {
@@ -2041,8 +2104,10 @@ mod tests {
         let agg: Vec<&String> = flags.iter().filter(|f| f.contains("older than")).collect();
         assert_eq!(agg.len(), 1, "one aggregate line for old runs: {:?}", flags);
         assert!(
-            agg[0].contains("pipeline-oldblk") && agg[0].starts_with("- runs/pipeline-"),
-            "old unhandled blocked run is named in the aggregate: {:?}",
+            agg[0].starts_with("- runs/pipeline-")
+                && agg[0].contains("1 of them")
+                && agg[0].contains("3 pipeline runs"),
+            "aggregate counts the 3 old runs, 1 of them unhandled: {:?}",
             agg
         );
     }
