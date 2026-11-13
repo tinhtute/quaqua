@@ -38,10 +38,7 @@ pub fn matches_pipeline_reviewer(w: &str, task: &str) -> bool {
         return true;
     }
     let task_pat = format!("-{}r", task);
-    if contains_prefix_digit(w, &task_pat) {
-        return true;
-    }
-    false
+    contains_prefix_digit(w, &task_pat)
 }
 
 /// True for an owner tag that names a project team's Lead (`<slug>-lead`).

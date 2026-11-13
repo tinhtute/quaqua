@@ -188,3 +188,31 @@ fn test_live_raw_refused_under_test() {
         "live_raw_refused must return true for live workspace raw directory under test"
     );
 }
+
+#[test]
+fn test_mode_detected_without_quaqua_test_env() {
+    let _guard = EnvGuard::new(&[
+        "QUAQUA_TEST",
+        "QUAQUA_RUNS_DIR",
+        "QUAQUA_HOME",
+        "QUAQUA_ROOT",
+    ]);
+    std::env::remove_var("QUAQUA_TEST");
+    std::env::remove_var("QUAQUA_RUNS_DIR");
+    std::env::remove_var("QUAQUA_HOME");
+    std::env::remove_var("QUAQUA_ROOT");
+
+    let live_runs = quaqua::workspace::live_workspace_runs().expect("system user home");
+    let live_db = quaqua::workspace::live_workspace_db().expect("system user home");
+
+    assert_ne!(
+        quaqua::worker::cleanup::default_runs_dir(),
+        live_runs,
+        "a cargo test run must never resolve the live runs dir, even without QUAQUA_TEST=1"
+    );
+    assert_ne!(
+        quaqua::bus::FarmBus::default_path(),
+        live_db,
+        "a cargo test run must never resolve the live db, even without QUAQUA_TEST=1"
+    );
+}

@@ -28,15 +28,11 @@ pub fn is_test_environment() -> bool {
     std::env::var("QUAQUA_TEST").as_deref() == Ok("1") || is_running_in_cargo_test()
 }
 
+/// Cargo sets `CARGO_BIN_EXE_<name>` at runtime only for integration-test
+/// (and bench) binaries, never for `cargo run`. The binary's directory is not
+/// a signal: it is `deps` on older cargo but `build/<pkg>/<hash>/out` on 1.100.
 fn is_running_in_cargo_test() -> bool {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if parent.ends_with("deps") {
-                return true;
-            }
-        }
-    }
-    false
+    std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("CARGO_BIN_EXE_"))
 }
 
 #[cfg(unix)]
