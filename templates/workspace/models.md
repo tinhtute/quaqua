@@ -28,7 +28,7 @@ Pick by task shape. Name = kind passed to `quaqua worker spawn`. Update "Seen" a
 
 ## Claude out — dormant plan (only when anh iu says Claude tokens are out)
 - CoS: anh iu opens opencode in `~/quaqua` (reads AGENTS.md); persona and rules unchanged.
-- suhuynh → pi · opencode-go/deepseek-v4.1-flash · max (alt: claude · opus-5.5 · medium); ni paused.
+- suhuynh → pi · mistral/deepseek-v4-1-flash-1017 · max (alt: claude · opus-5.5 · medium); ni paused.
 - truonglao back (anh iu, 2026-10-19): only for super-hard questions that need advising. Spawn mode lives in team.toml (`auto` = CoS/Lead call it when needed, current; `approve` = ask anh iu first).
 - Builder in this mode = `sude` (omp), so the reviewer stays on a different harness.
 - The table above is the live roster while Claude is in; this block is the plan for when it is out.

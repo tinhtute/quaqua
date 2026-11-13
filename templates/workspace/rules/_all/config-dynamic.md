@@ -26,7 +26,7 @@ Cấu hình đổi **không cần sửa code**: mọi giá trị nằm trong `te
 - `QUAQUA_LAYOUT_SHADOW=1` — escape hatch đưa layout gate về shadow mode (ghi would_deny, không chặn).
 
 ## Profile "Claude out" (mẫu đã chạy)
-Khi hết token Claude: `suhuynh` → `pi · opencode-go/deepseek-v4.1-flash · max` (thay thế: `claude · opus-5.5 · medium`); `ni`/`truonglao` pause; builder = `sude` (omp) để reviewer khác harness; CoS chạy trên opencode. Quay lại bảng gốc = sửa lại kind, không build lại.
+Khi hết token Claude: `suhuynh` → `pi · mistral/deepseek-v4-1-flash-1017 · max` (thay thế: `claude · opus-5.5 · medium`); `ni`/`truonglao` pause; builder = `sude` (omp) để reviewer khác harness; CoS chạy trên opencode. Quay lại bảng gốc = sửa lại kind, không build lại.
 
 ## Kiểm tra nhanh
 - `quaqua config get kinds.suhuynh.model` — đọc giá trị hiệu lực.
