@@ -3,13 +3,14 @@ name: Test
 # Every PR into main, and every push to main, runs the workspace test suite, the
 # workspace clippy gate, the cos-memory mod's tests, and lints the workflow
 # files. The check names are "Test / cargo test (workspace)" (which carries the
-# clippy and hermetic-DB steps), "Test / cos-memory mod tests" and
-# "Test / actionlint (workflows)".
+# clippy and hermetic-DB steps), "Test / cargo check (aarch64-apple-darwin)",
+# "Test / cos-memory mod tests" and "Test / actionlint (workflows)".
 #
 # Required today: ruleset 25703680 requires only "cargo test (workspace)" and
-# "actionlint (workflows)". "cos-memory mod tests" is NOT required yet, so a red
-# mod test shows on the PR but does not block the merge until that context is
-# added to the ruleset. Reword this to "all required" only once it is.
+# "actionlint (workflows)". "cos-memory mod tests" and "cargo check
+# (aarch64-apple-darwin)" are NOT required yet, so a red one shows on the PR but
+# does not block the merge until that context is added to the ruleset. Reword
+# this to "all required" only once they are.
 on:
   pull_request:
     branches: [main]
