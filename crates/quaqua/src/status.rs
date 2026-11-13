@@ -2464,7 +2464,7 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(handle_status(&a(&["--bogus"]), &mock), Ok(2));
         assert_eq!(handle_status(&a(&["--help"]), &mock), Ok(0));
-        assert_eq!(status_help().matches("--all").count() >= 1, true);
+        assert!(status_help().contains("--all"));
         for f in ["stale", "unresolved", "same-harness"] {
             assert!(status_help().contains(f), "help must document {f}");
         }
