@@ -85,7 +85,7 @@ fn lock_path(runs_dir: &Path, name: &str) -> PathBuf {
 
 /// Holds the exclusive lock that makes "is a core live? else start one" atomic
 /// between processes. Released when dropped (the fd closes).
-struct StartLock(File);
+struct StartLock(#[allow(dead_code)] File);
 
 impl StartLock {
     fn take(runs_dir: &Path, name: &str) -> std::io::Result<StartLock> {
