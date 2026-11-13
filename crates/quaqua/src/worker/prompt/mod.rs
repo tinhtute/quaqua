@@ -2,6 +2,7 @@
 
 pub mod brief;
 pub mod cost;
+pub mod detach;
 pub mod observer;
 pub mod outcome;
 pub mod playbook_check;
@@ -835,6 +836,28 @@ pub fn prompt_worker<G: GitOps>(
         let _ = std::fs::remove_file(WorkerMetadata::provider_retry_path(&runs_dir, name));
     }
     res
+}
+
+/// CLI entry: [`prompt_worker`] run in a session of its own, so the wait and
+/// the report delivery outlive the coordinator that launched it. This process
+/// only follows the core and mirrors its output and exit code.
+pub fn prompt_worker_cli<G: GitOps>(
+    name: &str,
+    task: Option<&str>,
+    resume: bool,
+    extend: Option<u64>,
+    git: &G,
+    herdr: &Herdr,
+) -> Result<(), (i32, String)> {
+    if std::env::var_os(detach::ENV).is_none() {
+        match detach::run(&default_runs_dir(), name) {
+            Ok(0) => return Ok(()),
+            Ok(code) => return Err((code, String::new())),
+            // Could not detach: wait in this process, as before.
+            Err(e) => eprintln!("WATCHDOG detach-failed | name={name} {e} — waiting in-process"),
+        }
+    }
+    prompt_worker(name, task, resume, extend, git, herdr)
 }
 
 fn prompt_worker_once<G: GitOps>(
