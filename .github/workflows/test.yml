@@ -88,6 +88,27 @@ jobs:
           HERMETIC_REQUIRE_STRACE: '1'
         run: bash tests/test_hermetic_db.sh
 
+  # The engine ships darwin release assets, and cfg(target_os = "macos") code
+  # is not compiled by the Linux jobs above. This type-checks the whole
+  # workspace, tests included, on a macOS runner so a darwin-only break fails
+  # the PR instead of the release. Check only: the C deps (ring, libsqlite3)
+  # are proven by the release build; the Rust cfg(macos) code is what this
+  # guards. Not required in the ruleset yet.
+  darwin-check:
+    name: cargo check (aarch64-apple-darwin)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7
+        with:
+          toolchain: 1.99.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets --target aarch64-apple-darwin
+
   # The cos-memory mod's tests are plain `node:test` files with no dependencies
   # (mods/cos-memory/package.json declares none), so a pinned Node major is the
   # whole setup: no install step, no lockfile, nothing to cache.
