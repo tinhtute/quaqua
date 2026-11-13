@@ -57,16 +57,30 @@ run() {
 
 run Linux
 [[ $rc -eq 0 ]] || fail "Linux: exit $rc: $(cat "$T/err")"
-for unit in quaqua-auditor.service quaqua-auditor.timer; do
-  dst="$T/home/.config/systemd/user/$unit"
-  [[ -L $dst && $(readlink "$dst") == "$root/scripts/auditor/systemd/$unit" ]] \
-    || fail "Linux: wrong unit symlink: $unit"
-done
+dst="$T/home/.config/systemd/user"
+[[ -L $dst/quaqua-auditor.timer && $(readlink "$dst/quaqua-auditor.timer") == "$root/scripts/auditor/systemd/quaqua-auditor.timer" ]] \
+  || fail "Linux: wrong timer symlink"
+# The user manager starts the job with a bare PATH (no ~/.local/bin): the
+# service must pin the install-time PATH so the harness CLI resolves.
+service="$dst/quaqua-auditor.service"
+[[ -f $service && ! -L $service ]] || fail "Linux: service must be a rendered file, not a symlink"
+pinned=$(sed -n 's/^Environment="PATH=\(.*\)"$/\1/p' "$service")
+[[ -n $pinned ]] || fail "Linux: service does not pin PATH: $(cat "$service")"
+case ":$pinned:" in *":$T/claude & tools:"*) ;; *) fail "Linux: pinned PATH lacks the harness dir: $pinned" ;; esac
+grep -qxF 'ExecStart=%h/.cargo/bin/quaqua auditor run' "$service" || fail "Linux: ExecStart changed: $(cat "$service")"
 [[ $(cat "$T/calls") == 'systemctl --user daemon-reload' ]] \
   || fail "Linux: unexpected manager calls: $(cat "$T/calls")"
 grep -q 'systemctl --user enable --now quaqua-auditor.timer' "$T/out" \
   || fail "Linux: no manual enable instruction"
-echo 'ok: Linux -> existing systemd symlinks + daemon-reload, no enable/start'
+# A pre-fix install left the service as a symlink into the checkout: the
+# reinstall must replace the link, not write through it into the template.
+ln -sfn "$root/scripts/auditor/systemd/quaqua-auditor.service" "$service"
+run Linux
+[[ $rc -eq 0 && -f $service && ! -L $service ]] || fail "Linux: reinstall left a symlinked service"
+grep -q '^Environment=' "$root/scripts/auditor/systemd/quaqua-auditor.service.in" \
+  && ! grep -q '^Environment="PATH=/' "$root/scripts/auditor/systemd/quaqua-auditor.service.in" \
+  || fail "Linux: reinstall wrote through the symlink into the template"
+echo 'ok: Linux -> rendered service pins PATH, timer symlink, daemon-reload, no enable/start'
 
 run Darwin
 [[ $rc -eq 0 ]] || fail "Darwin: exit $rc: $(cat "$T/err")"
