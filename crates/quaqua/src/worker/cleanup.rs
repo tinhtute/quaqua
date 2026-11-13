@@ -409,9 +409,13 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
 
     // agent_not_found alone is not "gone": liveness confirms it with
     // `agent list` before the worktree is removed (issue #69).
+    let mut agent_down = false;
     let parsed_json: Option<Value> = match liveness(herdr, name) {
         Liveness::Alive(body) => serde_json::from_str::<Value>(&body).ok(),
-        Liveness::Down => None, // agent already gone: no pane to close
+        Liveness::Down => {
+            agent_down = true; // agent already gone: no pane to close
+            None
+        }
         Liveness::Unknown(why) => {
             return Err((
                 1,
@@ -452,6 +456,23 @@ pub fn cleanup_worker_in<G: GitOps, H: HerdrOps>(
         .any(|p| Path::new(p) == wt);
     let branch = format!("quaqua/{name}");
     if !wt.is_dir() && !registered && !git.branch_exists(&repo, &branch) {
+        // A dead orphan: no agent, no worktree, no branch, and the spawn record
+        // proves this repo is the one the worker came from. Only its metadata
+        // is left; drop it. Without that proof stay refused (wrong repo?).
+        let runs_dir = override_runs_dir
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(default_runs_dir);
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let recorded_here = WorkerMetadata::load_repo(&runs_dir, name)
+            .map(|r| canon(&r) == repo)
+            .unwrap_or(false);
+        if agent_down && recorded_here {
+            WorkerMetadata::cleanup_worker_files(&runs_dir, name);
+            let _ = std::fs::remove_file(runs_dir.join(format!("{name}.base")));
+            let _ = std::fs::remove_file(crate::layout::layout_role_path(&runs_dir, name));
+            println!("cleaned {name} (orphan: no agent, worktree or branch; metadata removed)");
+            return Ok(());
+        }
         return Err((
             1,
             format!(

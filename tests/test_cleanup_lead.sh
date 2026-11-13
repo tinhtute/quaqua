@@ -121,6 +121,7 @@ echo "ok: live Peer -> refused, nothing closed, INDEX untouched"
 # ── no Lead / bad slug ──────────────────────────────────────────────────────
 # A Lead with no agent and no trace (INDEX owner is cos, no runs/ files) is a typo.
 sed 's/| baro-lead |/| cos |/' "$T/INDEX.orig" > "$T/INDEX.cos"
+find "$T/runs" -name 'baro-lead*' -delete
 : > "$T/calls"; cp "$T/INDEX.cos" "$T/projects/INDEX.md"; rc=0
 CALLS="$T/calls" HERDR_PANE_ID=w9:p13 QUAQUA_ROOT="$T" "$QUAQUA_BIN" lead cleanup baro >"$T/out" 2>"$T/err" || rc=$?
 [[ $rc -eq 1 ]] && grep -q "no live Lead 'baro-lead'" "$T/err" || fail "no lead: $(cat "$T/err")"
