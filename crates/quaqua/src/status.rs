@@ -800,6 +800,17 @@ pub fn format_status_report(
     orchestration: Result<&[OrchestrationRow], &str>,
     verdicts: Result<&[BranchVerdictRow], &str>,
 ) -> String {
+    format_status_report_opts(workflows, orchestration, verdicts, true)
+}
+
+/// Status report; `all == false` hides rows nobody can act on (see `StatusArgs`).
+pub fn format_status_report_opts(
+    workflows: Result<&[WorkflowStatusRow], &str>,
+    orchestration: Result<&[OrchestrationRow], &str>,
+    verdicts: Result<&[BranchVerdictRow], &str>,
+    all: bool,
+) -> String {
+    let _ = all;
     let mut out = String::new();
 
     out.push_str("=== Workflows (runs/quaqua.db) ===\n");
@@ -969,6 +980,22 @@ pub fn render_status_with_git<H: HerdrOps, G: GitOps>(
         orch_res.as_deref().map_err(|e| e.as_str()),
         verdicts_res.as_deref().map_err(|e| e.as_str()),
     ))
+}
+
+/// Parsed plain-status arguments (everything except `--metrics`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusArgs {
+    pub all: bool,
+    pub help: bool,
+}
+
+pub fn parse_status_args(args: &[String]) -> Result<StatusArgs, String> {
+    let _ = args;
+    Ok(StatusArgs::default())
+}
+
+pub fn status_help() -> String {
+    String::new()
 }
 
 /// CLI entrypoint for `quaqua status`.
@@ -2199,6 +2226,167 @@ mod tests {
     impl Drop for TempDirCleaner {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wf_row(id: &str, kind: &str, phase: Option<&str>, ts: u64) -> WorkflowStatusRow {
+        WorkflowStatusRow {
+            workflow_id: id.to_string(),
+            snap_seq: None,
+            last_event_kind: Some(kind.to_string()),
+            last_event_seq: Some(1),
+            last_event_ts_ms: Some(ts),
+            phase: phase.map(str::to_string),
+        }
+    }
+
+    fn vd_row(branch: &str, stale: bool, unresolved: bool, same: bool) -> BranchVerdictRow {
+        BranchVerdictRow {
+            branch: branch.to_string(),
+            head_sha: "abcdef1234".to_string(),
+            verdict_sha: "abcdef1234".to_string(),
+            level: VerdictLevel::ReviewClean,
+            is_verified: true,
+            stale,
+            unresolved,
+            same_harness: same,
+        }
+    }
+
+    fn filter_fixture() -> (Vec<WorkflowStatusRow>, Vec<BranchVerdictRow>) {
+        let wfs = vec![
+            // kept
+            wf_row("k-activity", "activity_scheduled", Some("build"), 5),
+            wf_row("k-child", "child_started", None, 5),
+            wf_row("k-disputed", "workflow_completed", Some("disputed"), 5),
+            wf_row("k-failed", "workflow_failed", None, 5),
+            wf_row("k-continue", "continue", None, 5),
+            wf_row("k-approval", "pause_for_approval", None, 1),
+            wf_row("k-retry", "provider_retry", None, 5),
+            // hidden
+            wf_row("h-done", "workflow_completed", Some("completed"), 5),
+            wf_row("h-done-nophase", "workflow_completed", None, 5),
+            wf_row("h-cancel", "workflow_cancelled", Some("cancelled"), 5),
+            wf_row("h-verdict", "verdict", None, 5),
+            wf_row("h-gap", "playbook_gap", None, 5),
+        ];
+        let vds = vec![
+            vd_row("b-ok", false, false, false),
+            vd_row("b-stale", true, false, false),
+            vd_row("b-same", false, false, true),
+            vd_row("b-gone", false, true, false),
+            vd_row("b-gone-stale", true, true, false),
+        ];
+        (wfs, vds)
+    }
+
+    #[test]
+    fn test_status_default_hides_terminal_workflows_and_unresolved_verdicts() {
+        let (wfs, vds) = filter_fixture();
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&vds), false);
+        for kept in [
+            "k-activity",
+            "k-child",
+            "k-disputed",
+            "k-failed",
+            "k-continue",
+            "k-approval",
+            "k-retry",
+            "b-ok",
+            "b-stale",
+            "b-same",
+        ] {
+            assert!(out.contains(kept), "{kept} must stay visible:\n{out}");
+        }
+        for hidden in [
+            "h-done",
+            "h-done-nophase",
+            "h-cancel",
+            "h-verdict",
+            "h-gap",
+            "b-gone",
+        ] {
+            assert!(!out.contains(hidden), "{hidden} must be hidden:\n{out}");
+        }
+        assert_eq!(
+            out.matches("5 hidden (quaqua status --all)").count(),
+            2,
+            "{out}"
+        );
+        assert!(out.contains("2 hidden (quaqua status --all)"), "{out}");
+    }
+
+    #[test]
+    fn test_status_all_shows_everything_without_hidden_line() {
+        let (wfs, vds) = filter_fixture();
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&vds), true);
+        for id in [
+            "k-approval",
+            "h-done",
+            "h-cancel",
+            "h-verdict",
+            "h-gap",
+            "b-gone",
+            "b-gone-stale",
+        ] {
+            assert!(out.contains(id), "{id} must show with --all:\n{out}");
+        }
+        assert!(!out.contains("hidden"), "{out}");
+    }
+
+    #[test]
+    fn test_status_hidden_line_only_in_sections_that_hid_rows() {
+        let wfs = vec![wf_row("k-live", "activity_scheduled", None, 5)];
+        let vds = vec![vd_row("b-gone", false, true, false)];
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&vds), false);
+        assert_eq!(
+            out.matches("hidden (quaqua status --all)").count(),
+            1,
+            "{out}"
+        );
+        assert!(out.contains("1 hidden (quaqua status --all)"));
+        assert!(!out.contains("b-gone"));
+    }
+
+    #[test]
+    fn test_status_empty_flag_cell_prints_ok() {
+        let vds = vec![
+            vd_row("b-ok", false, false, false),
+            vd_row("b-st", true, false, false),
+        ];
+        let out = format_status_report_opts(Ok(&[]), Ok(&[]), Ok(&vds), true);
+        let ok_line = out.lines().find(|l| l.contains("b-ok")).unwrap();
+        assert!(ok_line.trim_end().ends_with(" ok"), "{ok_line}");
+        let st_line = out.lines().find(|l| l.contains("b-st")).unwrap();
+        assert!(st_line.trim_end().ends_with("stale"), "{st_line}");
+    }
+
+    #[test]
+    fn test_status_args_all_help_and_unknown() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_status_args(&a(&[])).unwrap(),
+            StatusArgs {
+                all: false,
+                help: false
+            }
+        );
+        assert!(parse_status_args(&a(&["--all"])).unwrap().all);
+        assert!(parse_status_args(&a(&["--help"])).unwrap().help);
+        assert!(parse_status_args(&a(&["-h"])).unwrap().help);
+        assert!(parse_status_args(&a(&["--bogus"])).is_err());
+        assert!(parse_status_args(&a(&["--all", "extra"])).is_err());
+    }
+
+    #[test]
+    fn test_status_unknown_arg_exits_2_and_help_exits_0() {
+        let mock = MockHerdr::new("{}");
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(handle_status(&a(&["--bogus"]), &mock), Ok(2));
+        assert_eq!(handle_status(&a(&["--help"]), &mock), Ok(0));
+        assert_eq!(status_help().matches("--all").count() >= 1, true);
+        for f in ["stale", "unresolved", "same-harness"] {
+            assert!(status_help().contains(f), "help must document {f}");
         }
     }
 
