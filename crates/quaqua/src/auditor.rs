@@ -1496,12 +1496,17 @@ mod tests {
 
         let flags = run_deterministic_prechecks_at(&root, today, now_secs);
 
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("unpromoted")).collect();
+        assert_eq!(
+            agg.len(),
+            1,
+            "one aggregate line for the one recent unpromoted lesson: {:?}",
+            flags
+        );
         assert!(
-            flags
-                .iter()
-                .any(|f| f.contains("worker-recent.md") && f.contains("Lessons")),
-            "worker-recent.md (6 days ago) must be flagged: {:?}",
-            flags
+            agg[0].contains("1 run"),
+            "aggregate counts worker-recent.md (6 days ago): {:?}",
+            agg
         );
         assert!(
             !flags.iter().any(|f| f.contains("worker-old.md")),
@@ -1588,9 +1593,10 @@ mod tests {
             "rev-cap.md must NOT be flagged: {:?}",
             flags
         );
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("unpromoted")).collect();
         assert!(
-            flags.iter().any(|f| f.contains("rev-lesson.md")),
-            "rev-lesson.md with real lesson must be flagged: {:?}",
+            agg.len() == 1 && agg[0].contains("1 run"),
+            "only rev-lesson.md (real lesson) is counted: {:?}",
             flags
         );
     }
@@ -1915,6 +1921,181 @@ mod tests {
                 && f.contains("older than 24h")
                 && f.contains("sude-active")),
             "lost momentum (>24h with live worker) must be flagged for (c): {:?}",
+            flags
+        );
+    }
+
+    fn backdate(path: &Path, secs_ago: u64, now_secs: u64) {
+        let f = std::fs::File::open(path).unwrap();
+        let t = std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs - secs_ago),
+        );
+        f.set_times(t).unwrap();
+    }
+
+    fn git_init_commit(dir: &Path) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?} failed");
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c1"]);
+        git(&["rev-parse", "--short", "HEAD"])
+    }
+
+    #[test]
+    fn test_many_unpromoted_lessons_collapse_to_one_count_line() {
+        let root = test_temp_dir("lessons-agg");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        for i in 0..5 {
+            std::fs::write(
+                runs_dir.join(format!("w{i}.md")),
+                "# R\n\n## Lessons\n- something learned\n",
+            )
+            .unwrap();
+            backdate(&runs_dir.join(format!("w{i}.md")), 86400, now_secs);
+        }
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("unpromoted")).collect();
+        assert_eq!(agg.len(), 1, "5 lessons -> one line, not five: {:?}", flags);
+        assert!(agg[0].contains("5 runs"), "count is stated: {:?}", agg);
+        assert!(
+            !flags.iter().any(|f| f.contains("w3.md")),
+            "no per-file lesson line: {:?}",
+            flags
+        );
+    }
+
+    #[test]
+    fn test_old_pipeline_runs_counted_not_listed_fresh_ones_flagged() {
+        let root = test_temp_dir("pipe-old");
+        let runs_dir = root.join("runs");
+        let mem_dir = root.join("memory");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let repo = root.join("proj");
+        let _ = git_init_commit(&repo);
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        let put = |name: &str, started: &str, status: &str| {
+            std::fs::write(
+                runs_dir.join(format!("pipeline-{name}.md")),
+                format!(
+                    "# pipeline {name}\n- task: {name} \u{b7} repo: {}\n- started: {started}T10:00:00+07:00\n- {status}\n",
+                    repo.display()
+                ),
+            )
+            .unwrap();
+        };
+        // old (started 2026-10-19): bad sha in a real repo, unhandled blocked, handled blocked
+        put(
+            "oldbad",
+            "2026-10-19",
+            "status: clean \u{b7} commit deadbee \u{b7} elapsed 1m",
+        );
+        put("oldblk", "2026-10-19", "status: blocked");
+        put("oldok", "2026-10-19", "status: blocked");
+        std::fs::write(mem_dir.join("2026-10-20.md"), "- pipeline-oldok handled\n").unwrap();
+        // fresh (started 2026-11-12): same defects
+        put(
+            "freshbad",
+            "2026-11-12",
+            "status: clean \u{b7} commit deadbee \u{b7} elapsed 1m",
+        );
+        put("freshblk", "2026-11-12", "status: blocked");
+
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-freshbad.md") && f.contains("does not resolve")),
+            "fresh bad sha in a real repo is still flagged: {:?}",
+            flags
+        );
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-freshblk.md") && f.contains("no memory")),
+            "fresh unhandled blocked run is still listed: {:?}",
+            flags
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("pipeline-oldbad.md")),
+            "old clean run is not checked per sha: {:?}",
+            flags
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("pipeline-oldok")),
+            "old handled blocked run is silent: {:?}",
+            flags
+        );
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("older than")).collect();
+        assert_eq!(agg.len(), 1, "one aggregate line for old runs: {:?}", flags);
+        assert!(
+            agg[0].contains("pipeline-oldblk") && agg[0].starts_with("- runs/pipeline-"),
+            "old unhandled blocked run is named in the aggregate: {:?}",
+            agg
+        );
+    }
+
+    #[test]
+    fn test_recorded_repo_not_a_git_repo_is_one_line_per_repo() {
+        let root = test_temp_dir("pipe-nogit");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let dead = root.join("moved-away");
+        std::fs::create_dir_all(&dead).unwrap();
+        let live = root.join("live");
+        let _ = git_init_commit(&live);
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        for (i, sha) in ["aaa1111", "bbb2222", "ccc3333"].iter().enumerate() {
+            std::fs::write(
+                runs_dir.join(format!("pipeline-d{i}.md")),
+                format!(
+                    "- task: d{i} \u{b7} repo: {}\n- started: 2026-11-12T10:00:00+07:00\n- status: clean \u{b7} commit {sha}\n",
+                    dead.display()
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            runs_dir.join("pipeline-live1.md"),
+            format!(
+                "- task: live1 \u{b7} repo: {}\n- started: 2026-11-12T10:00:00+07:00\n- status: clean \u{b7} commit badbad0\n",
+                live.display()
+            ),
+        )
+        .unwrap();
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        let dead_lines: Vec<&String> = flags
+            .iter()
+            .filter(|f| f.contains(&*dead.display().to_string()))
+            .collect();
+        assert_eq!(
+            dead_lines.len(),
+            1,
+            "3 runs, one repo -> one line: {:?}",
+            flags
+        );
+        assert!(
+            dead_lines[0].contains("not a git repo") && dead_lines[0].contains("3 runs"),
+            "{:?}",
+            dead_lines
+        );
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-live1.md") && f.contains("does not resolve")),
+            "bad sha in a real git repo still flagged per run: {:?}",
             flags
         );
     }
