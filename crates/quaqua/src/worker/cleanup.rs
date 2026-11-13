@@ -964,6 +964,61 @@ pub(crate) mod metrics {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// A dead orphan (no agent, no worktree, no branch) whose spawn record
+    /// names this very repo is cleaned, so its metadata is not left for hand
+    /// removal; a second run changes nothing more.
+    #[test]
+    fn test_cleanup_dead_orphan_with_recorded_repo_is_cleaned() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let (tmp, runs_dir, owner, _foreign) = worktree_sandbox("orphan");
+        let _env = cleanup_env(&runs_dir);
+        let git = crate::git::Git::new();
+        WorkerMetadata::save_owner(&runs_dir, "w-orph", "cos").unwrap();
+        WorkerMetadata::save_repo(&runs_dir, "w-orph", &owner).unwrap();
+
+        cleanup_worker_in("w-orph", &owner, &git, &gone_herdr(), Some(&runs_dir))
+            .expect("a dead orphan of this repo must be cleaned");
+        assert!(!runs_dir.join("w-orph.owner").exists());
+        assert!(!runs_dir.join("w-orph.repo").exists());
+        assert!(
+            !runs_dir.join("telemetry.jsonl").exists(),
+            "an orphan never ran in a worktree: no telemetry row"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A live agent is never an orphan, even with no worktree and no branch.
+    #[test]
+    fn test_cleanup_live_agent_without_worktree_is_refused() {
+        let _lock = test_lock();
+        let _env_lock = crate::test_env::lock_env();
+        let (tmp, runs_dir, owner, _foreign) = worktree_sandbox("orphan-live");
+        let _env = cleanup_env(&runs_dir);
+        WorkerMetadata::save_owner(&runs_dir, "w-live", "cos").unwrap();
+        WorkerMetadata::save_repo(&runs_dir, "w-live", &owner).unwrap();
+        let herdr = MockHerdr {
+            agent_list_response: r#"{"result":{"agents":[{"name":"w-live"}]}}"#.to_string(),
+            agent_get_response:
+                r#"{"result":{"agent":{"name":"w-live","pane_id":"w1:p1","workspace_id":"w1"}}}"#
+                    .to_string(),
+        };
+
+        cleanup_worker_in(
+            "w-live",
+            &owner,
+            &crate::git::Git::new(),
+            &herdr,
+            Some(&runs_dir),
+        )
+        .expect_err("a live agent must not be cleaned as an orphan");
+        assert!(runs_dir.join("w-live.owner").exists());
+        assert!(runs_dir.join("w-live.repo").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// #170 F2: a Lead is cleaned by `quaqua lead cleanup <slug>`, which also
     /// closes the team workspace and returns the project to cos.
     #[test]

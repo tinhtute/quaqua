@@ -119,8 +119,29 @@ cmp -s "$T/projects/INDEX.md" "$T/INDEX.orig" || fail "live peer: INDEX touched"
 echo "ok: live Peer -> refused, nothing closed, INDEX untouched"
 
 # ── no Lead / bad slug ──────────────────────────────────────────────────────
-run baro
+# A Lead with no agent and no trace (INDEX owner is cos, no runs/ files) is a typo.
+sed 's/| baro-lead |/| cos |/' "$T/INDEX.orig" > "$T/INDEX.cos"
+: > "$T/calls"; cp "$T/INDEX.cos" "$T/projects/INDEX.md"; rc=0
+CALLS="$T/calls" HERDR_PANE_ID=w9:p13 QUAQUA_ROOT="$T" "$QUAQUA_BIN" lead cleanup baro >"$T/out" 2>"$T/err" || rc=$?
 [[ $rc -eq 1 ]] && grep -q "no live Lead 'baro-lead'" "$T/err" || fail "no lead: $(cat "$T/err")"
+cmp -s "$T/projects/INDEX.md" "$T/INDEX.cos" || fail "no lead: INDEX touched"
+
+# ── dead Lead orphan: no agent, INDEX still names it -> cleaned, owner -> cos ─
+run baro
+[[ $rc -eq 0 ]] || fail "orphan: exit $rc: $(cat "$T/err")"
+grep -qE '^\| baro \| ~/Lab/baro \| cos \|' "$T/projects/INDEX.md" || fail "orphan: owner not reset"
+grep -qE '^\| baro-web \| ~/Lab/baro-web \| baro-web-lead \|' "$T/projects/INDEX.md" || fail "orphan: other row touched"
+[[ ! -e $T/runs/baro-lead.rules.md ]] || fail "orphan: rules dump kept"
+! grep -q 'close' "$T/calls" || fail "orphan: closed something: $(cat "$T/calls")"
+echo "ok: dead Lead orphan -> cleaned, INDEX owner back to cos, nothing closed"
+
+# ── dead Lead that still owns a live Peer: refused ──────────────────────────
+printf 'baro-lead' > "$T/runs/sude-live.owner"
+run baro HERDR_LIVE=sude-live
+[[ $rc -eq 1 ]] && grep -q 'still owns live Peers: sude-live' "$T/err" || fail "orphan+peer: $(cat "$T/err")"
+cmp -s "$T/projects/INDEX.md" "$T/INDEX.orig" || fail "orphan+peer: INDEX touched"
+echo "ok: dead Lead with a live Peer -> refused"
+
 run Bad_slug
 [[ $rc -eq 1 ]] && grep -q '^# Usage:' "$T/err" || fail "bad slug: $(cat "$T/err")"
 [[ ! -s $T/calls ]] || fail "bad slug: herdr called"
