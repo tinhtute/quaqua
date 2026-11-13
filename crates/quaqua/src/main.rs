@@ -114,6 +114,7 @@ enum Command {
         args: Vec<String>,
     },
     /// Show workflow and orchestration status overview.
+    #[command(disable_help_flag = true)]
     Status {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

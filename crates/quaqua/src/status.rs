@@ -33,6 +33,8 @@ pub struct WorkflowStatusRow {
     pub last_event_seq: Option<u64>,
     pub last_event_ts_ms: Option<u64>,
     pub phase: Option<String>,
+    /// `status` of the last event's payload when it is `workflow_completed`.
+    pub completed_status: Option<String>,
 }
 
 /// Status of the worker report file (`runs/<name>.md`).
@@ -384,7 +386,7 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
     if has_events {
         let mut stmt = conn
             .prepare(
-                "SELECT e.workflow_id, e.seq, e.ts_ms, e.kind \
+                "SELECT e.workflow_id, e.seq, e.ts_ms, e.kind, e.payload_json \
                  FROM events e \
                  INNER JOIN ( \
                      SELECT workflow_id, MAX(seq) AS max_seq \
@@ -400,12 +402,13 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
                 let seq: i64 = row.get(1)?;
                 let ts_ms: i64 = row.get(2)?;
                 let kind: String = row.get(3)?;
-                Ok((wf, seq as u64, ts_ms as u64, kind))
+                let payload: String = row.get(4)?;
+                Ok((wf, seq as u64, ts_ms as u64, kind, payload))
             })
             .map_err(|e| format!("db error: executing events query: {e}"))?;
 
         for r in rows {
-            let (wf, seq, ts_ms, kind) =
+            let (wf, seq, ts_ms, kind, payload) =
                 r.map_err(|e| format!("db error: decoding event row: {e}"))?;
             let entry = map.entry(wf.clone()).or_insert_with(|| WorkflowStatusRow {
                 workflow_id: wf,
@@ -414,9 +417,15 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
                 last_event_seq: None,
                 last_event_ts_ms: None,
                 phase: None,
+                completed_status: None,
             });
             entry.last_event_seq = Some(seq);
             entry.last_event_ts_ms = Some(ts_ms);
+            if kind == "workflow_completed" {
+                entry.completed_status = serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|v| v.get("status").and_then(|x| x.as_str()).map(str::to_string));
+            }
             entry.last_event_kind = Some(kind);
         }
     }
@@ -453,6 +462,7 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
                 last_event_seq: None,
                 last_event_ts_ms: None,
                 phase: None,
+                completed_status: None,
             });
             entry.snap_seq = Some(seq);
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&state_json) {
@@ -804,11 +814,12 @@ pub fn format_status_report(
 }
 
 /// A workflow whose last event ends it: nobody can act on the row.
-/// `workflow_completed` with phase `disputed` stays (it needs a decision).
+/// `workflow_completed` with payload status `disputed` stays (it needs a decision);
+/// `playbook_gap` stays too: the worker still has to fix its report.
 fn is_terminal_workflow(w: &WorkflowStatusRow) -> bool {
     match w.last_event_kind.as_deref() {
-        Some("workflow_completed") => w.phase.as_deref() != Some("disputed"),
-        Some("workflow_cancelled" | "verdict" | "playbook_gap") => true,
+        Some("workflow_completed") => w.completed_status.as_deref() != Some("disputed"),
+        Some("workflow_cancelled" | "verdict") => true,
         _ => false,
     }
 }
@@ -985,19 +996,27 @@ pub fn format_status_report_opts(
     out
 }
 
-/// Render full status from explicit DB and runs directory paths.
-/// Unfiltered (`--all`) report.
+/// Render the default (filtered) status from explicit DB and runs directory paths.
 pub fn render_status<H: HerdrOps>(
     db_path: &Path,
     runs_dir: &Path,
     herdr: &H,
 ) -> Result<String, String> {
+    render_status_opts(db_path, runs_dir, herdr, &Git::new(), false)
+}
+
+/// Unfiltered (`--all`) report from explicit DB and runs directory paths.
+pub fn render_status_all<H: HerdrOps>(
+    db_path: &Path,
+    runs_dir: &Path,
+    herdr: &H,
+) -> Result<String, String> {
     let git = Git::new();
-    render_status_with_git(db_path, runs_dir, herdr, &git)
+    render_status_all_with_git(db_path, runs_dir, herdr, &git)
 }
 
 /// Unfiltered (`--all`) report with explicit Git implementation.
-pub fn render_status_with_git<H: HerdrOps, G: GitOps>(
+pub fn render_status_all_with_git<H: HerdrOps, G: GitOps>(
     db_path: &Path,
     runs_dir: &Path,
     herdr: &H,
@@ -1056,7 +1075,7 @@ with `N hidden (quaqua status --all)`.\n\
   --all    show every Workflows and Verdicts row\n\
 \n\
 Workflows hides rows whose last event is terminal: workflow_completed (except\n\
-phase disputed), workflow_cancelled, verdict, playbook_gap.\n\
+status disputed), workflow_cancelled, verdict.\n\
 \n\
 Verdicts FLAGS (`ok` = none set):\n\
   stale         the branch head moved after the verdict\n\
@@ -2317,6 +2336,9 @@ mod tests {
             last_event_seq: Some(1),
             last_event_ts_ms: Some(ts),
             phase: phase.map(str::to_string),
+            completed_status: phase
+                .filter(|_| kind == "workflow_completed")
+                .map(str::to_string),
         }
     }
 
@@ -2339,6 +2361,7 @@ mod tests {
             wf_row("k-activity", "activity_scheduled", Some("build"), 5),
             wf_row("k-child", "child_started", None, 5),
             wf_row("k-disputed", "workflow_completed", Some("disputed"), 5),
+            wf_row("k-gap", "playbook_gap", None, 5),
             wf_row("k-failed", "workflow_failed", None, 5),
             wf_row("k-continue", "continue", None, 5),
             wf_row("k-approval", "pause_for_approval", None, 1),
@@ -2348,7 +2371,6 @@ mod tests {
             wf_row("h-done-nophase", "workflow_completed", None, 5),
             wf_row("h-cancel", "workflow_cancelled", Some("cancelled"), 5),
             wf_row("h-verdict", "verdict", None, 5),
-            wf_row("h-gap", "playbook_gap", None, 5),
         ];
         let vds = vec![
             vd_row("b-ok", false, false, false),
@@ -2368,6 +2390,7 @@ mod tests {
             "k-activity",
             "k-child",
             "k-disputed",
+            "k-gap",
             "k-failed",
             "k-continue",
             "k-approval",
@@ -2383,13 +2406,12 @@ mod tests {
             "h-done-nophase",
             "h-cancel",
             "h-verdict",
-            "h-gap",
             "b-gone",
         ] {
             assert!(!out.contains(hidden), "{hidden} must be hidden:\n{out}");
         }
         assert_eq!(
-            out.matches("5 hidden (quaqua status --all)").count(),
+            out.matches("4 hidden (quaqua status --all)").count(),
             1,
             "{out}"
         );
@@ -2405,7 +2427,7 @@ mod tests {
             "h-done",
             "h-cancel",
             "h-verdict",
-            "h-gap",
+            "k-gap",
             "b-gone",
             "b-gone-stale",
         ] {
@@ -2585,6 +2607,32 @@ mod tests {
         assert_eq!(w2.last_event_seq, Some(1));
         assert_eq!(w2.last_event_kind, Some("workflow_started".to_string()));
         assert_eq!(w2.last_event_ts_ms, Some(2000));
+    }
+
+    #[test]
+    fn test_status_disputed_keyed_on_completed_status_without_snapshot() {
+        let tmp = temp_test_dir("disputed-nosnap");
+        let _cleaner = TempDirCleaner(tmp.clone());
+        let db_path = tmp.join("test.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE events (
+                    workflow_id TEXT NOT NULL, seq INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+                    kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                INSERT INTO events VALUES ('wf-disp', 1, 1, 'workflow_completed', '{"status":"disputed"}');
+                INSERT INTO events VALUES ('wf-done', 1, 1, 'workflow_completed', '{"status":"completed"}');
+                "#,
+            )
+            .expect("insert rows");
+        }
+        let wfs = query_workflows(&db_path).expect("query");
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&[]), false);
+        assert!(out.contains("wf-disp"), "{out}");
+        assert!(!out.contains("wf-done"), "{out}");
     }
 
     #[test]
@@ -3086,7 +3134,7 @@ mod tests {
         let mock = MockHerdr::new(mock_json);
         fs::write(tmp.join("sude-w1.owner"), "arch-lead\n").unwrap();
 
-        let out = render_status(&db_path, &tmp, &mock).expect("render status");
+        let out = render_status_all(&db_path, &tmp, &mock).expect("render status");
         assert!(out.contains("=== Workflows (runs/quaqua.db) ==="));
         assert!(out.contains("pipe-test"));
         assert!(out.contains("=== Orchestration ==="));
@@ -3508,7 +3556,7 @@ mod tests {
         let _guard = EnvGuard::capture(&["QUAQUA_TEAM_TOML"]);
         std::env::set_var("QUAQUA_TEAM_TOML", &missing);
 
-        let out = render_status(&db_path, &tmp, &mock)
+        let out = render_status_all(&db_path, &tmp, &mock)
             .expect("status must keep rendering when team.toml fails to load");
         assert!(out.contains("=== Workflows (runs/quaqua.db) ==="), "{out}");
         assert!(out.contains("=== Verdicts ==="), "{out}");
@@ -3605,7 +3653,7 @@ mod tests {
         assert!(report.contains("stale"));
     }
     #[test]
-    fn test_render_status_with_git_resolves_repo_from_index_and_flags_stale_or_unresolved() {
+    fn test_render_status_all_with_git_resolves_repo_from_index_and_flags_stale_or_unresolved() {
         let _env_lock = crate::test_env::lock_env();
         let ws = temp_test_dir("ws-render-status");
         let _cleaner_ws = TempDirCleaner(ws.clone());
@@ -3697,7 +3745,7 @@ mod tests {
         assert_ne!(sha1, sha2);
 
         let mock = MockHerdr::new(r#"{"result":{"agents":[]}}"#);
-        let out = render_status_with_git(&db_path, &runs_dir, &mock, &git)
+        let out = render_status_all_with_git(&db_path, &runs_dir, &mock, &git)
             .expect("render status with git");
 
         let stale_lines: Vec<&str> = out

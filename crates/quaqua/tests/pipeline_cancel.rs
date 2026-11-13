@@ -4,7 +4,7 @@
 //! 1. Terminal events (`workflow_cancelled`) written to parent and non-terminal children.
 //! 2. Idempotent: repeating cancel causes zero additional writes and converges cleanly.
 //! 3. Refuses cancellation if any child worker pane is alive in herdr.
-//! 4. `quaqua status` renders cancelled pipelines with phase `cancelled` and last event `workflow_cancelled`.
+//! 4. `quaqua status --all` renders cancelled pipelines with phase `cancelled` and last event `workflow_cancelled`.
 
 use quaqua::engine::journal::{EventRecord, Journal, SnapshotRecord};
 use quaqua::engine::journal_sqlite::SqliteJournal;
@@ -12,7 +12,7 @@ use quaqua::git::Git;
 use quaqua::herdr::{Herdr, HerdrOps};
 use quaqua::pipeline::cancel::cancel_pipeline;
 use quaqua::pipeline::handle_pipeline;
-use quaqua::status::render_status;
+use quaqua::status::render_status_all;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -331,7 +331,7 @@ fn test_status_shows_cancelled_pipeline_as_terminal_phase() {
     cancel_pipeline(task, Some("abandoned"), &runs.path, &herdr).unwrap();
 
     // Query status report
-    let status_out = render_status(&runs.db_path(), &runs.path, &herdr).expect("render status");
+    let status_out = render_status_all(&runs.db_path(), &runs.path, &herdr).expect("render status");
 
     // Parent workflow must be displayed with LAST_EVENT: workflow_cancelled and PHASE: cancelled
     let mut found_parent = false;
@@ -546,4 +546,17 @@ fn test_resume_cancelled_pipeline_is_refused() {
         msg.contains("was cancelled"),
         "expected 'was cancelled' in error message: {msg}"
     );
+}
+
+#[test]
+fn built_binary_status_help_and_short_help_print_status_help() {
+    for flag in ["--help", "-h"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"))
+            .args(["status", flag])
+            .output()
+            .expect("run quaqua status help");
+        assert!(out.status.success(), "{flag}: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(text, quaqua::status::status_help(), "{flag}");
+    }
 }
