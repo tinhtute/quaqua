@@ -260,12 +260,16 @@ fn watchdog_config_from_env(expect_verdict: bool, is_fallback_idle: bool) -> Wat
 /// coordinator that launched it (the same mechanism as `worker prompt`). `None`
 /// means this process is the detached core, or could not detach, and carries on.
 fn detach_pipeline(
+    detach: bool,
     runs_dir: &Path,
     task: &str,
     repo: &Path,
     is_resume: bool,
 ) -> Option<Result<(), (i32, String)>> {
     let name = format!("pipeline-{task}");
+    if !detach {
+        return None;
+    }
     if std::env::var_os(crate::worker::prompt::detach::ENV).is_some() {
         crate::worker::prompt::detach::core_begin(runs_dir, &name);
         return None;
@@ -282,13 +286,24 @@ fn detach_pipeline(
     }
 }
 
+/// The pipeline in this process, as the unit tests drive it.
 pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
-    let res = run_pipeline(args, git, herdr);
+    run_pipeline(args, git, herdr, false)
+}
+
+/// CLI entry: the pipeline run in a session of its own (see [`detach_pipeline`]).
+pub fn handle_pipeline_cli(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
+    let res = run_pipeline(args, git, herdr, true);
     crate::worker::prompt::detach::core_end(&res);
     res
 }
 
-fn run_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
+fn run_pipeline(
+    args: &[String],
+    git: &Git,
+    herdr: &Herdr,
+    detach: bool,
+) -> Result<(), (i32, String)> {
     let inv_start = now_sec();
     let runs_dir = default_runs_dir();
     let _ = std::fs::create_dir_all(&runs_dir);
@@ -469,7 +484,7 @@ fn run_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, S
             return Err((1, msg));
         }
 
-        if let Some(res) = detach_pipeline(&runs_dir, &task, &state_repo, true) {
+        if let Some(res) = detach_pipeline(detach, &runs_dir, &task, &state_repo, true) {
             return res;
         }
 
@@ -724,7 +739,7 @@ fn run_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, S
             ));
         }
 
-        if let Some(res) = detach_pipeline(&runs_dir, &task, &repo_path, false) {
+        if let Some(res) = detach_pipeline(detach, &runs_dir, &task, &repo_path, false) {
             return res;
         }
 
