@@ -256,6 +256,23 @@ fn watchdog_config_from_env(expect_verdict: bool, is_fallback_idle: bool) -> Wat
     config
 }
 
+/// Run the rest of the pipeline in a session of its own, so it outlives the
+/// coordinator that launched it (the same mechanism as `worker prompt`). `None`
+/// means this process is the detached core, or could not detach, and carries on.
+fn detach_pipeline(runs_dir: &Path, task: &str) -> Option<Result<(), (i32, String)>> {
+    if std::env::var_os(crate::worker::prompt::detach::ENV).is_some() {
+        return None;
+    }
+    match crate::worker::prompt::detach::run(runs_dir, &format!("pipeline-{task}")) {
+        Ok(0) => Some(Ok(())),
+        Ok(code) => Some(Err((code, String::new()))),
+        Err(e) => {
+            eprintln!("WATCHDOG detach-failed | pipeline={task} {e} — running in-process");
+            None
+        }
+    }
+}
+
 pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
     let inv_start = now_sec();
     let runs_dir = default_runs_dir();
@@ -435,6 +452,10 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                 )
             };
             return Err((1, msg));
+        }
+
+        if let Some(res) = detach_pipeline(&runs_dir, &task) {
+            return res;
         }
 
         state.pipeline_pid = std::process::id();
@@ -686,6 +707,10 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
                 1,
                 format!("pipeline '{task}' already has state — use --resume or a new task slug\n"),
             ));
+        }
+
+        if let Some(res) = detach_pipeline(&runs_dir, &task) {
+            return res;
         }
 
         let parent_wt = repo_path.parent().unwrap_or(Path::new("."));
