@@ -259,11 +259,18 @@ fn watchdog_config_from_env(expect_verdict: bool, is_fallback_idle: bool) -> Wat
 /// Run the rest of the pipeline in a session of its own, so it outlives the
 /// coordinator that launched it (the same mechanism as `worker prompt`). `None`
 /// means this process is the detached core, or could not detach, and carries on.
-fn detach_pipeline(runs_dir: &Path, task: &str) -> Option<Result<(), (i32, String)>> {
+fn detach_pipeline(
+    runs_dir: &Path,
+    task: &str,
+    is_resume: bool,
+) -> Option<Result<(), (i32, String)>> {
+    let name = format!("pipeline-{task}");
     if std::env::var_os(crate::worker::prompt::detach::ENV).is_some() {
+        crate::worker::prompt::detach::core_begin(runs_dir, &name);
         return None;
     }
-    match crate::worker::prompt::detach::run(runs_dir, &format!("pipeline-{task}")) {
+    // A resume joins a core that is still running instead of racing it.
+    match crate::worker::prompt::detach::run(runs_dir, &name, is_resume) {
         Ok(0) => Some(Ok(())),
         Ok(code) => Some(Err((code, String::new()))),
         Err(e) => {
@@ -274,6 +281,12 @@ fn detach_pipeline(runs_dir: &Path, task: &str) -> Option<Result<(), (i32, Strin
 }
 
 pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
+    let res = run_pipeline(args, git, herdr);
+    crate::worker::prompt::detach::core_end(&res);
+    res
+}
+
+fn run_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, String)> {
     let inv_start = now_sec();
     let runs_dir = default_runs_dir();
     let _ = std::fs::create_dir_all(&runs_dir);
@@ -454,7 +467,7 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
             return Err((1, msg));
         }
 
-        if let Some(res) = detach_pipeline(&runs_dir, &task) {
+        if let Some(res) = detach_pipeline(&runs_dir, &task, true) {
             return res;
         }
 
@@ -709,7 +722,7 @@ pub fn handle_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), 
             ));
         }
 
-        if let Some(res) = detach_pipeline(&runs_dir, &task) {
+        if let Some(res) = detach_pipeline(&runs_dir, &task, false) {
             return res;
         }
 

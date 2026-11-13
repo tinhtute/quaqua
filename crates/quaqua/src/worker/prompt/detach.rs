@@ -6,12 +6,18 @@
 //! logs under `runs/`, never a pipe the dying foreground could break) and only
 //! follows it: it mirrors the core's output and exit code, so a live caller
 //! sees what it always saw, and a dead one leaves the core to deliver.
+//!
+//! The core records its pid (`.<name>.prompt.pid`) while it runs and its exit
+//! code (`.<name>.prompt.exit`) when it ends. A `--resume` that finds a live
+//! core follows that one instead of starting a second watcher on the same
+//! report.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Set in the detached core so it runs the prompt instead of detaching again.
@@ -19,11 +25,62 @@ pub const ENV: &str = "QUAQUA_PROMPT_DETACHED";
 
 extern "C" {
     fn setsid() -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 /// Where the detached core's stdout (`out`) and stderr (`err`) are written.
 pub fn log_path(runs_dir: &Path, name: &str, stream: &str) -> PathBuf {
     runs_dir.join(format!(".{name}.prompt.{stream}"))
+}
+
+/// The live core's pid.
+pub fn pid_path(runs_dir: &Path, name: &str) -> PathBuf {
+    runs_dir.join(format!(".{name}.prompt.pid"))
+}
+
+/// The finished core's exit code.
+pub fn exit_path(runs_dir: &Path, name: &str) -> PathBuf {
+    runs_dir.join(format!(".{name}.prompt.exit"))
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes; pid > 0 never addresses a group.
+    pid > 0 && unsafe { kill(pid, 0) } == 0
+}
+
+/// The pid of the core that is running for `name`, if any. A pidfile whose
+/// process is gone (a core killed before it could clean up) is not a core.
+pub fn live_core(runs_dir: &Path, name: &str) -> Option<i32> {
+    let pid = std::fs::read_to_string(pid_path(runs_dir, name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    pid_alive(pid).then_some(pid)
+}
+
+static CORE: OnceLock<(PathBuf, String)> = OnceLock::new();
+
+/// Called by the detached core as it starts: publish its pid.
+pub fn core_begin(runs_dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(exit_path(runs_dir, name));
+    let _ = std::fs::write(
+        pid_path(runs_dir, name),
+        format!("{}\n", std::process::id()),
+    );
+    let _ = CORE.set((runs_dir.to_path_buf(), name.to_string()));
+}
+
+/// Called by the detached core with its result, before it returns it: record
+/// the exit code for a follower that is not the core's parent, then retire the
+/// pidfile. Liveness is the pid, not the file, so output the caller prints
+/// after this is still seen.
+pub fn core_end(res: &Result<(), (i32, String)>) {
+    if let Some((runs_dir, name)) = CORE.get() {
+        let code = res.as_ref().err().map_or(0, |(c, _)| *c);
+        let _ = std::fs::write(exit_path(runs_dir, name), format!("{code}\n"));
+        let _ = std::fs::remove_file(pid_path(runs_dir, name));
+    }
 }
 
 fn open_log(path: &Path) -> std::io::Result<File> {
@@ -60,10 +117,48 @@ impl Tail {
     }
 }
 
-/// Re-execute this command in a new session and follow it. `Ok(code)` is the
-/// core's exit code; `Err` means it could not be started, and the caller
-/// falls back to waiting in-process.
-pub fn run(runs_dir: &Path, name: &str) -> std::io::Result<i32> {
+/// Follow a core: mirror its logs and return its exit code. `child` is the
+/// core when this process started it; otherwise it is a core someone else
+/// started, found by pid, whose exit code it reads from the file the core left.
+fn follow(runs_dir: &Path, name: &str, pid: i32, mut child: Option<Child>) -> std::io::Result<i32> {
+    let (mut out_tail, mut err_tail) = (
+        Tail::new(&log_path(runs_dir, name, "out"))?,
+        Tail::new(&log_path(runs_dir, name, "err"))?,
+    );
+    let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
+    loop {
+        let done = match child.as_mut() {
+            // A core killed by a signal is a failed wait, not a success.
+            Some(c) => c.try_wait()?.map(|s| s.code().unwrap_or(1)),
+            None if pid_alive(pid) => None,
+            None => Some(
+                std::fs::read_to_string(exit_path(runs_dir, name))
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1),
+            ),
+        };
+        out_tail.pump(&mut stdout);
+        err_tail.pump(&mut stderr);
+        if let Some(code) = done {
+            return Ok(code);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run this command's wait in a new session and follow it, or, when
+/// `attach_if_live` and a core is already running for `name`, follow that one.
+/// `Ok(code)` is the core's exit code; `Err` means no core could be followed
+/// or started, and the caller falls back to waiting in-process.
+pub fn run(runs_dir: &Path, name: &str, attach_if_live: bool) -> std::io::Result<i32> {
+    if attach_if_live {
+        if let Some(pid) = live_core(runs_dir, name) {
+            if let Ok(code) = follow(runs_dir, name, pid, None) {
+                return Ok(code);
+            }
+        }
+    }
     std::fs::create_dir_all(runs_dir)?;
     let (out_path, err_path) = (
         log_path(runs_dir, name, "out"),
@@ -85,17 +180,7 @@ pub fn run(runs_dir: &Path, name: &str) -> std::io::Result<i32> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
-    let (mut out_tail, mut err_tail) = (Tail::new(&out_path)?, Tail::new(&err_path)?);
-    let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
-    loop {
-        let status = child.try_wait()?;
-        out_tail.pump(&mut stdout);
-        err_tail.pump(&mut stderr);
-        if let Some(status) = status {
-            // A core killed by a signal is a failed wait, not a success.
-            return Ok(status.code().unwrap_or(1));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let child = cmd.spawn()?;
+    let pid = child.id() as i32;
+    follow(runs_dir, name, pid, Some(child))
 }
