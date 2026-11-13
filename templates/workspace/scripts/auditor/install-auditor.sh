@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: install-auditor.sh
-#   Linux: symlink systemd units and reload the user manager (no enable/start).
+#   Linux: render the service (pins the install-time PATH), symlink the timer, reload the user manager (no enable/start).
 #   macOS: render a launchd plist in ~/Library/LaunchAgents (no manager calls).
 #   Prints the platform's activation command for the user to run manually.
 set -euo pipefail
@@ -62,9 +62,17 @@ case $(uname -s) in
     src="$root/scripts/auditor/systemd"
     dst="$HOME/.config/systemd/user"
     mkdir -p "$dst"
-    for unit in quaqua-auditor.service quaqua-auditor.timer; do
-      ln -sfn "$src/$unit" "$dst/$unit"
-    done
+    # The user manager starts the job with a bare PATH (no ~/.local/bin, no
+    # shell profile): pin the install-time PATH so the harness CLI resolves.
+    # Escape for sed's replacement, then for systemd (\\, ", and % specifiers).
+    job_path="${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
+    esc=$(printf '%s' "$job_path" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g' -e 's/[\\&|]/\\&/g')
+    tmp=$(mktemp "$dst/.quaqua-auditor.service.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+    sed -e "s|@PATH@|$esc|g" "$src/quaqua-auditor.service.in" > "$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$dst/quaqua-auditor.service"   # replaces a pre-fix symlink, never writes through it
+    ln -sfn "$src/quaqua-auditor.timer" "$dst/quaqua-auditor.timer"
     systemctl --user daemon-reload
     for unit in quaqua-auditor.service quaqua-auditor.timer; do
       if [[ ! -e "$dst/$unit" ]]; then

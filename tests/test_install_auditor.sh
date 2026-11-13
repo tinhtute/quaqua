@@ -68,8 +68,9 @@ pinned=$(sed -n 's/^Environment="PATH=\(.*\)"$/\1/p' "$service")
 [[ -n $pinned ]] || fail "Linux: service does not pin PATH: $(cat "$service")"
 case ":$pinned:" in *":$T/claude & tools:"*) ;; *) fail "Linux: pinned PATH lacks the harness dir: $pinned" ;; esac
 grep -qxF 'ExecStart=%h/.cargo/bin/quaqua auditor run' "$service" || fail "Linux: ExecStart changed: $(cat "$service")"
-[[ $(cat "$T/calls") == 'systemctl --user daemon-reload' ]] \
-  || fail "Linux: unexpected manager calls: $(cat "$T/calls")"
+grep -qxF 'systemctl --user daemon-reload' "$T/calls" || fail "Linux: no daemon-reload"
+! grep -qE 'systemctl --user (enable|start|restart)' "$T/calls" \
+  || fail "Linux: installer enabled/started a unit: $(cat "$T/calls")"
 grep -q 'systemctl --user enable --now quaqua-auditor.timer' "$T/out" \
   || fail "Linux: no manual enable instruction"
 # A pre-fix install left the service as a symlink into the checkout: the

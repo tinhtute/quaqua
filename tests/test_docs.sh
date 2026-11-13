@@ -93,10 +93,10 @@ grep -q 'Verdict: clean' "$root/crates/quaqua/src/pipeline/mod.rs" || fail "pipe
 echo "ok: report-tail contract documented for workers and pipeline reviewers"
 
 # ── scheduling assets: exactly one Auditor entrypoint (F8/F10) ───────────────
-[[ -f $ws/scripts/auditor/systemd/quaqua-auditor.service && -f $ws/scripts/auditor/systemd/quaqua-auditor.timer \
+[[ -f $ws/scripts/auditor/systemd/quaqua-auditor.service.in && -f $ws/scripts/auditor/systemd/quaqua-auditor.timer \
    && -f $ws/scripts/auditor/launchd/com.quaqua.auditor.plist.in ]] \
   || fail "systemd or launchd auditor scheduling assets missing"
-grep -q 'auditor run' "$ws/scripts/auditor/systemd/quaqua-auditor.service" \
+grep -q 'auditor run' "$ws/scripts/auditor/systemd/quaqua-auditor.service.in" \
   || fail "auditor service does not exec quaqua auditor run"
 grep -q 'auditor' "$ws/scripts/auditor/launchd/com.quaqua.auditor.plist.in" \
   || fail "launchd template does not exec the same auditor entrypoint"
