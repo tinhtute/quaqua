@@ -851,7 +851,8 @@ pub fn prompt_worker_cli<G: GitOps>(
 ) -> Result<(), (i32, String)> {
     if std::env::var_os(detach::ENV).is_none() {
         // A resume joins a core that is still running instead of racing it.
-        match detach::run(&default_runs_dir(), name, resume) {
+        let reattach = format!("quaqua worker prompt --resume {name}");
+        match detach::run(&default_runs_dir(), name, &reattach, resume) {
             Ok(0) => return Ok(()),
             Ok(code) => return Err((code, String::new())),
             // Could not detach: wait in this process, as before.

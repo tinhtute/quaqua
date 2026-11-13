@@ -262,6 +262,7 @@ fn watchdog_config_from_env(expect_verdict: bool, is_fallback_idle: bool) -> Wat
 fn detach_pipeline(
     runs_dir: &Path,
     task: &str,
+    repo: &Path,
     is_resume: bool,
 ) -> Option<Result<(), (i32, String)>> {
     let name = format!("pipeline-{task}");
@@ -270,7 +271,8 @@ fn detach_pipeline(
         return None;
     }
     // A resume joins a core that is still running instead of racing it.
-    match crate::worker::prompt::detach::run(runs_dir, &name, is_resume) {
+    let reattach = format!("quaqua pipeline --resume {task} {}", repo.display());
+    match crate::worker::prompt::detach::run(runs_dir, &name, &reattach, is_resume) {
         Ok(0) => Some(Ok(())),
         Ok(code) => Some(Err((code, String::new()))),
         Err(e) => {
@@ -467,7 +469,7 @@ fn run_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, S
             return Err((1, msg));
         }
 
-        if let Some(res) = detach_pipeline(&runs_dir, &task, true) {
+        if let Some(res) = detach_pipeline(&runs_dir, &task, &state_repo, true) {
             return res;
         }
 
@@ -722,7 +724,7 @@ fn run_pipeline(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, S
             ));
         }
 
-        if let Some(res) = detach_pipeline(&runs_dir, &task, false) {
+        if let Some(res) = detach_pipeline(&runs_dir, &task, &repo_path, false) {
             return res;
         }
 

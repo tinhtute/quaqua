@@ -17,6 +17,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -26,6 +27,17 @@ pub const ENV: &str = "QUAQUA_PROMPT_DETACHED";
 extern "C" {
     fn setsid() -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+const SIGINT: i32 = 2;
+/// The conventional exit code of a process ended by Ctrl-C.
+const EXIT_INTERRUPTED: i32 = 130;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigint(_: i32) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 /// Where the detached core's stdout (`out`) and stderr (`err`) are written.
@@ -120,13 +132,29 @@ impl Tail {
 /// Follow a core: mirror its logs and return its exit code. `child` is the
 /// core when this process started it; otherwise it is a core someone else
 /// started, found by pid, whose exit code it reads from the file the core left.
-fn follow(runs_dir: &Path, name: &str, pid: i32, mut child: Option<Child>) -> std::io::Result<i32> {
+fn follow(
+    runs_dir: &Path,
+    name: &str,
+    pid: i32,
+    reattach: &str,
+    mut child: Option<Child>,
+) -> std::io::Result<i32> {
     let (mut out_tail, mut err_tail) = (
         Tail::new(&log_path(runs_dir, name, "out"))?,
         Tail::new(&log_path(runs_dir, name, "err"))?,
     );
     let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
+    // Ctrl-C ends this tail only. The core is in a session of its own and
+    // keeps the in-flight report; say so and how to get back to it.
+    // SAFETY: the handler only stores to an atomic.
+    unsafe { signal(SIGINT, on_sigint) };
     loop {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            out_tail.pump(&mut stdout);
+            err_tail.pump(&mut stderr);
+            eprintln!("Ctrl-C: core pid {pid} keeps running; re-attach with `{reattach}`");
+            return Ok(EXIT_INTERRUPTED);
+        }
         let done = match child.as_mut() {
             // A core killed by a signal is a failed wait, not a success.
             Some(c) => c.try_wait()?.map(|s| s.code().unwrap_or(1)),
@@ -149,12 +177,18 @@ fn follow(runs_dir: &Path, name: &str, pid: i32, mut child: Option<Child>) -> st
 
 /// Run this command's wait in a new session and follow it, or, when
 /// `attach_if_live` and a core is already running for `name`, follow that one.
-/// `Ok(code)` is the core's exit code; `Err` means no core could be followed
+/// `reattach` is the command Ctrl-C tells the operator to run to follow the core
+/// again. `Ok(code)` is the core's exit code; `Err` means no core could be followed
 /// or started, and the caller falls back to waiting in-process.
-pub fn run(runs_dir: &Path, name: &str, attach_if_live: bool) -> std::io::Result<i32> {
+pub fn run(
+    runs_dir: &Path,
+    name: &str,
+    reattach: &str,
+    attach_if_live: bool,
+) -> std::io::Result<i32> {
     if attach_if_live {
         if let Some(pid) = live_core(runs_dir, name) {
-            if let Ok(code) = follow(runs_dir, name, pid, None) {
+            if let Ok(code) = follow(runs_dir, name, pid, reattach, None) {
                 return Ok(code);
             }
         }
@@ -182,5 +216,5 @@ pub fn run(runs_dir: &Path, name: &str, attach_if_live: bool) -> std::io::Result
     }
     let child = cmd.spawn()?;
     let pid = child.id() as i32;
-    follow(runs_dir, name, pid, Some(child))
+    follow(runs_dir, name, pid, reattach, Some(child))
 }
