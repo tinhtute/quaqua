@@ -30,7 +30,10 @@ Audit six things:
    `- [audit] <report file>:` line in any memory/YYYY-MM-DD.md (the
    handled marker CoS writes, see AGENTS.md); `## Lessons` lines (other than
    `none`) in runs/*.md from the last 7 days that no rules/ file cites as
-   `runs/<name>.md`.
+   `runs/<name>.md` — the pre-check below already counts these in ONE line;
+   copy it as is, never expand it per file (CoS promotes at most one lesson
+   per cleanup, so most are never promoted by design). Add a Lessons finding
+   only when the same lesson recurs across runs/*.md with no rule covering it.
 4. Pipeline runs (runs/pipeline-*.md, written by `quaqua pipeline`; the
    last `- status:` line is the outcome). Flag:
    - `status: disputed|blocked` with no memory/YYYY-MM-DD.md line naming
@@ -50,6 +53,11 @@ Audit six things:
      before acceptance; no handling line = still open. A Challenge already
      copied into a pipeline file's `## Challenge (from <file>)` section is
      covered by that file's flag — do not report it twice.
+   Pipeline runs that started more than 14 days ago are history: the pre-check
+   skips them; the pre-check prints one count line only when some of them are
+   blocked/disputed with no handling note, otherwise old runs are silent. Do not
+   list old runs one per line. A recorded repo that is
+   missing or not a git repo is ONE line per repo, never one per SHA.
 5. Live workers. Flag any live task worker in herdr that is stalled, untracked,
    or in an unhandled error state.
 6. Lead inbox timeline review. Inspect Lead-to-CoS inbox
@@ -538,6 +546,16 @@ fn mem_mentions(root: &Path, needles: &[&str]) -> bool {
     false
 }
 
+/// True when `dir` is inside a git work tree (git discovery, so a repo subdirectory counts).
+fn git_is_repo(dir: &Path) -> bool {
+    let res = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--git-dir"])
+        .output();
+    matches!(res, Ok(output) if output.status.success())
+}
+
 fn git_verify_commit(repo: &Path, sha: &str) -> bool {
     let arg = format!("{sha}^{{commit}}");
     let res = Command::new("git")
@@ -547,6 +565,8 @@ fn git_verify_commit(repo: &Path, sha: &str) -> bool {
         .output();
     matches!(res, Ok(output) if output.status.success())
 }
+
+const PIPELINE_CUTOFF_DAYS: u64 = 14;
 
 pub fn run_deterministic_prechecks(root: &Path) -> Vec<String> {
     let now_secs = crate::util::now_sec();
@@ -683,6 +703,14 @@ pub fn run_deterministic_prechecks_at(
     let mut flags: Vec<String> = Vec::new();
     // ── 1. pipeline-run pre-checks (runs/pipeline-*.md) ──────────────────────
     let runs_dir = root.join("runs");
+    let today_days = ymd_to_days(today.0, today.1, today.2);
+    // Runs that started more than PIPELINE_CUTOFF_DAYS ago are history: counted,
+    // never checked one per line. Dated by the in-file `- started:` line, else mtime.
+    let mut old_skipped = 0usize;
+    let mut old_unhandled: Vec<String> = Vec::new();
+    // recorded repo -> (first run, run count, why it cannot verify commits): one line per repo.
+    let mut dead_repos: std::collections::BTreeMap<String, (String, usize, &str)> =
+        std::collections::BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(&runs_dir) {
         let mut p_files: Vec<PathBuf> = entries
             .flatten()
@@ -714,6 +742,33 @@ pub fn run_deterministic_prechecks_at(
                 .take_while(|c| c.is_ascii_lowercase() || *c == '-')
                 .count();
             let st = &rest[..st_len];
+
+            let started_days = content
+                .lines()
+                .find_map(|l| l.strip_prefix("- started: "))
+                .and_then(|v| v.get(..10))
+                .and_then(parse_ymd)
+                .map(|(y, m, d)| ymd_to_days(y, m, d));
+            let mtime_days = std::fs::metadata(&f)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() / 86_400);
+            // Old = every date the file carries is old: a late resume that appends to an
+            // old run touches its mtime, and that run stays listed per file.
+            let is_old = |d: Option<u64>| {
+                d.is_none_or(|d| today_days.saturating_sub(d) > PIPELINE_CUTOFF_DAYS)
+            };
+            if (started_days.is_some() || mtime_days.is_some())
+                && is_old(started_days)
+                && is_old(mtime_days)
+            {
+                old_skipped += 1;
+                if matches!(st, "disputed" | "blocked") && !mem_mentions(root, &[base]) {
+                    old_unhandled.push(base.to_string());
+                }
+                continue;
+            }
 
             match st {
                 "disputed" | "blocked" => {
@@ -757,11 +812,17 @@ pub fn run_deterministic_prechecks_at(
                         root.to_path_buf()
                     };
 
-                    if !prepo.is_dir() {
-                        flags.push(format!(
-                            "- runs/{base}.md: status clean but recorded repo '{}' is missing",
-                            prepo.display()
-                        ));
+                    // `.git` must be in the repo itself: git discovery would walk up to a parent repo.
+                    if !prepo.is_dir() || !git_is_repo(&prepo) {
+                        let why = if prepo.is_dir() {
+                            "not a git repo"
+                        } else {
+                            "missing"
+                        };
+                        let e = dead_repos
+                            .entry(prepo.display().to_string())
+                            .or_insert_with(|| (base.to_string(), 0, why));
+                        e.1 += 1;
                     } else if sha.is_empty()
                         || sha == "none"
                         || sha == "?"
@@ -826,6 +887,28 @@ pub fn run_deterministic_prechecks_at(
                 _ => {}
             }
         }
+    }
+    for (repo, (first, n, why)) in dead_repos {
+        if n == 1 {
+            flags.push(format!(
+                "- runs/{first}.md: status clean but recorded repo '{repo}' is {why}"
+            ));
+        } else {
+            flags.push(format!(
+                "- runs/{first}.md ({n} runs, first listed): status clean but recorded repo '{repo}' is {why}; their commits cannot be checked"
+            ));
+        }
+    }
+    if !old_unhandled.is_empty() {
+        let who = if old_unhandled.len() <= 5 {
+            format!(": {}", old_unhandled.join(", "))
+        } else {
+            String::new()
+        };
+        flags.push(format!(
+            "- runs/pipeline-*.md: {old_skipped} pipeline runs older than {PIPELINE_CUTOFF_DAYS} days are not checked; {} of them blocked/disputed with no memory line naming them{who}",
+            old_unhandled.len()
+        ));
     }
 
     // ── 2. challenge pre-checks (runs/*.md) ───────────────────────────────────
@@ -1001,6 +1084,7 @@ pub fn run_deterministic_prechecks_at(
     }
 
     // ── 5. unpromoted lessons pre-checks (runs/*.md) ─────────────────────────
+    let mut unpromoted = 0usize;
     if let Ok(entries) = std::fs::read_dir(&runs_dir) {
         let mut r_files: Vec<PathBuf> = entries
             .flatten()
@@ -1061,11 +1145,15 @@ pub fn run_deterministic_prechecks_at(
                 let needle = format!("runs/{base}.md");
                 let cited = rules_contents.iter().any(|c| c.contains(&needle));
                 if !cited {
-                    flags.push(format!(
-                        "- runs/{base}.md: '## Lessons' unpromoted from the last 7 days — no rules/ file cites runs/{base}.md"
-                    ));
+                    unpromoted += 1;
                 }
             }
+        }
+        if unpromoted > 0 {
+            flags.push(format!(
+                "- runs/*.md: {} unpromoted '## Lessons' from the last 7 days (CoS promotes at most one per cleanup; not listed per file)",
+                if unpromoted == 1 { "1 run has".to_string() } else { format!("{unpromoted} runs have") }
+            ));
         }
     }
 
@@ -1086,7 +1174,6 @@ pub fn run_deterministic_prechecks_at(
         }
     }
 
-    let today_days = ymd_to_days(today.0, today.1, today.2);
     let mut cause_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for (f_days, path) in mem_files {
@@ -1496,12 +1583,17 @@ mod tests {
 
         let flags = run_deterministic_prechecks_at(&root, today, now_secs);
 
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("unpromoted")).collect();
+        assert_eq!(
+            agg.len(),
+            1,
+            "one aggregate line for the one recent unpromoted lesson: {:?}",
+            flags
+        );
         assert!(
-            flags
-                .iter()
-                .any(|f| f.contains("worker-recent.md") && f.contains("Lessons")),
-            "worker-recent.md (6 days ago) must be flagged: {:?}",
-            flags
+            agg[0].contains("1 run"),
+            "aggregate counts worker-recent.md (6 days ago): {:?}",
+            agg
         );
         assert!(
             !flags.iter().any(|f| f.contains("worker-old.md")),
@@ -1588,9 +1680,10 @@ mod tests {
             "rev-cap.md must NOT be flagged: {:?}",
             flags
         );
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("unpromoted")).collect();
         assert!(
-            flags.iter().any(|f| f.contains("rev-lesson.md")),
-            "rev-lesson.md with real lesson must be flagged: {:?}",
+            agg.len() == 1 && agg[0].contains("1 run"),
+            "only rev-lesson.md (real lesson) is counted: {:?}",
             flags
         );
     }
@@ -1915,6 +2008,289 @@ mod tests {
                 && f.contains("older than 24h")
                 && f.contains("sude-active")),
             "lost momentum (>24h with live worker) must be flagged for (c): {:?}",
+            flags
+        );
+    }
+
+    fn backdate(path: &Path, secs_ago: u64, now_secs: u64) {
+        let f = std::fs::File::open(path).unwrap();
+        let t = std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs - secs_ago),
+        );
+        f.set_times(t).unwrap();
+    }
+
+    fn git_init_commit(dir: &Path) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?} failed");
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c1"]);
+        git(&["rev-parse", "--short", "HEAD"])
+    }
+
+    #[test]
+    fn test_many_unpromoted_lessons_collapse_to_one_count_line() {
+        let root = test_temp_dir("lessons-agg");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        for i in 0..5 {
+            std::fs::write(
+                runs_dir.join(format!("w{i}.md")),
+                "# R\n\n## Lessons\n- something learned\n",
+            )
+            .unwrap();
+            backdate(&runs_dir.join(format!("w{i}.md")), 86400, now_secs);
+        }
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("unpromoted")).collect();
+        assert_eq!(agg.len(), 1, "5 lessons -> one line, not five: {:?}", flags);
+        assert!(agg[0].contains("5 runs"), "count is stated: {:?}", agg);
+        assert!(
+            !flags.iter().any(|f| f.contains("w3.md")),
+            "no per-file lesson line: {:?}",
+            flags
+        );
+    }
+
+    #[test]
+    fn test_old_pipeline_runs_counted_not_listed_fresh_ones_flagged() {
+        let root = test_temp_dir("pipe-old");
+        let runs_dir = root.join("runs");
+        let mem_dir = root.join("memory");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let repo = root.join("proj");
+        let _ = git_init_commit(&repo);
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        let put = |name: &str, started: &str, status: &str| {
+            std::fs::write(
+                runs_dir.join(format!("pipeline-{name}.md")),
+                format!(
+                    "# pipeline {name}\n- task: {name} \u{b7} repo: {}\n- started: {started}T10:00:00+07:00\n- {status}\n",
+                    repo.display()
+                ),
+            )
+            .unwrap();
+        };
+        // old (started 2026-10-19): bad sha in a real repo, unhandled blocked, handled blocked
+        put(
+            "oldbad",
+            "2026-10-19",
+            "status: clean \u{b7} commit deadbee \u{b7} elapsed 1m",
+        );
+        put("oldblk", "2026-10-19", "status: blocked");
+        put("oldok", "2026-10-19", "status: blocked");
+        for n in ["oldbad", "oldblk", "oldok"] {
+            backdate(
+                &runs_dir.join(format!("pipeline-{n}.md")),
+                25 * 86400,
+                now_secs,
+            );
+        }
+        std::fs::write(mem_dir.join("2026-10-20.md"), "- pipeline-oldok handled\n").unwrap();
+        // fresh (started 2026-11-12): same defects
+        put(
+            "freshbad",
+            "2026-11-12",
+            "status: clean \u{b7} commit deadbee \u{b7} elapsed 1m",
+        );
+        put("freshblk", "2026-11-12", "status: blocked");
+
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-freshbad.md") && f.contains("does not resolve")),
+            "fresh bad sha in a real repo is still flagged: {:?}",
+            flags
+        );
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-freshblk.md") && f.contains("no memory")),
+            "fresh unhandled blocked run is still listed: {:?}",
+            flags
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("pipeline-oldbad.md")),
+            "old clean run is not checked per sha: {:?}",
+            flags
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("pipeline-oldok")),
+            "old handled blocked run is silent: {:?}",
+            flags
+        );
+        let agg: Vec<&String> = flags.iter().filter(|f| f.contains("older than")).collect();
+        assert_eq!(agg.len(), 1, "one aggregate line for old runs: {:?}", flags);
+        assert!(
+            agg[0].starts_with("- runs/pipeline-")
+                && agg[0].contains("1 of them")
+                && agg[0].contains("3 pipeline runs")
+                && agg[0].contains("pipeline-oldblk")
+                && !agg[0].contains("pipeline-oldok")
+                && !agg[0].contains("grep"),
+            "aggregate counts the 3 old runs and names the 1 unhandled: {:?}",
+            agg
+        );
+    }
+
+    #[test]
+    fn test_recorded_repo_not_a_git_repo_is_one_line_per_repo() {
+        let root = test_temp_dir("pipe-nogit");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let dead = root.join("moved-away");
+        std::fs::create_dir_all(&dead).unwrap();
+        let live = root.join("live");
+        let _ = git_init_commit(&live);
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        for (i, sha) in ["aaa1111", "bbb2222", "ccc3333"].iter().enumerate() {
+            std::fs::write(
+                runs_dir.join(format!("pipeline-d{i}.md")),
+                format!(
+                    "- task: d{i} \u{b7} repo: {}\n- started: 2026-11-12T10:00:00+07:00\n- status: clean \u{b7} commit {sha}\n",
+                    dead.display()
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            runs_dir.join("pipeline-live1.md"),
+            format!(
+                "- task: live1 \u{b7} repo: {}\n- started: 2026-11-12T10:00:00+07:00\n- status: clean \u{b7} commit badbad0\n",
+                live.display()
+            ),
+        )
+        .unwrap();
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        let dead_lines: Vec<&String> = flags
+            .iter()
+            .filter(|f| f.contains(&*dead.display().to_string()))
+            .collect();
+        assert_eq!(
+            dead_lines.len(),
+            1,
+            "3 runs, one repo -> one line: {:?}",
+            flags
+        );
+        assert!(
+            dead_lines[0].contains("not a git repo") && dead_lines[0].contains("3 runs"),
+            "{:?}",
+            dead_lines
+        );
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-live1.md") && f.contains("does not resolve")),
+            "bad sha in a real git repo still flagged per run: {:?}",
+            flags
+        );
+    }
+
+    #[test]
+    fn test_old_run_with_recent_resume_stays_listed_per_file() {
+        let root = test_temp_dir("pipe-resume");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        // started 30 days ago, but the file was appended to yesterday (late resume -> blocked)
+        let f = runs_dir.join("pipeline-resumed.md");
+        std::fs::write(
+            &f,
+            "- task: resumed\n- started: 2026-10-14T10:00:00+07:00\n- status: blocked\n",
+        )
+        .unwrap();
+        backdate(&f, 86400, now_secs);
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-resumed.md") && f.contains("no memory")),
+            "recently touched run is listed per file: {:?}",
+            flags
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("older than")),
+            "{:?}",
+            flags
+        );
+    }
+
+    #[test]
+    fn test_old_runs_aggregate_names_runs_only_up_to_five() {
+        let root = test_temp_dir("pipe-names");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        let mk = |n: usize| {
+            for i in 0..n {
+                let f = runs_dir.join(format!("pipeline-b{i}.md"));
+                std::fs::write(
+                    &f,
+                    "- task: b\n- started: 2026-10-01T10:00:00+07:00\n- status: blocked\n",
+                )
+                .unwrap();
+                backdate(&f, 40 * 86400, now_secs);
+            }
+        };
+        mk(5);
+        let five = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        let line = five.iter().find(|f| f.contains("older than")).unwrap();
+        assert!(
+            line.contains("pipeline-b0") && line.contains("pipeline-b4"),
+            "{line}"
+        );
+        mk(6);
+        let six = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        let line = six.iter().find(|f| f.contains("older than")).unwrap();
+        assert!(
+            line.contains("6 of them") && !line.contains("pipeline-b0"),
+            "{line}"
+        );
+        assert!(!line.contains("grep"), "{line}");
+    }
+
+    #[test]
+    fn test_recorded_repo_inside_a_git_repo_is_still_checked_per_run() {
+        let root = test_temp_dir("pipe-subdir");
+        let runs_dir = root.join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let top = root.join("top");
+        let _ = git_init_commit(&top);
+        let sub = top.join("crates").join("x");
+        std::fs::create_dir_all(&sub).unwrap();
+        let now_secs = ymd_to_days(2026, 11, 13) * 86400 + 43200;
+        std::fs::write(
+            runs_dir.join("pipeline-sub1.md"),
+            format!(
+                "- task: sub1 \u{b7} repo: {}\n- started: 2026-11-12T10:00:00+07:00\n- status: clean \u{b7} commit badbad0\n",
+                sub.display()
+            ),
+        )
+        .unwrap();
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 13), now_secs);
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.contains("pipeline-sub1.md") && f.contains("does not resolve")),
+            "bad sha in a repo subdirectory is flagged per run: {:?}",
+            flags
+        );
+        assert!(
+            !flags.iter().any(|f| f.contains("not a git repo")),
+            "{:?}",
             flags
         );
     }
