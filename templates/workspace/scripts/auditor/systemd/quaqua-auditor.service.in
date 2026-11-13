@@ -3,4 +3,5 @@ Description=quaqua Auditor — read-only drift audit (quaqua auditor run)
 
 [Service]
 Type=oneshot
+Environment="PATH=@PATH@"
 ExecStart=%h/.cargo/bin/quaqua auditor run

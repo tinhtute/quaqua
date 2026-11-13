@@ -146,9 +146,12 @@ quaqua init     # dirs + rules.md, INDEX.md, _template.md, USER.md
 bash templates/workspace/scripts/auditor/install-auditor.sh  # installs scheduling files; prints manual activation command
 ```
 
-Linux: the installer symlinks the user service/timer and calls only
+Linux: the installer renders the user service from `quaqua-auditor.service.in`, pinning the
+install-time PATH (systemd's user manager starts jobs with a bare PATH that lacks
+`~/.local/bin`, so a bare unit cannot find `claude`), symlinks the timer, and calls only
 `systemctl --user daemon-reload`. Activate manually with
-`systemctl --user enable --now quaqua-auditor.timer`.
+`systemctl --user enable --now quaqua-auditor.timer`. Reinstall after moving the harness
+CLI or changing toolchain paths; an older install (symlinked service) needs one reinstall to pick up the PATH.
 
 macOS: install a current Bash (e.g. `brew install bash`), then put its `bin` directory
 first on PATH (`export PATH="$(brew --prefix bash)/bin:$PATH"` for Homebrew).

@@ -154,9 +154,9 @@ grep -q 'FAILED' "$report" || fail "failure: no failure report written"
 echo "ok: failure -> exit propagates, stub report notes the failure"
 
 # ── F8 packaging: exactly one Auditor entrypoint with all scheduling assets ──
-[[ -f $root/templates/workspace/scripts/auditor/systemd/quaqua-auditor.service ]] || fail "pkg: no systemd service shipped"
+[[ -f $root/templates/workspace/scripts/auditor/systemd/quaqua-auditor.service.in ]] || fail "pkg: no systemd service shipped"
 [[ -f $root/templates/workspace/scripts/auditor/systemd/quaqua-auditor.timer ]] || fail "pkg: no systemd timer shipped"
-grep -q 'auditor run' "$root/templates/workspace/scripts/auditor/systemd/quaqua-auditor.service" \
+grep -q 'auditor run' "$root/templates/workspace/scripts/auditor/systemd/quaqua-auditor.service.in" \
   || fail "pkg: service does not exec quaqua auditor run"
 grep -q 'OnCalendar' "$root/templates/workspace/scripts/auditor/systemd/quaqua-auditor.timer" || fail "pkg: timer has no schedule"
 grep -q 'systemd' "$src/auditor/install-auditor.sh" || fail "pkg: installer does not use systemd/"
