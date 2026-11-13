@@ -8,7 +8,7 @@ use quaqua::git::Git;
 use quaqua::herdr::Herdr;
 use quaqua::worker::cleanup::{cleanup_worker, default_runs_dir};
 use quaqua::worker::prompt::{
-    do_check_brief, prompt_worker, USAGE as PROMPT_USAGE, USAGE_HELP as PROMPT_USAGE_HELP,
+    do_check_brief, prompt_worker_cli, USAGE as PROMPT_USAGE, USAGE_HELP as PROMPT_USAGE_HELP,
 };
 use quaqua::worker::spawn::{parse_spawn_args, spawn_worker};
 use quaqua::worker::stop::{parse_stop_args, stop_worker};
@@ -569,7 +569,7 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
                 {
                     return Err((1, format!("{PROMPT_USAGE}\n")));
                 }
-                prompt_worker(name, None, true, extend, git, herdr)?;
+                prompt_worker_cli(name, None, true, extend, git, herdr)?;
                 return Ok(());
             }
 
@@ -592,7 +592,7 @@ fn handle_worker(args: &[String], git: &Git, herdr: &Herdr) -> Result<(), (i32, 
                     "error: task must be a brief with 'Goal:', 'Hard constraints:', 'Current design (open to challenge):' (rules/_all/brief.md)\n".to_string(),
                 ));
             }
-            prompt_worker(name, Some(task), false, None, git, herdr)?;
+            prompt_worker_cli(name, Some(task), false, None, git, herdr)?;
             Ok(())
         }
         "cleanup" => {
