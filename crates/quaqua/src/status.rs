@@ -33,6 +33,8 @@ pub struct WorkflowStatusRow {
     pub last_event_seq: Option<u64>,
     pub last_event_ts_ms: Option<u64>,
     pub phase: Option<String>,
+    /// `status` of the last event's payload when it is `workflow_completed`.
+    pub completed_status: Option<String>,
 }
 
 /// Status of the worker report file (`runs/<name>.md`).
@@ -384,7 +386,7 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
     if has_events {
         let mut stmt = conn
             .prepare(
-                "SELECT e.workflow_id, e.seq, e.ts_ms, e.kind \
+                "SELECT e.workflow_id, e.seq, e.ts_ms, e.kind, e.payload_json \
                  FROM events e \
                  INNER JOIN ( \
                      SELECT workflow_id, MAX(seq) AS max_seq \
@@ -400,12 +402,13 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
                 let seq: i64 = row.get(1)?;
                 let ts_ms: i64 = row.get(2)?;
                 let kind: String = row.get(3)?;
-                Ok((wf, seq as u64, ts_ms as u64, kind))
+                let payload: String = row.get(4)?;
+                Ok((wf, seq as u64, ts_ms as u64, kind, payload))
             })
             .map_err(|e| format!("db error: executing events query: {e}"))?;
 
         for r in rows {
-            let (wf, seq, ts_ms, kind) =
+            let (wf, seq, ts_ms, kind, payload) =
                 r.map_err(|e| format!("db error: decoding event row: {e}"))?;
             let entry = map.entry(wf.clone()).or_insert_with(|| WorkflowStatusRow {
                 workflow_id: wf,
@@ -414,9 +417,15 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
                 last_event_seq: None,
                 last_event_ts_ms: None,
                 phase: None,
+                completed_status: None,
             });
             entry.last_event_seq = Some(seq);
             entry.last_event_ts_ms = Some(ts_ms);
+            if kind == "workflow_completed" {
+                entry.completed_status = serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|v| v.get("status").and_then(|x| x.as_str()).map(str::to_string));
+            }
             entry.last_event_kind = Some(kind);
         }
     }
@@ -453,6 +462,7 @@ pub fn query_workflows(db_path: &Path) -> Result<Vec<WorkflowStatusRow>, String>
                 last_event_seq: None,
                 last_event_ts_ms: None,
                 phase: None,
+                completed_status: None,
             });
             entry.snap_seq = Some(seq);
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&state_json) {
@@ -800,6 +810,33 @@ pub fn format_status_report(
     orchestration: Result<&[OrchestrationRow], &str>,
     verdicts: Result<&[BranchVerdictRow], &str>,
 ) -> String {
+    format_status_report_opts(workflows, orchestration, verdicts, true)
+}
+
+/// A workflow whose last event ends it: nobody can act on the row.
+/// `workflow_completed` with payload status `disputed` stays (it needs a decision);
+/// `playbook_gap` stays too: the worker still has to fix its report.
+fn is_terminal_workflow(w: &WorkflowStatusRow) -> bool {
+    match w.last_event_kind.as_deref() {
+        Some("workflow_completed") => w.completed_status.as_deref() != Some("disputed"),
+        Some("workflow_cancelled" | "verdict") => true,
+        _ => false,
+    }
+}
+
+fn push_hidden_line(out: &mut String, hidden: usize) {
+    if hidden > 0 {
+        out.push_str(&format!("{hidden} hidden (quaqua status --all)\n"));
+    }
+}
+
+/// Status report; `all == false` hides rows nobody can act on (see `StatusArgs`).
+pub fn format_status_report_opts(
+    workflows: Result<&[WorkflowStatusRow], &str>,
+    orchestration: Result<&[OrchestrationRow], &str>,
+    verdicts: Result<&[BranchVerdictRow], &str>,
+    all: bool,
+) -> String {
     let mut out = String::new();
 
     out.push_str("=== Workflows (runs/quaqua.db) ===\n");
@@ -807,11 +844,20 @@ pub fn format_status_report(
         Ok([]) => {
             out.push_str("no workflows\n");
         }
-        Ok(wfs) => {
-            out.push_str(&format!(
-                "{:<20} {:<10} {:<20} {:<10} {:<12} {:<10}\n",
-                "WORKFLOW_ID", "SNAP_SEQ", "LAST_EVENT", "EVENT_SEQ", "LAST_TS", "PHASE"
-            ));
+        Ok(all_wfs) => {
+            let wfs: Vec<&WorkflowStatusRow> = all_wfs
+                .iter()
+                .filter(|w| all || !is_terminal_workflow(w))
+                .collect();
+            let hidden = all_wfs.len() - wfs.len();
+            if wfs.is_empty() {
+                out.push_str("no workflows\n");
+            } else {
+                out.push_str(&format!(
+                    "{:<20} {:<10} {:<20} {:<10} {:<12} {:<10}\n",
+                    "WORKFLOW_ID", "SNAP_SEQ", "LAST_EVENT", "EVENT_SEQ", "LAST_TS", "PHASE"
+                ));
+            }
             for wf in wfs {
                 let snap = wf
                     .snap_seq
@@ -832,6 +878,7 @@ pub fn format_status_report(
                     wf.workflow_id, snap, ev_kind, ev_seq, ev_ts, phase
                 ));
             }
+            push_hidden_line(&mut out, hidden);
         }
         Err(err) => {
             out.push_str(&format!("{err}\n"));
@@ -896,11 +943,18 @@ pub fn format_status_report(
         Ok([]) => {
             out.push_str("no verdicts\n");
         }
-        Ok(v_rows) => {
-            out.push_str(&format!(
-                "{:<24} {:<12} {:<20} {}\n",
-                "BRANCH", "HEAD", "VERDICT", "FLAGS"
-            ));
+        Ok(all_rows) => {
+            let v_rows: Vec<&BranchVerdictRow> =
+                all_rows.iter().filter(|r| all || !r.unresolved).collect();
+            let hidden = all_rows.len() - v_rows.len();
+            if v_rows.is_empty() {
+                out.push_str("no verdicts\n");
+            } else {
+                out.push_str(&format!(
+                    "{:<24} {:<12} {:<20} {}\n",
+                    "BRANCH", "HEAD", "VERDICT", "FLAGS"
+                ));
+            }
             for r in v_rows {
                 let mut flags = Vec::new();
                 if r.unresolved {
@@ -913,7 +967,7 @@ pub fn format_status_report(
                     flags.push("same-harness");
                 }
                 let flags_str = if flags.is_empty() {
-                    "-".to_string()
+                    "ok".to_string()
                 } else {
                     flags.join(", ")
                 };
@@ -932,6 +986,7 @@ pub fn format_status_report(
                     flags_str
                 ));
             }
+            push_hidden_line(&mut out, hidden);
         }
         Err(err) => {
             out.push_str(&format!("{err}\n"));
@@ -941,22 +996,42 @@ pub fn format_status_report(
     out
 }
 
-/// Render full status from explicit DB and runs directory paths.
+/// Render the default (filtered) status from explicit DB and runs directory paths.
 pub fn render_status<H: HerdrOps>(
     db_path: &Path,
     runs_dir: &Path,
     herdr: &H,
 ) -> Result<String, String> {
-    let git = Git::new();
-    render_status_with_git(db_path, runs_dir, herdr, &git)
+    render_status_opts(db_path, runs_dir, herdr, &Git::new(), false)
 }
 
-/// Render status with explicit Git implementation.
-pub fn render_status_with_git<H: HerdrOps, G: GitOps>(
+/// Unfiltered (`--all`) report from explicit DB and runs directory paths.
+pub fn render_status_all<H: HerdrOps>(
+    db_path: &Path,
+    runs_dir: &Path,
+    herdr: &H,
+) -> Result<String, String> {
+    let git = Git::new();
+    render_status_all_with_git(db_path, runs_dir, herdr, &git)
+}
+
+/// Unfiltered (`--all`) report with explicit Git implementation.
+pub fn render_status_all_with_git<H: HerdrOps, G: GitOps>(
     db_path: &Path,
     runs_dir: &Path,
     herdr: &H,
     git: &G,
+) -> Result<String, String> {
+    render_status_opts(db_path, runs_dir, herdr, git, true)
+}
+
+/// Render status; `all == false` hides rows nobody can act on.
+pub fn render_status_opts<H: HerdrOps, G: GitOps>(
+    db_path: &Path,
+    runs_dir: &Path,
+    herdr: &H,
+    git: &G,
+    all: bool,
 ) -> Result<String, String> {
     let wf_res = query_workflows(db_path);
     let orch_res = load_team_config()
@@ -964,11 +1039,49 @@ pub fn render_status_with_git<H: HerdrOps, G: GitOps>(
         .and_then(|cfg| scan_orchestration(runs_dir, herdr, &cfg));
     let repo = runs_dir.parent().unwrap_or_else(|| Path::new("."));
     let verdicts_res = query_branch_verdicts(db_path, repo, git);
-    Ok(format_status_report(
+    Ok(format_status_report_opts(
         wf_res.as_deref().map_err(|e| e.as_str()),
         orch_res.as_deref().map_err(|e| e.as_str()),
         verdicts_res.as_deref().map_err(|e| e.as_str()),
+        all,
     ))
+}
+
+/// Parsed plain-status arguments (everything except `--metrics`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusArgs {
+    pub all: bool,
+    pub help: bool,
+}
+
+pub fn parse_status_args(args: &[String]) -> Result<StatusArgs, String> {
+    let mut parsed = StatusArgs::default();
+    for a in args {
+        match a.as_str() {
+            "--all" => parsed.all = true,
+            "--help" | "-h" => parsed.help = true,
+            other => return Err(format!("unknown argument to status: {other}")),
+        }
+    }
+    Ok(parsed)
+}
+
+pub fn status_help() -> String {
+    "Usage: quaqua status [--all | --metrics[=<since>] [--since <dur>] [--owner <name>] [--json]]\n\
+\n\
+By default only rows someone can act on are shown. A section that hid rows ends\n\
+with `N hidden (quaqua status --all)`.\n\
+\n\
+  --all    show every Workflows and Verdicts row\n\
+\n\
+Workflows hides rows whose last event is terminal: workflow_completed (except\n\
+status disputed), workflow_cancelled, verdict.\n\
+\n\
+Verdicts FLAGS (`ok` = none set):\n\
+  stale         the branch head moved after the verdict\n\
+  unresolved    the branch resolves in no repo (hidden by default)\n\
+  same-harness  verifier and builder run the same harness\n"
+        .to_string()
 }
 
 /// CLI entrypoint for `quaqua status`.
@@ -988,13 +1101,26 @@ pub fn handle_status<H: HerdrOps>(args: &[String], herdr: &H) -> Result<i32, Str
         return Ok(0);
     }
 
+    let status_args = match parse_status_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}\n\n{}", status_help());
+            return Ok(2);
+        }
+    };
+    if status_args.help {
+        print!("{}", status_help());
+        return Ok(0);
+    }
+
     let runs_dir = if let Ok(dir) = std::env::var("QUAQUA_RUNS_DIR") {
         PathBuf::from(dir)
     } else {
         crate::workspace::workspace_root().join("runs")
     };
     let db_path = runs_dir.join("quaqua.db");
-    let report = render_status(&db_path, &runs_dir, herdr)?;
+    let git = Git::new();
+    let report = render_status_opts(&db_path, &runs_dir, herdr, &git, status_args.all)?;
     print!("{report}");
     Ok(0)
 }
@@ -2202,6 +2328,170 @@ mod tests {
         }
     }
 
+    fn wf_row(id: &str, kind: &str, phase: Option<&str>, ts: u64) -> WorkflowStatusRow {
+        WorkflowStatusRow {
+            workflow_id: id.to_string(),
+            snap_seq: None,
+            last_event_kind: Some(kind.to_string()),
+            last_event_seq: Some(1),
+            last_event_ts_ms: Some(ts),
+            phase: phase.map(str::to_string),
+            completed_status: phase
+                .filter(|_| kind == "workflow_completed")
+                .map(str::to_string),
+        }
+    }
+
+    fn vd_row(branch: &str, stale: bool, unresolved: bool, same: bool) -> BranchVerdictRow {
+        BranchVerdictRow {
+            branch: branch.to_string(),
+            head_sha: "abcdef1234".to_string(),
+            verdict_sha: "abcdef1234".to_string(),
+            level: VerdictLevel::ReviewClean,
+            is_verified: true,
+            stale,
+            unresolved,
+            same_harness: same,
+        }
+    }
+
+    fn filter_fixture() -> (Vec<WorkflowStatusRow>, Vec<BranchVerdictRow>) {
+        let wfs = vec![
+            // kept
+            wf_row("k-activity", "activity_scheduled", Some("build"), 5),
+            wf_row("k-child", "child_started", None, 5),
+            wf_row("k-disputed", "workflow_completed", Some("disputed"), 5),
+            wf_row("k-gap", "playbook_gap", None, 5),
+            wf_row("k-failed", "workflow_failed", None, 5),
+            wf_row("k-continue", "continue", None, 5),
+            wf_row("k-approval", "pause_for_approval", None, 1),
+            wf_row("k-retry", "provider_retry", None, 5),
+            // hidden
+            wf_row("h-done", "workflow_completed", Some("completed"), 5),
+            wf_row("h-done-nophase", "workflow_completed", None, 5),
+            wf_row("h-cancel", "workflow_cancelled", Some("cancelled"), 5),
+            wf_row("h-verdict", "verdict", None, 5),
+        ];
+        let vds = vec![
+            vd_row("b-ok", false, false, false),
+            vd_row("b-stale", true, false, false),
+            vd_row("b-same", false, false, true),
+            vd_row("b-gone", false, true, false),
+            vd_row("b-gone-stale", true, true, false),
+        ];
+        (wfs, vds)
+    }
+
+    #[test]
+    fn test_status_default_hides_terminal_workflows_and_unresolved_verdicts() {
+        let (wfs, vds) = filter_fixture();
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&vds), false);
+        for kept in [
+            "k-activity",
+            "k-child",
+            "k-disputed",
+            "k-gap",
+            "k-failed",
+            "k-continue",
+            "k-approval",
+            "k-retry",
+            "b-ok",
+            "b-stale",
+            "b-same",
+        ] {
+            assert!(out.contains(kept), "{kept} must stay visible:\n{out}");
+        }
+        for hidden in [
+            "h-done",
+            "h-done-nophase",
+            "h-cancel",
+            "h-verdict",
+            "b-gone",
+        ] {
+            assert!(!out.contains(hidden), "{hidden} must be hidden:\n{out}");
+        }
+        assert_eq!(
+            out.matches("4 hidden (quaqua status --all)").count(),
+            1,
+            "{out}"
+        );
+        assert!(out.contains("2 hidden (quaqua status --all)"), "{out}");
+    }
+
+    #[test]
+    fn test_status_all_shows_everything_without_hidden_line() {
+        let (wfs, vds) = filter_fixture();
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&vds), true);
+        for id in [
+            "k-approval",
+            "h-done",
+            "h-cancel",
+            "h-verdict",
+            "k-gap",
+            "b-gone",
+            "b-gone-stale",
+        ] {
+            assert!(out.contains(id), "{id} must show with --all:\n{out}");
+        }
+        assert!(!out.contains("hidden"), "{out}");
+    }
+
+    #[test]
+    fn test_status_hidden_line_only_in_sections_that_hid_rows() {
+        let wfs = vec![wf_row("k-live", "activity_scheduled", None, 5)];
+        let vds = vec![vd_row("b-gone", false, true, false)];
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&vds), false);
+        assert_eq!(
+            out.matches("hidden (quaqua status --all)").count(),
+            1,
+            "{out}"
+        );
+        assert!(out.contains("1 hidden (quaqua status --all)"));
+        assert!(!out.contains("b-gone"));
+    }
+
+    #[test]
+    fn test_status_empty_flag_cell_prints_ok() {
+        let vds = vec![
+            vd_row("b-ok", false, false, false),
+            vd_row("b-st", true, false, false),
+        ];
+        let out = format_status_report_opts(Ok(&[]), Ok(&[]), Ok(&vds), true);
+        let ok_line = out.lines().find(|l| l.contains("b-ok")).unwrap();
+        assert!(ok_line.trim_end().ends_with(" ok"), "{ok_line}");
+        let st_line = out.lines().find(|l| l.contains("b-st")).unwrap();
+        assert!(st_line.trim_end().ends_with("stale"), "{st_line}");
+    }
+
+    #[test]
+    fn test_status_args_all_help_and_unknown() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_status_args(&a(&[])).unwrap(),
+            StatusArgs {
+                all: false,
+                help: false
+            }
+        );
+        assert!(parse_status_args(&a(&["--all"])).unwrap().all);
+        assert!(parse_status_args(&a(&["--help"])).unwrap().help);
+        assert!(parse_status_args(&a(&["-h"])).unwrap().help);
+        assert!(parse_status_args(&a(&["--bogus"])).is_err());
+        assert!(parse_status_args(&a(&["--all", "extra"])).is_err());
+    }
+
+    #[test]
+    fn test_status_unknown_arg_exits_2_and_help_exits_0() {
+        let mock = MockHerdr::new("{}");
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(handle_status(&a(&["--bogus"]), &mock), Ok(2));
+        assert_eq!(handle_status(&a(&["--help"]), &mock), Ok(0));
+        assert!(status_help().contains("--all"));
+        for f in ["stale", "unresolved", "same-harness"] {
+            assert!(status_help().contains(f), "help must document {f}");
+        }
+    }
+
     #[test]
     fn test_status_missing_db_yields_no_workflows_cleanly() {
         let tmp = temp_test_dir("missing");
@@ -2317,6 +2607,32 @@ mod tests {
         assert_eq!(w2.last_event_seq, Some(1));
         assert_eq!(w2.last_event_kind, Some("workflow_started".to_string()));
         assert_eq!(w2.last_event_ts_ms, Some(2000));
+    }
+
+    #[test]
+    fn test_status_disputed_keyed_on_completed_status_without_snapshot() {
+        let tmp = temp_test_dir("disputed-nosnap");
+        let _cleaner = TempDirCleaner(tmp.clone());
+        let db_path = tmp.join("test.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE events (
+                    workflow_id TEXT NOT NULL, seq INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+                    kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, seq)
+                );
+                INSERT INTO events VALUES ('wf-disp', 1, 1, 'workflow_completed', '{"status":"disputed"}');
+                INSERT INTO events VALUES ('wf-done', 1, 1, 'workflow_completed', '{"status":"completed"}');
+                "#,
+            )
+            .expect("insert rows");
+        }
+        let wfs = query_workflows(&db_path).expect("query");
+        let out = format_status_report_opts(Ok(&wfs), Ok(&[]), Ok(&[]), false);
+        assert!(out.contains("wf-disp"), "{out}");
+        assert!(!out.contains("wf-done"), "{out}");
     }
 
     #[test]
@@ -2818,7 +3134,7 @@ mod tests {
         let mock = MockHerdr::new(mock_json);
         fs::write(tmp.join("sude-w1.owner"), "arch-lead\n").unwrap();
 
-        let out = render_status(&db_path, &tmp, &mock).expect("render status");
+        let out = render_status_all(&db_path, &tmp, &mock).expect("render status");
         assert!(out.contains("=== Workflows (runs/quaqua.db) ==="));
         assert!(out.contains("pipe-test"));
         assert!(out.contains("=== Orchestration ==="));
@@ -3240,7 +3556,7 @@ mod tests {
         let _guard = EnvGuard::capture(&["QUAQUA_TEAM_TOML"]);
         std::env::set_var("QUAQUA_TEAM_TOML", &missing);
 
-        let out = render_status(&db_path, &tmp, &mock)
+        let out = render_status_all(&db_path, &tmp, &mock)
             .expect("status must keep rendering when team.toml fails to load");
         assert!(out.contains("=== Workflows (runs/quaqua.db) ==="), "{out}");
         assert!(out.contains("=== Verdicts ==="), "{out}");
@@ -3337,7 +3653,7 @@ mod tests {
         assert!(report.contains("stale"));
     }
     #[test]
-    fn test_render_status_with_git_resolves_repo_from_index_and_flags_stale_or_unresolved() {
+    fn test_render_status_all_with_git_resolves_repo_from_index_and_flags_stale_or_unresolved() {
         let _env_lock = crate::test_env::lock_env();
         let ws = temp_test_dir("ws-render-status");
         let _cleaner_ws = TempDirCleaner(ws.clone());
@@ -3429,7 +3745,7 @@ mod tests {
         assert_ne!(sha1, sha2);
 
         let mock = MockHerdr::new(r#"{"result":{"agents":[]}}"#);
-        let out = render_status_with_git(&db_path, &runs_dir, &mock, &git)
+        let out = render_status_all_with_git(&db_path, &runs_dir, &mock, &git)
             .expect("render status with git");
 
         let stale_lines: Vec<&str> = out

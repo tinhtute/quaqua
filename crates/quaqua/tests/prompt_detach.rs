@@ -495,3 +495,74 @@ fn test_ctrl_c_leaves_the_pipeline_core_running() {
         &format!("quaqua pipeline --resume {TASK} {}", repo.display()),
     );
 }
+
+/// Resumes that start at the same instant, with no core running yet, must end
+/// up following one core: a second watcher on one report is the bug.
+#[test]
+fn test_simultaneous_resumes_start_exactly_one_core() {
+    for round in 0..4 {
+        let f = Fixture::new(&format!("race-{round}"));
+        let mut resumes: Vec<Child> = (0..3).map(|_| f.spawn_direct()).collect();
+        f.wait_for("the wait to start", || f.watching());
+        std::thread::sleep(Duration::from_secs(2));
+        let cores = f.watchers();
+        assert_eq!(cores.len(), 1, "round {round}: cores polling: {cores:?}");
+
+        f.release_worker();
+        f.wait_for("acceptance", || f.accepted());
+        for r in &mut resumes {
+            assert_eq!(r.wait().unwrap().code(), Some(0), "round {round}");
+        }
+    }
+}
+
+/// A core killed without a chance to clean up (SIGKILL, OOM) leaves no exit
+/// file. Whoever follows it must say so and exit with a code of its own, not 0
+/// and not the 1 a failed prompt also uses.
+const EXIT_CORE_DIED: i32 = 8;
+
+fn assert_killed_core_is_reported(f: &Fixture, mut follower: Child) {
+    f.wait_for("the core to poll", || !f.watchers().is_empty());
+    // Let the follower attach before the core goes, or it starts a new core.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(f.watchers().len(), 1, "the follower must join, not start");
+    let core = f.watchers()[0];
+    kill(&["-9", &core.to_string()]);
+    let end = Instant::now() + Duration::from_secs(10);
+    while follower.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < end, "the follower never noticed the death");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut err = String::new();
+    std::io::Read::read_to_string(follower.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert_eq!(
+        follower.wait().unwrap().code(),
+        Some(EXIT_CORE_DIED),
+        "stderr: {err}"
+    );
+    assert!(
+        err.contains(&core.to_string()) && err.contains("died"),
+        "the report names the dead core: {err}"
+    );
+    assert!(
+        err.contains("--resume"),
+        "the report says how to carry on: {err}"
+    );
+}
+
+#[test]
+fn test_follower_reports_a_core_that_died_without_an_exit_file() {
+    let f = Fixture::new("core-died-follower");
+    let launcher = f.launch("a");
+    f.wait_for("the wait to start", || f.watching());
+    f.coordinator_exits(launcher);
+    let follower = f.spawn_direct();
+    assert_killed_core_is_reported(&f, follower);
+}
+
+#[test]
+fn test_parent_reports_a_core_that_died_by_signal() {
+    let f = Fixture::new("core-died-parent");
+    let parent = f.spawn_direct();
+    assert_killed_core_is_reported(&f, parent);
+}

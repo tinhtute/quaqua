@@ -239,6 +239,26 @@ pub struct SqliteJournal {
 
 use crate::engine::sqlite::{open_conn, retry_while_busy};
 
+/// The journal tables, shared with `bus::gui` so the GUI views can be created
+/// on a database whichever opener ran first.
+pub(crate) const JOURNAL_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS events (
+    workflow_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    workflow_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, seq)
+);
+"#;
+
 impl SqliteJournal {
     /// Returns the default SQLite journal path at `<default_runs_dir>/quaqua.db`.
     pub fn default_path() -> PathBuf {
@@ -261,27 +281,7 @@ impl SqliteJournal {
         let conn = open_conn(path).map_err(|e| JournalError::StorageError(e.to_string()))?;
 
         // Initialize schema exactly per journal.rs specification.
-        retry_while_busy(|| {
-            conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS events (
-                    workflow_id TEXT NOT NULL,
-                    seq INTEGER NOT NULL,
-                    ts_ms INTEGER NOT NULL,
-                    kind TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    PRIMARY KEY (workflow_id, seq)
-                );
-
-                CREATE TABLE IF NOT EXISTS snapshots (
-                    workflow_id TEXT NOT NULL,
-                    seq INTEGER NOT NULL,
-                    state_json TEXT NOT NULL,
-                    PRIMARY KEY (workflow_id, seq)
-                );
-                "#,
-            )
-        })
+        retry_while_busy(|| conn.execute_batch(JOURNAL_SCHEMA_SQL))
         .map_err(|e| JournalError::StorageError(e.to_string()))?;
 
         Ok(Self {

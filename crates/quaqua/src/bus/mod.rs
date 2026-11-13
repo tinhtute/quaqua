@@ -4,6 +4,7 @@
 //! Uses shared SQLite connection opener with WAL mode, busy timeout, and retry_while_busy.
 
 pub mod events;
+pub mod gui;
 pub mod mail;
 pub mod migrate;
 pub mod recall;
@@ -271,6 +272,13 @@ impl FarmBus {
                 "#,
             )?;
             Ok(())
+        })?;
+
+        // GUI read contract (R1): the views read both the bus and the journal
+        // tables, so the journal tables are ensured here, after the legacy check.
+        crate::engine::sqlite::retry_while_busy(|| {
+            conn.execute_batch(crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL)?;
+            crate::bus::gui::ensure_gui_views(&conn)
         })?;
 
         let events_watermark: u64 = crate::bus::migrate::legacy_events_watermark(&conn);
@@ -944,7 +952,7 @@ mod tests {
         use crate::engine::journal::{EventRecord, Journal};
         use crate::engine::journal_sqlite::SqliteJournal;
         use crate::herdr::Herdr;
-        use crate::status::render_status;
+        use crate::status::render_status_all;
 
         let (db_path, _cleaner) = temp_db("status-unchanged");
         let runs_dir = db_path.parent().unwrap();
@@ -964,7 +972,7 @@ mod tests {
 
         let mock_herdr = Herdr::new();
         let status_before =
-            render_status(&db_path, runs_dir, &mock_herdr).expect("render status before");
+            render_status_all(&db_path, runs_dir, &mock_herdr).expect("render status before");
 
         // Now open FarmBus on the same database, creating superagent tables,
         // and insert several farm events.
@@ -991,7 +999,7 @@ mod tests {
 
         // Render status again: must be byte-identical!
         let status_after =
-            render_status(&db_path, runs_dir, &mock_herdr).expect("render status after");
+            render_status_all(&db_path, runs_dir, &mock_herdr).expect("render status after");
 
         assert_eq!(
             status_before, status_after,
