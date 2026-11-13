@@ -1,5 +1,5 @@
 ---
-status: active
+status: completed
 lane: normal
 ---
 # Harness MVP — quaqua end to end
@@ -60,22 +60,22 @@ lane: normal
   - surfaces: runs/ report only, no code | avoided: any engine change (a gap found goes back as a new phase)
   - phase check: `gh pr view <pr> --json mergedAt` `quaqua status --metrics` `jq .review.lastReviewAt ~/.claude/plugins/store/cos-memory_*.json`
 - phase_slug: `agy-progress`
-  status: planned (candidate from `mvp-run`; raw/2026-11-12-quaqua-rs-agyprobe.md Q1)
+  status: dropped 2026-11-13: no agy kind in team.toml, workspace runs claude-only (was: planned, candidate from `mvp-run`; raw/2026-11-12-quaqua-rs-agyprobe.md Q1)
   - goal: a working agy worker is not killed at its budget — agy reports no session id (`~/.gemini/config/hooks/herdr-agent-state.sh` absent, harness/mod.rs:79-82), so `session_seen` stays false, `last_progress_ms` stays 0 and the 25% grace never applies (workflow.rs budget block) | depends_on: none
   - surfaces: crates/quaqua/src/launch.rs (ship/install the hook), crates/quaqua/src/worker/prompt/{workflow,cost}.rs (`agy_session_mtime` fallback) | avoided: a pane-text progress source (spinners animate, it would mask real stalls)
   - phase check: a live agy worker past its budget with a moving conversation store gets grace, not exit 4
 - phase_slug: `agy-nudge`
-  status: planned (candidate from `mvp-run`; raw/2026-11-12-quaqua-rs-agyprobe.md Q2)
+  status: dropped 2026-11-13: no agy kind in team.toml, workspace runs claude-only (was: planned, candidate from `mvp-run`; raw/2026-11-12-quaqua-rs-agyprobe.md Q2)
   - goal: the 80% nudge reaches an agy worker mid-turn — agy queues a prompt until the running turn ends, so the send path does `esc` (HerdrRequest::SendKeys, `Harness::Agy.stop_keys`) then the Prompt for agy only; if that aborts real work, agy kinds get no nudge and the brief's Time budget is the only stop | depends_on: none
   - surfaces: crates/quaqua/src/worker/prompt/workflow.rs (nudge send), crates/quaqua/src/harness/mod.rs | avoided: every other harness's send path
   - phase check: a live agy worker at 80% of budget reacts to the nudge before its turn ends
 - phase_slug: `agy-effort`
-  status: planned (candidate from `mvp-run`)
+  status: dropped 2026-11-13: no agy kind in team.toml, workspace runs claude-only (was: planned, candidate from `mvp-run`)
   - goal: `--effort` is not passed to a model that rejects it (agy logs `--effort is not supported for model "gemini-3.8-flash"`), and an agy metrics row carries dollars from the Q6 transcript parse instead of blank | depends_on: Q6
   - surfaces: crates/quaqua/src/launch.rs (effort per harness/model), crates/quaqua/src/worker/ (cost parse) | avoided: a cost cap for agy (NG2 keeps the time cap as the runaway backstop)
   - phase check: `quaqua status --metrics` shows a $ figure on an agy row; an agy launch log has no "effort is not supported"
 - phase_slug: `merge-verdict`
-  status: planned (candidate from `mvp-run`; G1 in docs/research/plans/pstack-integration.md § Pilot)
+  status: moved to quaqua-rs backlog 2026-11-13 (CoS tracks) (was: planned, candidate from `mvp-run`; G1 in docs/research/plans/pstack-integration.md § Pilot)
   - goal: a merge to main carries a verifier verdict at the head SHA — 19 of 19 merges in the mvp-run window had none, because no merge event is journaled; record the verdict at merge so `status --metrics` counts G1 from it | depends_on: none
   - surfaces: crates/quaqua/src/status.rs (G1 counting, :1102-1136), crates/quaqua/src/{verify,ship}.rs, crates/quaqua/src/merge/ | avoided: a merge gate (warning first, the count is the evidence)
   - phase check: `quaqua status --metrics` G1 numerator falls below 19/19 over the next merges
@@ -89,15 +89,20 @@ lane: normal
 - 2026-11-12 — #256 merged (retro wave 3, 35b9edf): spawn bases on origin/<default>, `quaqua verify record`, watchdog blocked corroboration + Compact banner, clippy clean; 1217 tests pass.
 - 2026-11-12 — #244 merged (73ee97e): docs/audit/2026-11-12 intent audit at 41a5327, 3/5; no requirement changed.
 - 2026-11-12 — `mvp-run` done (R5): #258 merged d51d2d9 (brief → PR via `quaqua ship`, Principal squash-merge); 4+ mixed kinds (omp, claude, agy) with agy-pilot and agy-wave exit 4 at 2m/2m; live review fork fired on this Mac — `cos-memory_quaqua-4f9b87b55123.json` review.lastReviewAt=1794492448941 (21:07 +07) with `memory/rules.md` written at that instant; #259 adda975 fixed the mod test command to the glob form. Four follow-up candidates recorded from the run's gaps.
+- 2026-11-13 — decision — closed: R1–R5 met (independent full review APPROVE_WITH_REQUESTS, phase `mvp-run`); agy-progress/agy-nudge/agy-effort dropped (no agy kind in team.toml, workspace runs claude-only); merge-verdict moved to quaqua-rs backlog (CoS tracks); absorb: none
 
 ## Validation
 - 2026-11-12 CoS: R5 on main adda975 — PR #258 merged d51d2d9; `quaqua status --metrics` shows 4+ kinds and agy-pilot/agy-wave exit 4 at 2m/2m; live fork `jq -c .review ~/.claude/plugins/store/cos-memory_quaqua-4f9b87b55123.json` → `lastReviewAt:1794492448941` (2026-11-12 21:07:28 +07), `memory/rules.md` mtime 21:07 size 2402 matching the stamp. R2/R4 ride on main adda975 CI `Test` = success (workspace `cargo test`, mod tests, actionlint).
 - 2026-11-12 R1: `node --test "mods/cos-memory/tests/**/*.test.js"` on adda975 → 38 pass, 0 fail (Node 24.21.0); the directory form fails on Node 22+, which is why #259 changed it.
+- 2026-11-13 — phase `mvp-run` — verdict: APPROVE_WITH_REQUESTS — mode: full
+  - R1 `node --test "mods/cos-memory/tests/**/*.test.js"` 38 pass 0 fail; R2 `cargo test -p quaqua config_kill_refused` + `--test config` 17 passed (refusal sits in validate/spawn/watchdog, not `load_team_config` — reword R2); R3 install_smoke all checks passed, `git status --porcelain mods/cos-memory` empty, live fork lastReviewAt 1794540430467 (2026-11-13 10:27 +07, Linux host); R4 `cargo test -p quaqua ship` 8 passed, never-merge asserted
+  - R5 by history: PR #258 merged d51d2d9 2026-11-12T13:26Z; agy-pilot/agy-wave rows are Mac-only, host-local agy stop agy-watchtest exit 4 383s/300s; agy no longer configured
+  - `QUAQUA_TEST=1 cargo test --locked --no-fail-fast` 1218 passed 1 failed (env-only identity test); without QUAQUA_TEST bus_migrate 2 fail on cargo 1.100 (hermeticity, new task); CI Test on bff639a success
+  - judge: independent (runs/suhuynh-mvprev.md), claude/opus
 
 ## Current State and Next Action
 - active_phase: none
-- lifecycle_status: locked (R1–R5 met on main adda975; the four phases after `mvp-run` are candidates, not yet locked)
+- lifecycle_status: completed
 - blockers: none
-- open_items: 0 open of 10 map lines; 4 follow-up phase candidates (`agy-progress`, `agy-nudge`, `agy-effort`, `merge-verdict`)
-- unknowns: (1) `quaqua status --metrics` lists per-worker kind/harness, exit, wall/budget and $/budget rows, and #255 records watchdog exit-4 stops, so the 4+ kinds and an agy stop line are measurable; agy rows carry no dollars, so an agy cost cap is not (R5 allows a watchdog stop, NG2).
-- exact_next_action: lock and work phase `agy-progress` (a working agy worker must not be killed at its budget): agy reports no session id because `~/.gemini/config/hooks/herdr-agent-state.sh` is absent, so `last_progress_ms` never moves and the 25% grace never applies; fix is to ship the hook or fall back in `agy_session_mtime`, then prove it on a live agy worker past its budget. `agy-nudge`, `agy-effort` and `merge-verdict` follow from the same run's gaps.
+- open_items: none
+- exact_next_action: none; plan closed 2026-11-13 (merge-verdict tracked in the quaqua-rs backlog by CoS)
