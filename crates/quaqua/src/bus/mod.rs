@@ -944,7 +944,7 @@ mod tests {
         use crate::engine::journal::{EventRecord, Journal};
         use crate::engine::journal_sqlite::SqliteJournal;
         use crate::herdr::Herdr;
-        use crate::status::render_status;
+        use crate::status::render_status_all;
 
         let (db_path, _cleaner) = temp_db("status-unchanged");
         let runs_dir = db_path.parent().unwrap();
@@ -964,7 +964,7 @@ mod tests {
 
         let mock_herdr = Herdr::new();
         let status_before =
-            render_status(&db_path, runs_dir, &mock_herdr).expect("render status before");
+            render_status_all(&db_path, runs_dir, &mock_herdr).expect("render status before");
 
         // Now open FarmBus on the same database, creating superagent tables,
         // and insert several farm events.
@@ -991,7 +991,7 @@ mod tests {
 
         // Render status again: must be byte-identical!
         let status_after =
-            render_status(&db_path, runs_dir, &mock_herdr).expect("render status after");
+            render_status_all(&db_path, runs_dir, &mock_herdr).expect("render status after");
 
         assert_eq!(
             status_before, status_after,
