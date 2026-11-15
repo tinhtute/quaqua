@@ -427,6 +427,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qq-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "quaqua"
 version = "2.6.0"
 dependencies = [

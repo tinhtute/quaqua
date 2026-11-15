@@ -3,4 +3,4 @@
 # No [package] here on purpose — the binary lives in crates/quaqua.
 [workspace]
 resolver = "2"
-members = ["crates/quaqua"]
+members = ["crates/quaqua", "crates/qq-core"]
