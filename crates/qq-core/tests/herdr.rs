@@ -1,10 +1,10 @@
 use qq_core::herdr::liveness::{worker_liveness_state, Liveness, WorkerState};
-use qq_core::herdr::{FakeHerdr, HerdrClient};
+use qq_core::herdr::{CliHerdr, FakeHerdr, HerdrClient, Reply, Verb, NAME_CLASH, PANE_BUSY};
 use qq_core::testkit::TestWorkspace;
 use std::io::ErrorKind;
 
 fn started(f: &FakeHerdr, name: &str, pane: &str) {
-    assert!(f.agent_start(name, "claude", pane, 30_000).unwrap().ok);
+    assert!(f.agent_start(name, "claude", pane, 30_000, &[]).unwrap().ok);
 }
 
 #[test]
@@ -20,9 +20,9 @@ fn herdr_fake_contract() {
     assert_eq!(f.agent_list().unwrap().body.matches(r#""name""#).count(), 1);
 
     // busy pane: a different agent cannot take an occupied pane.
-    let busy = f.agent_start("x", "claude", "%1", 30_000).unwrap();
+    let busy = f.agent_start("x", "claude", "%1", 30_000, &[]).unwrap();
     assert!(!busy.ok);
-    assert_eq!(busy.error_code().as_deref(), Some("pane_busy"));
+    assert_eq!(busy.error_code().as_deref(), Some(PANE_BUSY));
     assert_eq!(
         f.agent_get("x").unwrap().error_code().as_deref(),
         Some("agent_not_found")
@@ -143,4 +143,120 @@ fn hook_state_beats_screen_only_when_fresh() {
         status_from(None, "blocked", 1000, 600),
         WorkerState::Blocked
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_start_appends_agent_args_after_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = TestWorkspace::new("cli-args");
+    let out = ws.root().join("argv.txt");
+    let bin = ws.root().join("herdr-stub.sh");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{}}'\n", out.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cli = CliHerdr {
+        bin: bin.to_string_lossy().into_owned(),
+    };
+    let r = cli
+        .agent_start("w", "omp", "%1", 5000, &["--model", "m1", "--thinking", "high"])
+        .unwrap();
+    assert!(r.ok);
+    let argv: Vec<String> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        argv,
+        [
+            "agent", "start", "w", "--kind", "omp", "--pane", "%1", "--timeout", "5000", "--",
+            "--model", "m1", "--thinking", "high"
+        ]
+    );
+    // no extra args: no bare `--`.
+    cli.agent_start("w", "omp", "%1", 5000, &[]).unwrap();
+    let argv = std::fs::read_to_string(&out).unwrap();
+    assert!(!argv.lines().any(|l| l == "--"));
+}
+
+#[test]
+fn fake_start_remembers_agent_args() {
+    let f = FakeHerdr::new();
+    f.agent_start("w", "omp", "%1", 1, &["--model", "m1"]).unwrap();
+    assert_eq!(f.start_args("w"), ["--model", "m1"]);
+}
+
+#[test]
+fn fake_injects_reply_or_fault_per_verb() {
+    use qq_core::herdr::liveness::liveness;
+    let f = FakeHerdr::new();
+    started(&f, "other", "%9");
+    // get says not found (real), list is garbage: only that verb is faulted.
+    f.set_reply(Verb::List, Reply::ok("garbage"));
+    assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
+    assert!(f.agent_get("other").unwrap().ok);
+    // list times out; get still answers.
+    f.set_fault(Verb::List, ErrorKind::TimedOut);
+    assert_eq!(f.agent_list().unwrap_err().kind(), ErrorKind::TimedOut);
+    assert!(f.agent_get("other").unwrap().ok);
+    // sticky until cleared, then real behaviour is back.
+    assert!(f.agent_list().is_err());
+    f.clear(Verb::List);
+    assert_eq!(liveness(&f, "w"), Liveness::Down);
+    // an injected get reply beats the real agent.
+    f.set_reply(Verb::Get, Reply::err("agent_not_found"));
+    assert_eq!(f.agent_get("other").unwrap().error_code().as_deref(), Some("agent_not_found"));
+}
+
+#[test]
+fn prompt_then_wait_for_done_succeeds_with_scripted_status() {
+    let f = FakeHerdr::new();
+    started(&f, "w", "%1");
+    f.script_status("w", &["working", "done"]);
+    let r = f
+        .agent_prompt("w", "go", Some((&["idle", "done"], 1000)))
+        .unwrap();
+    assert!(r.ok, "{}", r.body);
+    assert!(r.body.contains(r#""agent_status":"done""#));
+    // no script: the wait still times out (the fake has no clock).
+    started(&f, "v", "%2");
+    let r = f.agent_prompt("v", "go", Some((&["done"], 10))).unwrap();
+    assert_eq!(r.error_code().as_deref(), Some("timeout"));
+}
+
+#[test]
+fn fake_is_shareable_across_threads() {
+    fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+    assert_send_sync::<FakeHerdr>();
+    assert_send_sync::<CliHerdr>();
+    assert_send_sync::<dyn HerdrClient>();
+
+    let f = std::sync::Arc::new(FakeHerdr::new());
+    started(&f, "w", "%1");
+    f.script_status("w", &["done"]);
+    let worker = {
+        let f = f.clone();
+        std::thread::spawn(move || f.agent_prompt("w", "go", Some((&["done"], 1000))).unwrap())
+    };
+    assert!(worker.join().unwrap().ok);
+    assert_eq!(f.prompts().len(), 1);
+}
+
+#[test]
+fn name_clash_is_not_a_busy_pane() {
+    let f = FakeHerdr::new();
+    started(&f, "w", "%1");
+    assert_ne!(PANE_BUSY, NAME_CLASH);
+    // same name, other pane / other kind: name clash.
+    let r = f.agent_start("w", "claude", "%2", 1, &[]).unwrap();
+    assert_eq!(r.error_code().as_deref(), Some(NAME_CLASH));
+    let r = f.agent_start("w", "codex", "%1", 1, &[]).unwrap();
+    assert_eq!(r.error_code().as_deref(), Some(NAME_CLASH));
+    // other name on the occupied pane: busy pane.
+    let r = f.agent_start("x", "claude", "%1", 1, &[]).unwrap();
+    assert_eq!(r.error_code().as_deref(), Some(PANE_BUSY));
 }
