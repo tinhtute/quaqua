@@ -77,6 +77,9 @@ impl HerdrClient for FakeHerdr {
         self.transport()?;
         let mut st = self.st.borrow_mut();
         // A pane hosts one agent; a second start there is refused, not stacked.
+        // `pane_busy` is this fake's own code: herdr 0.9.5 documents none for a
+        // start on an occupied pane. The documented busy error is `agent_blocked`
+        // on prompt, replayed below.
         if st.agents.iter().any(|(n, a)| a.pane == pane && n != name) {
             return Ok(Reply::err("pane_busy"));
         }

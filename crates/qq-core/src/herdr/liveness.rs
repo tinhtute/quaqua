@@ -302,3 +302,292 @@ pub fn liveness<H: HerdrClient>(herdr: &H, name: &str) -> Liveness {
         Some(_) => Liveness::Down,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::Reply;
+    use std::io;
+
+    struct Fake {
+        get: io::Result<(bool, String)>,
+        list: io::Result<String>,
+    }
+
+    fn clone_res<T: Clone>(r: &io::Result<T>) -> io::Result<T> {
+        match r {
+            Ok(v) => Ok(v.clone()),
+            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+        }
+    }
+
+    impl HerdrClient for Fake {
+        fn agent_get(&self, _: &str) -> io::Result<Reply> {
+            clone_res(&self.get).map(|(ok, body)| Reply { ok, body })
+        }
+        fn agent_list(&self) -> io::Result<Reply> {
+            clone_res(&self.list).map(Reply::ok)
+        }
+        fn agent_start(&self, _: &str, _: &str, _: &str, _: u32) -> io::Result<Reply> {
+            unimplemented!()
+        }
+        fn agent_wait(&self, _: &str, _: &[&str], _: u64) -> io::Result<Reply> {
+            unimplemented!()
+        }
+        fn agent_prompt(&self, _: &str, _: &str, _: Option<(&[&str], u64)>) -> io::Result<Reply> {
+            unimplemented!()
+        }
+    }
+
+    const ALIVE: &str = r#"{"result":{"agent":{"name":"w","pane_id":"%1"}}}"#;
+    const NOT_FOUND: &str = r#"{"error":{"code":"agent_not_found"}}"#;
+    const LIST_OTHER: &str = r#"{"result":{"agents":[{"name":"cos"}]}}"#;
+    const LIST_W: &str = r#"{"result":{"agents":[{"name":"w"}]}}"#;
+    const LIST_EMPTY: &str = r#"{"result":{"agents":[]}}"#;
+
+    fn fake(get: io::Result<(bool, String)>, list: io::Result<String>) -> Fake {
+        Fake { get, list }
+    }
+
+    #[test]
+    fn alive_when_get_returns_agent() {
+        let f = fake(Ok((true, ALIVE.into())), Ok(LIST_W.into()));
+        assert_eq!(liveness(&f, "w"), Liveness::Alive(ALIVE.into()));
+    }
+
+    #[test]
+    fn down_only_when_list_confirms_not_found() {
+        let f = fake(Ok((false, NOT_FOUND.into())), Ok(LIST_OTHER.into()));
+        assert_eq!(liveness(&f, "w"), Liveness::Down);
+    }
+
+    #[test]
+    fn not_found_but_listed_is_unknown() {
+        let f = fake(Ok((false, NOT_FOUND.into())), Ok(LIST_W.into()));
+        assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
+    }
+
+    #[test]
+    fn get_timeout_is_unknown() {
+        let f = fake(
+            Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
+            Ok(LIST_OTHER.into()),
+        );
+        assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
+    }
+
+    #[test]
+    fn empty_or_broken_list_is_unknown() {
+        for list in [
+            Ok(LIST_EMPTY.to_string()),
+            Ok("garbage".to_string()),
+            Err(io::Error::other("socket")),
+        ] {
+            let f = fake(Ok((false, NOT_FOUND.into())), list);
+            assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
+        }
+    }
+
+    #[test]
+    fn other_get_error_is_unknown() {
+        let f = fake(
+            Ok((false, r#"{"error":{"code":"socket_error"}}"#.into())),
+            Ok(LIST_OTHER.into()),
+        );
+        assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
+    }
+
+    #[test]
+    fn hook_state_parsing_formats() {
+        // Plain format: "<state> <ts>"
+        let h1 = HookState::parse("working 1730000000").expect("parse plain");
+        assert_eq!(h1.state, WorkerState::Working);
+        assert_eq!(h1.timestamp_sec, 1730000000);
+
+        let h2 = HookState::parse("blocked 1730000010").expect("parse blocked");
+        assert_eq!(h2.state, WorkerState::Blocked);
+        assert_eq!(h2.timestamp_sec, 1730000010);
+
+        let h3 = HookState::parse("idle 1730000020").expect("parse idle");
+        assert_eq!(h3.state, WorkerState::Idle);
+        assert_eq!(h3.timestamp_sec, 1730000020);
+
+        // Key-value lines
+        let h4 = HookState::parse("state=working\nts=1730000030\n").expect("parse kv");
+        assert_eq!(h4.state, WorkerState::Working);
+        assert_eq!(h4.timestamp_sec, 1730000030);
+
+        // JSON format
+        let h5 = HookState::parse(r#"{"state": "blocked", "timestamp": 1730000040}"#)
+            .expect("parse json");
+        assert_eq!(h5.state, WorkerState::Blocked);
+        assert_eq!(h5.timestamp_sec, 1730000040);
+
+        // State only without timestamp
+        let h6 = HookState::parse("working").expect("parse bare");
+        assert_eq!(h6.state, WorkerState::Working);
+        assert_eq!(h6.timestamp_sec, 0);
+
+        // Empty / whitespace
+        assert!(HookState::parse("").is_none());
+        assert!(HookState::parse("   \n\t  ").is_none());
+    }
+
+    #[test]
+    fn hook_state_staleness_expiration() {
+        let h = HookState::new(WorkerState::Working, 1000);
+        // Bound = 600s
+        assert!(!h.is_stale(1000, 600)); // age 0
+        assert!(!h.is_stale(1500, 600)); // age 500
+        assert!(!h.is_stale(1600, 600)); // age 600 (boundary)
+        assert!(h.is_stale(1601, 600)); // age 601 (expired)
+        assert!(h.is_stale(2000, 600)); // age 1000 (expired)
+
+        // Bound = 0 disables staleness
+        assert!(!h.is_stale(999999, 0));
+
+        // Future timestamp (clock skew)
+        assert!(!h.is_stale(900, 600));
+    }
+
+    #[test]
+    fn status_from_derives_state_from_fresh_hook_events() {
+        let now = 1000;
+        let bound = 600;
+
+        // 1. Hook says working: overrides screen (even when screen says idle or unknown)
+        let working_hook = HookState::new(WorkerState::Working, 950);
+        assert_eq!(
+            status_from(Some(&working_hook), "idle", now, bound),
+            WorkerState::Working
+        );
+        assert_eq!(
+            status_from(Some(&working_hook), "unknown", now, bound),
+            WorkerState::Working
+        );
+
+        // 2. Hook says blocked: overrides screen (even when screen says working or idle)
+        let blocked_hook = HookState::new(WorkerState::Blocked, 950);
+        assert_eq!(
+            status_from(Some(&blocked_hook), "working", now, bound),
+            WorkerState::Blocked
+        );
+        assert_eq!(
+            status_from(Some(&blocked_hook), "idle", now, bound),
+            WorkerState::Blocked
+        );
+
+        // 3. Hook says idle: overrides screen working false-positive (pane mis-tag)
+        let idle_hook = HookState::new(WorkerState::Idle, 950);
+        assert_eq!(
+            status_from(Some(&idle_hook), "working", now, bound),
+            WorkerState::Idle
+        );
+        assert_eq!(
+            status_from(Some(&idle_hook), "unknown", now, bound),
+            WorkerState::Idle
+        );
+
+        // 4. Hook says idle but screen sees done or blocked (shepherdr terminal/menu condition)
+        assert_eq!(
+            status_from(Some(&idle_hook), "done", now, bound),
+            WorkerState::Done
+        );
+        assert_eq!(
+            status_from(Some(&idle_hook), "blocked", now, bound),
+            WorkerState::Blocked
+        );
+
+        // 5. Screen confirmed dead/gone dominates
+        assert_eq!(
+            status_from(Some(&working_hook), "dead", now, bound),
+            WorkerState::Dead
+        );
+        assert_eq!(
+            status_from(Some(&working_hook), "gone", now, bound),
+            WorkerState::Dead
+        );
+    }
+
+    #[test]
+    fn status_from_falls_back_to_screen_without_state_file() {
+        let now = 1000;
+        let bound = 600;
+
+        // No hook state: screen status is used directly
+        assert_eq!(
+            status_from(None, "working", now, bound),
+            WorkerState::Working
+        );
+        assert_eq!(status_from(None, "idle", now, bound), WorkerState::Idle);
+        assert_eq!(
+            status_from(None, "blocked", now, bound),
+            WorkerState::Blocked
+        );
+        assert_eq!(status_from(None, "done", now, bound), WorkerState::Done);
+        assert_eq!(status_from(None, "dead", now, bound), WorkerState::Dead);
+    }
+
+    #[test]
+    fn status_from_falls_back_to_screen_when_hook_state_is_stale() {
+        let now = 2000;
+        let bound = 600; // valid only if ts >= 1400
+
+        let stale_working = HookState::new(WorkerState::Working, 1000); // 1000s old > 600s
+        assert_eq!(
+            status_from(Some(&stale_working), "idle", now, bound),
+            WorkerState::Idle
+        );
+
+        let stale_blocked = HookState::new(WorkerState::Blocked, 1200); // 800s old > 600s
+        assert_eq!(
+            status_from(Some(&stale_blocked), "working", now, bound),
+            WorkerState::Working
+        );
+    }
+
+    #[test]
+    fn worker_liveness_state_with_filesystem_and_screen_fallback() {
+        let tmp = std::env::temp_dir().join(format!("qq-liveness-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let runs_dir = &tmp;
+        let now = 1730000500;
+        let bound = 600;
+
+        // Screen says idle
+        let f_idle = fake(
+            Ok((
+                true,
+                r#"{"result":{"agent":{"name":"w1","agent_status":"idle"}}}"#.into(),
+            )),
+            Ok(LIST_W.into()),
+        );
+
+        // Case 1: No state file -> screen fallback returns Idle
+        let st1 = worker_liveness_state(&f_idle, runs_dir, "w1", now, bound);
+        assert_eq!(st1, WorkerState::Idle);
+
+        // Case 2: State file says working -> hook state returns Working
+        let state_file = runs_dir.join(".w1.state");
+        std::fs::write(&state_file, format!("working {}\n", now - 10)).unwrap();
+        let st2 = worker_liveness_state(&f_idle, runs_dir, "w1", now, bound);
+        assert_eq!(st2, WorkerState::Working);
+
+        // Case 3: State file says blocked -> hook state returns Blocked
+        std::fs::write(&state_file, format!("blocked {}\n", now - 10)).unwrap();
+        let st3 = worker_liveness_state(&f_idle, runs_dir, "w1", now, bound);
+        assert_eq!(st3, WorkerState::Blocked);
+
+        // Case 4: Stale state file (older than bound) -> falls back to screen
+        std::fs::write(&state_file, format!("working {}\n", now - 1000)).unwrap();
+        let st4 = worker_liveness_state(&f_idle, runs_dir, "w1", now, bound);
+        assert_eq!(st4, WorkerState::Idle);
+
+        // Case 5: Agent confirmed down -> Dead
+        let f_down = fake(Ok((false, NOT_FOUND.into())), Ok(LIST_OTHER.into()));
+        let st5 = worker_liveness_state(&f_down, runs_dir, "w1", now, bound);
+        assert_eq!(st5, WorkerState::Dead);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
