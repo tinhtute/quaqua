@@ -2,9 +2,7 @@
 //! idle timer. No activity, no poll, no wake row ever reaches the journal.
 
 use qq_core::engine::journal_sqlite::SqliteJournal;
-use qq_core::engine::runner::{
-    resume, run_until_blocked, RunnerOptions, RunnerOutcome,
-};
+use qq_core::engine::runner::{resume, run_until_blocked, RunnerOptions, RunnerOutcome};
 use qq_core::engine::{
     Activity, ActivityError, ActivityRequest, ActivityResult, Journal, StepDecision, VirtualClock,
     Workflow, WorkflowContext, WorkflowEvent,
@@ -163,6 +161,8 @@ fn daemon_idle_worker_adds_no_poll_events() {
         )
         .expect("resume with signal");
         assert!(matches!(outcome, RunnerOutcome::Blocked(_)), "{outcome:?}");
+        // The idle timer survives the kill: replay re-arms it on the fresh clock.
+        assert_eq!(clock.pending_timers_count(), 1);
     }
 
     // Idle two virtual hours: the driver moves time, the runner fires the timer.

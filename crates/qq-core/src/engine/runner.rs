@@ -1117,8 +1117,7 @@ pub fn run_until_blocked<W: Workflow, C: RunnerClock>(
         } else if clock.pending_timers_count() > 0 {
             let now = clock.now_ms();
             let mut fired_tags = clock.fire_due(now);
-            if fired_tags.is_empty() && options.advance_virtual_time && clock.advances_virtually()
-            {
+            if fired_tags.is_empty() && options.advance_virtual_time && clock.advances_virtually() {
                 if let Some(deadline) = clock.next_deadline() {
                     fired_tags = clock.fire_due(deadline);
                 }
@@ -3792,7 +3791,11 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .filter(|e| e.kind == "signal")
-                .map(|e| serde_json::from_str::<SignalData>(&e.payload_json).unwrap().name)
+                .map(|e| {
+                    serde_json::from_str::<SignalData>(&e.payload_json)
+                        .unwrap()
+                        .name
+                })
                 .collect();
             assert_eq!(journaled, ["a", "b", "c", "done"]);
         }
