@@ -155,6 +155,11 @@ Unknowns: none
 Evidence: diff + test output
 EOF
 
+# Sandbox roster: the template with tieude on sude's harness, so the default
+# "harness" policy has a same-harness pair to refuse (tieude/sude).
+sed '/^\[kinds\.tieude\]/,/^\[kinds\.sude\]/s/^harness = .*/harness = "omp"/' \
+  "$root/templates/workspace/team.toml" > "$T/home/quaqua/team.toml"
+
 tele="$T/home/quaqua/runs/telemetry.jsonl"
 runsdir="$T/home/quaqua/runs"
 
@@ -191,6 +196,13 @@ reject "brief lacks headers"  'Goal.*Hard constraints.*Current design' -- isl "$
 reject "same harness"         'different harnesses' -- isl "$T/repo" --brief "$T/brief.md" --builder tieude --reviewer sude
 reject "same kind"            'different harnesses' -- isl "$T/repo" --brief "$T/brief.md" --builder suhuynh --reviewer suhuynh
 reject "non-reviewer kind"    'can_review = false in team.toml' -- isl "$T/repo" --brief "$T/brief.md" --builder ni --reviewer tieude
+# builder_reviewer_differ = "kind": two kinds on one harness pass, the same kind is refused.
+sed 's/^builder_reviewer_differ = .*/builder_reviewer_differ = "kind"/' \
+  "$root/templates/workspace/team.toml" > "$T/team-kind.toml"
+reject "kind policy: same kind"  'different kinds' QUAQUA_TEAM_TOML="$T/team-kind.toml" -- isl "$T/repo" --brief "$T/brief.md" --builder suhuynh --reviewer suhuynh
+run_pipe QUAQUA_TEAM_TOML="$T/team-kind.toml" -- kd "$T/repo" --brief "$T/brief.md" --builder ni --reviewer suhuynh
+! grep -q 'must be different' "$T/err" || fail "kind policy: ni/suhuynh refused: $(cat "$T/err")"
+echo "ok: kind policy: ni/suhuynh passes the differ check"
 reject "bad --review"         'auto|always|skip' -- isl "$T/repo" --brief "$T/brief.md" --review maybe
 reject "--rounds 0"           'integer >= 1' -- isl "$T/repo" --brief "$T/brief.md" --rounds 0
 reject "builder name >20"     'exceeds 20 chars' -- abcdefghijklmnopq "$T/repo" --brief "$T/brief.md"

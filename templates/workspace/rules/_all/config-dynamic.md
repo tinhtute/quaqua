@@ -16,7 +16,7 @@ Cấu hình đổi **không cần sửa code**: mọi giá trị nằm trong `te
 `[kinds.<name>]` gói `harness` (opencode/omp/claude/pi/agy) · `model` · `effort` (bắt buộc; opencode: variant `#effort`) · `fallback` (1 hop khi start fail) · `can_review` · `on_cost_cap` (`warn` mặc định | `kill`: watchdog interrupt 1 lần ở 100% cost budget; `kill` cần stop key trên harness của kind **và** của fallback — opencode/omp/agy có, claude/pi không; `config validate` và `worker spawn` từ chối, watchdog hạ xuống warn).
 - Đổi model/effort của một kind = sửa 1 dòng trong team.toml; spawn kế tiếp dùng giá trị mới.
 - Reviewer: bất kỳ kind `can_review = true` — pipeline không còn allowlist cứng (2026-10-17, runs/sude-guard.md); fallback của reviewer cũng phải `can_review = true`.
-- Builder/reviewer khác harness: `strategy.builder_reviewer_differ = "harness"` (mặc định) — `config validate` so cặp mặc định (`purposes.build`, không có thì `default_kind`, với `default_reviewer`); pipeline còn từ chối mọi cặp trùng harness lúc chạy (kể cả `--builder`/`--reviewer` chỉ định). `"kind"` và `"none"` chỉ tắt kiểm tra lúc validate, không tắt kiểm tra lúc chạy.
+- Builder/reviewer khác harness: `strategy.builder_reviewer_differ = "harness"` (mặc định) — `config validate` so cặp mặc định (`purposes.build`, không có thì `default_kind`, với `default_reviewer`); pipeline lúc chạy theo cùng key này, cả reviewer mặc định lẫn `--reviewer`: `"harness"` từ chối cặp trùng harness; `"kind"` chỉ từ chối builder == reviewer (cùng tên kind, khác kind trên một harness vẫn được); `"none"` không từ chối gì. `"kind"` và `"none"` tắt kiểm tra harness lúc validate.
 - Lead: `strategy.lead_kind` (override `LEAD_KIND`), đi qua cùng `build_launch_cmd` như worker.
 
 ## Một lần, không đổi file

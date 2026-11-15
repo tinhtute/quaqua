@@ -318,6 +318,23 @@ pub fn harness_of_kind<'a>(kind: &str, cfg: &'a crate::config::Config) -> Option
     cfg.kinds.get(kind).map(|k| k.harness.as_str())
 }
 
+/// Whether a builder/reviewer pair satisfies `strategy.builder_reviewer_differ`.
+/// "none" refuses nothing; "kind" refuses only the same kind name; anything else
+/// (the default "harness") refuses two kinds on one harness.
+pub fn reviewer_pair_allowed(
+    policy: &str,
+    builder: &str,
+    builder_harness: &str,
+    reviewer: &str,
+    reviewer_harness: &str,
+) -> bool {
+    match policy {
+        "none" => true,
+        "kind" => builder != reviewer,
+        _ => builder_harness != reviewer_harness,
+    }
+}
+
 pub fn select_default_reviewer(
     builder: &str,
     cfg: &crate::config::Config,
@@ -333,7 +350,7 @@ pub fn select_default_reviewer(
             continue;
         }
         if let Some(rh) = harness_of_kind(cand, cfg) {
-            if bh != rh {
+            if reviewer_pair_allowed(&cfg.strategy.builder_reviewer_differ, builder, bh, cand, rh) {
                 if let Some(kind_cfg) = cfg.kinds.get(cand) {
                     if kind_cfg.can_review {
                         return Ok(cand.clone());
