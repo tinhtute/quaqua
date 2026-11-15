@@ -143,6 +143,10 @@ impl HerdrClient for CliHerdr {
         timeout_ms: u32,
         agent_args: &[&str],
     ) -> io::Result<Reply> {
+        debug_assert!(
+            agent_args.first() != Some(&"--"),
+            "agent_args must not start with `--`; the separator is added here"
+        );
         let t = timeout_ms.to_string();
         let mut args = argv(&[
             "agent",

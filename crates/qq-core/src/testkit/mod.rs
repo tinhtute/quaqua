@@ -34,6 +34,26 @@ impl TestWorkspace {
         ws
     }
 
+    /// `QUAQUA_TEAM_TOML` as it was before this workspace took the env lock.
+    pub fn prev_team_toml(&self) -> Option<&OsString> {
+        self.prev_team_toml.as_ref()
+    }
+
+    /// Drop the workspace and return `QUAQUA_TEAM_TOML` as read while the env
+    /// lock is still held, so the value cannot be another test's.
+    pub fn finish(self) -> Option<OsString> {
+        self.restore();
+        std::env::var_os("QUAQUA_TEAM_TOML")
+    }
+
+    fn restore(&self) {
+        match &self.prev_team_toml {
+            Some(v) => std::env::set_var("QUAQUA_TEAM_TOML", v),
+            None => std::env::remove_var("QUAQUA_TEAM_TOML"),
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -54,10 +74,6 @@ impl TestWorkspace {
 
 impl Drop for TestWorkspace {
     fn drop(&mut self) {
-        match &self.prev_team_toml {
-            Some(v) => std::env::set_var("QUAQUA_TEAM_TOML", v),
-            None => std::env::remove_var("QUAQUA_TEAM_TOML"),
-        }
-        let _ = std::fs::remove_dir_all(&self.root);
+        self.restore();
     }
 }

@@ -110,17 +110,15 @@ fn liveness_state_combines_hook_file_and_screen() {
 
 #[test]
 fn testkit_workspace_points_team_toml_at_temp_and_restores() {
-    let before = std::env::var_os("QUAQUA_TEAM_TOML");
-    {
-        let ws = TestWorkspace::new("kit");
-        assert_eq!(
-            std::env::var_os("QUAQUA_TEAM_TOML"),
-            Some(ws.team_toml().into_os_string())
-        );
-        assert!(ws.db_path().starts_with(ws.root()));
-        assert!(!ws.db_path().exists());
-    }
-    assert_eq!(std::env::var_os("QUAQUA_TEAM_TOML"), before);
+    let ws = TestWorkspace::new("kit");
+    let before = ws.prev_team_toml().cloned();
+    assert_eq!(
+        std::env::var_os("QUAQUA_TEAM_TOML"),
+        Some(ws.team_toml().into_os_string())
+    );
+    assert!(ws.db_path().starts_with(ws.root()));
+    assert!(!ws.db_path().exists());
+    assert_eq!(ws.finish(), before);
 }
 
 #[test]
