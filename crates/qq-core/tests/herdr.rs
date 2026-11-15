@@ -285,3 +285,13 @@ fn name_clash_is_not_a_busy_pane() {
     let r = f.agent_start("x", "claude", "%1", 1, &[]).unwrap();
     assert_eq!(r.error_code().as_deref(), Some(PANE_BUSY));
 }
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "agent_args")]
+fn agent_args_leading_double_dash_is_rejected() {
+    let cli = CliHerdr {
+        bin: "/nonexistent-herdr".into(),
+    };
+    let _ = cli.agent_start("w", "omp", "%1", 5000, &["--", "x"]);
+}
