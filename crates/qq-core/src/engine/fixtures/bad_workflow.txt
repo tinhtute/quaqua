@@ -1,0 +1,44 @@
+// Line 1: Synthetic test fixture for determinism guard
+impl Workflow for BadFsWorkflow {
+    type Input = ();
+    type State = ();
+    type Output = ();
+
+    fn step(&self, _: &mut Self::State, _: &mut WorkflowContext, _: Option<WorkflowEvent>) -> StepDecision<Self::Output> {
+        let _ = std::fs::read_to_string("forbidden.txt");
+        StepDecision::Continue
+    }
+}
+
+impl Workflow for BadProcessWorkflow {
+    type Input = ();
+    type State = ();
+    type Output = ();
+
+    fn step(&self, _: &mut Self::State, _: &mut WorkflowContext, _: Option<WorkflowEvent>) -> StepDecision<Self::Output> {
+        let _ = std::process::Command::new("sh");
+        StepDecision::Continue
+    }
+}
+
+impl Workflow for BadNetWorkflow {
+    type Input = ();
+    type State = ();
+    type Output = ();
+
+    fn step(&self, _: &mut Self::State, _: &mut WorkflowContext, _: Option<WorkflowEvent>) -> StepDecision<Self::Output> {
+        let _ = std::net::TcpStream::connect("127.0.0.1:8080");
+        StepDecision::Continue
+    }
+}
+
+// Clean workflow in the same file should not cause additional false alarms
+impl Workflow for CleanWorkflow {
+    type Input = ();
+    type State = ();
+    type Output = ();
+
+    fn step(&self, _: &mut Self::State, _: &mut WorkflowContext, _: Option<WorkflowEvent>) -> StepDecision<Self::Output> {
+        StepDecision::Continue
+    }
+}
