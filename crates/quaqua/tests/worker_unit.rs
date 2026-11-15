@@ -5104,6 +5104,8 @@ fn test_cap_gate_charges_a_pipeline_two_slots() {
 /// done when no shipped file still names the old role. Dated `memory/` logs,
 /// the CoS-owned `AGENTS.md` template, the research notes, and the test tree
 /// (which has to spell the pattern to ban it) are history, not live contracts.
+/// `crates/qq-core` is a separate product: there the word names a new, planned
+/// role, not the retired CoS label.
 #[test]
 fn test_no_dangling_legacy_role_reference() {
     let legacy = concat!("super", "visor");
@@ -5120,7 +5122,7 @@ fn test_no_dangling_legacy_role_reference() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if path.is_dir() {
-                if !skip_dirs.contains(&name.as_str()) {
+                if !skip_dirs.contains(&name.as_str()) && path != root.join("crates/qq-core") {
                     stack.push(path);
                 }
                 continue;
