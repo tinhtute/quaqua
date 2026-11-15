@@ -7,6 +7,24 @@ pub mod liveness;
 
 pub use fake::FakeHerdr;
 
+/// Error code for a start on a pane that already hosts another agent. Not a
+/// herdr 0.9.5 documented code: T39's live probe may replace the value, so
+/// classify by this const, never by the literal.
+pub const PANE_BUSY: &str = "pane_busy";
+/// Error code for a start whose name is already taken by an agent with a
+/// different kind or pane (distinct from an occupied pane).
+pub const NAME_CLASH: &str = "agent_name_clash";
+
+/// The herdr verbs of [`HerdrClient`], for [`FakeHerdr`] fault/reply injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Verb {
+    Start,
+    Get,
+    List,
+    Wait,
+    Prompt,
+}
+
 use std::io;
 use std::process::Command;
 
@@ -40,10 +58,18 @@ impl Reply {
     }
 }
 
-pub trait HerdrClient {
-    /// `herdr agent start NAME --kind KIND --pane PANE --timeout MS`.
-    fn agent_start(&self, name: &str, kind: &str, pane: &str, timeout_ms: u32)
-        -> io::Result<Reply>;
+/// `Send + Sync`: drivers run on daemon threads while a test holds the same client.
+pub trait HerdrClient: Send + Sync {
+    /// `herdr agent start NAME --kind KIND --pane PANE --timeout MS [-- AGENT_ARG...]`;
+    /// `agent_args` are the agent's own args (model, effort), without the `--`.
+    fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane: &str,
+        timeout_ms: u32,
+        agent_args: &[&str],
+    ) -> io::Result<Reply>;
     /// `herdr agent get NAME`.
     fn agent_get(&self, name: &str) -> io::Result<Reply>;
     /// `herdr agent list`.
@@ -115,9 +141,10 @@ impl HerdrClient for CliHerdr {
         kind: &str,
         pane: &str,
         timeout_ms: u32,
+        agent_args: &[&str],
     ) -> io::Result<Reply> {
         let t = timeout_ms.to_string();
-        self.run(&argv(&[
+        let mut args = argv(&[
             "agent",
             "start",
             name,
@@ -127,7 +154,12 @@ impl HerdrClient for CliHerdr {
             pane,
             "--timeout",
             &t,
-        ]))
+        ]);
+        if !agent_args.is_empty() {
+            args.push("--".into());
+            args.extend(agent_args.iter().map(|a| a.to_string()));
+        }
+        self.run(&args)
     }
 
     fn agent_get(&self, name: &str) -> io::Result<Reply> {

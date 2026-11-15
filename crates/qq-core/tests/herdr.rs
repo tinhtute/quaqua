@@ -154,7 +154,10 @@ fn cli_start_appends_agent_args_after_timeout() {
     let bin = ws.root().join("herdr-stub.sh");
     std::fs::write(
         &bin,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{}}'\n", out.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{}}'\n",
+            out.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -162,7 +165,13 @@ fn cli_start_appends_agent_args_after_timeout() {
         bin: bin.to_string_lossy().into_owned(),
     };
     let r = cli
-        .agent_start("w", "omp", "%1", 5000, &["--model", "m1", "--thinking", "high"])
+        .agent_start(
+            "w",
+            "omp",
+            "%1",
+            5000,
+            &["--model", "m1", "--thinking", "high"],
+        )
         .unwrap();
     assert!(r.ok);
     let argv: Vec<String> = std::fs::read_to_string(&out)
@@ -173,8 +182,20 @@ fn cli_start_appends_agent_args_after_timeout() {
     assert_eq!(
         argv,
         [
-            "agent", "start", "w", "--kind", "omp", "--pane", "%1", "--timeout", "5000", "--",
-            "--model", "m1", "--thinking", "high"
+            "agent",
+            "start",
+            "w",
+            "--kind",
+            "omp",
+            "--pane",
+            "%1",
+            "--timeout",
+            "5000",
+            "--",
+            "--model",
+            "m1",
+            "--thinking",
+            "high"
         ]
     );
     // no extra args: no bare `--`.
@@ -186,7 +207,8 @@ fn cli_start_appends_agent_args_after_timeout() {
 #[test]
 fn fake_start_remembers_agent_args() {
     let f = FakeHerdr::new();
-    f.agent_start("w", "omp", "%1", 1, &["--model", "m1"]).unwrap();
+    f.agent_start("w", "omp", "%1", 1, &["--model", "m1"])
+        .unwrap();
     assert_eq!(f.start_args("w"), ["--model", "m1"]);
 }
 
@@ -209,7 +231,10 @@ fn fake_injects_reply_or_fault_per_verb() {
     assert_eq!(liveness(&f, "w"), Liveness::Down);
     // an injected get reply beats the real agent.
     f.set_reply(Verb::Get, Reply::err("agent_not_found"));
-    assert_eq!(f.agent_get("other").unwrap().error_code().as_deref(), Some("agent_not_found"));
+    assert_eq!(
+        f.agent_get("other").unwrap().error_code().as_deref(),
+        Some("agent_not_found")
+    );
 }
 
 #[test]

@@ -306,94 +306,63 @@ pub fn liveness<H: HerdrClient>(herdr: &H, name: &str) -> Liveness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::Reply;
+    use crate::herdr::{FakeHerdr, Reply, Verb};
     use std::io;
 
-    struct Fake {
-        get: io::Result<(bool, String)>,
-        list: io::Result<String>,
-    }
-
-    fn clone_res<T: Clone>(r: &io::Result<T>) -> io::Result<T> {
-        match r {
-            Ok(v) => Ok(v.clone()),
-            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+    /// Fake whose `get` says `agent_not_found` (as for a gone agent) and whose
+    /// `list` names `others`; `w` is never started.
+    fn gone_with(others: &[&str]) -> FakeHerdr {
+        let f = FakeHerdr::new();
+        for (i, n) in others.iter().enumerate() {
+            f.agent_start(n, "claude", &format!("%{}", i + 9), 1, &[])
+                .unwrap();
         }
-    }
-
-    impl HerdrClient for Fake {
-        fn agent_get(&self, _: &str) -> io::Result<Reply> {
-            clone_res(&self.get).map(|(ok, body)| Reply { ok, body })
-        }
-        fn agent_list(&self) -> io::Result<Reply> {
-            clone_res(&self.list).map(Reply::ok)
-        }
-        fn agent_start(&self, _: &str, _: &str, _: &str, _: u32) -> io::Result<Reply> {
-            unimplemented!()
-        }
-        fn agent_wait(&self, _: &str, _: &[&str], _: u64) -> io::Result<Reply> {
-            unimplemented!()
-        }
-        fn agent_prompt(&self, _: &str, _: &str, _: Option<(&[&str], u64)>) -> io::Result<Reply> {
-            unimplemented!()
-        }
-    }
-
-    const ALIVE: &str = r#"{"result":{"agent":{"name":"w","pane_id":"%1"}}}"#;
-    const NOT_FOUND: &str = r#"{"error":{"code":"agent_not_found"}}"#;
-    const LIST_OTHER: &str = r#"{"result":{"agents":[{"name":"cos"}]}}"#;
-    const LIST_W: &str = r#"{"result":{"agents":[{"name":"w"}]}}"#;
-    const LIST_EMPTY: &str = r#"{"result":{"agents":[]}}"#;
-
-    fn fake(get: io::Result<(bool, String)>, list: io::Result<String>) -> Fake {
-        Fake { get, list }
+        f
     }
 
     #[test]
     fn alive_when_get_returns_agent() {
-        let f = fake(Ok((true, ALIVE.into())), Ok(LIST_W.into()));
-        assert_eq!(liveness(&f, "w"), Liveness::Alive(ALIVE.into()));
+        let f = gone_with(&["w"]);
+        let body = f.agent_get("w").unwrap().body;
+        assert_eq!(liveness(&f, "w"), Liveness::Alive(body));
     }
 
     #[test]
     fn down_only_when_list_confirms_not_found() {
-        let f = fake(Ok((false, NOT_FOUND.into())), Ok(LIST_OTHER.into()));
+        let f = gone_with(&["cos"]);
         assert_eq!(liveness(&f, "w"), Liveness::Down);
     }
 
     #[test]
     fn not_found_but_listed_is_unknown() {
-        let f = fake(Ok((false, NOT_FOUND.into())), Ok(LIST_W.into()));
+        let f = gone_with(&["w"]);
+        f.set_reply(Verb::Get, Reply::err("agent_not_found"));
         assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
     }
 
     #[test]
     fn get_timeout_is_unknown() {
-        let f = fake(
-            Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
-            Ok(LIST_OTHER.into()),
-        );
+        let f = gone_with(&["cos"]);
+        f.set_fault(Verb::Get, io::ErrorKind::TimedOut);
         assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
     }
 
     #[test]
     fn empty_or_broken_list_is_unknown() {
-        for list in [
-            Ok(LIST_EMPTY.to_string()),
-            Ok("garbage".to_string()),
-            Err(io::Error::other("socket")),
-        ] {
-            let f = fake(Ok((false, NOT_FOUND.into())), list);
+        let empty = gone_with(&[]);
+        let garbage = gone_with(&["cos"]);
+        garbage.set_reply(Verb::List, Reply::ok("garbage"));
+        let broken = gone_with(&["cos"]);
+        broken.set_fault(Verb::List, io::ErrorKind::Other);
+        for f in [empty, garbage, broken] {
             assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
         }
     }
 
     #[test]
     fn other_get_error_is_unknown() {
-        let f = fake(
-            Ok((false, r#"{"error":{"code":"socket_error"}}"#.into())),
-            Ok(LIST_OTHER.into()),
-        );
+        let f = gone_with(&["cos"]);
+        f.set_reply(Verb::Get, Reply::err("socket_error"));
         assert!(matches!(liveness(&f, "w"), Liveness::Unknown(_)));
     }
 
@@ -556,13 +525,7 @@ mod tests {
         let bound = 600;
 
         // Screen says idle
-        let f_idle = fake(
-            Ok((
-                true,
-                r#"{"result":{"agent":{"name":"w1","agent_status":"idle"}}}"#.into(),
-            )),
-            Ok(LIST_W.into()),
-        );
+        let f_idle = gone_with(&["w1"]);
 
         // Case 1: No state file -> screen fallback returns Idle
         let st1 = worker_liveness_state(&f_idle, runs_dir, "w1", now, bound);
@@ -585,7 +548,7 @@ mod tests {
         assert_eq!(st4, WorkerState::Idle);
 
         // Case 5: Agent confirmed down -> Dead
-        let f_down = fake(Ok((false, NOT_FOUND.into())), Ok(LIST_OTHER.into()));
+        let f_down = gone_with(&["cos"]);
         let st5 = worker_liveness_state(&f_down, runs_dir, "w1", now, bound);
         assert_eq!(st5, WorkerState::Dead);
         let _ = std::fs::remove_dir_all(&tmp);

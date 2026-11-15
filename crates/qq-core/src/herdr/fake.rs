@@ -1,29 +1,38 @@
-//! In-memory herdr. Replies mirror the CLI's JSON shapes; tests drive state
-//! with [`FakeHerdr::set_status`] and read effects back with [`FakeHerdr::prompts`].
+//! In-memory herdr, the only place tests replace herdr. Replies mirror the
+//! CLI's JSON shapes. Tests drive it with [`FakeHerdr::set_status`],
+//! [`FakeHerdr::script_status`], per-verb [`FakeHerdr::set_reply`] /
+//! [`FakeHerdr::set_fault`], and read effects back with [`FakeHerdr::prompts`].
 
-use super::{HerdrClient, Reply};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use super::{HerdrClient, Reply, Verb, NAME_CLASH, PANE_BUSY};
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Clone)]
 struct Agent {
     kind: String,
     pane: String,
     status: String,
+    start_args: Vec<String>,
+    /// Statuses the agent moves through, one per unmatched wait step.
+    script: VecDeque<String>,
 }
 
 #[derive(Default)]
 struct State {
     agents: BTreeMap<String, Agent>,
     prompts: Vec<(String, String)>,
-    /// When set, the next transport call fails with this error kind.
+    /// When set, the next call (any verb) fails with this transport error kind.
     fail_next: Option<io::ErrorKind>,
+    /// Sticky per-verb transport errors, until [`FakeHerdr::clear`].
+    faults: BTreeMap<Verb, io::ErrorKind>,
+    /// Sticky per-verb canned replies, until [`FakeHerdr::clear`].
+    replies: BTreeMap<Verb, Reply>,
 }
 
 #[derive(Default)]
 pub struct FakeHerdr {
-    st: RefCell<State>,
+    st: Mutex<State>,
 }
 
 fn agent_json(name: &str, a: &Agent) -> String {
@@ -31,39 +40,130 @@ fn agent_json(name: &str, a: &Agent) -> String {
         .to_string()
 }
 
+fn agent_reply(name: &str, a: &Agent) -> Reply {
+    Reply::ok(format!(
+        r#"{{"result":{{"agent":{}}}}}"#,
+        agent_json(name, a)
+    ))
+}
+
+/// herdr's wait: block until the status matches. The fake has no clock, so the
+/// scripted statuses stand in for time passing; a script that runs out without a
+/// match is a timeout.
+fn wait_in(a: &mut Agent, name: &str, until: &[&str]) -> Reply {
+    let matches = |s: &str| {
+        if until.is_empty() {
+            ["idle", "done", "blocked"].contains(&s)
+        } else {
+            until.contains(&s)
+        }
+    };
+    while !matches(&a.status) {
+        match a.script.pop_front() {
+            Some(next) => a.status = next,
+            None => return Reply::err("timeout"),
+        }
+    }
+    agent_reply(name, a)
+}
+
 impl FakeHerdr {
     pub fn new() -> Self {
         Self::default()
     }
 
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Test control: force an agent's status (`idle`, `working`, `blocked`, `done`).
     pub fn set_status(&self, name: &str, status: &str) {
-        if let Some(a) = self.st.borrow_mut().agents.get_mut(name) {
+        if let Some(a) = self.lock().agents.get_mut(name) {
             a.status = status.to_string();
+        }
+    }
+
+    /// Test control: the statuses an agent moves through while a wait is pending,
+    /// one step per non-matching poll. `prompt` then wait-for-`done` succeeds with
+    /// `script_status(name, &["working", "done"])`.
+    pub fn script_status(&self, name: &str, statuses: &[&str]) {
+        if let Some(a) = self.lock().agents.get_mut(name) {
+            a.script = statuses.iter().map(|s| s.to_string()).collect();
         }
     }
 
     /// Test control: drop an agent as if its pane closed.
     pub fn remove(&self, name: &str) {
-        self.st.borrow_mut().agents.remove(name);
+        self.lock().agents.remove(name);
     }
 
-    /// Test control: the next call returns a transport error (timeout, socket).
+    /// Test control: the next call (any verb) returns a transport error.
     pub fn fail_next(&self, kind: io::ErrorKind) {
-        self.st.borrow_mut().fail_next = Some(kind);
+        self.lock().fail_next = Some(kind);
+    }
+
+    /// Test control: every call of `verb` returns this transport error until
+    /// [`FakeHerdr::clear`]. Other verbs are untouched.
+    pub fn set_fault(&self, verb: Verb, kind: io::ErrorKind) {
+        let mut st = self.lock();
+        st.replies.remove(&verb);
+        st.faults.insert(verb, kind);
+    }
+
+    /// Test control: every call of `verb` returns this reply, with no effect on
+    /// the agents, until [`FakeHerdr::clear`]. Other verbs are untouched.
+    pub fn set_reply(&self, verb: Verb, reply: Reply) {
+        let mut st = self.lock();
+        st.faults.remove(&verb);
+        st.replies.insert(verb, reply);
+    }
+
+    /// Test control: drop the injection for `verb`.
+    pub fn clear(&self, verb: Verb) {
+        let mut st = self.lock();
+        st.faults.remove(&verb);
+        st.replies.remove(&verb);
     }
 
     /// Prompts delivered so far, as `(agent, text)`.
     pub fn prompts(&self) -> Vec<(String, String)> {
-        self.st.borrow().prompts.clone()
+        self.lock().prompts.clone()
     }
 
-    fn transport(&self) -> io::Result<()> {
-        match self.st.borrow_mut().fail_next.take() {
-            Some(k) => Err(io::Error::new(k, "fake transport failure")),
-            None => Ok(()),
-        }
+    /// The agent args the agent was started with (after the `--`).
+    pub fn start_args(&self, name: &str) -> Vec<String> {
+        self.lock()
+            .agents
+            .get(name)
+            .map(|a| a.start_args.clone())
+            .unwrap_or_default()
     }
+
+    /// Lock the state and apply injections for `verb`: `Err` for a transport
+    /// fault, `Ok(Err(reply))` for a canned reply, `Ok(Ok(guard))` to proceed.
+    #[allow(clippy::type_complexity)]
+    fn enter(&self, verb: Verb) -> io::Result<Result<MutexGuard<'_, State>, Reply>> {
+        let mut st = self.lock();
+        if let Some(k) = st.fail_next.take() {
+            return Err(io::Error::new(k, "fake transport failure"));
+        }
+        if let Some(k) = st.faults.get(&verb) {
+            return Err(io::Error::new(*k, "fake transport failure"));
+        }
+        if let Some(r) = st.replies.get(&verb) {
+            return Ok(Err(r.clone()));
+        }
+        Ok(Ok(st))
+    }
+}
+
+macro_rules! enter {
+    ($self:ident, $verb:expr) => {
+        match $self.enter($verb)? {
+            Ok(st) => st,
+            Err(reply) => return Ok(reply),
+        }
+    };
 }
 
 impl HerdrClient for FakeHerdr {
@@ -73,44 +173,45 @@ impl HerdrClient for FakeHerdr {
         kind: &str,
         pane: &str,
         _timeout_ms: u32,
+        agent_args: &[&str],
     ) -> io::Result<Reply> {
-        self.transport()?;
-        let mut st = self.st.borrow_mut();
-        // A pane hosts one agent; a second start there is refused, not stacked.
-        // `pane_busy` is this fake's own code: herdr 0.9.5 documents none for a
-        // start on an occupied pane. The documented busy error is `agent_blocked`
-        // on prompt, replayed below.
-        if st.agents.iter().any(|(n, a)| a.pane == pane && n != name) {
-            return Ok(Reply::err("pane_busy"));
+        let mut st = enter!(self, Verb::Start);
+        if let Some(a) = st.agents.get(name) {
+            // Same name, same kind and pane: converge on the running agent
+            // (idempotent start). Anything else is a name clash, not a busy pane.
+            return Ok(if a.kind == kind && a.pane == pane {
+                agent_reply(name, a)
+            } else {
+                Reply::err(NAME_CLASH)
+            });
         }
-        // Same name, same pane: converge on the running agent (idempotent start).
-        let a = st.agents.entry(name.to_string()).or_insert_with(|| Agent {
+        // A pane hosts one agent; a start there by another name is refused.
+        // `PANE_BUSY` is this fake's own code (see its doc).
+        if st.agents.values().any(|a| a.pane == pane) {
+            return Ok(Reply::err(PANE_BUSY));
+        }
+        let a = Agent {
             kind: kind.into(),
             pane: pane.into(),
             status: "idle".into(),
-        });
-        if a.kind != kind || a.pane != pane {
-            return Ok(Reply::err("pane_busy"));
-        }
-        let body = format!(r#"{{"result":{{"agent":{}}}}}"#, agent_json(name, a));
-        Ok(Reply::ok(body))
+            start_args: agent_args.iter().map(|s| s.to_string()).collect(),
+            script: VecDeque::new(),
+        };
+        let reply = agent_reply(name, &a);
+        st.agents.insert(name.to_string(), a);
+        Ok(reply)
     }
 
     fn agent_get(&self, name: &str) -> io::Result<Reply> {
-        self.transport()?;
-        let st = self.st.borrow();
+        let st = enter!(self, Verb::Get);
         Ok(match st.agents.get(name) {
-            Some(a) => Reply::ok(format!(
-                r#"{{"result":{{"agent":{}}}}}"#,
-                agent_json(name, a)
-            )),
+            Some(a) => agent_reply(name, a),
             None => Reply::err("agent_not_found"),
         })
     }
 
     fn agent_list(&self) -> io::Result<Reply> {
-        self.transport()?;
-        let st = self.st.borrow();
+        let st = enter!(self, Verb::List);
         let items: Vec<String> = st.agents.iter().map(|(n, a)| agent_json(n, a)).collect();
         Ok(Reply::ok(format!(
             r#"{{"result":{{"agents":[{}]}}}}"#,
@@ -119,24 +220,10 @@ impl HerdrClient for FakeHerdr {
     }
 
     fn agent_wait(&self, name: &str, until: &[&str], _timeout_ms: u64) -> io::Result<Reply> {
-        self.transport()?;
-        let st = self.st.borrow();
-        let Some(a) = st.agents.get(name) else {
-            return Ok(Reply::err("agent_not_found"));
-        };
-        let matches = if until.is_empty() {
-            ["idle", "done", "blocked"].contains(&a.status.as_str())
-        } else {
-            until.contains(&a.status.as_str())
-        };
-        // The fake has no clock: a state that does not match now never will.
-        Ok(if matches {
-            Reply::ok(format!(
-                r#"{{"result":{{"agent":{}}}}}"#,
-                agent_json(name, a)
-            ))
-        } else {
-            Reply::err("timeout")
+        let mut st = enter!(self, Verb::Wait);
+        Ok(match st.agents.get_mut(name) {
+            Some(a) => wait_in(a, name, until),
+            None => Reply::err("agent_not_found"),
         })
     }
 
@@ -146,24 +233,20 @@ impl HerdrClient for FakeHerdr {
         text: &str,
         wait: Option<(&[&str], u64)>,
     ) -> io::Result<Reply> {
-        self.transport()?;
-        {
-            let mut st = self.st.borrow_mut();
-            let Some(a) = st.agents.get(name) else {
-                return Ok(Reply::err("agent_not_found"));
-            };
-            // herdr rejects a blocked agent before any input is sent.
-            if a.status == "blocked" {
-                return Ok(Reply::err("agent_blocked"));
-            }
-            st.prompts.push((name.to_string(), text.to_string()));
-            if let Some(a) = st.agents.get_mut(name) {
-                a.status = "working".into();
-            }
+        let mut st = enter!(self, Verb::Prompt);
+        let st = &mut *st;
+        let Some(a) = st.agents.get_mut(name) else {
+            return Ok(Reply::err("agent_not_found"));
+        };
+        // herdr rejects a blocked agent before any input is sent.
+        if a.status == "blocked" {
+            return Ok(Reply::err("agent_blocked"));
         }
-        match wait {
-            None => Ok(Reply::ok(r#"{"result":{"submitted":true}}"#)),
-            Some((until, timeout_ms)) => self.agent_wait(name, until, timeout_ms),
-        }
+        a.status = "working".into();
+        st.prompts.push((name.to_string(), text.to_string()));
+        Ok(match wait {
+            None => Reply::ok(r#"{"result":{"submitted":true}}"#),
+            Some((until, _)) => wait_in(a, name, until),
+        })
     }
 }
