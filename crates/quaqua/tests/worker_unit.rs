@@ -1677,6 +1677,60 @@ can_review = true
     assert_eq!(sel_fallback, "ni");
 }
 
+/// `strategy.builder_reviewer_differ` decides what the default reviewer must
+/// differ in: "kind" allows another kind on the same harness, "none" allows any.
+#[test]
+fn test_select_default_reviewer_follows_differ_policy() {
+    use quaqua::pipeline::select_default_reviewer;
+
+    let cfg_for = |policy: &str, reviewers: &str| -> quaqua::config::Config {
+        let toml_str = format!(
+            r#"
+schema_version = 2
+[strategy]
+default_kind = "ni"
+default_reviewer = {reviewers}
+builder_reviewer_differ = "{policy}"
+[kinds.ni]
+harness = "claude"
+model = "opus-5.5"
+can_review = true
+[kinds.rev]
+harness = "claude"
+model = "opus-5.5"
+can_review = true
+[kinds.mute]
+harness = "claude"
+model = "opus-5.5"
+can_review = false
+"#
+        );
+        toml::from_str(&toml_str).unwrap()
+    };
+
+    // "harness": every candidate shares the builder's harness -> refused.
+    let cfg = cfg_for("harness", r#"["rev"]"#);
+    assert!(select_default_reviewer("ni", &cfg).is_err());
+
+    // "kind": a different kind on the same harness is picked, skipping the builder's own kind.
+    let cfg = cfg_for("kind", r#"["ni", "rev"]"#);
+    assert_eq!(select_default_reviewer("ni", &cfg).unwrap(), "rev");
+
+    // "kind": only the builder's own kind on offer -> error.
+    let cfg = cfg_for("kind", r#"["ni"]"#);
+    assert!(select_default_reviewer("ni", &cfg).is_err());
+
+    // "kind": can_review = false still applies. (The unavailable-reviewers env
+    // var is process-global and covered by the test above; not set here; the
+    // candidate is named `rev` so that test's env var cannot race this one.)
+    let cfg = cfg_for("kind", r#"["mute", "rev"]"#);
+    assert_eq!(select_default_reviewer("ni", &cfg).unwrap(), "rev");
+
+    // "none": the first available can_review candidate wins, even the builder's own kind.
+    let cfg = cfg_for("none", r#"["mute", "ni", "rev"]"#);
+    assert_eq!(select_default_reviewer("ni", &cfg).unwrap(), "ni");
+}
+
 /// SLP: a project Lead spawns at most `[roles.lead] max_peers` (default 4) Peers;
 /// the CoS keeps the global `[limits] max_workers_per_orchestrator`. Every spawn
 /// path checks the same gate, so a refusal names the cap that fired.

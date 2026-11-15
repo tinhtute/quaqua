@@ -22,7 +22,7 @@ use crate::engine::workflow::{StepDecision, Workflow, WorkflowContext, WorkflowE
 use crate::worker::prompt::workflow::{SingleWorkerState, SingleWorkerWorkflow, WatchdogConfig};
 pub use phases::{
     blocked_outcome, file_mtime, harness_of_kind, has_real_blockers, log_blockers, log_challenge,
-    pipeline_finished, select_default_reviewer, PipelineContext, StepResult,
+    pipeline_finished, reviewer_pair_allowed, select_default_reviewer, PipelineContext, StepResult,
 };
 pub use state::{
     parse_blocked_gate, PipelineInput, PipelineOutput, PipelinePhase, PipelineState,
@@ -681,8 +681,16 @@ fn run_pipeline(
                         format!("reviewer kind '{r}' has can_review = false in team.toml\n"),
                     ));
                 }
-                if bh == rh {
-                    return Err((1, format!("builder and reviewer must be different harnesses (models.md): {builder}/{r} are both {bh}\n")));
+                let policy = cfg.strategy.builder_reviewer_differ.as_str();
+                if !reviewer_pair_allowed(policy, &builder, bh, &r, rh) {
+                    return Err((
+                        1,
+                        if policy == "kind" {
+                            format!("builder and reviewer must be different kinds (strategy.builder_reviewer_differ = \"kind\"): both are {builder}\n")
+                        } else {
+                            format!("builder and reviewer must be different harnesses (models.md): {builder}/{r} are both {bh}\n")
+                        },
+                    ));
                 }
                 r
             }
