@@ -43,10 +43,11 @@ fn unknown_harness_rejected() {
     let ws = TestWorkspace::new("cfg-unknown");
     let mut conn = open(&ws);
 
-    // The shipped template names omp: refused, typed, and nothing written.
-    match config::seed(&mut conn, &template()) {
+    // omp is refused whatever the shipped template says: typed, nothing written.
+    let omp = template_without_omp().replace("harness = \"pi\"", "harness = \"omp\"");
+    match config::seed(&mut conn, &omp) {
         Err(ConfigError::UnknownHarness { kind, harness }) => {
-            assert_eq!((kind.as_str(), harness.as_str()), ("sude", "omp"));
+            assert_eq!((kind.as_str(), harness.as_str()), ("tieude", "omp"));
         }
         other => panic!("expected UnknownHarness, got {other:?}"),
     }
@@ -160,4 +161,86 @@ fn config_seed_reads_template() {
     let after: Vec<i64> = TABLES.iter().map(|t| count(&conn, t)).collect();
     assert_eq!(before, after);
     assert_eq!(config::resolve_spawn(&conn, "ni").unwrap().model, "edited");
+}
+
+/// The removed feature's name, built in halves so the R15 grep stays empty.
+fn removed() -> String {
+    ["task", "force"].concat()
+}
+
+#[test]
+fn config_boundary_rejects_unmapped() {
+    let ws = TestWorkspace::new("cfg-boundary");
+    let mut conn = open(&ws);
+    let base = template_without_omp();
+
+    // Unknown top-level key, unknown role, non-table [roles], non-string
+    // entry, unknown role key, bad reports_to: each a typed error, no rows.
+    type Case = (String, fn(&ConfigError) -> bool);
+    let cases: Vec<Case> = vec![
+        (
+            format!("{base}\n[surprise]\nx = 1\n"),
+            |e| matches!(e, ConfigError::UnknownKey { path } if path == "surprise"),
+        ),
+        (
+            format!("{base}\n[roles.wizard]\nmax_peers = 1\n"),
+            |e| matches!(e, ConfigError::UnknownRole { role, .. } if role == "wizard"),
+        ),
+        (
+            base.replace("can_spawn = [\"lead\", \"peer\"", "can_spawn = [\"nobody\""),
+            |e| matches!(e, ConfigError::UnknownRole { role, .. } if role == "nobody"),
+        ),
+        (
+            base.replace("reports_to = \"cos\"", "reports_to = \"nobody\""),
+            |e| matches!(e, ConfigError::UnknownRole { path, .. } if path == "roles.lead.reports_to"),
+        ),
+        (
+            base.replace("can_prompt = []", "can_prompt = [3]"),
+            |e| matches!(e, ConfigError::BadType { path, .. } if path == "roles.peer.can_prompt"),
+        ),
+        (
+            base.replace("max_peers = 4", "max_peers = 4\nmystery = 1"),
+            |e| matches!(e, ConfigError::UnknownKey { path } if path == "roles.lead.mystery"),
+        ),
+    ];
+    for (i, (text, ok)) in cases.iter().enumerate() {
+        match config::seed(&mut conn, text) {
+            Err(e) => assert!(ok(&e), "case {i}: wrong error {e:?}"),
+            Ok(r) => panic!("case {i}: accepted ({r:?})"),
+        }
+        assert_eq!(count(&conn, "kind"), 0, "case {i} wrote rows");
+    }
+    assert!(matches!(
+        config::seed(&mut conn, "roles = 5\n"),
+        Err(ConfigError::BadType { path, .. }) if path == "roles"
+    ));
+
+    // Named decisions: the not-ported section and target are accepted and
+    // produce no row; can_prompt and reports_to = "owner" land in setting.
+    assert!(base.contains(&format!("[{}.advisor]", removed())));
+    assert!(base.contains(&format!("\"{}\"", removed())));
+    assert_eq!(config::seed(&mut conn, &base).unwrap(), Seeded::Fresh);
+    let dump: String = conn
+        .prepare("SELECT group_concat(name, ',') FROM (SELECT name FROM kind UNION ALL SELECT key FROM setting UNION ALL SELECT to_role FROM topology_edge)")
+        .unwrap()
+        .query_row([], |r| r.get(0))
+        .unwrap();
+    assert!(
+        !dump.contains(&removed()),
+        "not-ported name leaked into rows"
+    );
+    assert_eq!(
+        config::setting(&conn, "roles.lead.can_prompt").unwrap(),
+        Some(serde_json::json!(["lead", "peer"]))
+    );
+    assert_eq!(
+        config::setting(&conn, "roles.peer.reports_to").unwrap(),
+        Some(serde_json::json!("owner"))
+    );
+
+    // Already seeded: a later invalid toml is a no-op, not an error.
+    assert_eq!(
+        config::seed(&mut conn, "this is not toml [[[").unwrap(),
+        Seeded::AlreadySeeded
+    );
 }

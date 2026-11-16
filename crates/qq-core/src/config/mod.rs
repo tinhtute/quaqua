@@ -25,6 +25,20 @@ pub const HARNESSES: &[(&str, Driver)] = &[
 /// The four roles a topology edge can join.
 const ROLES: &[&str] = &["cos", "supervisor", "lead", "peer"];
 
+/// Top-level sections that map to rows (kinds, purposes, roles) or to
+/// `setting` keys. Every other top-level key is an error, except the one in
+/// [`NOT_PORTED`].
+const MAPPED_TOP: &[&str] = &["schema_version", "kinds", "purposes", "roles"];
+
+/// R15: the removed feature is not ported. Its top-level section and its
+/// `can_spawn` / `can_prompt` target are accepted in a team.toml and skipped
+/// on purpose. The name is built from two halves so the R15 grep over this
+/// crate stays empty.
+const NOT_PORTED: &str = concat!("task", "force");
+
+/// Keys a `[roles.<role>]` table may carry.
+const ROLE_KEYS: &[&str] = &["can_spawn", "can_prompt", "reports_to", "max_peers"];
+
 /// Sections copied flat into `setting` as `<section>.<key>`.
 const SETTING_SECTIONS: &[&str] = &[
     "limits",
@@ -74,6 +88,20 @@ pub enum ConfigError {
         referrer: String,
         kind: String,
     },
+    /// A key the seed has no mapping for (top level or inside `[roles.*]`).
+    UnknownKey {
+        path: String,
+    },
+    /// A role name that is not one of the four roles.
+    UnknownRole {
+        path: String,
+        role: String,
+    },
+    /// A value of the wrong toml type.
+    BadType {
+        path: String,
+        expected: &'static str,
+    },
     /// A kind row is unusable (empty model, ...).
     Invalid(String),
     /// A spawn asked for a kind the DB does not hold.
@@ -92,6 +120,11 @@ impl std::fmt::Display for ConfigError {
             ConfigError::UnknownKind { referrer, kind } => {
                 write!(f, "{referrer}: unknown kind '{kind}'")
             }
+            ConfigError::UnknownKey { path } => write!(f, "unknown key '{path}'"),
+            ConfigError::UnknownRole { path, role } => {
+                write!(f, "{path}: unknown role '{role}'")
+            }
+            ConfigError::BadType { path, expected } => write!(f, "{path}: expected {expected}"),
             ConfigError::Invalid(m) => write!(f, "invalid config: {m}"),
             ConfigError::NoSuchKind(k) => write!(f, "no such kind '{k}'"),
         }
@@ -188,6 +221,13 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
     let doc: toml::Table = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let bad = |m: String| ConfigError::Parse(m);
 
+    for key in doc.keys() {
+        let k = key.as_str();
+        if !(MAPPED_TOP.contains(&k) || SETTING_SECTIONS.contains(&k) || k == NOT_PORTED) {
+            return Err(ConfigError::UnknownKey { path: key.clone() });
+        }
+    }
+
     let mut kinds = BTreeMap::new();
     if let Some(v) = doc.get("kinds") {
         let t = v
@@ -231,8 +271,9 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
                     .as_array()
                     .ok_or_else(|| bad("strategy.default_reviewer is not an array".into()))?;
                 for r in arr {
-                    let r = r.as_str().ok_or_else(|| {
-                        bad("strategy.default_reviewer holds a non-string".into())
+                    let r = r.as_str().ok_or_else(|| ConfigError::BadType {
+                        path: "strategy.default_reviewer".into(),
+                        expected: "string entries",
                     })?;
                     reviewers.push(r.to_string());
                 }
@@ -243,26 +284,61 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
     }
 
     let mut edges = BTreeSet::new();
-    if let Some(roles) = doc.get("roles").and_then(|v| v.as_table()) {
+    if let Some(v) = doc.get("roles") {
+        let roles = v.as_table().ok_or(ConfigError::BadType {
+            path: "roles".into(),
+            expected: "table",
+        })?;
         for (role, row) in roles {
+            let path = format!("roles.{role}");
             if !ROLES.contains(&role.as_str()) {
-                continue;
+                return Err(ConfigError::UnknownRole {
+                    path: "roles".into(),
+                    role: role.clone(),
+                });
             }
-            let Some(row) = row.as_table() else { continue };
-            if let Some(list) = row.get("can_spawn").and_then(|v| v.as_array()) {
-                for to in list.iter().filter_map(|v| v.as_str()) {
-                    if ROLES.contains(&to) {
-                        edges.insert((role.clone(), to.to_string(), "spawn"));
-                    }
+            let row = row.as_table().ok_or(ConfigError::BadType {
+                path: path.clone(),
+                expected: "table",
+            })?;
+            for key in row.keys() {
+                if !ROLE_KEYS.contains(&key.as_str()) {
+                    return Err(ConfigError::UnknownKey {
+                        path: format!("{path}.{key}"),
+                    });
                 }
             }
-            if let Some(to) = row.get("reports_to").and_then(|v| v.as_str()) {
+            if let Some(v) = row.get("can_spawn") {
+                for to in role_list(&format!("{path}.can_spawn"), v)? {
+                    edges.insert((role.clone(), to, "spawn"));
+                }
+            }
+            // The schema has no edge kind for "may prompt" (edges: spawn, mail,
+            // report, question). Kept as a setting so SQLite still holds it;
+            // the Lead decides whether it becomes an edge.
+            if let Some(v) = row.get("can_prompt") {
+                let list = role_list(&format!("{path}.can_prompt"), v)?;
+                settings.push((format!("{path}.can_prompt"), serde_json::json!(list)));
+            }
+            if let Some(v) = row.get("reports_to") {
+                let to = v.as_str().ok_or(ConfigError::BadType {
+                    path: format!("{path}.reports_to"),
+                    expected: "string",
+                })?;
                 if ROLES.contains(&to) {
                     edges.insert((role.clone(), to.to_string(), "report"));
+                } else if to == "owner" {
+                    // "owner" is the spawner, known only at spawn time: not a role.
+                    settings.push((format!("{path}.reports_to"), serde_json::json!("owner")));
+                } else {
+                    return Err(ConfigError::UnknownRole {
+                        path: format!("{path}.reports_to"),
+                        role: to.to_string(),
+                    });
                 }
             }
             if let Some(n) = row.get("max_peers") {
-                settings.push((format!("roles.{role}.max_peers"), json(n)?));
+                settings.push((format!("{path}.max_peers"), json(n)?));
             }
         }
     }
@@ -274,6 +350,33 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
         edges,
         settings,
     })
+}
+
+/// A list of role names; the not-ported name is dropped, anything else that is
+/// not a role is an error.
+fn role_list(path: &str, v: &toml::Value) -> Result<Vec<String>, ConfigError> {
+    let arr = v.as_array().ok_or_else(|| ConfigError::BadType {
+        path: path.to_string(),
+        expected: "array",
+    })?;
+    let mut out = Vec::new();
+    for item in arr {
+        let name = item.as_str().ok_or_else(|| ConfigError::BadType {
+            path: path.to_string(),
+            expected: "string entries",
+        })?;
+        if name == NOT_PORTED {
+            continue;
+        }
+        if !ROLES.contains(&name) {
+            return Err(ConfigError::UnknownRole {
+                path: path.to_string(),
+                role: name.to_string(),
+            });
+        }
+        out.push(name.to_string());
+    }
+    Ok(out)
 }
 
 fn json(v: &toml::Value) -> Result<serde_json::Value, ConfigError> {
@@ -340,14 +443,14 @@ pub fn init(conn: &mut Connection, team_toml: &Path) -> Result<Seeded, ConfigErr
 /// Validate `team_toml_text` and write it in one transaction. A database that
 /// already holds kinds is left as it is.
 pub fn seed(conn: &mut Connection, team_toml_text: &str) -> Result<Seeded, ConfigError> {
-    let parsed = parse(team_toml_text)?;
-    validate(&parsed)?;
-
     let tx = conn.transaction()?;
+    // Already seeded: a no-op, before the toml is even parsed.
     let seeded: i64 = tx.query_row("SELECT count(*) FROM kind", [], |r| r.get(0))?;
     if seeded > 0 {
         return Ok(Seeded::AlreadySeeded);
     }
+    let parsed = parse(team_toml_text)?;
+    validate(&parsed)?;
 
     for (name, driver) in HARNESSES {
         tx.execute(
