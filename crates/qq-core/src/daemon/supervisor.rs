@@ -187,7 +187,9 @@ impl Supervisor {
             .kinds
             .get(kind)
             .ok_or_else(|| format!("unknown workflow kind '{kind}'"))?;
-        if self.loops().contains_key(id) {
+        // One lock from the check to the insert: two starts of one id cannot both pass.
+        let mut loops = self.loops();
+        if loops.contains_key(id) {
             return Ok(false);
         }
         if let Some(row) = self.store.workflow(id)? {
@@ -197,7 +199,7 @@ impl Supervisor {
         }
         let driver = factory(id, Some(input))?;
         self.store.register_workflow(id, kind, now_ms())?;
-        self.spawn_loop(id, driver);
+        self.spawn_loop(&mut loops, id, driver);
         Ok(true)
     }
 
@@ -205,7 +207,8 @@ impl Supervisor {
     pub fn recover(&self) -> Result<Vec<String>, String> {
         let mut revived = Vec::new();
         for row in self.store.workflows()? {
-            if row.finished_ms.is_some() || self.loops().contains_key(&row.id) {
+            let mut loops = self.loops();
+            if row.finished_ms.is_some() || loops.contains_key(&row.id) {
                 continue;
             }
             let Some(factory) = self.kinds.get(&row.kind) else {
@@ -214,7 +217,7 @@ impl Supervisor {
             };
             match factory(&row.id, None) {
                 Ok(driver) => {
-                    self.spawn_loop(&row.id, driver);
+                    self.spawn_loop(&mut loops, &row.id, driver);
                     revived.push(row.id);
                 }
                 Err(e) => eprintln!("qq daemon: cannot recover {}: {e}", row.id),
@@ -256,13 +259,18 @@ impl Supervisor {
         }
     }
 
-    fn spawn_loop(&self, id: &str, driver: Box<dyn WorkflowDriver>) {
+    fn spawn_loop(
+        &self,
+        loops: &mut HashMap<String, Slot>,
+        id: &str,
+        driver: Box<dyn WorkflowDriver>,
+    ) {
         let (tx, rx) = channel::<Msg>();
         let store = Arc::clone(&self.store);
         let journal = store.journal();
         let wf = id.to_string();
         let handle = std::thread::spawn(move || run_loop(&wf, driver, rx, &store, journal));
-        self.loops().insert(id.to_string(), Slot { tx, handle });
+        loops.insert(id.to_string(), Slot { tx, handle });
     }
 }
 
@@ -274,6 +282,7 @@ fn run_loop(
     mut journal: SharedJournal,
 ) {
     let mut events: Vec<WorkflowEvent> = Vec::new();
+    let mut stopping = false;
     loop {
         match driver.advance(&mut journal, std::mem::take(&mut events)) {
             Ok(Progress::Running) => {}
@@ -291,6 +300,9 @@ fn run_loop(
                 eprintln!("qq daemon: workflow {id} stopped: {e}");
                 return;
             }
+        }
+        if stopping {
+            return;
         }
         // Wait for a pushed event or the next deadline, whichever comes first.
         let first = match driver.next_deadline() {
@@ -315,7 +327,12 @@ fn run_loop(
         while let Ok(m) = rx.try_recv() {
             match m {
                 Msg::Event(e) => events.push(*e),
-                Msg::Stop => return,
+                // Events already taken off the channel were acknowledged to
+                // their senders: apply them once more before stopping.
+                Msg::Stop => {
+                    stopping = true;
+                    break;
+                }
             }
         }
     }

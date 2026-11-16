@@ -98,6 +98,11 @@ fn start_daemon(
         herdr,
     });
     d.register_kind("collector", collector_factory());
+    d.register_verb(
+        "whoami",
+        Box::new(|_, req| Ok(json!({ "caller": req.caller }))),
+    )
+    .unwrap();
     d.spawn()
 }
 
@@ -172,6 +177,20 @@ fn daemon_rpc_roundtrip() {
     )
     .unwrap();
     assert_eq!(nowf.error.unwrap().code, "no_such_workflow");
+
+    // Handlers see the caller of the request.
+    let who = rpc::call(
+        &sock,
+        &Request {
+            verb: "whoami".into(),
+            args: Value::Null,
+            caller: Some("peer-a".into()),
+        },
+    )
+    .unwrap()
+    .into_result()
+    .unwrap();
+    assert_eq!(who["caller"], "peer-a");
 
     // One connection, several lines: one response line each, in order.
     let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
@@ -326,6 +345,13 @@ fn watchers_emit_signals_on_change_only() {
 
     fake.script_status("w1", &["working", "blocked"]);
     rpc_ok(&ws, "watch.agent", json!({"workflow": "wf", "agent": "w1"}));
+    // A repeat of the same watch must not journal each change twice.
+    rpc_ok(&ws, "watch.agent", json!({"workflow": "wf", "agent": "w1"}));
+    rpc_ok(
+        &ws,
+        "watch.report",
+        json!({"workflow": "wf", "path": report}),
+    );
     let statuses = |rows: &[(String, Value)]| -> Vec<String> {
         rows.iter()
             .filter(|(k, p)| k == "signal" && p.to_string().contains("\"herdr\""))
@@ -362,4 +388,22 @@ fn watchers_emit_signals_on_change_only() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(reports(&journal_rows(&ws, "wf")), 1);
     daemon.stop().unwrap();
+}
+
+#[test]
+fn acknowledged_signal_survives_immediate_stop() {
+    let ws = TestWorkspace::new("flush");
+    let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).unwrap();
+    rpc_ok(
+        &ws,
+        "workflow.start",
+        json!({"kind": "collector", "id": "wf"}),
+    );
+    for n in ["a", "b", "c"] {
+        let r = rpc_ok(&ws, "signal", json!({"workflow": "wf", "name": n}));
+        assert_eq!(r["delivered"], true);
+    }
+    // No wait: stop right behind the acknowledgements.
+    daemon.stop().unwrap();
+    assert_eq!(count(&journal_rows(&ws, "wf"), "signal"), 3);
 }

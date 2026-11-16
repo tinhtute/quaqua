@@ -35,10 +35,41 @@ pub struct Ctx {
     pub herdr: Arc<dyn HerdrClient>,
     shutdown: Arc<AtomicBool>,
     stop_watchers: Arc<AtomicBool>,
-    watchers: Mutex<Vec<JoinHandle<()>>>,
+    watchers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl Ctx {
+    /// Starts a watcher under `key`; a repeat of a live key is a no-op, so two
+    /// calls never journal one change twice. A finished agent watcher is
+    /// replaced (`restart_finished`); a finished report watcher stays, since
+    /// its one Signal is already out.
+    fn add_watcher(
+        &self,
+        key: &str,
+        workflow: &str,
+        restart_finished: bool,
+        spawn: impl FnOnce(Arc<Supervisor>, Arc<AtomicBool>) -> JoinHandle<()>,
+    ) -> Result<(), RpcError> {
+        if !self.supervisor.is_running(workflow) {
+            return Err(RpcError::new(
+                "no_such_workflow",
+                format!("workflow '{workflow}' is not running"),
+            ));
+        }
+        let mut watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = watchers.get(key) {
+            if !(restart_finished && h.is_finished()) {
+                return Ok(());
+            }
+        }
+        let h = spawn(
+            Arc::clone(&self.supervisor),
+            Arc::clone(&self.stop_watchers),
+        );
+        watchers.insert(key.to_string(), h);
+        Ok(())
+    }
+
     /// Asks the daemon to stop; wakes the accept loop.
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -46,7 +77,8 @@ impl Ctx {
     }
 }
 
-pub type Handler = Box<dyn Fn(&Ctx, &Value) -> Result<Value, RpcError> + Send + Sync>;
+/// A verb handler gets the whole request, caller included.
+pub type Handler = Box<dyn Fn(&Ctx, &Request) -> Result<Value, RpcError> + Send + Sync>;
 
 pub struct Config {
     pub runs_dir: PathBuf,
@@ -156,7 +188,8 @@ impl Daemon {
         add(
             self,
             "workflow.start",
-            Box::new(|ctx, args| {
+            Box::new(|ctx, req| {
+                let args = &req.args;
                 let kind = str_arg(args, "kind")?;
                 let id = str_arg(args, "id")?;
                 let input = args.get("input").cloned().unwrap_or(Value::Null);
@@ -170,7 +203,8 @@ impl Daemon {
         add(
             self,
             "signal",
-            Box::new(|ctx, args| {
+            Box::new(|ctx, req| {
+                let args = &req.args;
                 let id = str_arg(args, "workflow")?;
                 let name = str_arg(args, "name")?;
                 let source = args.get("source").and_then(Value::as_str).unwrap_or("rpc");
@@ -184,51 +218,32 @@ impl Daemon {
         add(
             self,
             "watch.agent",
-            Box::new(|ctx, args| {
+            Box::new(|ctx, req| {
+                let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let agent = str_arg(args, "agent")?;
-                if !ctx.supervisor.is_running(wf) {
-                    return Err(RpcError::new(
-                        "no_such_workflow",
-                        format!("workflow '{wf}' is not running"),
-                    ));
-                }
-                let h = watch::watch_agent(
-                    Arc::clone(&ctx.herdr),
-                    agent.to_string(),
-                    wf.to_string(),
-                    Arc::clone(&ctx.supervisor),
-                    Arc::clone(&ctx.stop_watchers),
-                );
-                ctx.watchers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(h);
+                ctx.add_watcher(&format!("agent:{wf}:{agent}"), wf, true, |sup, stop| {
+                    watch::watch_agent(
+                        Arc::clone(&ctx.herdr),
+                        agent.to_string(),
+                        wf.to_string(),
+                        sup,
+                        stop,
+                    )
+                })?;
                 Ok(json!({ "watching": agent }))
             }),
         );
         add(
             self,
             "watch.report",
-            Box::new(|ctx, args| {
+            Box::new(|ctx, req| {
+                let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let path = str_arg(args, "path")?;
-                if !ctx.supervisor.is_running(wf) {
-                    return Err(RpcError::new(
-                        "no_such_workflow",
-                        format!("workflow '{wf}' is not running"),
-                    ));
-                }
-                let h = watch::watch_report(
-                    PathBuf::from(path),
-                    wf.to_string(),
-                    Arc::clone(&ctx.supervisor),
-                    Arc::clone(&ctx.stop_watchers),
-                );
-                ctx.watchers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(h);
+                ctx.add_watcher(&format!("report:{wf}:{path}"), wf, false, |sup, stop| {
+                    watch::watch_report(PathBuf::from(path), wf.to_string(), sup, stop)
+                })?;
                 Ok(json!({ "watching": path }))
             }),
         );
@@ -254,7 +269,7 @@ impl Daemon {
             herdr: cfg.herdr,
             shutdown: Arc::new(AtomicBool::new(false)),
             stop_watchers: Arc::new(AtomicBool::new(false)),
-            watchers: Mutex::new(Vec::new()),
+            watchers: Mutex::new(HashMap::new()),
         });
         let verbs = Arc::new(verbs);
         for conn in listener.incoming() {
@@ -271,7 +286,8 @@ impl Daemon {
             .watchers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .drain(..)
+            .drain()
+            .map(|(_, h)| h)
             .collect();
         for w in watchers {
             let _ = w.join();
@@ -353,7 +369,7 @@ fn serve_conn(stream: UnixStream, ctx: &Ctx, verbs: &BTreeMap<String, Handler>) 
                     rpc::UNKNOWN_VERB,
                     format!("no verb '{}'", req.verb),
                 )),
-                Some(h) => match h(ctx, &req.args) {
+                Some(h) => match h(ctx, &req) {
                     Ok(v) => Response::ok(v),
                     Err(e) => Response::err(e),
                 },
