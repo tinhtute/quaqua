@@ -133,8 +133,8 @@ enum Sent {
 fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     let to = str_arg(&req.args, "to")?;
     let body = str_arg(&req.args, "body")?;
-    if body.len() > 4096 {
-        return Err(bad("body over 4096 bytes"));
+    if body.chars().count() > 4096 {
+        return Err(bad("body over 4096 characters"));
     }
     let kind = req
         .args
@@ -229,7 +229,47 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             }
         }
     }
+    if created {
+        // Best effort: the mail is stored, so a herdr that is down or does not
+        // support a verb never fails the send.
+        if kind == "escalate" || kind == "blocked" {
+            let _ = ctx.herdr.notification_show(
+                &format!("quaqua mail: {kind}"),
+                &format!("{from} -> {to}: {kind}"),
+                Some("request"),
+            );
+        }
+        if !signalled {
+            wake_idle(ctx, to, from, kind);
+        }
+    }
     Ok(json!({ "id": id, "created": created, "signalled": signalled }))
+}
+
+/// Nudges `to` about new mail when it sits idle in herdr right now. The CoS is
+/// never nudged (its inbox is read on its own turn); a busy agent reads the
+/// mail at its next inbox read.
+fn wake_idle(ctx: &Ctx, to: &str, from: &str, kind: &str) {
+    if to == "cos" {
+        return;
+    }
+    let Ok(reply) = ctx.herdr.agent_get(to) else {
+        return;
+    };
+    let status = serde_json::from_str::<Value>(&reply.body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/result/agent/agent_status")?
+                .as_str()
+                .map(String::from)
+        });
+    if !reply.ok || !matches!(status.as_deref(), Some("idle" | "done")) {
+        return;
+    }
+    let line = format!("quaqua: new {kind} mail from {from}; read your inbox");
+    let _ = ctx
+        .herdr
+        .agent_prompt(to, &line.replace(['\n', '\r'], " "), None);
 }
 
 /// The Signal payload for mail waiting past `who`'s cursor: the newest item's

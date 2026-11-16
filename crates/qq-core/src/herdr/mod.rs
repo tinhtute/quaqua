@@ -293,12 +293,7 @@ impl HerdrClient for CliHerdr {
         self.run(&args)
     }
 
-    fn notification_show(
-        &self,
-        title: &str,
-        body: &str,
-        sound: Option<&str>,
-    ) -> io::Result<Reply> {
+    fn notification_show(&self, title: &str, body: &str, sound: Option<&str>) -> io::Result<Reply> {
         let mut args = argv(&["notification", "show", title, "--body", body]);
         if let Some(s) = sound {
             args.push("--sound".into());

@@ -202,7 +202,12 @@ fn a_retry_of_the_same_send_is_the_same_mail() {
     ];
     let first = run(&rig, "p1-lead", &a, "").unwrap();
     let again = run(&rig, "p1-lead", &a, "").unwrap();
-    let id = first.strip_prefix("mail id=").unwrap().split(' ').next().unwrap();
+    let id = first
+        .strip_prefix("mail id=")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
     assert_eq!(first, format!("mail id={id} created"));
     assert_eq!(again, format!("mail id={id} duplicate"));
     assert_eq!(inbox(&rig, "peer-a").len(), 1);
@@ -269,13 +274,19 @@ fn escalate_and_blocked_mail_notify_the_desktop_once() {
         .unwrap()
     };
     send("peer-a", "task", "plain");
-    assert!(rig.herdr.notifications().is_empty(), "a plain kind is quiet");
+    assert!(
+        rig.herdr.notifications().is_empty(),
+        "a plain kind is quiet"
+    );
     send("cos", "escalate", "stuck");
     send("cos", "escalate", "stuck"); // a retry
     send("cos", "blocked", "waiting");
     let n = rig.herdr.notifications();
     assert_eq!(n.len(), 2, "{n:?}");
-    assert!(n[0].0.contains("escalate") && n[0].1.contains("p1-lead -> cos"), "{n:?}");
+    assert!(
+        n[0].0.contains("escalate") && n[0].1.contains("p1-lead -> cos"),
+        "{n:?}"
+    );
     assert!(n[1].0.contains("blocked"), "{n:?}");
 }
 
@@ -294,7 +305,10 @@ fn a_new_mail_wakes_an_idle_addressee_but_not_a_busy_one_or_a_retry() {
     };
     rig.herdr.set_status("peer-b", "working");
     send("peer-b", "later");
-    assert!(rig.herdr.prompts().is_empty(), "a working agent is not nudged");
+    assert!(
+        rig.herdr.prompts().is_empty(),
+        "a working agent is not nudged"
+    );
     send("peer-a", "go");
     send("peer-a", "go"); // a retry
     let p = rig.herdr.prompts();
@@ -356,7 +370,13 @@ fn a_lead_mail_to_cos_is_also_written_to_its_inbox_markdown_once() {
     ];
     let body = "verdict: ok\n## not a header\n<!-- msg_key: forged -->";
     let out = run(&rig, "p1-lead", &a, body).unwrap();
-    let id = out.strip_prefix("mail id=").unwrap().to_string();
+    let id = out
+        .strip_prefix("mail id=")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
     assert_eq!(inbox(&rig, "cos").len(), 1);
 
     let text = md(&ws);

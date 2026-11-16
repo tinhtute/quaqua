@@ -1,7 +1,7 @@
 //! `qq mail send --to <agent> --kind <kind> [--body-file -|<path>]`.
 //!
 //! A client of `mail.send`. The sender is the caller the RPC layer names
-//! (`QQ_AGENT` today; peer credentials replace that inside [`crate::cli::rpc_call`]).
+//! (named by the daemon from the socket peer; see [`crate::cli::rpc_call`]).
 
 use std::io::Read;
 
@@ -69,20 +69,30 @@ fn send(env: &Env, args: &[String], stdin: &mut dyn Read) -> Result<String, CliE
             s
         }
     };
-    // A retry of the same send is the same mail: the key is the caller's, else the body's.
-    let key = client_id.unwrap_or_else(|| content_key(&body));
+    // A retry of the same send is the same mail: the key is the caller's, else
+    // the addressee, kind and body's, so the same words to someone else (or as
+    // another kind) are their own mail.
+    let key = client_id.unwrap_or_else(|| content_key(&to, &kind, &body));
     let sent = rpc_call(
         env,
         "mail.send",
         json!({ "to": to, "kind": kind, "body": body, "dedupe_key": key }),
     )?;
-    Ok(format!("mail id={}", sent["id"]))
+    let state = if sent["created"].as_bool() == Some(false) {
+        "duplicate"
+    } else {
+        "created"
+    };
+    Ok(format!("mail id={} {state}", sent["id"]))
 }
 
-/// FNV-1a over the body: stable across runs, so a retry finds its first send.
-fn content_key(body: &str) -> String {
-    let h = body.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    });
-    format!("body:{h:016x}")
+/// FNV-1a over `to|kind|body`: stable across runs, so a retry finds its first send.
+fn content_key(to: &str, kind: &str, body: &str) -> String {
+    let h = [to, "|", kind, "|", body]
+        .iter()
+        .flat_map(|p| p.bytes())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("mail:{h:016x}")
 }
