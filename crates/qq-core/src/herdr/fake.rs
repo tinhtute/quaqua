@@ -44,6 +44,8 @@ struct State {
     meta: BTreeMap<String, (BTreeMap<String, String>, Option<String>)>,
     /// `(anchor pane, direction)` of every split, in order.
     splits: Vec<(String, String)>,
+    /// `(new pane, cwd)` of every `pane_split_in`.
+    split_cwds: Vec<(String, String)>,
     next_id: u32,
 }
 
@@ -135,6 +137,11 @@ impl FakeHerdr {
     }
 
     /// Every split so far as `(anchor pane, direction)`.
+    /// `(new pane, cwd)` of every cwd-carrying split, in order.
+    pub fn split_cwds(&self) -> Vec<(String, String)> {
+        self.lock().split_cwds.clone()
+    }
+
     pub fn splits(&self) -> Vec<(String, String)> {
         self.lock().splits.clone()
     }
@@ -364,6 +371,19 @@ impl HerdrClient for FakeHerdr {
         Ok(Reply::ok(format!(
             r#"{{"result":{{"pane":{{"pane_id":"{id}","tab_id":"{tab}"}}}}}}"#
         )))
+    }
+
+    fn pane_split_in(&self, target: &str, dir: &str, cwd: &str) -> io::Result<Reply> {
+        let reply = self.pane_split(target, dir)?;
+        if reply.ok {
+            if let Some(id) = serde_json::from_str::<serde_json::Value>(&reply.body)
+                .ok()
+                .and_then(|v| v.pointer("/result/pane/pane_id")?.as_str().map(String::from))
+            {
+                self.lock().split_cwds.push((id, cwd.to_string()));
+            }
+        }
+        Ok(reply)
     }
 
     fn pane_close(&self, pane: &str) -> io::Result<Reply> {

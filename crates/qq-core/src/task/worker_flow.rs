@@ -16,6 +16,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[path = "spawn_cmd.rs"]
+pub mod spawn_cmd;
+
 use super::spawn::{spawn, Role, SpawnError, SpawnSpec};
 use crate::cli::{Install, Registry as CliRegistry};
 use crate::daemon::supervisor::{Factory, Machine, Progress, WorkflowDriver};
