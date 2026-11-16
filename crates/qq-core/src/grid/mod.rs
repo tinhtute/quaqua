@@ -205,18 +205,61 @@ pub enum Op {
 /// One spawn-recorded pane and whether an open agent still holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recorded {
+    /// The agent name the pane was recorded for.
+    pub name: String,
     pub pane: String,
     pub open: bool,
+}
+
+/// What `grid reconcile --only/--tab` narrows a reconcile to. Both only
+/// narrow: an empty filter is the whole scope.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Filter {
+    /// Agent names (`--only a,b`): only their panes. Empty = no narrowing.
+    pub only: Vec<String>,
+    /// Exact tab label (`--tab X`): `X-2` is another tab and is left alone.
+    pub tab: Option<String>,
+}
+
+impl Filter {
+    /// `--only` is a comma-separated name set; blanks are dropped, so
+    /// `--only ""` narrows nothing.
+    pub fn only_from(list: &str) -> Vec<String> {
+        list.split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    fn admits(&self, p: &Pane, recorded: &[Recorded]) -> bool {
+        self.tab.as_deref().is_none_or(|t| p.tab == t)
+            && (self.only.is_empty()
+                || recorded
+                    .iter()
+                    .any(|r| r.pane == p.id && self.only.contains(&r.name)))
+    }
 }
 
 /// Panes to close: live, recorded at spawn, held by no open agent, and
 /// admitted by `scope`. Everything else (a CoS, a human's shell, another
 /// farm's worker) is left alone; a repeat finds nothing.
 pub fn reconcile_plan(panes: &[Pane], recorded: &[Recorded], scope: &Scope) -> Vec<Op> {
+    reconcile_plan_filtered(panes, recorded, scope, &Filter::default())
+}
+
+/// [`reconcile_plan`] narrowed by `filter`.
+pub fn reconcile_plan_filtered(
+    panes: &[Pane],
+    recorded: &[Recorded],
+    scope: &Scope,
+    filter: &Filter,
+) -> Vec<Op> {
     panes
         .iter()
         .filter(|p| {
-            recorded.iter().any(|r| r.pane == p.id && !r.open)
+            filter.admits(p, recorded)
+                && recorded.iter().any(|r| r.pane == p.id && !r.open)
                 && !recorded.iter().any(|r| r.pane == p.id && r.open)
                 && scope.admits(p)
         })
@@ -227,12 +270,13 @@ pub fn reconcile_plan(panes: &[Pane], recorded: &[Recorded], scope: &Scope) -> V
 /// The panes the database recorded at spawn.
 pub fn recorded_panes(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Recorded>> {
     let mut st = conn.prepare(
-        "SELECT pane_id, ended_ms IS NULL FROM agent WHERE pane_id IS NOT NULL AND pane_id != ''",
+        "SELECT name, pane_id, ended_ms IS NULL FROM agent WHERE pane_id IS NOT NULL AND pane_id != ''",
     )?;
     let rows = st.query_map([], |r| {
         Ok(Recorded {
-            pane: r.get(0)?,
-            open: r.get(1)?,
+            name: r.get(0)?,
+            pane: r.get(1)?,
+            open: r.get(2)?,
         })
     })?;
     rows.collect()
@@ -244,9 +288,19 @@ pub fn reconcile(
     conn: &rusqlite::Connection,
     scope: &Scope,
 ) -> Result<Vec<Op>, String> {
+    reconcile_filtered(ops, conn, scope, &Filter::default())
+}
+
+/// [`reconcile`] narrowed by `filter`.
+pub fn reconcile_filtered(
+    ops: &dyn PaneOps,
+    conn: &rusqlite::Connection,
+    scope: &Scope,
+    filter: &Filter,
+) -> Result<Vec<Op>, String> {
     let panes = ops.panes().map_err(|e| e.to_string())?;
     let recorded = recorded_panes(conn).map_err(|e| e.to_string())?;
-    let plan = reconcile_plan(&panes, &recorded, scope);
+    let plan = reconcile_plan_filtered(&panes, &recorded, scope, filter);
     for op in &plan {
         match op {
             Op::Close(id) => ops.close_pane(id).map_err(|e| e.to_string())?,
@@ -386,10 +440,19 @@ impl PaneOps for HerdrPanes<'_> {
 
 fn grid_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate::cli::CliError> {
     use crate::cli::{rpc_call, CliError};
-    let usage = || CliError::new(1, "usage: grid reconcile | grid acquire <repo>");
+    let usage = || {
+        CliError::new(
+            1,
+            "usage: grid reconcile [--only <names>] [--tab <label>] | grid acquire <repo>",
+        )
+    };
     match args.first().map(String::as_str) {
         Some("reconcile") => {
-            Ok(rpc_call(env, "grid.reconcile", serde_json::json!({}))?.to_string())
+            let call = reconcile_args(&args[1..]).map_err(|m| match m {
+                Some(m) => CliError::new(1, m),
+                None => usage(),
+            })?;
+            Ok(rpc_call(env, "grid.reconcile_scoped", call)?.to_string())
         }
         Some("acquire") => {
             let repo = args.get(1).ok_or_else(usage)?;
@@ -397,6 +460,75 @@ fn grid_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate:
         }
         _ => Err(usage()),
     }
+}
+
+/// The `grid.reconcile_scoped` request for `reconcile`'s flags. `Err(None)` is
+/// a usage error; `Err(Some(m))` a flag with a bad value.
+fn reconcile_args(args: &[String]) -> Result<serde_json::Value, Option<String>> {
+    let (mut only, mut tab) = (Vec::new(), None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (a.as_str(), None),
+        };
+        if flag != "--only" && flag != "--tab" {
+            return Err(None);
+        }
+        let value = match inline {
+            Some(v) => v,
+            None => it.next().ok_or(None)?.as_str(),
+        };
+        if flag == "--only" {
+            only.extend(Filter::only_from(value));
+        } else if value.is_empty() {
+            return Err(Some("--tab requires a non-empty label".into()));
+        } else {
+            tab = Some(value.to_string());
+        }
+    }
+    Ok(serde_json::json!({ "only": only, "tab": tab }))
+}
+
+/// `grid.reconcile_scoped {only: [name], tab: label|null}`: [`reconcile_filtered`]
+/// over the daemon's herdr and database; answers the panes it closed.
+fn register_reconcile(d: &mut crate::daemon::Daemon) -> Result<(), String> {
+    use crate::rpc::RpcError;
+    let herdr = d.herdr();
+    let runs = d.runs_dir().to_path_buf();
+    d.register_verb(
+        "grid.reconcile_scoped",
+        Box::new(move |_, req| {
+            let filter = Filter {
+                only: req
+                    .args
+                    .get("only")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|n| n.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                tab: req
+                    .args
+                    .get("tab")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            };
+            let conn = crate::db::open(&runs.join(crate::db::path::DB_FILE))
+                .map_err(|e| RpcError::new("internal", e.to_string()))?;
+            let ops = reconcile_filtered(
+                &HerdrPanes(herdr.as_ref()),
+                &conn,
+                &Scope::from_runs_dir(&runs),
+                &filter,
+            )
+            .map_err(|e| RpcError::new("refused", e))?;
+            let closed: Vec<&str> = ops.iter().map(|Op::Close(id)| id.as_str()).collect();
+            Ok(serde_json::json!({ "closed": closed.len(), "panes": closed }))
+        }),
+    )
 }
 
 fn lead_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate::cli::CliError> {
@@ -416,7 +548,8 @@ fn lead_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate:
 /// daemon verbs they call are registered by `task::prompt::INSTALL`.
 pub const INSTALL: crate::cli::Install = install;
 
-fn install(cli: &mut crate::cli::Registry, _: &mut crate::daemon::Daemon) -> Result<(), String> {
+fn install(cli: &mut crate::cli::Registry, d: &mut crate::daemon::Daemon) -> Result<(), String> {
+    register_reconcile(d)?;
     cli.register(crate::cli::Command {
         name: "grid",
         help: "reconcile | acquire <repo>",

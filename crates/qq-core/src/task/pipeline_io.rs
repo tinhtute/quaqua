@@ -348,7 +348,7 @@ fn input_of(a: &Value, runs_dir: &Path) -> Result<PipelineInput, RpcError> {
         "pane": text(a, "pane")?,
         "runs_dir": runs_dir,
     });
-    for k in ["project_id", "max_rounds", "timeout_ms", "check"] {
+    for k in ["project_id", "max_rounds", "timeout_ms", "check", "plan"] {
         if let Some(x) = a.get(k) {
             v[k] = x.clone();
         }
@@ -367,6 +367,21 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 .signal(&id, "pipeline", "cancel", Value::Null)
                 .map_err(internal)?;
             return Ok(json!({ "workflow": id, "cancelled": true }));
+        }
+        if let Some(task) = req.args.get("resume").and_then(Value::as_str) {
+            let id = format!("pipeline:{task}");
+            if !ctx.supervisor.is_running(&id) {
+                return Err(RpcError::new("not_found", format!("{id} is not running")));
+            }
+            let payload = match req.args.get("rounds").and_then(Value::as_u64) {
+                Some(n) if n >= 1 => json!({ "rounds": n }),
+                Some(_) => return Err(bad("--rounds must be an integer >= 1".to_string())),
+                None => Value::Null,
+            };
+            ctx.supervisor
+                .signal(&id, "pipeline", "resume", payload)
+                .map_err(internal)?;
+            return Ok(json!({ "workflow": id, "resumed": true }));
         }
         let input = input_of(&req.args, &deps.runs_dir)?;
         let id = format!("pipeline:{}", input.task);
@@ -389,6 +404,7 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 && old.repo == input.repo
                 && old.integ == input.integ
                 && old.check == input.check
+                && old.plan == input.plan
                 && old.pane == input.pane;
             if !same {
                 return Err(RpcError::new(
@@ -455,13 +471,11 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     merge::register(daemon)?;
     cli.register(Command {
         name: "pipeline",
-        help: "pipeline '<json>' | --cancel <task>: build -> cross-harness review -> gate -> merge for one task",
-        run: |env, args| match args {
-            [flag, task] if flag == "--cancel" => {
-                crate::cli::rpc_call(env, VERB, json!({ "cancel": task }))
-                    .map(|r| serde_json::to_string_pretty(&r).unwrap_or_default())
-            }
-            _ => forward(env, VERB, args),
+        help: "pipeline '<json>' [--rounds <N>] | --resume <task> [<repo>] [--rounds <N>] | --cancel <task>: build -> cross-harness review -> gate -> merge for one task",
+        run: |env, args| {
+            let call = pipeline_args(args)?;
+            crate::cli::rpc_call(env, VERB, call)
+                .map(|r| serde_json::to_string_pretty(&r).unwrap_or_default())
         },
     })?;
     cli.register(Command {
@@ -469,6 +483,54 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
         help: "merge '<json>': merge branches into the integration branch, one at a time",
         run: |env, args| forward(env, "merge", args),
     })
+}
+
+const PIPELINE_USAGE: &str = "usage: pipeline '<json>' [--rounds <N>] | pipeline --resume <task> [<repo>] [--rounds <N>] | pipeline --cancel <task>";
+
+fn rounds_of(v: &str) -> Result<u64, CliError> {
+    match v.parse::<u64>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(CliError::new(1, "--rounds must be an integer >= 1")),
+    }
+}
+
+/// The `pipeline` verb's request for a command line. `--rounds` is the
+/// round cap of a start and of a resume (the command line wins over the
+/// brief); `--resume` continues a paused flow (the old `<repo>` is accepted
+/// and ignored: the flow knows its repo).
+fn pipeline_args(args: &[String]) -> Result<Value, CliError> {
+    let usage = || CliError::new(1, PIPELINE_USAGE);
+    let mut rounds = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--rounds" {
+            rounds = Some(rounds_of(it.next().ok_or_else(usage)?)?);
+        } else if let Some(v) = a.strip_prefix("--rounds=") {
+            rounds = Some(rounds_of(v)?);
+        } else {
+            rest.push(a.as_str());
+        }
+    }
+    match rest.as_slice() {
+        ["--cancel", task] if rounds.is_none() => Ok(json!({ "cancel": task })),
+        ["--resume", task] | ["--resume", task, _] => {
+            let mut v = json!({ "resume": task });
+            if let Some(n) = rounds {
+                v["rounds"] = json!(n);
+            }
+            Ok(v)
+        }
+        [raw] if !raw.starts_with("--") => {
+            let mut v: Value = serde_json::from_str(raw)
+                .map_err(|e| CliError::new(1, format!("bad json: {e}")))?;
+            if let Some(n) = rounds {
+                v["max_rounds"] = json!(n);
+            }
+            Ok(v)
+        }
+        _ => Err(usage()),
+    }
 }
 
 fn forward(env: &crate::cli::Env, verb: &str, args: &[String]) -> Result<String, CliError> {
