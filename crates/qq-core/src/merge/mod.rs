@@ -164,6 +164,20 @@ impl Drop for TempWorktree<'_> {
     }
 }
 
+/// The check of a Rust `*-integ` target when the request names none (#170): a
+/// merge that is clean as text can still fail to compile.
+pub const INTEG_CHECK_CMD: &str = "cargo check --workspace --locked";
+
+/// The explicit check when given (an empty one means none), else the cargo
+/// check for a `*-integ` branch whose tree has a `Cargo.toml`.
+pub fn resolve_check(explicit: Option<&str>, integ: &str, target: &Path) -> Option<String> {
+    if let Some(cmd) = explicit {
+        return (!cmd.trim().is_empty()).then(|| cmd.to_string());
+    }
+    (integ.ends_with("-integ") && target.join("Cargo.toml").is_file())
+        .then(|| INTEG_CHECK_CMD.to_string())
+}
+
 /// A check passes when it exits 0 and leaves tracked files untouched.
 fn run_check(dir: &Path, cmd: Option<&str>) -> bool {
     let Some(cmd) = cmd else { return true };
@@ -245,6 +259,7 @@ pub fn run(req: &Request) -> Result<Vec<Merged>, MergeError> {
         return Err(op(format!("worktree {} is dirty", target.display())));
     }
 
+    let check = resolve_check(req.check.as_deref(), &req.integ, &target);
     let mut merged = Vec::new();
     for (branch, tip) in plan {
         let before = resolve(&target, "HEAD").ok_or_else(|| op("cannot read integration HEAD"))?;
@@ -266,13 +281,13 @@ pub fn run(req: &Request) -> Result<Vec<Merged>, MergeError> {
             let _ = git(&target, &["merge", "--abort"]);
             return Err(MergeError::Conflict { branch });
         }
-        if !run_check(&target, req.check.as_deref()) {
+        if !run_check(&target, check.as_deref()) {
             let reset =
                 git(&target, &["reset", "--hard", &before]).map_err(|e| op(e.to_string()))?;
             if !reset.status.success() {
                 return Err(op("reset --hard failed while undoing a merge"));
             }
-            return Err(if run_check(&target, req.check.as_deref()) {
+            return Err(if run_check(&target, check.as_deref()) {
                 MergeError::CheckFailed { branch }
             } else {
                 MergeError::BaseBroken { branch }

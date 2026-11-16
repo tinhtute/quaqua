@@ -33,25 +33,86 @@ use crate::rpc::{self, Request, RpcError};
 
 pub const VERB: &str = "pipeline";
 
+/// Registers a report watcher: `(workflow id, report path)`.
+pub type Watch = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+
+/// The daemon's `watch.report` verb, over the workspace socket.
+pub fn rpc_watch(runs_dir: &Path) -> Watch {
+    let socket = rpc::socket_path(runs_dir);
+    Arc::new(move |wf, path| {
+        rpc::call(
+            &socket,
+            &Request::new("watch.report", json!({ "workflow": wf, "path": path })),
+        )
+        .map_err(|e| e.to_string())?
+        .into_result()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+}
+
 /// What the flow needs from the daemon's surroundings.
 pub struct Deps {
     pub herdr: Arc<dyn HerdrClient>,
     pub runs_dir: PathBuf,
     pub drivers: Drivers,
+    /// How a report watcher is registered; tests plug a closure in.
+    pub watch: Watch,
+}
+
+impl Deps {
+    /// The real wiring: watchers go through the daemon socket.
+    pub fn new(herdr: Arc<dyn HerdrClient>, runs_dir: PathBuf, drivers: Drivers) -> Deps {
+        let watch = rpc_watch(&runs_dir);
+        Deps {
+            herdr,
+            runs_dir,
+            drivers,
+            watch,
+        }
+    }
 }
 
 /// The effects of one flow. Expected failures come back as results the flow
 /// turns into a pause; an `Err` would stop the daemon loop.
-struct Effects {
+pub struct Effects {
     deps: Arc<Deps>,
     input: PipelineInput,
 }
 
 impl Effects {
+    pub fn new(deps: Arc<Deps>, input: PipelineInput) -> Effects {
+        Effects { deps, input }
+    }
+
+    fn id(&self) -> String {
+        format!("pipeline:{}", self.input.task)
+    }
+
+    /// Moves a report that is already at `path` aside, then registers the
+    /// watcher: the wait can only be answered by a file written after the prompt.
+    fn arm(&self, path: &str) -> bool {
+        if Path::new(path).exists() {
+            let stale = format!("{path}.stale-{}", SystemClock.now_ms());
+            if std::fs::rename(path, stale).is_err() {
+                return false;
+            }
+        }
+        (self.deps.watch)(&self.id(), path).is_ok()
+    }
+
     fn tip(&self) -> String {
         merge::resolve(
             Path::new(&self.input.repo),
             &format!("refs/heads/{}", self.input.branch),
+        )
+        .unwrap_or_default()
+    }
+
+    fn base(&self) -> String {
+        merge::resolve(
+            Path::new(&self.input.repo),
+            &format!("refs/heads/{}", self.input.integ),
         )
         .unwrap_or_default()
     }
@@ -61,6 +122,18 @@ impl Effects {
         let Ok(conn) = crate::db::open(&db) else {
             return false;
         };
+        // A restart re-enters this step: an agent already open under this name
+        // and kind is reused, herdr is not asked to start it again.
+        let open: Option<String> = conn
+            .query_row(
+                "SELECT kind FROM agent WHERE name = ?1 AND ended_ms IS NULL",
+                [name],
+                |row| row.get(0),
+            )
+            .ok();
+        if open.as_deref() == Some(kind) {
+            return true;
+        }
         spawn(
             &conn,
             self.deps.herdr.as_ref(),
@@ -97,16 +170,20 @@ impl Activity for Effects {
                     HerdrResult::Unknown
                 }))
             }
+            ActivityRequest::ReportFile(ReportFileRequest::Exists { path }) => Ok(
+                ActivityResult::ReportFile(ReportFileResult::Exists(self.arm(path))),
+            ),
             ActivityRequest::ReportFile(ReportFileRequest::Read { path }) => Ok(
                 ActivityResult::ReportFile(match std::fs::read_to_string(path) {
                     Ok(text) => ReportFileResult::Content(text),
                     Err(_) => ReportFileResult::Exists(false),
                 }),
             ),
-            // The branch tip, read through git (empty when the branch is gone).
-            ActivityRequest::Git(GitRequest::CurrentSha) => {
-                Ok(ActivityResult::Git(GitResult::Sha(self.tip())))
-            }
+            // `"<branch tip> <integration tip>"`, read through git (a part is
+            // empty when its branch is gone).
+            ActivityRequest::Git(GitRequest::CurrentSha) => Ok(ActivityResult::Git(
+                GitResult::Sha(format!("{} {}", self.tip(), self.base())),
+            )),
             // `branch` carries the reviewed sha: the queue merges exactly that
             // commit and refuses when the branch tip is no longer it. A refusal
             // is a `Sha("<code>: <why>")`: `GitResult` has no failure variant
@@ -135,15 +212,58 @@ impl Activity for Effects {
     }
 }
 
-/// The input journaled as the replay base of `id` (a daemon restart).
-fn journaled_input(db: &Path, id: &str) -> Result<PipelineInput, String> {
+/// The state journaled as the replay base of `id` (a daemon restart).
+fn journaled_state(db: &Path, id: &str) -> Result<Value, String> {
     let j = SqliteJournal::open(db).map_err(|e| e.to_string())?;
     let snap = j
         .load_latest_snapshot(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{id}: no journaled base"))?;
-    let v: Value = serde_json::from_str(&snap.state_json).map_err(|e| e.to_string())?;
+    serde_json::from_str(&snap.state_json).map_err(|e| e.to_string())
+}
+
+fn journaled_input(db: &Path, id: &str) -> Result<PipelineInput, String> {
+    let v = journaled_state(db, id)?;
     pipeline::input_from(v.get("input").ok_or("snapshot has no input")?)
+}
+
+/// The report path the flow armed last, read from the journal: the latest
+/// snapshot can be older than the flow's state (the runner skips a snapshot it
+/// cannot place), the armed events are always there.
+fn last_armed(db: &Path, id: &str) -> Option<String> {
+    let j = SqliteJournal::open(db).ok()?;
+    j.load_events(id, 0)
+        .ok()?
+        .iter()
+        .rev()
+        .filter(|e| e.kind == "activity_scheduled")
+        .filter_map(|e| serde_json::from_str::<Value>(&e.payload_json).ok())
+        .find_map(|v| {
+            v.pointer("/activity/ReportFile/Exists/path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// A revived flow needs its report watcher again (the old one died with the
+/// daemon). Re-arming the last armed path is always safe: a report the flow
+/// already took is ignored because a later stage awaits another path. The
+/// daemon is not serving yet while workflows are revived, so the registration
+/// retries in the background.
+fn rearm_in_background(deps: &Arc<Deps>, id: &str) {
+    let db = deps.runs_dir.join(crate::db::path::DB_FILE);
+    let Some(report) = last_armed(&db, id) else {
+        return;
+    };
+    let (watch, id) = (Arc::clone(&deps.watch), id.to_string());
+    std::thread::spawn(move || {
+        for _ in 0..150 {
+            if watch(&id, &report).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
 }
 
 fn factory(deps: &Arc<Deps>) -> Factory {
@@ -151,15 +271,16 @@ fn factory(deps: &Arc<Deps>) -> Factory {
     Arc::new(move |id, input| {
         let (input, fresh) = match input {
             Some(v) => (pipeline::input_from(v)?, true),
-            None => (
-                journaled_input(&deps.runs_dir.join(crate::db::path::DB_FILE), id)?,
-                false,
-            ),
+            None => {
+                let state = journaled_state(&deps.runs_dir.join(crate::db::path::DB_FILE), id)?;
+                rearm_in_background(&deps, id);
+                (
+                    pipeline::input_from(state.get("input").ok_or("snapshot has no input")?)?,
+                    false,
+                )
+            }
         };
-        let acts = Box::new(Effects {
-            deps: Arc::clone(&deps),
-            input: input.clone(),
-        });
+        let acts = Box::new(Effects::new(Arc::clone(&deps), input.clone()));
         let machine = if fresh {
             Machine::new(PipelineFlow, id, PipelineState::new(input), acts)
         } else {
@@ -237,6 +358,16 @@ fn input_of(a: &Value, runs_dir: &Path) -> Result<PipelineInput, RpcError> {
 
 fn start_verb(deps: Arc<Deps>) -> Handler {
     Box::new(move |ctx, req| {
+        if let Some(task) = req.args.get("cancel").and_then(Value::as_str) {
+            let id = format!("pipeline:{task}");
+            if !ctx.supervisor.is_running(&id) {
+                return Err(RpcError::new("not_found", format!("{id} is not running")));
+            }
+            ctx.supervisor
+                .signal(&id, "pipeline", "cancel", Value::Null)
+                .map_err(internal)?;
+            return Ok(json!({ "workflow": id, "cancelled": true }));
+        }
         let input = input_of(&req.args, &deps.runs_dir)?;
         let id = format!("pipeline:{}", input.task);
         let db = deps.runs_dir.join(crate::db::path::DB_FILE);
@@ -244,26 +375,33 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
         check_kinds(&conn, &input.builder_kind, &input.reviewer_kind)?;
 
         if let Some(w) = ctx.store.workflow(&id).map_err(internal)? {
-            if let Ok(old) = journaled_input(&db, &id) {
-                if (
-                    &old.brief,
-                    &old.branch,
-                    &old.builder_kind,
-                    &old.reviewer_kind,
-                ) != (
-                    &input.brief,
-                    &input.branch,
-                    &input.builder_kind,
-                    &input.reviewer_kind,
-                ) {
-                    return Err(RpcError::new(
-                        "conflict",
-                        format!("{id} already runs another task"),
-                    ));
-                }
+            // Fail closed: when the journaled input cannot be read the repeat
+            // is not known to be the same task.
+            let old = journaled_input(&db, &id).map_err(|e| {
+                internal(format!(
+                    "{id}: cannot compare with the journaled input: {e}"
+                ))
+            })?;
+            let same = old.brief == input.brief
+                && old.branch == input.branch
+                && old.builder_kind == input.builder_kind
+                && old.reviewer_kind == input.reviewer_kind
+                && old.repo == input.repo
+                && old.integ == input.integ
+                && old.check == input.check
+                && old.pane == input.pane;
+            if !same {
+                return Err(RpcError::new(
+                    "conflict",
+                    format!("{id} already runs another task"),
+                ));
             }
             if w.finished_ms.is_some() {
                 return Ok(json!({ "workflow": id, "finished": true }));
+            }
+            if ctx.supervisor.is_running(&id) {
+                // Converged: the flow is live, nothing is spawned a second time.
+                return Ok(json!({ "workflow": id, "running": true }));
             }
         }
         spawn(
@@ -287,24 +425,8 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
         ctx.supervisor
             .start(pipeline::KIND, &id, &json!(input))
             .map_err(|e| RpcError::new("workflow_start_refused", e))?;
-        if ctx.supervisor.is_running(&id) {
-            // Repeats are ignored by the flow once it is past `Armed`.
-            let _ = ctx.supervisor.signal(&id, "pipeline", "start", Value::Null);
-            let mut reports = vec![input.build_report()];
-            for r in 1..=input.max_rounds + 1 {
-                reports.push(input.review_report(r));
-                reports.push(input.fix_report(r));
-            }
-            for path in reports {
-                rpc::call(
-                    &ctx.socket,
-                    &Request::new("watch.report", json!({ "workflow": id, "path": path })),
-                )
-                .map_err(internal)?
-                .into_result()
-                .map_err(|e| internal(e.to_string()))?;
-            }
-        }
+        // The flow arms its own report watchers as it enters each attempt.
+        let _ = ctx.supervisor.signal(&id, "pipeline", "start", Value::Null);
         Ok(json!({ "workflow": id }))
     })
 }
@@ -324,17 +446,23 @@ pub const INSTALL: Install = install;
 fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     register(
         daemon,
-        Deps {
-            herdr: Arc::new(CliHerdr::new()),
-            runs_dir: crate::db::path::default_runs_dir(),
-            drivers: Drivers::native(),
-        },
+        Deps::new(
+            Arc::new(CliHerdr::new()),
+            crate::db::path::default_runs_dir(),
+            Drivers::native(),
+        ),
     )?;
     merge::register(daemon)?;
     cli.register(Command {
         name: "pipeline",
-        help: "pipeline '<json>': build -> cross-harness review -> gate -> merge for one task",
-        run: |env, args| forward(env, VERB, args),
+        help: "pipeline '<json>' | --cancel <task>: build -> cross-harness review -> gate -> merge for one task",
+        run: |env, args| match args {
+            [flag, task] if flag == "--cancel" => {
+                crate::cli::rpc_call(env, VERB, json!({ "cancel": task }))
+                    .map(|r| serde_json::to_string_pretty(&r).unwrap_or_default())
+            }
+            _ => forward(env, VERB, args),
+        },
     })?;
     cli.register(Command {
         name: "merge",

@@ -80,20 +80,18 @@ impl PipelineInput {
     pub fn builder(&self) -> String {
         format!("{}-b", self.task)
     }
-    pub fn reviewer(&self) -> String {
-        format!("{}-r", self.task)
+    /// A fresh reviewer per round: no memory of an earlier verdict.
+    pub fn reviewer(&self, round: u32) -> String {
+        format!("{}-r{round}", self.task)
     }
-    fn report(&self, file: String) -> String {
-        format!("{}/{}", self.runs_dir.trim_end_matches('/'), file)
-    }
-    pub fn build_report(&self) -> String {
-        self.report(format!("{}.build.md", self.task))
-    }
-    pub fn review_report(&self, round: u32) -> String {
-        self.report(format!("{}.r{round}.md", self.task))
-    }
-    pub fn fix_report(&self, round: u32) -> String {
-        self.report(format!("{}.fix{round}.md", self.task))
+    /// The report of attempt `seq` (every prompt gets a path nobody wrote yet,
+    /// so a stale file or an already-fired watcher can never answer it).
+    pub fn report_for(&self, tag: &str, seq: u32) -> String {
+        format!(
+            "{}/{}.{tag}.a{seq}.md",
+            self.runs_dir.trim_end_matches('/'),
+            self.task
+        )
     }
 }
 
@@ -119,6 +117,10 @@ pub enum BlockKind {
     RoundsExhausted,
     /// The tip moved after review; approval re-reviews the new tip.
     Moved,
+    /// The integration base itself fails its check: approval ends the flow
+    /// (`held`) instead of re-running a merge that cannot pass; the reviewed
+    /// candidate is landed with the `merge` verb once the base is fixed.
+    Hold,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,6 +140,16 @@ pub struct PipelineState {
     pub prompted: bool,
     pub report_seen: bool,
     pub reading: bool,
+    /// Prompt attempts so far; each one owns the report path `report`.
+    pub seq: u32,
+    /// The report the current wait is for.
+    pub report: String,
+    /// The prompt held back until its report watcher is armed.
+    pub pending: Option<(String, String)>,
+    /// Generation of the live deadline timer (a resume arms a fresh one).
+    pub deadline_gen: u32,
+    /// Merge refusals sent back to the builder.
+    pub merge_fixes: u32,
     pub round: u32,
     /// What the builder claimed in its report (never trusted on its own).
     pub claimed: Option<String>,
@@ -145,8 +157,9 @@ pub struct PipelineState {
     pub candidate: Option<String>,
     /// The sha the current review is bound to.
     pub reviewed: Option<String>,
+    /// The report of the last review (what a fix round answers).
+    pub review_path: String,
     pub findings: u32,
-    pub review_changed: bool,
     pub blocked: Option<Blocked>,
 }
 
@@ -159,12 +172,17 @@ impl PipelineState {
             prompted: false,
             report_seen: false,
             reading: false,
+            seq: 0,
+            report: String::new(),
+            pending: None,
+            deadline_gen: 0,
+            merge_fixes: 0,
             round: 0,
             claimed: None,
             candidate: None,
             reviewed: None,
+            review_path: String::new(),
             findings: 0,
-            review_changed: false,
             blocked: None,
         }
     }
@@ -211,75 +229,104 @@ fn block(s: &mut PipelineState, from: Stage, kind: BlockKind, code: i32, why: St
     StepDecision::PauseForApproval { reason }
 }
 
-fn enter_prompt(
-    s: &mut PipelineState,
-    stage: Stage,
-    tag: &str,
-    to: String,
-    text: String,
-) -> Decision {
+/// The next attempt's report path: one per prompt, never reused.
+fn next_report(s: &mut PipelineState, tag: &str) -> String {
+    s.seq += 1;
+    s.report = s.input.report_for(tag, s.seq);
+    s.report.clone()
+}
+
+/// Enters a waiting stage: the report watcher is armed first (`arm-<seq>`),
+/// the prompt follows once the watcher is in (`prompt-<seq>`).
+fn enter_prompt(s: &mut PipelineState, stage: Stage, to: String, text: String) -> Decision {
     s.stage = stage;
     s.prompted = false;
     s.report_seen = false;
     s.reading = false;
+    s.pending = Some((to, text));
     activity(
-        &format!("prompt-{tag}"),
-        ActivityRequest::Herdr(HerdrRequest::Prompt {
-            name: to,
-            task: text,
+        &format!("arm-{}", s.seq),
+        ActivityRequest::ReportFile(ReportFileRequest::Exists {
+            path: s.report.clone(),
         }),
     )
 }
 
 fn enter_build(s: &mut PipelineState) -> Decision {
+    let report = next_report(s, "build");
     let i = &s.input;
     let text = format!(
-        "{}\n\nPipeline phase: BUILD. Commit on branch {} (repo {}). Write your report to {}. \
+        "{}\n\nPipeline phase: BUILD. Commit on branch {} (repo {}). Write your report to {report}. \
          End it with `Verified: <level> <full 40-hex sha of your last commit>`. A wrong premise is \
          disputed under '## Challenge' with evidence; a task already satisfied says 'Outcome: NO_CHANGES'.",
-        i.brief,
-        i.branch,
-        i.repo,
-        i.build_report()
+        i.brief, i.branch, i.repo
     );
     let to = i.builder();
-    enter_prompt(s, Stage::Build, "build", to, text)
+    enter_prompt(s, Stage::Build, to, text)
 }
 
+/// A fresh reviewer for `round` is spawned (or reused when already open),
+/// then prompted by `begin_review`.
 fn enter_review(s: &mut PipelineState, round: u32) -> Decision {
     s.round = round;
     s.reviewed = s.candidate.clone();
+    s.stage = Stage::SpawnReview;
+    activity(
+        &format!("spawn-review-{round}"),
+        ActivityRequest::Herdr(HerdrRequest::Spawn {
+            name: s.input.reviewer(round),
+            kind: s.input.reviewer_kind.clone(),
+            repo: s.input.repo.clone(),
+            approve_kinds: Vec::new(),
+        }),
+    )
+}
+
+fn begin_review(s: &mut PipelineState) -> Decision {
+    let round = s.round;
+    let report = next_report(s, &format!("r{round}"));
     let sha = s.reviewed.clone().unwrap_or_default();
     let i = &s.input;
     let text = format!(
         "Pipeline phase: REVIEW (round {round}) of task '{}'.\nReview exactly commit {sha} on branch {} \
          (repo {}); do not edit code; run the checks the brief names in the foreground.\nBrief:\n{}\n\n\
-         Write your report to {}. Tag each finding under '## Findings' as '- [critical|major|minor|trivial] <finding>'. \
+         Write your report to {report}. Tag each finding under '## Findings' as '- [critical|major|minor|trivial] <finding>'. \
          End with exactly one line: 'Verdict: clean' or 'Verdict: <N> findings'. Dispute a wrong premise under '## Challenge'.",
-        i.task,
-        i.branch,
-        i.repo,
-        i.brief,
-        i.review_report(round)
+        i.task, i.branch, i.repo, i.brief
     );
-    let to = i.reviewer();
-    enter_prompt(s, Stage::Review, &format!("review-{round}"), to, text)
+    let to = i.reviewer(round);
+    enter_prompt(s, Stage::Review, to, text)
 }
 
 fn enter_fix(s: &mut PipelineState) -> Decision {
     let round = s.round;
+    let review = s.review_path.clone();
+    let report = next_report(s, &format!("fix{round}"));
     let i = &s.input;
     let text = format!(
-        "Pipeline phase: FIX (after review round {round}). Resolve the {} blocking findings in {} \
+        "Pipeline phase: FIX (after review round {round}). Resolve the {} blocking findings in {review} \
          on branch {}; commit each fix; a wrong finding is disputed under '## Challenge'. \
-         Write your report to {} and end it with `Verified: <level> <full 40-hex sha of your last commit>`.",
-        s.findings,
-        i.review_report(round),
-        i.branch,
-        i.fix_report(round)
+         Write your report to {report} and end it with `Verified: <level> <full 40-hex sha of your last commit>`.",
+        s.findings, i.branch
     );
     let to = i.builder();
-    enter_prompt(s, Stage::Fix, &format!("fix-{round}"), to, text)
+    enter_prompt(s, Stage::Fix, to, text)
+}
+
+/// The merge queue refused the reviewed sha (conflict or failed check): the
+/// builder fixes it on its branch, then the new tip is reviewed again.
+fn enter_merge_fix(s: &mut PipelineState, why: &str) -> Decision {
+    s.merge_fixes += 1;
+    let report = next_report(s, &format!("mfix{}", s.merge_fixes));
+    let i = &s.input;
+    let text = format!(
+        "Pipeline phase: FIX (merge refused). Merging {} into {} failed: {why}. Bring {} up to date \
+         with {} (resolve conflicts, make the check pass), commit, and write your report to {report}; \
+         end it with `Verified: <level> <full 40-hex sha of your last commit>`.",
+        i.branch, i.integ, i.branch, i.integ
+    );
+    let to = i.builder();
+    enter_prompt(s, Stage::Fix, to, text)
 }
 
 fn enter_gate(s: &mut PipelineState) -> Decision {
@@ -287,21 +334,18 @@ fn enter_gate(s: &mut PipelineState) -> Decision {
     activity("gate-tip", ActivityRequest::Git(GitRequest::CurrentSha))
 }
 
-fn report_path(s: &PipelineState) -> String {
-    match s.stage {
-        Stage::Build => s.input.build_report(),
-        Stage::Review => s.input.review_report(s.round),
-        _ => s.input.fix_report(s.round),
-    }
+fn same_file(a: &str, b: &str) -> bool {
+    let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
+    a.file_name().is_some() && a.file_name() == b.file_name()
 }
 
 fn read_if_ready(s: &mut PipelineState) -> Decision {
     let waiting = matches!(s.stage, Stage::Build | Stage::Review | Stage::Fix);
     if waiting && s.prompted && s.report_seen && !s.reading {
         s.reading = true;
-        let path = report_path(s);
+        let path = s.report.clone();
         return activity(
-            &format!("read-{:?}-{}", s.stage, s.round),
+            &format!("read-{:?}-{}", s.stage, s.seq),
             ActivityRequest::ReportFile(ReportFileRequest::Read { path }),
         );
     }
@@ -317,11 +361,11 @@ fn resume(s: &mut PipelineState) -> Decision {
         BlockKind::Restart => match b.from {
             Stage::Build => enter_build(s),
             Stage::Fix => enter_fix(s),
-            Stage::Review => {
+            Stage::Review => begin_review(s),
+            Stage::SpawnReview => {
                 let r = s.round.max(1);
                 enter_review(s, r)
             }
-            Stage::SpawnReview => spawn_reviewer(s),
             _ => enter_gate(s),
         },
         BlockKind::RoundsExhausted => {
@@ -334,20 +378,14 @@ fn resume(s: &mut PipelineState) -> Decision {
             s.input.max_rounds = s.input.max_rounds.max(next);
             enter_review(s, next)
         }
+        BlockKind::Hold => done("held", s, None),
     }
 }
 
-fn spawn_reviewer(s: &mut PipelineState) -> Decision {
-    s.stage = Stage::SpawnReview;
-    activity(
-        "spawn-review",
-        ActivityRequest::Herdr(HerdrRequest::Spawn {
-            name: s.input.reviewer(),
-            kind: s.input.reviewer_kind.clone(),
-            repo: s.input.repo.clone(),
-            approve_kinds: Vec::new(),
-        }),
-    )
+/// `"<branch tip> <integration tip>"` as the CurrentSha activity returns it.
+fn tips(pair: &str) -> (&str, &str) {
+    let mut w = pair.split_whitespace();
+    (w.next().unwrap_or(""), w.next().unwrap_or(""))
 }
 
 pub struct PipelineFlow;
@@ -363,11 +401,11 @@ impl PipelineFlow {
             return match parse_verdict(content) {
                 Err(why) => block(s, from, BlockKind::Restart, BLOCK_BAD_REVIEW, why),
                 Ok(n) => {
+                    s.review_path = s.report.clone();
                     s.findings = blocking_findings(&s.input.brief, content, n);
                     if s.findings == 0 {
                         return enter_gate(s);
                     }
-                    s.review_changed = true;
                     if s.round >= s.input.max_rounds {
                         let why = format!(
                             "review rounds exhausted ({} rounds, {} blocking findings remain)",
@@ -391,10 +429,21 @@ impl PipelineFlow {
             Ok(sha) => {
                 s.claimed = Some(sha);
                 activity(
-                    &format!("bind-{}", s.round),
+                    &format!("bind-{}", s.seq),
                     ActivityRequest::Git(GitRequest::CurrentSha),
                 )
             }
+        }
+    }
+
+    fn on_merge_refused(&self, s: &mut PipelineState, why: String) -> Decision {
+        let code = why.split(':').next().unwrap_or("").trim();
+        match code {
+            "merge_conflict" | "check_failed" if s.merge_fixes < s.input.max_rounds => {
+                enter_merge_fix(s, &why)
+            }
+            "base_broken" => block(s, Stage::Gate, BlockKind::Hold, BLOCK_MERGE_REFUSED, why),
+            _ => block(s, Stage::Gate, BlockKind::Restart, BLOCK_MERGE_REFUSED, why),
         }
     }
 }
@@ -407,27 +456,34 @@ impl Workflow for PipelineFlow {
     fn step(
         &self,
         s: &mut PipelineState,
-        _ctx: &mut WorkflowContext,
+        ctx: &mut WorkflowContext,
         event: Option<WorkflowEvent>,
     ) -> Decision {
         match event {
             None if !s.armed => {
                 s.armed = true;
                 StepDecision::ScheduleTimer {
-                    id: "deadline".into(),
+                    id: format!("deadline-{}", s.deadline_gen),
                     duration: Duration::from_millis(s.input.timeout_ms),
                 }
             }
-            Some(WorkflowEvent::Signal { source, name, .. }) => {
-                match (source.as_str(), name.as_str()) {
-                    ("pipeline", "start") if s.stage == Stage::Armed => enter_build(s),
-                    ("report", "appeared") => {
-                        s.report_seen = true;
-                        read_if_ready(s)
+            Some(WorkflowEvent::Signal {
+                source,
+                name,
+                payload,
+            }) => match (source.as_str(), name.as_str()) {
+                ("pipeline", "start") if s.stage == Stage::Armed => enter_build(s),
+                ("pipeline", "cancel") => done("cancelled", s, None),
+                ("report", "appeared") => {
+                    let path = payload.get("path").and_then(Value::as_str).unwrap_or("");
+                    if !same_file(path, &s.report) {
+                        return StepDecision::Continue;
                     }
-                    _ => StepDecision::Continue,
+                    s.report_seen = true;
+                    read_if_ready(s)
                 }
-            }
+                _ => StepDecision::Continue,
+            },
             Some(WorkflowEvent::ApprovalResolved { approved, reason }) => {
                 if s.stage != Stage::Blocked {
                     return StepDecision::Continue;
@@ -438,10 +494,17 @@ impl Workflow for PipelineFlow {
                         reason: reason.unwrap_or_else(|| "blocked gate aborted".into()),
                     };
                 }
+                // The deadline fired into the pause and was dropped: a resumed
+                // flow gets a fresh one.
+                s.deadline_gen += 1;
+                ctx.schedule_timer(
+                    format!("deadline-{}", s.deadline_gen),
+                    Duration::from_millis(s.input.timeout_ms),
+                );
                 resume(s)
             }
-            Some(WorkflowEvent::TimerFired { id }) if id == "deadline" => {
-                if s.stage == Stage::Blocked {
+            Some(WorkflowEvent::TimerFired { id }) if id.starts_with("deadline-") => {
+                if s.stage == Stage::Blocked || id != format!("deadline-{}", s.deadline_gen) {
                     return StepDecision::Continue;
                 }
                 StepDecision::Fail {
@@ -452,6 +515,28 @@ impl Workflow for PipelineFlow {
             Some(WorkflowEvent::ActivityCompleted { id, result }) => {
                 let kind = id.split('-').next().unwrap_or("");
                 match (kind, result) {
+                    ("arm", ActivityResult::ReportFile(ReportFileResult::Exists(true))) => {
+                        match s.pending.take() {
+                            Some((to, text)) => activity(
+                                &format!("prompt-{}", s.seq),
+                                ActivityRequest::Herdr(HerdrRequest::Prompt {
+                                    name: to,
+                                    task: text,
+                                }),
+                            ),
+                            None => StepDecision::Continue,
+                        }
+                    }
+                    ("arm", _) => {
+                        let from = s.stage;
+                        block(
+                            s,
+                            from,
+                            BlockKind::Restart,
+                            BLOCK_UNFINISHED,
+                            "the report watcher could not be armed".into(),
+                        )
+                    }
                     ("prompt", ActivityResult::Herdr(HerdrResult::Prompted { .. })) => {
                         s.prompted = true;
                         read_if_ready(s)
@@ -461,7 +546,7 @@ impl Workflow for PipelineFlow {
                         reason: "herdr did not take the prompt".into(),
                     },
                     ("spawn", ActivityResult::Herdr(HerdrResult::Spawned { .. })) => {
-                        enter_review(s, 1)
+                        begin_review(s)
                     }
                     ("spawn", _) => block(
                         s,
@@ -483,9 +568,14 @@ impl Workflow for PipelineFlow {
                             "the report could not be read".into(),
                         )
                     }
-                    ("bind", ActivityResult::Git(GitResult::Sha(tip))) => {
+                    ("bind", ActivityResult::Git(GitResult::Sha(pair))) => {
                         let from = s.stage;
+                        let (tip, base) = tips(&pair);
                         let claimed = s.claimed.clone().unwrap_or_default();
+                        if !crate::merge::is_full_sha(tip) {
+                            let why = format!("cannot read the tip of {}", s.input.branch);
+                            return block(s, from, BlockKind::Restart, BLOCK_BAD_SHA, why);
+                        }
                         if !tip.eq_ignore_ascii_case(&claimed) {
                             let why = format!(
                                 "claimed sha {claimed} is not the tip {tip} of {}",
@@ -493,17 +583,26 @@ impl Workflow for PipelineFlow {
                             );
                             return block(s, from, BlockKind::Restart, BLOCK_BAD_SHA, why);
                         }
-                        s.candidate = Some(tip);
+                        // Nothing beyond the integration branch: nothing to review or merge.
+                        if tip.eq_ignore_ascii_case(base) {
+                            return done("no_changes", s, None);
+                        }
+                        s.candidate = Some(tip.to_string());
                         match from {
                             Stage::Fix => {
                                 let next = s.round + 1;
                                 enter_review(s, next)
                             }
-                            _ => spawn_reviewer(s),
+                            _ => enter_review(s, 1),
                         }
                     }
-                    ("gate", ActivityResult::Git(GitResult::Sha(tip))) => {
+                    ("gate", ActivityResult::Git(GitResult::Sha(pair))) => {
+                        let (tip, _) = tips(&pair);
                         let reviewed = s.reviewed.clone().unwrap_or_default();
+                        if !crate::merge::is_full_sha(tip) {
+                            let why = format!("cannot read the tip of {}", s.input.branch);
+                            return block(s, Stage::Gate, BlockKind::Restart, BLOCK_BAD_SHA, why);
+                        }
                         if !tip.eq_ignore_ascii_case(&reviewed) {
                             let why = format!(
                                 "acceptance refused: {} moved after review (reviewed {reviewed}, tip now {tip})",
@@ -511,7 +610,7 @@ impl Workflow for PipelineFlow {
                             );
                             let d = block(s, Stage::Review, BlockKind::Moved, BLOCK_SHA_MOVED, why);
                             if let Some(b) = s.blocked.as_mut() {
-                                b.moved_to = Some(tip);
+                                b.moved_to = Some(tip.to_string());
                             }
                             return d;
                         }
@@ -526,7 +625,7 @@ impl Workflow for PipelineFlow {
                         done("merged", s, Some(sha))
                     }
                     ("merge", ActivityResult::Git(GitResult::Sha(why))) => {
-                        block(s, Stage::Gate, BlockKind::Restart, BLOCK_MERGE_REFUSED, why)
+                        self.on_merge_refused(s, why)
                     }
                     ("bind" | "gate" | "merge", _) => {
                         let from = if s.stage == Stage::Merge {
@@ -662,13 +761,27 @@ fn blocking_findings(brief: &str, report: &str, verdict_count: u32) -> u32 {
         .and_then(|v| v.split_whitespace().next())
         .and_then(severity)
         .unwrap_or(2);
-    let tags: Vec<u8> = report
-        .lines()
-        .filter_map(|l| {
-            let rest = l.trim().strip_prefix("- [")?;
-            severity(rest.split_once(']')?.0)
-        })
-        .collect();
+    // Only lines under `## Findings` are findings (a quoted tag in another
+    // section is not one).
+    let mut in_findings = false;
+    let mut tags: Vec<u8> = Vec::new();
+    for l in report.lines() {
+        let t = l.trim();
+        if t.starts_with("## ") {
+            in_findings = t.trim_start_matches("## ").eq_ignore_ascii_case("findings");
+            continue;
+        }
+        if !in_findings {
+            continue;
+        }
+        if let Some(sev) = t
+            .strip_prefix("- [")
+            .and_then(|rest| rest.split_once(']'))
+            .and_then(|(tag, _)| severity(tag))
+        {
+            tags.push(sev);
+        }
+    }
     let tagged_blocking = tags.iter().filter(|t| **t >= must).count() as u32;
     let untagged = verdict_count.saturating_sub(tags.len() as u32);
     tagged_blocking + untagged
@@ -695,7 +808,7 @@ mod tests {
 
     #[test]
     fn severity_gates_blocking_findings() {
-        let report = "- [major] a\n- [trivial] b\n- [minor] c\nVerdict: 3 findings";
+        let report = "## Findings\n- [major] a\n- [trivial] b\n- [minor] c\n\n## Notes\n- [major] not a finding\nVerdict: 3 findings";
         assert_eq!(blocking_findings("brief", report, 3), 1);
         assert_eq!(blocking_findings("Must fix: minor", report, 3), 2);
         // untagged findings of the count all block
