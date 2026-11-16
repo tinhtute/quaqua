@@ -2,9 +2,9 @@
 
 use qq_core::cli::{Env, Registry};
 use qq_core::config::{self, ConfigError, Driver, Seeded};
-use qq_core::daemon::{Config, Daemon};
+use qq_core::daemon::{Config, Daemon, DaemonHandle};
 use qq_core::db;
-use qq_core::herdr::CliHerdr;
+use qq_core::herdr::FakeHerdr;
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -81,6 +81,7 @@ fn unknown_harness_rejected() {
     let env = Env {
         runs_dir: ws.runs_dir(),
     };
+    let (_registry, daemon) = start(&ws);
     let before = config::roster(&conn).unwrap();
     for h in ["omp", "nope"] {
         let file = ws.root().join(format!("{h}.toml"));
@@ -107,6 +108,19 @@ fn unknown_harness_rejected() {
     }
     assert_eq!(config::roster(&conn).unwrap(), before);
     assert!(config::kind(&conn, "fresh").unwrap().is_none());
+    daemon.stop().unwrap();
+}
+
+/// A daemon with the config verbs installed on a fresh registry; the CLI
+/// commands in that registry are its clients.
+fn start(ws: &TestWorkspace) -> (Registry, DaemonHandle) {
+    let mut registry = Registry::new();
+    let mut daemon = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: Arc::new(FakeHerdr::new()),
+    });
+    config::INSTALL(&mut registry, &mut daemon).expect("config installs");
+    (registry, daemon.spawn().expect("daemon starts"))
 }
 
 fn strs(a: &[&str]) -> Vec<String> {
@@ -119,12 +133,7 @@ fn config_set_import_roster() {
     let env = Env {
         runs_dir: ws.runs_dir(),
     };
-    let mut registry = Registry::new();
-    let mut daemon = Daemon::new(Config {
-        runs_dir: ws.runs_dir(),
-        herdr: Arc::new(CliHerdr::new()),
-    });
-    config::INSTALL(&mut registry, &mut daemon).expect("config installs");
+    let (registry, daemon) = start(&ws);
     let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
 
     // import: the toml goes in through the verb; a repeat converges.
@@ -203,7 +212,13 @@ fn config_set_import_roster() {
     // bad edits are refused and leave the row alone.
     assert_eq!(run(&["config", "set", "kind.scout.fallback", "ghost"]), 1);
     assert_eq!(run(&["config", "set", "kind.ghost.model", "m"]), 1);
-    assert_eq!(run(&["config", "set", "kind.half", r#"{"model":"m"}"#]), 2);
+    assert_eq!(run(&["config", "set", "kind.half", r#"{"model":"m"}"#]), 1);
+    // the toml's own spellings are not keys: refused, nothing stored.
+    let settings = count(&open(&ws), "setting");
+    assert_eq!(run(&["config", "set", "kinds.scout.model", "m"]), 1);
+    assert_eq!(run(&["config", "set", "purposes.build", "scout"]), 1);
+    assert_eq!(run(&["config", "set", "roles.cos.can_spawn", "[]"]), 1);
+    assert_eq!(count(&open(&ws), "setting"), settings);
     assert_eq!(run(&["config", "set", "purpose.x", "ghost"]), 1);
     assert_eq!(run(&["config", "get", "kind.ghost"]), 1);
     let k = config::kind(&open(&ws), "scout").unwrap().unwrap();
@@ -213,6 +228,7 @@ fn config_set_import_roster() {
     // does not undo it: the file's own kinds win, the rest stays.
     assert_eq!(run(&["config", "import", toml]), 0);
     assert!(config::kind(&open(&ws), "scout").unwrap().is_some());
+    daemon.stop().unwrap();
 }
 
 #[test]

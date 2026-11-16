@@ -4,18 +4,21 @@
 //! the one the next spawn reads ([`resolve_spawn`]). Every write is one
 //! transaction and converges: repeating a command leaves the same rows.
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Map, Value};
 
 use super::{parse, setting, validate, ConfigError, Kind, Parsed, RawKind, HARNESSES};
-use crate::cli::{CliError, Command, Env, Install, Registry};
-use crate::daemon::Daemon;
+use crate::cli::{rpc_call, CliError, Command, Env, Install, Registry};
+use crate::daemon::{Ctx, Daemon};
 use crate::db::path::DB_FILE;
+use crate::rpc::{Request, RpcError, BAD_REQUEST};
 
 /// The entry `cli::MODULES` lists (the Lead adds it at wave end).
 pub const INSTALL: Install = install;
 
-fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
+/// The daemon owns `qq.db` (R7): the verbs `config` and `roster` run there,
+/// and the CLI commands of the same names are thin clients of them.
+fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     registry.register(Command {
         name: "config",
         help: "config get [key] | set <key> <value> | import <team.toml> | validate [team.toml]",
@@ -25,7 +28,50 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
         name: "roster",
         help: "list kinds with harness, model, use_for and avoid",
         run: roster_cmd,
-    })
+    })?;
+    daemon.register_verb("config", Box::new(|ctx, req| serve(ctx, req, exec_config)))?;
+    daemon.register_verb(
+        "roster",
+        Box::new(|ctx, req| serve(ctx, req, |c, _| exec_roster(c))),
+    )
+}
+
+type Exec = fn(&mut Connection, &[String]) -> Result<String, CliError>;
+
+fn serve(ctx: &Ctx, req: &Request, exec: Exec) -> Result<Value, RpcError> {
+    let argv: Vec<String> = req
+        .args
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut conn = crate::db::open(&ctx.runs_dir.join(DB_FILE))
+        .map_err(|e| RpcError::new("internal", e.to_string()))?;
+    match exec(&mut conn, &argv) {
+        Ok(out) => Ok(json!({ "out": out })),
+        Err(e) if e.code == 2 => Err(RpcError::new(BAD_REQUEST, e.message)),
+        Err(e) => Err(RpcError::new("config_refused", e.message)),
+    }
+}
+
+fn client(env: &Env, verb: &str, args: &[String]) -> Result<String, CliError> {
+    let v = rpc_call(env, verb, json!({ "argv": args }))?;
+    Ok(v.get("out")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+    client(env, "config", args)
+}
+
+pub fn roster_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+    client(env, "roster", args)
 }
 
 const FIELDS: &[&str] = &[
@@ -50,20 +96,16 @@ fn fail(e: impl std::fmt::Display) -> CliError {
     CliError::new(1, e.to_string())
 }
 
-fn open(env: &Env) -> Result<Connection, CliError> {
-    crate::db::open(&env.runs_dir.join(DB_FILE)).map_err(fail)
-}
-
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
 // ---- commands ----------------------------------------------------------------
 
-pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+fn exec_config(conn: &mut Connection, args: &[String]) -> Result<String, CliError> {
     let a = |i: usize| args.get(i).map(String::as_str);
     match a(0) {
-        Some("get") => get(&open(env)?, a(1)).map(|v| match v {
+        Some("get") => get(conn, a(1)).map(|v| match v {
             Value::String(s) => s,
             v => pretty(&v),
         }),
@@ -71,8 +113,7 @@ pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
             let (Some(key), Some(val)) = (a(1), a(2)) else {
                 return Err(usage("set <key> <value>"));
             };
-            let mut conn = open(env)?;
-            set(&mut conn, key, val)?;
+            set(conn, key, val)?;
             Ok(format!("set {key}"))
         }
         Some("import") => {
@@ -80,18 +121,16 @@ pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
                 return Err(usage("import <team.toml>"));
             };
             let text = std::fs::read_to_string(path).map_err(fail)?;
-            let mut conn = open(env)?;
-            let n = import(&mut conn, &text).map_err(fail)?;
+            let n = import(conn, &text).map_err(fail)?;
             Ok(format!("imported {n} kinds"))
         }
         Some("validate") => {
-            let conn = open(env)?;
             match a(1) {
                 Some(path) => {
                     let text = std::fs::read_to_string(path).map_err(fail)?;
-                    check_text(&conn, &text).map_err(fail)?;
+                    check_text(conn, &text).map_err(fail)?;
                 }
-                None => check_db(&conn).map_err(fail)?,
+                None => check_db(conn).map_err(fail)?,
             }
             Ok("ok".to_string())
         }
@@ -101,8 +140,8 @@ pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     }
 }
 
-pub fn roster_cmd(env: &Env, _: &[String]) -> Result<String, CliError> {
-    let kinds = super::roster(&open(env)?).map_err(fail)?;
+fn exec_roster(conn: &mut Connection) -> Result<String, CliError> {
+    let kinds = super::roster(conn).map_err(fail)?;
     Ok(kinds
         .iter()
         .map(|k| {
@@ -178,7 +217,7 @@ fn get(conn: &Connection, key: Option<&str>) -> Result<Value, CliError> {
             "settings": settings,
         }));
     };
-    if key == "reviewers" {
+    if key == "reviewers" || key == "strategy.default_reviewer" {
         return Ok(json!(super::reviewers(conn).map_err(fail)?));
     }
     if let Some(rest) = key.strip_prefix("kind.") {
@@ -222,7 +261,9 @@ fn ensure_harnesses(tx: &Transaction<'_>) -> Result<(), ConfigError> {
 }
 
 fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
-    let tx = conn.transaction().map_err(fail)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(fail)?;
     ensure_harnesses(&tx).map_err(fail)?;
     if let Some(rest) = key.strip_prefix("kind.") {
         match rest.split_once('.') {
@@ -264,7 +305,7 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
             params![p, raw],
         )
         .map_err(fail)?;
-    } else if key == "reviewers" {
+    } else if key == "reviewers" || key == "strategy.default_reviewer" {
         let Value::Array(items) = loose(raw) else {
             return Err(CliError::new(2, "reviewers must be a JSON array of kinds"));
         };
@@ -285,8 +326,11 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
             .map_err(fail)?;
         }
     } else {
-        if key.is_empty() {
-            return Err(usage("set <key> <value>"));
+        if !setting_key(key) {
+            return Err(CliError::new(
+                2,
+                format!("unknown key '{key}': use kind.<name>[.field], purpose.<p>, reviewers or a team.toml setting"),
+            ));
         }
         tx.execute(
             "INSERT INTO setting (key, value_json) VALUES (?1, ?2)
@@ -296,6 +340,22 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
         .map_err(fail)?;
     }
     tx.commit().map_err(fail)
+}
+
+/// A key the toml seed maps to a `setting` row: a flat section key, or a role
+/// setting. Anything else would be stored and never read.
+fn setting_key(key: &str) -> bool {
+    let parts: Vec<&str> = key.split('.').collect();
+    match parts.as_slice() {
+        ["schema_version"] => true,
+        [sec, rest @ ..] if super::SETTING_SECTIONS.contains(sec) && !rest.is_empty() => {
+            !rest.iter().any(|p| p.is_empty())
+        }
+        ["roles", role, k] => {
+            super::ROLES.contains(role) && matches!(*k, "can_prompt" | "reports_to" | "max_peers")
+        }
+        _ => false,
+    }
 }
 
 fn require_kind(conn: &Connection, referrer: &str, kind: &str) -> Result<(), CliError> {
@@ -479,7 +539,7 @@ fn check_text(conn: &Connection, text: &str) -> Result<(), ConfigError> {
 /// settings are upserted, edges added; the reviewer list is replaced when the
 /// file names one. Nothing the file omits is deleted. Returns the kinds named.
 fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = parse_checked(&tx, text)?;
     ensure_harnesses(&tx)?;
     // Only the file's own kinds are written; the stored stand-ins are skipped.
