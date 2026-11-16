@@ -11,7 +11,8 @@
 //!
 //! Hard rules hold whatever the config says: Peer-to-Peer mail, a Peer
 //! mailing anyone but its spawner, a Peer spawning or running any
-//! orchestration call, a second active Lead in a project, and a push from an
+//! orchestration call, any Supervisor edge to a Peer, a Lead spawned without
+//! a project, a second active Lead in a project, and a push from an
 //! unfenced driver.
 
 mod gate;
@@ -25,10 +26,13 @@ use crate::config::{self, Driver};
 use crate::daemon::Daemon;
 use crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL;
 
-pub use gate::{check as gate_check, evaluate as gate_evaluate, Verdict as GateVerdict};
+pub use gate::{
+    check as gate_check, evaluate as gate_evaluate, evaluate_reader as gate_evaluate_reader,
+    Verdict as GateVerdict,
+};
 
 /// Workflow id of the stream that holds refusals in `events`.
-pub const JOURNAL_STREAM: &str = "authority";
+pub const JOURNAL_STREAM: &str = "authority:refusals";
 /// Event kind of a refusal row.
 pub const REFUSAL_KIND: &str = "refusal";
 
@@ -257,12 +261,20 @@ pub fn refusals(conn: &Connection) -> Result<Vec<Refusal>, AuthError> {
         .collect()
 }
 
-fn unknown(conn: &Connection, caller: &str, edge: &str, who: &str) -> Result<Decision, AuthError> {
+/// `who` (the caller or the target) is not an active agent; the refusal
+/// records the attempted `target` either way.
+fn unknown(
+    conn: &Connection,
+    caller: &str,
+    edge: &str,
+    target: &str,
+    who: &str,
+) -> Result<Decision, AuthError> {
     refuse(
         conn,
         caller,
         edge,
-        who,
+        target,
         &format!("'{who}' is not an active agent"),
     )
 }
@@ -277,10 +289,22 @@ pub fn check_spawn(
 ) -> Result<Decision, AuthError> {
     let target = target_role.as_str();
     let Some(c) = resolve(conn, caller)? else {
-        return unknown(conn, caller, "spawn", caller);
+        return unknown(conn, caller, "spawn", target, caller);
     };
     if c.role == Role::Peer {
         return refuse(conn, caller, "spawn", target, "a Peer can spawn nothing");
+    }
+    if c.role == Role::Supervisor && target_role == Role::Peer {
+        return refuse(
+            conn,
+            caller,
+            "spawn",
+            target,
+            "a Supervisor has no edge to Peers",
+        );
+    }
+    if target_role == Role::Lead && project.is_none() {
+        return refuse(conn, caller, "spawn", target, "a Lead needs a project");
     }
     if !has_edge(conn, c.role, target_role, "spawn")? {
         return refuse(
@@ -314,10 +338,10 @@ pub fn check_spawn(
 /// target's. A Supervisor's `question` edge does not carry mail.
 pub fn check_mail(conn: &Connection, caller: &str, target: &str) -> Result<Decision, AuthError> {
     let Some(c) = resolve(conn, caller)? else {
-        return unknown(conn, caller, "mail", caller);
+        return unknown(conn, caller, "mail", target, caller);
     };
     let Some(t) = resolve(conn, target)? else {
-        return unknown(conn, caller, "mail", target);
+        return unknown(conn, caller, "mail", target, target);
     };
     if c.role == Role::Peer {
         if t.role == Role::Peer {
@@ -334,8 +358,28 @@ pub fn check_mail(conn: &Connection, caller: &str, target: &str) -> Result<Decis
         }
         return Ok(Decision::Allowed);
     }
+    if c.role == Role::Supervisor && t.role == Role::Peer {
+        return refuse(
+            conn,
+            caller,
+            "mail",
+            target,
+            "a Supervisor has no edge to Peers",
+        );
+    }
     for edge in ["mail", "spawn", "report"] {
         if has_edge(conn, c.role, t.role, edge)? {
+            let own = t.spawner_id == Some(c.id)
+                || (c.project_id.is_some() && t.project_id == c.project_id);
+            if c.role == Role::Lead && t.role == Role::Peer && !own {
+                return refuse(
+                    conn,
+                    caller,
+                    "mail",
+                    target,
+                    "a Lead mails only Peers of its own project",
+                );
+            }
             return Ok(Decision::Allowed);
         }
     }
@@ -352,14 +396,23 @@ pub fn check_mail(conn: &Connection, caller: &str, target: &str) -> Result<Decis
 /// setting (from team.toml) must list the target's role; no setting, no edge.
 pub fn check_prompt(conn: &Connection, caller: &str, target: &str) -> Result<Decision, AuthError> {
     let Some(c) = resolve(conn, caller)? else {
-        return unknown(conn, caller, "prompt", caller);
+        return unknown(conn, caller, "prompt", target, caller);
     };
     let Some(t) = resolve(conn, target)? else {
-        return unknown(conn, caller, "prompt", target);
+        return unknown(conn, caller, "prompt", target, target);
     };
     let listed = config::setting(conn, &format!("roles.{}.can_prompt", c.role.as_str()))?
         .and_then(|v| v.as_array().cloned())
         .is_some_and(|l| l.iter().any(|x| x.as_str() == Some(t.role.as_str())));
+    if c.role == Role::Supervisor && t.role == Role::Peer {
+        return refuse(
+            conn,
+            caller,
+            "prompt",
+            target,
+            "a Supervisor has no edge to Peers",
+        );
+    }
     if c.role != Role::Peer && listed {
         Ok(Decision::Allowed)
     } else {
@@ -381,10 +434,10 @@ pub fn check_question(
     target: &str,
 ) -> Result<Decision, AuthError> {
     let Some(c) = resolve(conn, caller)? else {
-        return unknown(conn, caller, "question", caller);
+        return unknown(conn, caller, "question", target, caller);
     };
     let Some(t) = resolve(conn, target)? else {
-        return unknown(conn, caller, "question", target);
+        return unknown(conn, caller, "question", target, target);
     };
     if t.role != Role::Peer && has_edge(conn, c.role, t.role, "question")? {
         Ok(Decision::Allowed)
@@ -412,7 +465,7 @@ pub fn check_orchestration(
     fence: Fence,
 ) -> Result<Decision, AuthError> {
     let Some(c) = resolve(conn, caller)? else {
-        return unknown(conn, caller, "orchestration", caller);
+        return unknown(conn, caller, "orchestration", op.as_str(), caller);
     };
     if c.role == Role::Peer {
         return refuse(

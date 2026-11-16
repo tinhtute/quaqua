@@ -1,11 +1,13 @@
 //! The `gate` verb: the Claude Code PreToolUse(Bash) hook, ported from
 //! `crates/quaqua/src/gate`. Stateless: it tokenizes the hook's command and
 //! blocks what the daemon alone may do under R11 — a herdr pane, tab or
-//! workspace spawn/move, and any `git push`. Everything else is allowed.
+//! workspace spawn/move/close, any `git push`, and a `gh` merge. Everything
+//! else is allowed. It fails closed: empty input, a read error, a body that
+//! is not JSON, or a missing or non-string `tool_input.command` all block.
 //!
-//! Not ported: the old gate's `ask`/`deny` outward prompts (gh merge, force
-//! push wording, `pkill -f`, removed worker scripts) and the CoS-pane lookup;
-//! they belong to the old CLI's surface, not to the daemon's doors.
+//! Not ported: the old gate's `ask` prompts, `pkill -f`, removed worker
+//! scripts, and the CoS-pane lookup (every pane close is blocked instead: the
+//! daemon is the door).
 
 use super::tokenizer::tokenize;
 use crate::cli::{CliError, Command, Env};
@@ -16,6 +18,8 @@ pub const BLOCK_EXIT: i32 = 2;
 const PANE_MESSAGE: &str = "blocked: spawn/move panes and workspaces only through the qq daemon (qq call task.spawn / grid verbs)";
 const PUSH_MESSAGE: &str =
     "blocked: git push only through the qq daemon (the daemon is the one door for push)";
+const MERGE_MESSAGE: &str =
+    "blocked: merge only through the qq daemon (the daemon is the one door for merge)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -23,31 +27,85 @@ pub enum Verdict {
     Block(&'static str),
 }
 
-/// Decide for the hook's stdin JSON. Empty input allows; input that is not
-/// JSON fails closed (the gate cannot read the command it guards).
+/// Decide for the hook's stdin JSON. Anything the gate cannot read as a
+/// command string blocks.
 pub fn evaluate(hook_json: &str) -> Verdict {
-    if hook_json.trim().is_empty() {
-        return Verdict::Allow;
-    }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(hook_json) else {
         return Verdict::Block(PANE_MESSAGE);
     };
-    let cmd = v
+    match v
         .get("tool_input")
         .and_then(|t| t.get("command"))
         .and_then(|c| c.as_str())
-        .unwrap_or("");
-    check(cmd)
+    {
+        Some(cmd) if !cmd.trim().is_empty() => check(cmd),
+        _ => Verdict::Block(PANE_MESSAGE),
+    }
+}
+
+/// [`evaluate`] over a reader (the hook's stdin); a read error blocks.
+pub fn evaluate_reader<R: std::io::Read>(mut r: R) -> Verdict {
+    let mut s = String::new();
+    match r.read_to_string(&mut s) {
+        Ok(_) => evaluate(&s),
+        Err(_) => Verdict::Block(PANE_MESSAGE),
+    }
 }
 
 /// Check one shell command: every simple command in it, nested ones included.
 pub fn check(command: &str) -> Verdict {
-    for seg in tokenize(command) {
-        if let v @ Verdict::Block(_) = check_words(&seg) {
+    let segs = tokenize(command);
+    for seg in &segs {
+        if let v @ Verdict::Block(_) = check_words(seg) {
             return v;
         }
     }
+    // A shell that reads its script from stdin (`| bash`, `bash -s`, a
+    // here-string or heredoc) hides the script from the tokenizer: block when
+    // the command text names a push.
+    if mentions_push(command) && segs.iter().any(|s| reads_stdin_script(s)) {
+        return Verdict::Block(PUSH_MESSAGE);
+    }
     Verdict::Allow
+}
+
+fn mentions_push(text: &str) -> bool {
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .collect();
+    words.contains(&"git") && words.contains(&"push")
+}
+
+fn is_shell(base: &str) -> bool {
+    matches!(
+        base,
+        "bash" | "sh" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "fish"
+    )
+}
+
+/// The words of a shell invocation (busybox applet unwrapped), if `w` is one.
+fn shell_args(w: &[String]) -> Option<&[String]> {
+    let i = w.iter().position(|x| !keyword(x) && !is_assignment(x))?;
+    let base = w[i].rsplit('/').next().unwrap_or(&w[i]);
+    let a = &w[i + 1..];
+    if is_shell(base) {
+        Some(a)
+    } else if base == "busybox" && a.first().is_some_and(|x| is_shell(x)) {
+        Some(&a[1..])
+    } else {
+        None
+    }
+}
+
+/// A shell with no `-c` payload and no script file reads stdin.
+fn reads_stdin_script(w: &[String]) -> bool {
+    let Some(a) = shell_args(w) else {
+        return false;
+    };
+    if a.iter().any(|x| is_c_flag(x)) {
+        return false;
+    }
+    a.iter().all(|x| x.starts_with('-')) || a.iter().any(|x| x == "-s")
 }
 
 fn keyword(w: &str) -> bool {
@@ -105,7 +163,9 @@ fn guarded_pair(a: &str, b: &str) -> bool {
         (a, b),
         ("pane", "split")
             | ("pane", "move")
+            | ("pane", "close")
             | ("tab", "create")
+            | ("tab", "close")
             | ("workspace", "create")
             | ("workspace", "close")
             | ("agent", "start")
@@ -121,19 +181,62 @@ fn check_words(w: &[String]) -> Verdict {
     match base {
         "herdr" => check_herdr(a),
         "git" => check_git(a),
-        "bash" | "sh" | "dash" | "zsh" => {
-            for k in 0..a.len() {
-                if is_c_flag(&a[k]) && k + 1 < a.len() {
-                    return check(&a[k + 1]);
-                }
-            }
-            Verdict::Allow
-        }
+        "gh" => check_gh(a),
+        b if is_shell(b) => check_shell(a),
+        "busybox" if a.first().is_some_and(|x| is_shell(x)) => check_shell(&a[1..]),
         "eval" if !a.is_empty() => check(&a.join(" ")),
+        "find" => check_find(a),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
-        | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" => wrapper(base, a),
+        | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
         _ => Verdict::Allow,
     }
+}
+
+fn check_shell(a: &[String]) -> Verdict {
+    for k in 0..a.len() {
+        if is_c_flag(&a[k]) && k + 1 < a.len() {
+            return check(&a[k + 1]);
+        }
+    }
+    Verdict::Allow
+}
+
+/// `find … -exec|-execdir|-ok|-okdir CMD … ;|+`: CMD is checked.
+fn check_find(a: &[String]) -> Verdict {
+    for (k, w) in a.iter().enumerate() {
+        if matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let cmd: Vec<String> = a[k + 1..]
+                .iter()
+                .take_while(|x| x.as_str() != ";" && x.as_str() != "+")
+                .cloned()
+                .collect();
+            if let v @ Verdict::Block(_) = check_words(&cmd) {
+                return v;
+            }
+        }
+    }
+    Verdict::Allow
+}
+
+/// `gh pr merge`, a merge endpoint through `gh api`, or a merge mutation.
+fn check_gh(a: &[String]) -> Verdict {
+    let pr = a.iter().position(|x| x == "pr");
+    if pr.is_some_and(|p| a[p + 1..].iter().any(|x| x == "merge")) {
+        return Verdict::Block(MERGE_MESSAGE);
+    }
+    if a.iter().any(|x| x == "api") {
+        let merge_path = a.iter().any(|x| {
+            let path = x.split('?').next().unwrap_or(x).trim_end_matches('/');
+            !x.starts_with('-') && (path.ends_with("/merge") || path.ends_with("/merges"))
+        });
+        let explicit_get = a.windows(2).any(|w| {
+            matches!(w[0].as_str(), "-X" | "--method") && w[1].eq_ignore_ascii_case("GET")
+        }) || a.iter().any(|x| x.eq_ignore_ascii_case("-XGET"));
+        if (merge_path && !explicit_get) || a.iter().any(|x| x.contains("mergePullRequest")) {
+            return Verdict::Block(MERGE_MESSAGE);
+        }
+    }
+    Verdict::Allow
 }
 
 /// A guarded pair counts only as the command's verb: every word before it is
@@ -160,7 +263,20 @@ fn check_git(a: &[String]) -> Verdict {
     let mut i = 0;
     while i < a.len() {
         let w = a[i].as_str();
-        if w == "-C" || w == "-c" {
+        if w == "-c" || (w.starts_with("-c") && w.len() > 2) {
+            let cfg = if w == "-c" { a.get(i + 1) } else { Some(&a[i]) };
+            let cfg = cfg.map(|c| c.trim_start_matches("-c")).unwrap_or("");
+            if let Some(rest) = cfg.strip_prefix("alias.") {
+                let body = rest.split_once('=').map_or("", |x| x.1);
+                if body
+                    .split_whitespace()
+                    .any(|t| t.trim_start_matches('!') == "push")
+                {
+                    return Verdict::Block(PUSH_MESSAGE);
+                }
+            }
+            i += if w == "-c" { 2 } else { 1 };
+        } else if w == "-C" {
             i += 2;
         } else if w == "--help" || w == "-h" {
             return Verdict::Allow;
@@ -189,17 +305,38 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
         "sudo" => " u g h p C T U R t D ",
         "env" => " u C S ",
         "nice" => " n ",
+        "timeout" => " s k ",
+        "xargs" => " I n L P s d E a ",
         _ => " ",
     };
     let mut k = 0;
+    let mut duration_pending = base == "timeout";
     while k < a.len() {
         if let Some(f) = single_letter_flag(&a[k]) {
             if value_flags.contains(&format!(" {f} ")) {
+                // `env -S 'cmd args'`: the value is a command line.
+                if base == "env" && f == 'S' {
+                    if let Some(p) = a.get(k + 1) {
+                        if let v @ Verdict::Block(_) = check(p) {
+                            return v;
+                        }
+                    }
+                }
                 k += 2;
                 continue;
             }
         }
+        if let Some(p) = a[k].strip_prefix("--split-string=") {
+            if let v @ Verdict::Block(_) = check(p) {
+                return v;
+            }
+        }
         if a[k].starts_with('-') || is_assignment(&a[k]) {
+            k += 1;
+            continue;
+        }
+        if duration_pending {
+            duration_pending = false;
             k += 1;
             continue;
         }
@@ -209,17 +346,12 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
 }
 
 fn run(_: &Env, args: &[String]) -> Result<String, CliError> {
-    let input = match args {
-        [flag, json] if flag == "--json" => json.clone(),
-        [] => {
-            use std::io::Read;
-            let mut s = String::new();
-            let _ = std::io::stdin().read_to_string(&mut s);
-            s
-        }
+    let verdict = match args {
+        [flag, json] if flag == "--json" => evaluate(json),
+        [] => evaluate_reader(std::io::stdin()),
         _ => return Err(CliError::new(2, "usage: qq gate [--json <hook-json>]")),
     };
-    match evaluate(&input) {
+    match verdict {
         Verdict::Allow => Ok(String::new()),
         Verdict::Block(msg) => Err(CliError::new(BLOCK_EXIT, msg)),
     }

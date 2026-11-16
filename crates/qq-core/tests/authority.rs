@@ -116,7 +116,7 @@ fn topology_refuses_off_edge() {
     // Same rows are plain `events` rows a reader of the journal can see.
     let n: i64 = conn
         .query_row(
-            "SELECT count(*) FROM events WHERE workflow_id = 'authority' AND kind = 'refusal'",
+            "SELECT count(*) FROM events WHERE workflow_id = 'authority:refusals' AND kind = 'refusal'",
             [],
             |r| r.get(0),
         )
@@ -278,13 +278,255 @@ fn gate_verb_blocks_pane_and_push() {
     ] {
         assert_eq!(hook(cmd), 0, "must allow: {cmd}");
     }
-    // Input the gate cannot parse fails closed; empty input allows.
+    // Input the gate cannot parse fails closed, empty input included.
     assert_eq!(
         registry.dispatch(&env, &["gate".into(), "--json".into(), "{not json".into()]),
         2
     );
     assert_eq!(
         registry.dispatch(&env, &["gate".into(), "--json".into(), String::new()]),
-        0
+        2
+    );
+}
+
+fn gate_exit(cmd: &str) -> i32 {
+    let ws = TestWorkspace::new("auth-gate-x");
+    let mut registry = Registry::new();
+    let mut daemon = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: Arc::new(FakeHerdr::new()),
+    });
+    authority::INSTALL(&mut registry, &mut daemon).unwrap();
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let json = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+    registry.dispatch(&env, &["gate".into(), "--json".into(), json.to_string()])
+}
+
+#[test]
+fn gate_wrappers_cannot_hide_push() {
+    for cmd in [
+        "timeout 60 git push origin x",
+        "timeout -s KILL 5 git push",
+        "xargs -I{} git push",
+        "xargs -I {} git push origin {}",
+        "xargs -n1 git push",
+        "xargs -P 4 -n 1 git push",
+        "echo x | xargs git push",
+        "env -S 'git push origin x'",
+        "env --split-string='git push'",
+        "find . -exec git push \\;",
+        "find . -execdir git push {} +",
+        "echo 'git push' | bash",
+        "echo 'git push' | sh",
+        "echo 'git push' | zsh -s",
+        "bash -s <<< 'git push'",
+        "sh <<EOF\ngit push\nEOF",
+        "ksh -c 'git push'",
+        "fish -c 'git push'",
+        "dash -c 'git push'",
+        "busybox sh -c 'git push'",
+        "git -c alias.p=push p",
+        "git -calias.p='push origin' p",
+        "git -c alias.p='!git push' p",
+    ] {
+        assert_eq!(gate_exit(cmd), 2, "must block: {cmd}");
+    }
+}
+
+#[test]
+fn gate_wrapper_negatives() {
+    for cmd in [
+        "timeout 60 cargo test",
+        "xargs -I{} echo {}",
+        "xargs -n1 git status",
+        "env -S 'git status'",
+        "env FOO=1 git log",
+        "find . -name '*.rs' -exec grep push {} +",
+        "find . -exec git status {} \\;",
+        "echo 'git push' | wc -c",
+        "echo hello | bash",
+        "bash scripts/build.sh",
+        "bash -s <<< 'echo hi'",
+        "ksh -c 'echo hi'",
+        "busybox sh -c 'ls'",
+        "git -c user.name=x status",
+        "git -c alias.st=status st",
+        "gh pr view 12",
+        "herdr pane list",
+    ] {
+        assert_eq!(gate_exit(cmd), 0, "must allow: {cmd}");
+    }
+}
+
+#[test]
+fn gate_blocks_gh_merge() {
+    for cmd in [
+        "gh pr merge 12",
+        "gh pr merge --squash --auto",
+        "gh pr -R o/r merge 12",
+        "gh api -X PUT repos/o/r/pulls/12/merge",
+        "gh api --method POST repos/o/r/merges -f base=main -f head=x",
+        "gh api repos/o/r/pulls/12/merge -X PUT",
+        "gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+        "echo go && gh pr merge 3",
+    ] {
+        assert_eq!(gate_exit(cmd), 2, "must block: {cmd}");
+    }
+    for cmd in [
+        "gh pr view 12",
+        "gh pr list",
+        "gh api repos/o/r/pulls/12",
+        "gh api -X GET repos/o/r/pulls/12/merge",
+    ] {
+        assert_eq!(gate_exit(cmd), 0, "must allow: {cmd}");
+    }
+}
+
+#[test]
+fn gate_blocks_close() {
+    for cmd in [
+        "herdr pane close 1-2",
+        "herdr pane close --current",
+        "herdr tab close 1",
+        "herdr workspace close w",
+        "herdr --session x pane close p",
+    ] {
+        assert_eq!(gate_exit(cmd), 2, "must block: {cmd}");
+    }
+    assert_eq!(gate_exit("herdr pane close --help"), 0);
+    assert_eq!(gate_exit("herdr pane read 1-2"), 0);
+}
+
+#[test]
+fn gate_fails_closed() {
+    for json in [
+        "",
+        "   ",
+        "{}",
+        r#"{"tool_input":{}}"#,
+        r#"{"tool_input":{"command":5}}"#,
+        r#"{"tool_input":{"command":null}}"#,
+        r#"{"tool_input":{"command":""}}"#,
+        "not json",
+    ] {
+        assert_eq!(
+            authority::gate_evaluate(json),
+            authority::GateVerdict::Block(
+                "blocked: spawn/move panes and workspaces only through the qq daemon (qq call task.spawn / grid verbs)"
+            ),
+            "must block: {json:?}"
+        );
+    }
+    struct Broken;
+    impl std::io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdin gone"))
+        }
+    }
+    assert!(matches!(
+        authority::gate_evaluate_reader(Broken),
+        authority::GateVerdict::Block(_)
+    ));
+    let ok = br#"{"tool_input":{"command":"ls"}}"#;
+    assert_eq!(
+        authority::gate_evaluate_reader(&ok[..]),
+        authority::GateVerdict::Allow
+    );
+}
+
+#[test]
+fn supervisor_has_no_peer_edge_even_with_config() {
+    let ws = TestWorkspace::new("auth-sup-peer");
+    let conn = setup(&ws);
+    // A config that grants every Supervisor -> Peer edge still gets refused.
+    for kind in ["spawn", "mail", "report", "question"] {
+        edge(&conn, "supervisor", "peer", kind);
+    }
+    conn.execute(
+        "INSERT INTO setting (key, value_json) VALUES ('roles.supervisor.can_prompt', '[\"peer\"]')",
+        [],
+    )
+    .unwrap();
+    let cos = agent(&conn, "cos", "cos", None, None);
+    let lead = agent(&conn, "lead-a", "lead", Some(1), Some(cos));
+    agent(&conn, "p1", "peer", Some(1), Some(lead));
+    agent(&conn, "sup", "supervisor", None, None);
+
+    refused(check_spawn(&conn, "sup", Role::Peer, Some(1)).unwrap());
+    refused(check_mail(&conn, "sup", "p1").unwrap());
+    refused(check_prompt(&conn, "sup", "p1").unwrap());
+    refused(check_question(&conn, "sup", "p1").unwrap());
+    assert_eq!(authority::refusals(&conn).unwrap().len(), 4);
+}
+
+#[test]
+fn lead_spawn_needs_project() {
+    let ws = TestWorkspace::new("auth-lead-np");
+    let conn = setup(&ws);
+    agent(&conn, "cos", "cos", None, None);
+    let r = refused(check_spawn(&conn, "cos", Role::Lead, None).unwrap());
+    assert_eq!((r.caller.as_str(), r.edge.as_str()), ("cos", "spawn"));
+    allowed(check_spawn(&conn, "cos", Role::Lead, Some(1)).unwrap());
+    // A Peer may still be spawned without a project (a CoS-owned worker).
+    allowed(check_spawn(&conn, "cos", Role::Peer, None).unwrap());
+}
+
+#[test]
+fn lead_mail_scoped_to_own_project() {
+    let ws = TestWorkspace::new("auth-lead-scope");
+    let conn = setup(&ws);
+    let cos = agent(&conn, "cos", "cos", None, None);
+    let a = agent(&conn, "lead-a", "lead", Some(1), Some(cos));
+    let b = agent(&conn, "lead-b", "lead", Some(2), Some(cos));
+    agent(&conn, "pa", "peer", Some(1), Some(a));
+    agent(&conn, "pb", "peer", Some(2), Some(b));
+    // A Peer of project 1 spawned by someone else, to prove spawner also counts.
+    agent(&conn, "px", "peer", Some(2), Some(a));
+
+    allowed(check_mail(&conn, "lead-a", "pa").unwrap());
+    allowed(check_mail(&conn, "lead-a", "px").unwrap());
+    let r = refused(check_mail(&conn, "lead-a", "pb").unwrap());
+    assert_eq!(
+        (r.caller.as_str(), r.edge.as_str(), r.target.as_str()),
+        ("lead-a", "mail", "pb")
+    );
+    allowed(check_mail(&conn, "lead-b", "pb").unwrap());
+    refused(check_mail(&conn, "lead-b", "pa").unwrap());
+}
+
+#[test]
+fn unreadable_database_is_an_error_not_an_allow() {
+    // No schema at all: the decision cannot be made, so every check errs and
+    // the caller must refuse.
+    let conn = Connection::open_in_memory().unwrap();
+    assert!(check_spawn(&conn, "cos", Role::Peer, Some(1)).is_err());
+    assert!(check_mail(&conn, "a", "b").is_err());
+    assert!(check_prompt(&conn, "a", "b").is_err());
+    assert!(check_question(&conn, "a", "b").is_err());
+    assert!(check_orchestration(&conn, "a", Op::Push, Fence::Fenced).is_err());
+}
+
+#[test]
+fn unknown_caller_refusal_records_attempted_target() {
+    let ws = TestWorkspace::new("auth-unknown");
+    let conn = setup(&ws);
+    agent(&conn, "lead-a", "lead", Some(1), None);
+    refused(check_spawn(&conn, "ghost", Role::Peer, Some(1)).unwrap());
+    refused(check_mail(&conn, "ghost", "lead-a").unwrap());
+    refused(check_orchestration(&conn, "ghost", Op::Merge, Fence::Fenced).unwrap());
+    let log = authority::refusals(&conn).unwrap();
+    let got: Vec<(&str, &str, &str)> = log
+        .iter()
+        .map(|r| (r.caller.as_str(), r.edge.as_str(), r.target.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("ghost", "spawn", "peer"),
+            ("ghost", "mail", "lead-a"),
+            ("ghost", "orchestration", "merge"),
+        ]
     );
 }
