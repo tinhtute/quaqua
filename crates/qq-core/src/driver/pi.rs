@@ -4,9 +4,9 @@
 //! session jsonl herdr reports in `agent_session` (`kind:"path"`).
 //!
 //! Hook: pi's `tool_call` extension event can block a call (`{block:true,
-//! reason}`); the installed extension asks `quaqua gate` and blocks on exit 2.
+//! reason}`); the installed extension asks `quaqua gate` and blocks unless it exits 0 (fail closed, also on spawn error).
 
-use super::{HarnessDriver, Hook, Usage};
+use super::{exclude_from_git, write_atomic, HarnessDriver, Hook, Usage};
 use std::io;
 use std::path::Path;
 
@@ -20,16 +20,14 @@ fn hook_source(gate: &Path) -> String {
         r#"// Written by quaqua (driver pi). Do not edit.
 import {{ spawnSync }} from "node:child_process";
 const GATE = {gate:?};
-const PUSH = /\bgit\b(\s+-\S+(\s+\S+)?)*\s+push\b/;
 export default function (pi: any) {{
 	pi.on("tool_call", async (event: any) => {{
 		if (event.toolName !== "bash") return undefined;
 		const command = String(event.input?.command ?? "");
 		const payload = JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }}, cwd: process.cwd() }});
 		const r = spawnSync(GATE, ["gate"], {{ input: payload, encoding: "utf8" }});
-		const blocked = r.error ? PUSH.test(command) : r.status === 2;
-		if (!blocked) return undefined;
-		return {{ block: true, reason: (r.stderr || "Blocked by quaqua gate.").trim() }};
+		if (!r.error && r.status === 0) return undefined;
+		return {{ block: true, reason: String(r.stderr || "Blocked by quaqua gate.").trim() }};
 	}});
 }}
 "#
@@ -70,26 +68,28 @@ impl HarnessDriver for Pi {
         let path = worktree.join(HOOK_REL);
         let want = hook_source(gate);
         if std::fs::read_to_string(&path).ok().as_deref() != Some(want.as_str()) {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension("ts.tmp");
-            std::fs::write(&tmp, want)?;
-            std::fs::rename(&tmp, &path)?;
+            write_atomic(&path, want.as_bytes())?;
         }
+        exclude_from_git(worktree, &format!("/{HOOK_REL}"))?;
         Ok(Some(Hook { path }))
     }
 
-    /// Sums every assistant `message.usage` line of the session jsonl:
-    /// `input`, `output`, `cacheRead`, `cacheWrite` and `cost.total` (USD).
+    /// Sums the `message.usage` of every assistant message entry of the
+    /// session jsonl: `input`, `output`, `cacheRead`, `cacheWrite` and
+    /// `cost.total` (USD). An assistant entry without a cost makes the cost
+    /// unknown (`None`), never $0.
     fn usage(&self, session_file: &Path) -> io::Result<Option<Usage>> {
         let text = std::fs::read_to_string(session_file)?;
         let mut u = Usage::default();
+        let mut cost = Some(0.0);
         let mut seen = false;
         for line in text.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue; // a half-written last line
             };
+            if v.pointer("/message/role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue;
+            }
             let Some(m) = v.pointer("/message/usage") else {
                 continue;
             };
@@ -99,11 +99,12 @@ impl HarnessDriver for Pi {
             u.output += n("output");
             u.cache_read += n("cacheRead");
             u.cache_write += n("cacheWrite");
-            u.cost_usd += m
-                .pointer("/cost/total")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
+            cost = match (cost, m.pointer("/cost/total").and_then(|x| x.as_f64())) {
+                (Some(t), Some(c)) => Some(t + c),
+                _ => None,
+            };
         }
+        u.cost_usd = cost;
         Ok(seen.then_some(u))
     }
 }

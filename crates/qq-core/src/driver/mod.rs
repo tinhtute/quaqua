@@ -30,7 +30,8 @@ pub struct Usage {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
-    pub cost_usd: f64,
+    /// `None`: some assistant entry carried no cost, so the total is unknown.
+    pub cost_usd: Option<f64>,
 }
 
 /// Where a driver's fence hook was written (idempotent: same bytes, same path).
@@ -78,8 +79,9 @@ pub trait HarnessDriver: Send + Sync {
         Vec::new()
     }
 
-    /// Writes this driver's fence hook into `worktree`, gating through the
-    /// executable `gate` (`quaqua gate` or a wrapper). `None`: no hook exists.
+    /// Writes this driver's fence hook into `worktree`, gating through
+    /// `<gate> gate` (argv; `gate` is the quaqua binary). Never touches a
+    /// tracked file. `None`: no hook exists.
     fn install_hook(&self, _worktree: &Path, _gate: &Path) -> io::Result<Option<Hook>> {
         Ok(None)
     }
@@ -93,32 +95,96 @@ pub trait HarnessDriver: Send + Sync {
 
 /// Stops a working agent: sends each of the driver's stop sequences in order,
 /// waiting `settle_ms` for idle after each, and stops at the first that works.
-/// Already idle converges with no keys sent. `false`: no sequence idled it
-/// (the caller falls back to `herdr agent stop`).
+/// Already idle converges with no keys sent. A per-sequence error moves on to
+/// the next sequence. `false`: nothing idled it (the caller falls back to
+/// `herdr agent stop`); never an error.
 pub fn stop(
     client: &dyn HerdrClient,
     driver: &dyn HarnessDriver,
     name: &str,
     settle_ms: u64,
 ) -> io::Result<bool> {
-    let idle = |c: &dyn HerdrClient| -> io::Result<bool> {
-        Ok(c.agent_wait(name, &["idle"], settle_ms)?.ok)
-    };
     if let Ok(r) = client.agent_get(name) {
-        if r.ok && r.body.contains(r#""agent_status":"idle""#) {
+        if r.ok && agent_status(&r.body).as_deref() == Some("idle") {
             return Ok(true);
         }
     }
     for seq in driver.stop_sequences() {
         let keys: Vec<&str> = seq.iter().map(String::as_str).collect();
-        if !client.agent_send_keys(name, &keys)?.ok {
-            continue;
+        match client.agent_send_keys(name, &keys) {
+            Ok(r) if r.ok => {}
+            _ => continue,
         }
-        if idle(client)? {
+        if matches!(client.agent_wait(name, &["idle"], settle_ms), Ok(r) if r.ok) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn agent_status(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.pointer("/result/agent/agent_status")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Single-quotes `s` for a POSIX shell.
+pub(crate) fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Writes `bytes` to `path` via a unique tmp file and rename.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let tmp = path.with_file_name(name);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Adds `pattern` (a repo-root-anchored path) to the repository's
+/// `info/exclude` once, so an installed hook file is never committed.
+pub(crate) fn exclude_from_git(worktree: &Path, pattern: &str) -> io::Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "git rev-parse failed in {}",
+            worktree.display()
+        )));
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let path = worktree.join(rel);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if text.lines().any(|l| l == pattern) {
+        return Ok(());
+    }
+    let mut text = text;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(pattern);
+    text.push('\n');
+    write_atomic(&path, text.as_bytes())
 }
 
 /// Starts `driver`'s agent. A transport error is retried (start converges on

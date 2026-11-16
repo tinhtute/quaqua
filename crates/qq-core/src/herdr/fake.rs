@@ -133,7 +133,6 @@ impl FakeHerdr {
         self.lock().prompts.clone()
     }
 
-    /// The agent args the agent was started with (after the `--`).
     /// Every `send-keys` call, in order: (agent, keys).
     pub fn keys(&self) -> Vec<(String, Vec<String>)> {
         self.lock().keys.clone()
@@ -147,6 +146,7 @@ impl FakeHerdr {
         );
     }
 
+    /// The agent args the agent was started with (after the `--`).
     pub fn start_args(&self, name: &str) -> Vec<String> {
         self.lock()
             .agents
