@@ -46,6 +46,8 @@ struct State {
     splits: Vec<(String, String)>,
     /// `(new pane, cwd)` of every `pane_split_in`.
     split_cwds: Vec<(String, String)>,
+    /// pane id -> (shell pid, foreground pids) `pane_process_info` reports.
+    pids: BTreeMap<String, (u32, Vec<u32>)>,
     next_id: u32,
 }
 
@@ -149,6 +151,14 @@ impl FakeHerdr {
     /// Whether herdr still has `pane`.
     pub fn has_pane(&self, pane: &str) -> bool {
         self.lock().panes.contains_key(pane)
+    }
+
+    /// Test control: the shell pid and foreground pids `pane_process_info`
+    /// reports for `pane`.
+    pub fn set_pane_pids(&self, pane: &str, shell: u32, foreground: &[u32]) {
+        self.lock()
+            .pids
+            .insert(pane.to_string(), (shell, foreground.to_vec()));
     }
 
     /// What `pane_read` returns for `pane` (its whole scrollback).
@@ -490,6 +500,23 @@ impl HerdrClient for FakeHerdr {
         let all: Vec<&str> = text.lines().collect();
         let tail = &all[all.len().saturating_sub(lines as usize)..];
         Ok(Reply::ok(tail.join("\n")))
+    }
+
+    fn pane_process_info(&self, pane: &str) -> io::Result<Reply> {
+        let st = enter!(self, Verb::PaneProcessInfo);
+        if !st.panes.contains_key(pane) {
+            return Ok(Reply::err("pane_not_found"));
+        }
+        let Some((shell, fg)) = st.pids.get(pane) else {
+            return Ok(Reply::err("process_info_unavailable"));
+        };
+        let fg: Vec<_> = fg.iter().map(|p| serde_json::json!({"pid": p})).collect();
+        Ok(Reply::ok(
+            serde_json::json!({"result":{"process_info":{
+                "pane_id": pane, "shell_pid": shell, "foreground_processes": fg,
+            }}})
+            .to_string(),
+        ))
     }
 
     fn pane_get(&self, pane: &str) -> io::Result<Reply> {

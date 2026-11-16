@@ -6,6 +6,8 @@
 //! Pane access goes through [`PaneOps`], two calls the CLI forwards to
 //! `CliHerdr` (`pane_get` and `pane_report_metadata`).
 
+pub mod peer;
+
 use std::path::{Component, Path};
 
 use serde_json::Value;
@@ -262,7 +264,8 @@ pub fn heal(panes: &dyn PaneOps, runs_dir: &Path) -> Result<Vec<String>, String>
 /// The entry `cli::MODULES` lists.
 pub const INSTALL: Install = install;
 
-fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
+fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
+    daemon.require_peer(std::sync::Arc::new(peer::HerdrPeers::new(daemon.herdr())));
     registry.register(Command {
         name: "identity",
         help: "identity heal: restore the CoS pane tokens after a herdr restart",

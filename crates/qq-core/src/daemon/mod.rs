@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::herdr::HerdrClient;
+use crate::identity::peer::{self, PeerResolver};
 use crate::rpc::{self, Request, Response, RpcError};
 use store::Store;
 use supervisor::{Factory, LiveHook, Supervisor};
@@ -196,6 +197,7 @@ pub struct Daemon {
     verbs: BTreeMap<String, Handler>,
     kinds: HashMap<String, Factory>,
     live_hooks: Vec<LiveHook>,
+    peers: Option<Arc<dyn PeerResolver>>,
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
@@ -221,6 +223,7 @@ impl Daemon {
             verbs: BTreeMap::new(),
             kinds: HashMap::new(),
             live_hooks: Vec::new(),
+            peers: None,
         };
         d.register_builtin();
         d
@@ -242,6 +245,13 @@ impl Daemon {
         }
         self.kinds.insert(kind.to_string(), factory);
         Ok(())
+    }
+
+    /// Names every caller from the socket peer: a request's own `caller` is
+    /// replaced by the resolved agent, and a peer that maps to none is refused
+    /// before any verb runs. Without it the claimed `caller` stands.
+    pub fn require_peer(&mut self, peers: Arc<dyn PeerResolver>) {
+        self.peers = Some(peers);
     }
 
     /// The herdr handle the daemon was configured with, for installs that
@@ -360,6 +370,7 @@ impl Daemon {
             verbs,
             kinds,
             live_hooks,
+            peers,
         } = self;
         let socket = rpc::socket_path(&cfg.runs_dir);
         std::fs::create_dir_all(&cfg.runs_dir)?;
@@ -393,8 +404,8 @@ impl Daemon {
                 break;
             }
             let Ok(stream) = conn else { continue };
-            let (ctx, verbs) = (Arc::clone(&ctx), Arc::clone(&verbs));
-            std::thread::spawn(move || serve_conn(stream, &ctx, &verbs));
+            let (ctx, verbs, peers) = (Arc::clone(&ctx), Arc::clone(&verbs), peers.clone());
+            std::thread::spawn(move || serve_conn(stream, &ctx, &verbs, peers.as_deref()));
         }
         // Stopping: close the door first, so a new daemon is not kept out by
         // a watcher blocked in `agent wait` (herdr cannot cancel it).
@@ -515,10 +526,17 @@ fn bind_socket(path: &Path) -> Result<UnixListener, DaemonError> {
     }
 }
 
-fn serve_conn(stream: UnixStream, ctx: &Ctx, verbs: &BTreeMap<String, Handler>) {
+fn serve_conn(
+    stream: UnixStream,
+    ctx: &Ctx,
+    verbs: &BTreeMap<String, Handler>,
+    peers: Option<&dyn PeerResolver>,
+) {
     let Ok(mut out) = stream.try_clone() else {
         return;
     };
+    // Read once: the peer of a connected socket never changes.
+    let cred = peers.map(|_| peer::peer_cred(&stream));
     let mut reader = BufReader::new(stream);
     while let Ok(Some(line)) = rpc::read_line(&mut reader) {
         if line.trim().is_empty() {
@@ -526,14 +544,17 @@ fn serve_conn(stream: UnixStream, ctx: &Ctx, verbs: &BTreeMap<String, Handler>) 
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             Err(e) => Response::err(RpcError::new(rpc::BAD_REQUEST, e.to_string())),
-            Ok(req) => match verbs.get(&req.verb) {
-                None => Response::err(RpcError::new(
-                    rpc::UNKNOWN_VERB,
-                    format!("no verb '{}'", req.verb),
-                )),
-                Some(h) => match h(ctx, &req) {
-                    Ok(v) => Response::ok(v),
-                    Err(e) => Response::err(e),
+            Ok(req) => match identify(req, peers, cred.as_ref()) {
+                Err(e) => Response::err(e),
+                Ok(req) => match verbs.get(&req.verb) {
+                    None => Response::err(RpcError::new(
+                        rpc::UNKNOWN_VERB,
+                        format!("no verb '{}'", req.verb),
+                    )),
+                    Some(h) => match h(ctx, &req) {
+                        Ok(v) => Response::ok(v),
+                        Err(e) => Response::err(e),
+                    },
                 },
             },
         };
@@ -541,4 +562,24 @@ fn serve_conn(stream: UnixStream, ctx: &Ctx, verbs: &BTreeMap<String, Handler>) 
             return;
         }
     }
+}
+
+/// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
+/// client's claim is dropped); an unreadable or unmapped peer is refused.
+fn identify(
+    mut req: Request,
+    peers: Option<&dyn PeerResolver>,
+    cred: Option<&io::Result<peer::PeerCred>>,
+) -> Result<Request, RpcError> {
+    let (Some(peers), Some(cred)) = (peers, cred) else {
+        return Ok(req);
+    };
+    let cred = cred.as_ref().map_err(|e| {
+        RpcError::new(
+            peer::UNMAPPED_PEER,
+            format!("caller not identified: socket peer unreadable: {e}"),
+        )
+    })?;
+    req.caller = Some(peers.resolve(*cred)?.0);
+    Ok(req)
 }

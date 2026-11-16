@@ -33,6 +33,7 @@ pub enum Verb {
     PaneGet,
     PaneReportMetadata,
     PaneRead,
+    PaneProcessInfo,
 }
 
 use std::io;
@@ -151,6 +152,12 @@ pub trait HerdrClient: Send + Sync {
     /// recent text. The reply body is the text itself, not JSON.
     fn pane_read(&self, _pane: &str, _lines: u32) -> io::Result<Reply> {
         Err(unsupported("pane read"))
+    }
+    /// `herdr pane process-info --pane PANE`:
+    /// `{"result":{"process_info":{"shell_pid":N,"foreground_processes":[{"pid":N,..}]}}}`.
+    /// Default `Unsupported`.
+    fn pane_process_info(&self, _pane: &str) -> io::Result<Reply> {
+        Err(unsupported("pane process-info"))
     }
 }
 
@@ -322,6 +329,10 @@ impl HerdrClient for CliHerdr {
 
     fn pane_get(&self, pane: &str) -> io::Result<Reply> {
         self.run(&argv(&["pane", "get", pane]))
+    }
+
+    fn pane_process_info(&self, pane: &str) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "process-info", "--pane", pane]))
     }
 
     fn pane_read(&self, pane: &str, lines: u32) -> io::Result<Reply> {
