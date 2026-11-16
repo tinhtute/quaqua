@@ -1,12 +1,13 @@
 //! Mail through the daemon: `mail.send`, `mail.inbox`, `mail.ack`.
 //!
-//! A send is stored once (a repeat with the same `dedupe_key` from the same
-//! sender returns the first mail), journaled once under `mail:<id>`, and
+//! A send is stored once (a repeat with the same `dedupe_key` and content from
+//! the same sender returns the first mail; other content is a `conflict`),
+//! journaled in the same transaction under `mail:<id>`, and
 //! pushed as one `mail` Signal to the workflow named like the addressee, if
 //! that workflow runs. Nothing polls. Delivery reads the rows after the
-//! recipient's cursor and advances the cursor in the same transaction, so a
-//! re-read never redelivers; `peek` plus `ack` is the form that survives a
-//! lost response.
+//! recipient's cursor; with `advance: true` the cursor moves in the same
+//! transaction, so a re-read never redelivers. `ack` is the form that
+//! survives a lost response.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -17,10 +18,14 @@ use serde_json::{json, Value};
 use crate::cli::Registry;
 use crate::daemon::{Ctx, Daemon};
 use crate::db::path::DB_FILE;
-use crate::engine::journal::{EventRecord, Journal};
 use crate::rpc::{self, Request, RpcError};
 
 /// Registers the mail verbs. Called from `cli::MODULES`.
+///
+/// Contract: a `mail` Signal is a push to a workflow running at send time. A
+/// workflow that starts later, or after a daemon restart, is not signalled for
+/// mail already stored, so it reads `mail.inbox` at start. `mail.inbox` only
+/// peeks unless `advance: true`; `mail.ack` is the retry-safe way to advance.
 pub fn install(_: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     let bus = Arc::new(Bus::default());
     for (name, f) in [
@@ -33,6 +38,9 @@ pub fn install(_: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Most mail one `mail.inbox` call returns.
+const MAX_PAGE: i64 = 100;
 
 type Op = fn(&Bus, &Ctx, &Request) -> Result<Value, RpcError>;
 
@@ -52,6 +60,10 @@ impl Bus {
         let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
             let c = crate::db::open(&runs_dir.join(DB_FILE)).map_err(internal)?;
+            // The journal tables are the engine's; the idempotent DDL keeps the
+            // send transaction independent of who opened the file first.
+            c.execute_batch(crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL)
+                .map_err(internal)?;
             *slot = Some(c);
         }
         f(slot.as_mut().expect("opened above")).map_err(internal)
@@ -90,6 +102,12 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+enum Sent {
+    New(i64),
+    Same(i64),
+    Conflict(i64),
+}
+
 fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     let to = str_arg(&req.args, "to")?;
     let body = str_arg(&req.args, "body")?;
@@ -107,38 +125,51 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         .as_deref()
         .ok_or_else(|| bad("mail needs a caller to name the sender"))?;
 
-    let (id, created) = bus.with(&ctx.runs_dir, |c| {
-        let n = c.execute(
-            "INSERT OR IGNORE INTO mail (sender, recipient, kind, body, dedupe_key, created_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![from, to, kind, body, key, now_ms() as i64],
+    // Row and journal line commit together, so a mail is never delivered
+    // unjournaled; a retry finds both and writes neither.
+    let outcome = bus.with(&ctx.runs_dir, |c| {
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms() as i64;
+        let n = tx.execute(
+            "INSERT INTO mail (sender, recipient, kind, body, dedupe_key, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(sender, dedupe_key) DO NOTHING",
+            params![from, to, kind, body, key, now],
         )?;
-        let id = if n == 1 {
-            c.last_insert_rowid()
-        } else {
-            c.query_row(
-                "SELECT id FROM mail WHERE sender = ?1 AND dedupe_key = ?2",
-                params![from, key],
-                |r| r.get(0),
-            )?
-        };
-        Ok((id, n == 1))
+        if n == 1 {
+            let id = tx.last_insert_rowid();
+            let payload = json!({ "id": id, "from": from, "to": to, "kind": kind });
+            tx.execute(
+                "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) \
+                 VALUES (?1, 1, ?2, 'mail_sent', ?3)",
+                params![format!("mail:{id}"), now, payload.to_string()],
+            )?;
+            tx.commit()?;
+            return Ok(Sent::New(id));
+        }
+        let (id, r, k, b): (i64, String, String, String) = tx.query_row(
+            "SELECT id, recipient, kind, body FROM mail WHERE sender = ?1 AND dedupe_key = ?2",
+            params![from, key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        Ok(
+            if (r.as_str(), k.as_str(), b.as_str()) == (to, kind, body) {
+                Sent::Same(id)
+            } else {
+                Sent::Conflict(id)
+            },
+        )
     })?;
-
-    // Journal once per mail, also when a retry finds the row but a crash
-    // came before its journal line.
-    let jid = format!("mail:{id}");
-    let mut journal = ctx.store.journal();
-    let seen = journal.load_events(&jid, 1).map_err(internal)?;
-    if seen.is_empty() {
-        let payload = json!({ "id": id, "from": from, "to": to, "kind": kind });
-        journal
-            .append_event(
-                &jid,
-                &EventRecord::new(0, now_ms(), "mail_sent", payload.to_string()),
-            )
-            .map_err(internal)?;
-    }
+    let (id, created) = match outcome {
+        Sent::New(id) => (id, true),
+        Sent::Same(id) => (id, false),
+        Sent::Conflict(id) => {
+            return Err(RpcError::new(
+                "conflict",
+                format!("dedupe_key already used for a different mail (id {id})"),
+            ))
+        }
+    };
 
     // The push: only for a new mail, only if the addressee's workflow runs.
     // The inbox is the record, so a missing workflow is not an error.
@@ -159,20 +190,25 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
 
 fn inbox(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     let who = owner(req)?;
-    let peek = req
+    let advance_cursor = req
         .args
-        .get("peek")
+        .get("advance")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let limit = req
+        .args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .map_or(MAX_PAGE, |l| l.clamp(1, MAX_PAGE));
     let mail = bus.with(&ctx.runs_dir, |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cursor = cursor_of(&tx, who)?;
         let rows: Vec<Value> = {
             let mut st = tx.prepare(
                 "SELECT id, sender, kind, body, created_ms FROM mail \
-                 WHERE recipient = ?1 AND id > ?2 ORDER BY id",
+                 WHERE recipient = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
             )?;
-            let it = st.query_map(params![who, cursor], |r| {
+            let it = st.query_map(params![who, cursor, limit], |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?, "from": r.get::<_, String>(1)?,
                     "kind": r.get::<_, String>(2)?, "body": r.get::<_, String>(3)?,
@@ -181,7 +217,7 @@ fn inbox(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             })?;
             it.collect::<Result<_, _>>()?
         };
-        if !peek {
+        if advance_cursor {
             if let Some(last) = rows.last().and_then(|m| m["id"].as_i64()) {
                 advance(&tx, who, last)?;
             }
