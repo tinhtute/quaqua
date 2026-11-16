@@ -402,6 +402,14 @@ fn snapshot_if_contiguous<S: Serialize>(
     if cursor.diverged {
         return Ok(());
     }
+    // A resume that applied nothing new lands on a seq already snapshotted:
+    // that snapshot already holds this state, so leave it be.
+    if journal
+        .load_latest_snapshot(workflow_id)?
+        .is_some_and(|s| s.seq >= cursor.seq)
+    {
+        return Ok(());
+    }
     journal.append_snapshot(
         workflow_id,
         &SnapshotRecord::new(
