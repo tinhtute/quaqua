@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::herdr::HerdrClient;
 use crate::rpc::{self, Request, Response, RpcError};
 use store::Store;
-use supervisor::{Factory, Supervisor};
+use supervisor::{Factory, LiveHook, Supervisor};
 
 /// A live watcher: kept so a repeat of its key is a no-op while it runs.
 struct WatcherSlot {
@@ -52,7 +52,7 @@ impl Ctx {
     /// calls never journal one change twice. `restart_finished` marks an agent
     /// watcher, which a later call replaces once it ends; a report watcher
     /// stays until its workflow ends, since its one Signal is already out.
-    fn add_watcher(
+    pub fn add_watcher(
         &self,
         key: &str,
         workflow: &str,
@@ -88,6 +88,63 @@ impl Ctx {
                 handle,
             },
         );
+        Ok(())
+    }
+
+    /// Watches `agent` in herdr for `workflow` and remembers the watch, so a
+    /// restarted daemon re-arms it. A repeat changes nothing.
+    pub fn watch_agent(&self, workflow: &str, agent: &str) -> Result<(), RpcError> {
+        self.add_watcher(
+            &format!("agent:{workflow}:{agent}"),
+            workflow,
+            true,
+            |sup, stop| {
+                watch::watch_agent(
+                    Arc::clone(&self.herdr),
+                    agent.to_string(),
+                    workflow.to_string(),
+                    sup,
+                    stop,
+                )
+            },
+        )?;
+        self.store
+            .remember_agent_watch(workflow, agent, now_ms())
+            .map_err(internal)
+    }
+
+    /// Watches the report file `path` (already normalized) for `workflow` and
+    /// remembers the watch, so a restarted daemon re-arms it. A report that
+    /// already exists is seen at once; the flow treats `report/appeared` as
+    /// idempotent. A repeat changes nothing.
+    pub fn watch_report(&self, workflow: &str, path: &Path) -> Result<(), RpcError> {
+        self.add_watcher(
+            &format!("report:{workflow}:{}", path.display()),
+            workflow,
+            false,
+            |sup, stop| watch::watch_report(path.to_path_buf(), workflow.to_string(), sup, stop),
+        )?;
+        self.store
+            .remember_report_watch(workflow, path, now_ms())
+            .map_err(internal)
+    }
+
+    /// Re-arms the remembered agent and report watches of every workflow whose
+    /// loop runs. A watch whose workflow is finished or gone is skipped.
+    ///
+    /// Delivery is at-least-once: a re-armed agent watcher reports the current
+    /// status first, changed or not, so a restart can repeat the last status.
+    fn rearm_watches(&self) -> Result<(), String> {
+        for (workflow, agent) in self.store.agent_watches()? {
+            if self.supervisor.is_running(&workflow) {
+                let _ = self.watch_agent(&workflow, &agent);
+            }
+        }
+        for (workflow, path) in self.store.report_watches()? {
+            if self.supervisor.is_running(&workflow) {
+                let _ = self.watch_report(&workflow, &path);
+            }
+        }
         Ok(())
     }
 
@@ -138,6 +195,7 @@ pub struct Daemon {
     cfg: Config,
     verbs: BTreeMap<String, Handler>,
     kinds: HashMap<String, Factory>,
+    live_hooks: Vec<LiveHook>,
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
@@ -150,12 +208,19 @@ fn internal(e: String) -> RpcError {
     RpcError::new("internal", e)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 impl Daemon {
     pub fn new(cfg: Config) -> Self {
         let mut d = Daemon {
             cfg,
             verbs: BTreeMap::new(),
             kinds: HashMap::new(),
+            live_hooks: Vec::new(),
         };
         d.register_builtin();
         d
@@ -177,6 +242,23 @@ impl Daemon {
         }
         self.kinds.insert(kind.to_string(), factory);
         Ok(())
+    }
+
+    /// The herdr handle the daemon was configured with, for installs that
+    /// would otherwise rebuild their own.
+    pub fn herdr(&self) -> Arc<dyn HerdrClient> {
+        Arc::clone(&self.cfg.herdr)
+    }
+
+    /// The workspace `runs/` directory the daemon serves.
+    pub fn runs_dir(&self) -> &Path {
+        &self.cfg.runs_dir
+    }
+
+    /// Adds a hook run for each workflow whose loop goes live, on a new start
+    /// and on each recovery at daemon start.
+    pub fn on_workflow_live(&mut self, hook: LiveHook) {
+        self.live_hooks.push(hook);
     }
 
     fn register_builtin(&mut self) {
@@ -248,15 +330,7 @@ impl Daemon {
                 let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let agent = str_arg(args, "agent")?;
-                ctx.add_watcher(&format!("agent:{wf}:{agent}"), wf, true, |sup, stop| {
-                    watch::watch_agent(
-                        Arc::clone(&ctx.herdr),
-                        agent.to_string(),
-                        wf.to_string(),
-                        sup,
-                        stop,
-                    )
-                })?;
+                ctx.watch_agent(wf, agent)?;
                 Ok(json!({ "watching": agent }))
             }),
         );
@@ -267,10 +341,7 @@ impl Daemon {
                 let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let path = normalize(&ctx.runs_dir, str_arg(args, "path")?);
-                let key = format!("report:{wf}:{}", path.display());
-                ctx.add_watcher(&key, wf, false, |sup, stop| {
-                    watch::watch_report(path.clone(), wf.to_string(), sup, stop)
-                })?;
+                ctx.watch_report(wf, &path)?;
                 Ok(json!({ "watching": path }))
             }),
         );
@@ -284,7 +355,12 @@ impl Daemon {
 
     /// `ready` is told once the socket is bound and the workflows revived.
     fn run(self, ready: Option<mpsc::Sender<()>>) -> Result<(), DaemonError> {
-        let Daemon { cfg, verbs, kinds } = self;
+        let Daemon {
+            cfg,
+            verbs,
+            kinds,
+            live_hooks,
+        } = self;
         let socket = rpc::socket_path(&cfg.runs_dir);
         std::fs::create_dir_all(&cfg.runs_dir)?;
         let db_path = cfg.runs_dir.join(crate::db::path::DB_FILE);
@@ -293,6 +369,9 @@ impl Daemon {
         let store = Arc::new(Store::open(&db_path).map_err(DaemonError::Store)?);
         let listener = bind_socket(&socket)?;
         let supervisor = Supervisor::new(Arc::clone(&store), kinds);
+        for h in live_hooks {
+            supervisor.on_live(h);
+        }
         supervisor.recover().map_err(DaemonError::Store)?;
         let ctx = Arc::new(Ctx {
             runs_dir: cfg.runs_dir,
@@ -304,6 +383,7 @@ impl Daemon {
             stop_watchers: Arc::new(AtomicBool::new(false)),
             watchers: Mutex::new(HashMap::new()),
         });
+        ctx.rearm_watches().map_err(DaemonError::Store)?;
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());

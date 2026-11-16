@@ -506,6 +506,40 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             None => {}
         }
 
+        // Gate and attribute the spawn. The gate is skipped only for the open
+        // agent's own spawner retrying (it converges and spawns nothing new);
+        // any other caller goes through it. A request with no caller is not
+        // gated (identity is client-asserted).
+        let caller = req.caller.as_deref();
+        let open = crate::authority::resolve(&conn, name).map_err(internal)?;
+        let own_retry = match (&open, caller) {
+            (Some(o), Some(c)) => {
+                let who = crate::authority::resolve(&conn, c).map_err(internal)?;
+                o.spawner_id.is_some() && who.map(|w| w.id) == o.spawner_id
+            }
+            _ => false,
+        };
+        if let (Some(caller), false) = (caller, own_retry) {
+            let target = match role {
+                Role::Lead => crate::authority::Role::Lead,
+                Role::Peer => crate::authority::Role::Peer,
+            };
+            if let crate::authority::Decision::Refused(r) =
+                crate::authority::check_spawn(&conn, caller, target, project_id)
+                    .map_err(internal)?
+            {
+                return Err(RpcError::new(
+                    "refused",
+                    format!("{} -> {}: {}", r.caller, r.target, r.reason),
+                ));
+            }
+        }
+        let spawner_id = match caller {
+            Some(c) => crate::authority::resolve(&conn, c)
+                .map_err(internal)?
+                .map(|a| a.id),
+            None => None,
+        };
         let spawned = spawn(
             &conn,
             deps.herdr.as_ref(),
@@ -516,7 +550,7 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 role,
                 pane: text(a, "pane")?,
                 project_id,
-                spawner_id: None,
+                spawner_id,
             },
             now_ms(),
         )
