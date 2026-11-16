@@ -94,7 +94,7 @@ impl Registry {
 pub type Install = fn(&mut Registry, &mut Daemon) -> Result<(), String>;
 
 /// Every module's install. Each module adds exactly one line here.
-pub const MODULES: &[Install] = &[];
+pub const MODULES: &[Install] = &[crate::task::worker_flow::INSTALL];
 
 /// The CLI registry and the daemon, both filled from the core and [`MODULES`].
 pub fn assemble(env: &Env) -> Result<(Registry, Daemon), String> {
