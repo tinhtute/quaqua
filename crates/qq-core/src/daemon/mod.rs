@@ -441,36 +441,32 @@ impl Daemon {
     }
 }
 
+/// The held lock. Dropping unlocks, not just closes: a child forked mid-run
+/// shares the open file until it execs, and a plain close would leave the flock
+/// with it. Every exit path of `run` goes through this drop.
+struct WorkspaceLock(File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// An exclusive advisory lock on the database file itself, so the one-daemon
 /// rule needs no sidecar file. The OS drops it when the process dies.
-///
-/// A restart overlaps the old daemon's last moments, and a child forked by
-/// another thread shares the lock's open file until it execs, so a held lock
-/// gets a short grace before it means another daemon is running.
-fn lock_workspace(db: &Path, socket: &Path) -> Result<File, DaemonError> {
+fn lock_workspace(db: &Path, socket: &Path) -> Result<WorkspaceLock, DaemonError> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(db)?;
-    let deadline = std::time::Instant::now() + LOCK_GRACE;
-    loop {
-        match f.try_lock() {
-            Ok(()) => return Ok(f),
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(TryLockError::WouldBlock) => {
-                return Err(DaemonError::AlreadyRunning(socket.to_path_buf()))
-            }
-            Err(TryLockError::Error(e)) => return Err(e.into()),
-        }
+    match f.try_lock() {
+        Ok(()) => Ok(WorkspaceLock(f)),
+        Err(TryLockError::WouldBlock) => Err(DaemonError::AlreadyRunning(socket.to_path_buf())),
+        Err(TryLockError::Error(e)) => Err(e.into()),
     }
 }
-
-/// How long a held workspace lock is waited for before it counts as a running daemon.
-const LOCK_GRACE: Duration = Duration::from_millis(1500);
 
 /// `path` made absolute under `runs_dir` with `.` and `..` folded out, so two
 /// spellings of one file share one watcher key. Lexical: touches no disk.

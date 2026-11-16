@@ -9,6 +9,16 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// The herdr variables a live pane exports. A test workspace must never act
 /// on that pane, so they are cleared while it lives.
+const HERDR_KEYS: [&str; 7] = [
+    "HERDR_PANE",
+    "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_SESSION",
+    "HERDR_SOCKET_PATH",
+    "HERDR_BIN_PATH",
+];
+
 const HERDR_ENV: [&str; 6] = [
     "HERDR_PANE",
     "HERDR_PANE_ID",
@@ -39,25 +49,30 @@ impl TestWorkspace {
         let root = std::env::temp_dir().join(format!("qq-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("runs")).expect("create temp workspace");
-        let mut prev_herdr: Vec<_> = HERDR_ENV
+        let prev_herdr = HERDR_KEYS
             .iter()
-            .chain(["HERDR_BIN_PATH"].iter())
             .map(|k| (*k, std::env::var_os(k)))
             .collect();
-        prev_herdr.shrink_to_fit();
         let ws = TestWorkspace {
             prev_team_toml: std::env::var_os("QUAQUA_TEAM_TOML"),
             prev_herdr,
             root,
             _lock: lock,
         };
-        for k in HERDR_ENV {
-            std::env::remove_var(k);
-        }
-        std::env::set_var("HERDR_BIN_PATH", ws.root.join("no-herdr"));
+        ws.seal_herdr();
         std::fs::write(ws.team_toml(), "").expect("write team.toml");
         std::env::set_var("QUAQUA_TEAM_TOML", ws.team_toml());
         ws
+    }
+
+    /// Clears the pane variables and points `HERDR_BIN_PATH` at a missing
+    /// binary. [`TestWorkspace::new`] does it; a test that sets herdr
+    /// variables under the env lock seals again before running commands.
+    pub fn seal_herdr(&self) {
+        for k in HERDR_ENV {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("HERDR_BIN_PATH", self.root.join("no-herdr"));
     }
 
     /// `QUAQUA_TEAM_TOML` as it was before this workspace took the env lock.

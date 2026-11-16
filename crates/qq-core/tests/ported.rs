@@ -596,10 +596,11 @@ fn workspace_commands_never_reach_the_inherited_herdr() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // What a live pane exports; set before the workspace takes the env lock.
+    let ws = TestWorkspace::new("live-herdr");
+    // What a live pane exports, set under the env lock; sealing must undo it.
     std::env::set_var("HERDR_BIN_PATH", &fake);
     std::env::set_var("HERDR_PANE_ID", "w9:p9");
-    let ws = TestWorkspace::new("live-herdr");
+    ws.seal_herdr();
     let env = Env {
         runs_dir: ws.runs_dir(),
     };
@@ -613,8 +614,6 @@ fn workspace_commands_never_reach_the_inherited_herdr() {
     );
     let seen = std::fs::read_to_string(&calls).unwrap_or_default();
     drop(ws);
-    std::env::remove_var("HERDR_BIN_PATH");
-    std::env::remove_var("HERDR_PANE_ID");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(seen, "", "the live herdr was called");
 }
