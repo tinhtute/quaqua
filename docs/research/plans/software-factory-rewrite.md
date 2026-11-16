@@ -241,7 +241,7 @@ lane: high-risk
   - phase check: `cargo test --locked -p qq-core && cargo clippy --locked --all-targets -- -D warnings && test -d crates/qq-core/templates/workspace && test -z "$(git grep -n -i -E 'taskforce|telemetry_otel|mod (gui|legacy)|bus_migrate|layout_migrate' -- crates/qq-core | grep -v -E '^crates/qq-core/src/config/mod\.rs:[0-9]+:const NOT_PORTED: &str = "taskforce";$')" && test -z "$(git grep -n -i -w -E 'omp|taskforce' -- crates/qq-core/templates/workspace)"`, plus the T66 output in `## Validation`
 
 ## Log
-- 2026-11-16 CoS ruling: HerdrClient += pane_split, pane_close, pane_list, tab_create, tab_close, pane_get, pane_report_metadata, pane_read (additive, defaults Unsupported)
+- 2026-11-16 CoS ruling: HerdrClient += pane_split, pane_close, pane_list, tab_create, tab_close, tab_list, pane_get, pane_report_metadata, pane_read (additive, defaults Unsupported)
 - 2026-11-16 CoS: HerdrClient += agent_send_keys (additive)
 - 2026-11-16: switch-ready: Lead added the nine phase module declarations to lib.rs in one scaffold commit before wave 1 (seam file, additive), so wave Peers share no file; each Peer exposes `pub const INSTALL` and the Lead's wave-end commit adds the `cli::MODULES` lines.
 - 2026-11-16: `synchronous=NORMAL` accepted by anh iu (closes the pending note on the CI journal lock line below): an app crash loses nothing; a power loss may lose the last journal events.

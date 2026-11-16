@@ -397,22 +397,35 @@ pub fn place_pane(
     project_id: Option<i64>,
 ) -> Result<String, RpcError> {
     if let Ok(r) = herdr.agent_get(name) {
-        if let Some(p) = serde_json::from_str::<Value>(&r.body)
-            .ok()
-            .and_then(|v| v.pointer("/result/agent/pane_id")?.as_str().map(String::from))
-        {
+        if let Some(p) = serde_json::from_str::<Value>(&r.body).ok().and_then(|v| {
+            v.pointer("/result/agent/pane_id")?
+                .as_str()
+                .map(String::from)
+        }) {
             return Ok(p);
         }
     }
     let id = project_id.ok_or_else(|| bad("a spawn needs 'pane' or a 'project_id' to place it"))?;
     let repo: String = conn
-        .query_row("SELECT repo_path FROM project WHERE id = ?1", [id], |r| r.get(0))
+        .query_row("SELECT repo_path FROM project WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .map_err(|_| bad(format!("no project {id} to place '{name}'")))?;
     let repo = std::path::Path::new(&repo)
         .file_name()
         .map_or_else(|| repo.clone(), |f| f.to_string_lossy().into_owned());
-    crate::grid::acquire(&crate::grid::HerdrPanes(herdr), &repo)
-        .map_err(|e| RpcError::new("place_failed", e.to_string()))
+    let runs = conn
+        .path()
+        .and_then(|p| Path::new(p).parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| bad("no runs dir to place '".to_string() + name + "' in"))?;
+    crate::grid::acquire(
+        &crate::grid::HerdrPanes(herdr),
+        &repo,
+        &crate::grid::Scope::from_runs_dir(&runs),
+        &runs,
+    )
+    .map_err(|e| RpcError::new("place_failed", e.to_string()))
 }
 
 /// The input `task.start` journaled for `id`, read from the replay base.

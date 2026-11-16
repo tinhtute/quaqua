@@ -29,6 +29,7 @@ pub enum Verb {
     PaneList,
     TabCreate,
     TabClose,
+    TabList,
     PaneGet,
     PaneReportMetadata,
     PaneRead,
@@ -121,6 +122,10 @@ pub trait HerdrClient: Send + Sync {
     /// `herdr tab close TAB`.
     fn tab_close(&self, _tab: &str) -> io::Result<Reply> {
         Err(unsupported("tab close"))
+    }
+    /// `herdr tab list`: `{"result":{"tabs":[{tab_id,label,...}]}}`.
+    fn tab_list(&self) -> io::Result<Reply> {
+        Err(unsupported("tab list"))
     }
     /// `herdr pane get PANE`.
     fn pane_get(&self, _pane: &str) -> io::Result<Reply> {
@@ -291,6 +296,10 @@ impl HerdrClient for CliHerdr {
 
     fn tab_close(&self, tab: &str) -> io::Result<Reply> {
         self.run(&argv(&["tab", "close", tab]))
+    }
+
+    fn tab_list(&self) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "list"]))
     }
 
     fn pane_get(&self, pane: &str) -> io::Result<Reply> {

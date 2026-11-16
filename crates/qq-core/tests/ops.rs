@@ -85,13 +85,16 @@ fn tabs(h: &FakeHerdr) -> Vec<String> {
 
 #[test]
 fn prompt_check_brief_and_resume() {
-    let ok = prompt::check_brief(BRIEF, None).unwrap();
+    let ok = prompt::check_brief(BRIEF, None, None).unwrap();
     assert_eq!((ok.budget_sec, ok.source), (900, "brief"));
     assert!(ok.warnings.is_empty());
     // the env override wins, no budget line falls to the default
-    assert_eq!(prompt::check_brief(BRIEF, Some(60)).unwrap().source, "env");
+    assert_eq!(
+        prompt::check_brief(BRIEF, Some(60), None).unwrap().source,
+        "env"
+    );
     let no_time = BRIEF.replace("Time budget: 15 min\n", "");
-    let d = prompt::check_brief(&no_time, None).unwrap();
+    let d = prompt::check_brief(&no_time, None, None).unwrap();
     assert_eq!((d.budget_sec, d.source), (2700, "default"));
     // rejected briefs
     for bad in [
@@ -101,12 +104,38 @@ fn prompt_check_brief_and_resume() {
         format!("{BRIEF}Review rounds: 0\n"),
         BRIEF.replace("15 min", "soon"),
     ] {
-        assert!(prompt::check_brief(&bad, None).is_err(), "{bad}");
+        assert!(prompt::check_brief(&bad, None, None).is_err(), "{bad}");
     }
     // advisory gaps only warn
-    let w =
-        prompt::check_brief(&BRIEF.replace("Playbook: feature", "Playbook: none"), None).unwrap();
+    let w = prompt::check_brief(
+        &BRIEF.replace("Playbook: feature", "Playbook: none"),
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(w.warnings.len(), 1);
+    // a '<…>' placeholder in Context warns
+    let c = prompt::check_brief(
+        &BRIEF.replace("Context: none, test", "Context: <files / PR pointers…>"),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        c.warnings.iter().any(|w| w.contains("Context")),
+        "{:?}",
+        c.warnings
+    );
+    // with a playbooks index, a named playbook must resolve
+    let pb = std::env::temp_dir().join(format!("qq-ops-playbooks-{}", std::process::id()));
+    std::fs::create_dir_all(&pb).unwrap();
+    std::fs::write(pb.join("feature.md"), "---\nname: feature\n---\n").unwrap();
+    assert!(prompt::check_brief(BRIEF, None, Some(&pb)).is_ok());
+    let missing = BRIEF.replace("Playbook: feature", "Playbook: nope");
+    let e = prompt::check_brief(&missing, None, Some(&pb)).unwrap_err();
+    assert!(e.contains("nope"), "{e}");
+    // no index at all: the name is not checked
+    assert!(prompt::check_brief(&missing, None, Some(&pb.join("absent"))).is_ok());
 
     // watchdog codes
     let base = Observed {
@@ -222,9 +251,75 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
 
-#[test]
-fn cleanup_keeps_branch() {
-    let (dir, conn) = seeded("cleanup");
+/// Panes herdr shows that are not this workspace's workers, in real shapes.
+struct Foreign {
+    cos: String,
+    human: String,
+    other_farm: String,
+}
+
+fn foreign(h: &FakeHerdr) -> Foreign {
+    Foreign {
+        cos: h.seed_pane(
+            "main",
+            Some("claude"),
+            &[
+                ("grid_role", "cos"),
+                ("grid_owner", "me"),
+                ("grid_farm", "f1"),
+            ],
+        ),
+        human: h.seed_pane("main", None, &[]),
+        other_farm: h.seed_pane(
+            "other-workers",
+            Some("claude"),
+            &[
+                ("grid_role", "worker"),
+                ("grid_owner", "me"),
+                ("grid_farm", "f2"),
+            ],
+        ),
+    }
+}
+
+fn survive(h: &FakeHerdr, f: &Foreign) {
+    for (what, p) in [
+        ("cos", &f.cos),
+        ("human", &f.human),
+        ("other farm", &f.other_farm),
+    ] {
+        assert!(h.has_pane(p), "the {what} pane must survive");
+    }
+}
+
+fn set_pane(conn: &Connection, name: &str, pane: &str) {
+    conn.execute(
+        "UPDATE agent SET pane_id = ?2 WHERE name = ?1",
+        [name, pane],
+    )
+    .unwrap();
+}
+
+fn scope_f1() -> grid::Scope {
+    grid::Scope {
+        owner: None,
+        farm: Some("f1".into()),
+    }
+}
+
+/// A repo with a committed worker worktree `wt-w1` on branch `quaqua/w1`,
+/// plus the agent record, a recorded pane and a sidecar.
+fn worker_fixture(
+    tag: &str,
+    herdr: &FakeHerdr,
+) -> (
+    std::path::PathBuf,
+    Connection,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let (dir, conn) = seeded(tag);
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
@@ -247,61 +342,185 @@ fn cleanup_keeps_branch() {
     git(&wt, &["add", "."]);
     git(&wt, &["commit", "-q", "-m", "work"]);
     add_agent(&conn, "w1", "peer", "tieude", None);
+    let pane = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[("grid_role", "worker"), ("grid_farm", "f1")],
+    );
+    set_pane(&conn, "w1", &pane);
+    std::fs::write(dir.join(".w1.budget"), "60\n").unwrap();
+    std::fs::write(dir.join(".w1.provider_retry"), "2\n").unwrap();
+    (dir, conn, repo, wt, pane)
+}
 
-    cleanup::cleanup_worker(&conn, &repo, &wt, "w1", 5).unwrap();
-    assert!(!wt.exists());
-    assert!(git(&repo, &["branch", "--list", "quaqua/w1"]).contains("quaqua/w1"));
-    assert!(ended(&conn, "w1"));
-    // a repeat converges
-    cleanup::cleanup_worker(&conn, &repo, &wt, "w1", 6).unwrap();
+fn target<'a>(
+    dir: &'a Path,
+    repo: &'a Path,
+    wt: &'a Path,
+    allow_dirty: bool,
+) -> cleanup::Target<'a> {
+    cleanup::Target {
+        repo,
+        worktree: wt,
+        runs_dir: dir,
+        name: "w1",
+        allow_dirty,
+    }
 }
 
 #[test]
-fn stop_refuses_unverified_harness_and_releases_pane_when_idle() {
+fn cleanup_keeps_branch() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup", &herdr);
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+
+    cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t, 5).unwrap();
+    assert!(!wt.exists());
+    assert!(git(&repo, &["branch", "--list", "quaqua/w1"]).contains("quaqua/w1"));
+    assert!(ended(&conn, "w1"));
+    assert!(!herdr.has_pane(&pane), "cleanup closes the recorded pane");
+    assert!(!dir.join(".w1.budget").exists() && !dir.join(".w1.provider_retry").exists());
+    survive(&herdr, &f);
+    // a repeat converges
+    cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t, 6).unwrap();
+    survive(&herdr, &f);
+}
+
+#[test]
+fn cleanup_refuses_dirty_and_wrong_repo_and_foreign_pane() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-refuse", &herdr);
+    let panes = HerdrPanes(&herdr);
+
+    // dirty (an untracked file counts): refused, listing the path, nothing touched
+    std::fs::write(wt.join("scratch.txt"), "x").unwrap();
+    let r = cleanup::cleanup_worker(
+        &conn,
+        &panes,
+        &scope_f1(),
+        &target(&dir, &repo, &wt, false),
+        5,
+    );
+    assert_eq!(r, Err(OpsError::Dirty(vec!["scratch.txt".into()])));
+    assert!(wt.join("scratch.txt").exists() && herdr.has_pane(&pane));
+    assert!(!ended(&conn, "w1") && dir.join(".w1.budget").exists());
+
+    // a repo that owns neither the worktree nor the branch: refused untouched
+    let other = dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    std::fs::write(other.join("a"), "a").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-q", "-m", "base"]);
+    let gone = dir.join("no-such-wt");
+    let r = cleanup::cleanup_worker(
+        &conn,
+        &panes,
+        &scope_f1(),
+        &target(&dir, &other, &gone, true),
+        5,
+    );
+    assert!(matches!(r, Err(OpsError::WrongRepo(_))), "{r:?}");
+    assert!(herdr.has_pane(&pane) && !ended(&conn, "w1"));
+
+    // the explicit flag discards the uncommitted path; git never runs --force
+    cleanup::cleanup_worker(
+        &conn,
+        &panes,
+        &scope_f1(),
+        &target(&dir, &repo, &wt, true),
+        6,
+    )
+    .unwrap();
+    assert!(!wt.exists() && ended(&conn, "w1") && !herdr.has_pane(&pane));
+    survive(&herdr, &f);
+
+    // a record that names a CoS pane never gets that pane closed
+    add_agent(&conn, "w2", "peer", "tieude", None);
+    set_pane(&conn, "w2", &f.cos);
+    let wt2 = dir.join("wt-w2");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/w2",
+            &wt2.to_string_lossy(),
+        ],
+    );
+    let t2 = cleanup::Target {
+        name: "w2",
+        ..target(&dir, &repo, &wt2, false)
+    };
+    cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t2, 7).unwrap();
+    assert!(ended(&conn, "w2"));
+    survive(&herdr, &f);
+}
+
+#[test]
+fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     let (_dir, conn) = seeded("stop");
     let herdr = FakeHerdr::new();
-    let panes = HerdrPanes(&herdr);
-    let drivers = Registry::native();
-    // claude has no verified stop sequence: a working agent is refused, pane kept
-    add_agent(&conn, "c1", "peer", "ni", None);
-    let first = panes.create_tab("r-workers").unwrap();
-    herdr
-        .agent_start("c1", "claude", &first.id, 1, &[])
-        .unwrap();
-    herdr.set_status("c1", "working");
-    let r = cleanup::stop_worker(&conn, &herdr, &panes, &drivers, "c1", 9);
-    assert_eq!(r, Err(OpsError::NotStopped("c1".into())));
+    let f = foreign(&herdr);
+    // claude and pi have no verified stop sequence: refused before anything
+    // is sent, working or idle
+    for (name, kind, harness) in [("c1", "ni", "claude"), ("p1", "tieude", "pi")] {
+        add_agent(&conn, name, "peer", kind, None);
+        let pane = herdr.seed_pane("r-workers", None, &[]);
+        set_pane(&conn, name, &pane);
+        herdr.agent_start(name, harness, &pane, 1, &[]).unwrap();
+        for status in ["working", "idle"] {
+            herdr.set_status(name, status);
+            let r = cleanup::stop_worker(&conn, &herdr, name);
+            assert_eq!(
+                r,
+                Err(OpsError::Unverified(harness.into())),
+                "{name} {status}"
+            );
+        }
+    }
     assert!(
         herdr.keys().is_empty(),
         "nothing is sent for an unverified harness"
     );
-    assert!(!ended(&conn, "c1"));
-    assert_eq!(panes.panes().unwrap().len(), 1);
 
-    // pi stops on esc: pane released, agent ended
-    add_agent(&conn, "p1", "peer", "tieude", None);
-    let second = panes.split(&first.id).unwrap();
-    herdr.agent_start("p1", "pi", &second.id, 1, &[]).unwrap();
-    herdr.set_status("p1", "working");
-    herdr.idle_on_keys("p1", &["esc"]);
-    cleanup::stop_worker(&conn, &herdr, &panes, &drivers, "p1", 9).unwrap();
-    assert!(ended(&conn, "p1"));
-    let left = panes.panes().unwrap();
+    // opencode stops on esc esc; the worker, its pane and its record stay
+    add_agent(&conn, "o1", "peer", "sude", None);
+    let pane = herdr.seed_pane("r-workers", None, &[]);
+    set_pane(&conn, "o1", &pane);
+    herdr.agent_start("o1", "opencode", &pane, 1, &[]).unwrap();
+    herdr.set_status("o1", "working");
+    herdr.idle_on_keys("o1", &["esc", "esc"]);
+    cleanup::stop_worker(&conn, &herdr, "o1").unwrap();
     assert_eq!(
-        left.len(),
-        1,
-        "the stopped worker's pane is closed: {left:?}"
+        herdr.keys(),
+        vec![("o1".to_string(), vec!["esc".to_string(), "esc".to_string()])]
     );
-    assert_eq!(left[0].agent.as_deref(), Some("c1"));
+    assert!(herdr
+        .keys()
+        .iter()
+        .all(|(_, k)| k.iter().all(|x| x != "ctrl+c")));
+    assert!(herdr.has_pane(&pane) && !ended(&conn, "o1"));
+    assert!(
+        herdr.agent_get("o1").unwrap().ok,
+        "the agent is still alive"
+    );
+    survive(&herdr, &f);
 }
 
 #[test]
 fn grid_four_per_tab() {
     let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
     let panes = HerdrPanes(&herdr);
     let mut got = Vec::new();
     // five spawns with no pane named: each lands where grid placement says
-    let (_sd, sconn) = seeded("spawnplace");
+    let (sd, sconn) = seeded("spawnplace");
     sconn
         .execute(
             "INSERT INTO project (slug, repo_path, created_ms) VALUES ('repo', '/x/repo', 1)",
@@ -331,12 +550,26 @@ fn grid_four_per_tab() {
     }
     // a repeat of a spawn keeps its pane rather than placing a new one
     assert_eq!(place_pane(&sconn, &herdr, "w2", Some(1)).unwrap(), got[2]);
-    assert_eq!(tabs(&herdr), vec!["repo-workers", "repo-workers-2"]);
+    assert_eq!(
+        tabs(&herdr),
+        vec!["main", "other-workers", "repo-workers", "repo-workers-2"]
+    );
     let per_tab = |t: &str| panes.panes().unwrap().iter().filter(|p| p.tab == t).count();
     assert_eq!((per_tab("repo-workers"), per_tab("repo-workers-2")), (4, 1));
+    // the spawn recorded its pane, and placement tagged it as a worker pane
+    let recorded: String = sconn
+        .query_row("SELECT pane_id FROM agent WHERE name = 'w3'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(recorded, got[3]);
+    let tok = herdr.tokens(&got[3]);
+    assert_eq!(tok.get("grid_role").map(String::as_str), Some("worker"));
+    assert_eq!(tok.get("grid_farm"), grid::farm_id(&sd).as_ref());
     // a closed pane's slot is refilled before a third tab opens
     panes.close_pane(&got[1]).unwrap();
-    let id = grid::acquire(&panes, "repo").unwrap();
+    let scope = grid::Scope::from_runs_dir(&sd);
+    let id = grid::acquire(&panes, "repo", &scope, &sd).unwrap();
     let tab = panes
         .panes()
         .unwrap()
@@ -348,15 +581,104 @@ fn grid_four_per_tab() {
     assert_eq!(grid::place("repo", &[4, 4]).tab, "repo-workers-3");
 
     // reconcile closes the pane of an agent the DB ended, and only that one
-    let (_d, conn) = seeded("grid");
-    for n in ["w0", "w2", "w3", "w4"] {
-        add_agent(&conn, n, "peer", "tieude", None);
-    }
-    conn.execute("UPDATE agent SET ended_ms = 2 WHERE name = 'w0'", [])
+    sconn
+        .execute("UPDATE agent SET ended_ms = 2 WHERE name = 'w0'", [])
         .unwrap();
-    let ops = grid::reconcile(&panes, &conn).unwrap();
+    let ops = grid::reconcile(&panes, &sconn, &scope).unwrap();
     assert_eq!(ops, vec![grid::Op::Close(got[0].clone())]);
-    assert!(grid::reconcile(&panes, &conn).unwrap().is_empty());
+    assert!(grid::reconcile(&panes, &sconn, &scope).unwrap().is_empty());
+    survive(&herdr, &f);
+}
+
+#[test]
+fn reconcile_closes_only_recorded_panes_of_this_scope() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (_d, conn) = seeded("reconcile");
+    let panes = HerdrPanes(&herdr);
+    let mine = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[("grid_role", "worker"), ("grid_farm", "f1")],
+    );
+    let untagged = herdr.seed_pane("repo-workers", None, &[]);
+    let live = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[("grid_role", "worker"), ("grid_farm", "f1")],
+    );
+    let unrecorded = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[("grid_role", "worker"), ("grid_farm", "f1")],
+    );
+    // ended agents recorded for our panes and (worst case) the foreign agent panes
+    for (n, p) in [
+        ("e-mine", &mine),
+        ("e-untagged", &untagged),
+        ("e-cos", &f.cos),
+        ("e-other", &f.other_farm),
+    ] {
+        add_agent(&conn, n, "peer", "tieude", None);
+        set_pane(&conn, n, p);
+        conn.execute("UPDATE agent SET ended_ms = 2 WHERE name = ?1", [n])
+            .unwrap();
+    }
+    add_agent(&conn, "alive", "peer", "tieude", None);
+    set_pane(&conn, "alive", &live);
+
+    let ops = grid::reconcile(&panes, &conn, &scope_f1()).unwrap();
+    let mut closed: Vec<String> = ops.into_iter().map(|grid::Op::Close(p)| p).collect();
+    closed.sort();
+    let mut want = vec![mine.clone(), untagged.clone()];
+    want.sort();
+    assert_eq!(closed, want);
+    // The human's pane is in no spawn record, so it survives with the CoS pane,
+    // the other farm's worker, the live agent's pane and the unrecorded pane.
+    assert!(herdr.has_pane(&f.human) && herdr.has_pane(&f.cos) && herdr.has_pane(&f.other_farm));
+    assert!(herdr.has_pane(&live) && herdr.has_pane(&unrecorded));
+    assert!(grid::reconcile(&panes, &conn, &scope_f1())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn concurrent_acquires_never_share_a_pane() {
+    let herdr = FakeHerdr::new();
+    let dir = std::env::temp_dir().join(format!("qq-ops-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let scope = grid::Scope::default();
+    let ids: Vec<String> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| s.spawn(|| grid::acquire(&HerdrPanes(&herdr), "repo", &scope, &dir).unwrap()))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut uniq = ids.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), 8, "{ids:?}");
+    let panes = HerdrPanes(&herdr).panes().unwrap();
+    let n = |t: &str| panes.iter().filter(|p| p.tab == t).count();
+    assert_eq!((n("repo-workers"), n("repo-workers-2")), (4, 4));
+}
+
+#[test]
+fn placement_splits_a_two_by_two() {
+    let herdr = FakeHerdr::new();
+    let dir = std::env::temp_dir().join(format!("qq-ops-2x2-{}", std::process::id()));
+    let scope = grid::Scope::default();
+    let ids: Vec<String> = (0..4)
+        .map(|_| grid::acquire(&HerdrPanes(&herdr), "repo", &scope, &dir).unwrap())
+        .collect();
+    assert_eq!(
+        herdr.splits(),
+        vec![
+            (ids[0].clone(), "right".to_string()),
+            (ids[0].clone(), "down".to_string()),
+            (ids[1].clone(), "down".to_string()),
+        ]
+    );
 }
 
 #[test]
@@ -479,10 +801,13 @@ fn prompt_wait_exits_on_report_and_on_timebox() {
         let _ = std::fs::remove_file(runs.join(f));
     }
 
-    // Silence past the budget: one 80% nudge, then exit 4.
+    // Silence past the budget: one 80% nudge, then exit 4. (An idle agent: a
+    // working one counts as progress and earns the grace.)
+    h.set_status("w", "idle");
     let clock = FakeClock {
         now: 5000.into(),
-        on_sleep: Box::new(|_| {}),
+        // the fake flips an agent to working on our nudge; a silent one goes idle again
+        on_sleep: Box::new(|_| h.set_status("w", "idle")),
     };
     let cfg = wait_cfg(&runs, &journal, 60);
     assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::BudgetExceeded);
@@ -516,8 +841,10 @@ fn prompt_wait_retries_a_provider_error_then_escalates() {
     // Each retry clears the verdict; the harness errors again after a sleep.
     let clock = FakeClock {
         now: 0.into(),
-        on_sleep: Box::new(move |_| {
+        on_sleep: Box::new(|_| {
             let _ = std::fs::write(&again, "retryable 529 0\n");
+            // a harness that errors again goes idle again after our "continue"
+            h.set_status("w", "idle");
         }),
     };
     let cfg = wait_cfg(&runs, &journal, 7200);
@@ -596,7 +923,10 @@ fn prompt_wait_classifies_the_pane_tail() {
     let echo = || h.set_pane_text("p1", "Error: 529 overloaded\ncontinue\n");
     let clock = FakeClock {
         now: 0.into(),
-        on_sleep: Box::new(|_| echo()),
+        on_sleep: Box::new(|_| {
+            echo();
+            h.set_status("w", "idle");
+        }),
     };
     let mut cfg = wait_cfg(&runs, &journal, 7200);
     cfg.harness = Some(Shape::Omp);
@@ -684,4 +1014,174 @@ fn prompt_sends_the_brief_once_and_resume_sends_nothing() {
         prompt::prompt_run(&h, &clock, &runs, &args(&["w", "no headers"]), &tuning).unwrap_err();
     assert_eq!(e.code, 1);
     assert_eq!(h.prompts().len(), 1);
+}
+
+#[test]
+fn core_died_needs_a_db_open_agent_that_herdr_lost() {
+    let (runs, conn) = seeded("coredied");
+    let h = FakeHerdr::new();
+    let f = foreign(&h);
+    add_agent(&conn, "w", "peer", "tieude", None);
+    let journal = |_: &str, _: serde_json::Value| {};
+    let clock = || FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    // DB says open, herdr has no such agent: it died without an end record.
+    let cfg = wait_cfg(&runs, &journal, 7200);
+    assert_eq!(prompt::wait(&h, &clock(), &cfg), Exit::CoreDied);
+    // DB says ended: the same absence is only a stall.
+    conn.execute("UPDATE agent SET ended_ms = 2 WHERE name = 'w'", [])
+        .unwrap();
+    assert_eq!(prompt::wait(&h, &clock(), &cfg), Exit::Stalled);
+    survive(&h, &f);
+}
+
+#[test]
+fn resume_continues_the_provider_retry_count() {
+    let (runs, _c) = seeded("resumeretry");
+    let h = FakeHerdr::new();
+    let f = foreign(&h);
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    // three retries were spent before the wait was resumed
+    std::fs::write(runs.join(".w.provider_retry"), "3\n").unwrap();
+    std::fs::write(runs.join(".w.error"), "retryable 529 0\n").unwrap();
+    let again = runs.join(".w.error");
+    let events = std::cell::RefCell::new(Vec::<String>::new());
+    let journal = |k: &str, _: serde_json::Value| events.borrow_mut().push(k.to_string());
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {
+            let _ = std::fs::write(&again, "retryable 529 0\n");
+            h.set_status("w", "idle");
+        }),
+    };
+    let cfg = wait_cfg(&runs, &journal, 7200);
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::ProviderError);
+    // 3 spent + 1 = the cap of 4: one more retry, not four
+    assert_eq!(
+        events
+            .borrow()
+            .iter()
+            .filter(|k| *k == "provider_retry")
+            .count(),
+        1
+    );
+    survive(&h, &f);
+}
+
+#[test]
+fn auto_extend_needs_a_diff_that_moved_since_wait_start() {
+    let (runs, _c) = seeded("autoext");
+    let repo = runs.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a"), "a").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    let journal = |_: &str, _: serde_json::Value| {};
+    let reset = || {
+        for f in [
+            ".w.budget",
+            ".w.elapsed",
+            ".w.nudged",
+            ".w.grace",
+            ".w.autoext",
+        ] {
+            let _ = std::fs::remove_file(runs.join(f));
+        }
+    };
+    let mut cfg = wait_cfg(&runs, &journal, 60);
+    cfg.worktree = Some(repo.clone());
+
+    // the worktree is dirty from the start and never moves: no extension
+    std::fs::write(repo.join("a"), "dirty").unwrap();
+    let clock = FakeClock {
+        now: 5000.into(),
+        on_sleep: Box::new(|_| h.set_status("w", "idle")),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::BudgetExceeded);
+    assert_eq!(clock.now_sec() - 5000, 60);
+
+    // the diff moves mid-wait: one 25% extension, then the deadline holds
+    reset();
+    let clock = FakeClock {
+        now: 5000.into(),
+        on_sleep: Box::new(|now| {
+            h.set_status("w", "idle");
+            if now == 5030 {
+                std::fs::write(repo.join("a"), "moved").unwrap();
+            }
+        }),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::BudgetExceeded);
+    assert_eq!(clock.now_sec() - 5000, 75);
+}
+
+#[test]
+fn working_is_progress_and_the_pane_tail_is_the_second_signal() {
+    let (runs, _c) = seeded("progress");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    let journal = |_: &str, _: serde_json::Value| {};
+    // working with a silent pane and no diff: never a stall; only the hard cap
+    h.set_status("w", "working");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    let cfg = wait_cfg(&runs, &journal, 100_000);
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::HardCap);
+
+    // neither working nor idle (status unknown), but the pane keeps printing:
+    // progress. The 600 s stall clock starts only once the pane goes quiet.
+    for f in [".w.budget", ".w.elapsed", ".w.nudged"] {
+        let _ = std::fs::remove_file(runs.join(f));
+    }
+    h.set_status("w", "unknown");
+    let n = std::cell::Cell::new(0u32);
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now < 1500 {
+                n.set(n.get() + 1);
+                h.set_pane_text("p1", &format!("line {}\n", n.get()));
+            }
+        }),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::Stalled);
+    assert!(clock.now_sec() >= 2000, "stalled at {}", clock.now_sec());
+}
+
+#[test]
+fn lead_cleanup_closes_only_the_recorded_pane() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (_d, conn) = seeded("leadclean");
+    let p = add_project(&conn, "proj");
+    let mine = herdr.seed_pane(
+        "repo-workers",
+        Some("claude"),
+        &[("grid_role", "lead"), ("grid_farm", "f1")],
+    );
+    let bystander = herdr.seed_pane("repo-workers", Some("pi"), &[("grid_role", "worker")]);
+    add_agent(&conn, "proj-lead", "lead", "ni", Some(p));
+    set_pane(&conn, "proj-lead", &mine);
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    // the Lead's pane carries role=lead, which a worker-only scope never closes
+    survive(&herdr, &f);
+    assert!(herdr.has_pane(&bystander));
+    let ended: Option<i64> = conn
+        .query_row(
+            "SELECT ended_ms FROM agent WHERE name = 'proj-lead'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ended, Some(9));
 }

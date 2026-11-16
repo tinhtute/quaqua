@@ -1,8 +1,11 @@
 //! Pane placement: four workers per tab, a fifth opens `<repo>-workers-2`.
 //!
 //! Placement is a pure function over the tabs' occupancy; the herdr calls it
-//! implies go through [`PaneOps`], the seam the frozen `HerdrClient` has no
-//! methods for yet (`pane split|close|list`, `tab create`).
+//! implies go through [`PaneOps`]. List-and-claim runs under [`lock::GridLock`]
+//! and a claim is a `grid_role=worker` token, so two placements never share a
+//! pane. Reconcile and cleanup close only a pane recorded in `agent.pane_id`.
+
+pub mod lock;
 
 /// Workers a tab holds before the next one opens a new tab.
 pub const PER_TAB: usize = 4;
@@ -42,93 +45,208 @@ pub fn place(repo: &str, occupancy: &[usize]) -> Target {
     }
 }
 
-/// One live pane as herdr reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One live pane as herdr reports it (`pane list` joined with `tab list`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Pane {
     pub id: String,
+    /// Label of the pane's tab, from `tab list` by `tab_id`.
     pub tab: String,
-    /// The agent running in it, when any.
-    pub agent: Option<String>,
+    /// The harness `pane list` reports in `agent` (e.g. `claude`), not an agent name.
+    pub harness: Option<String>,
+    pub role: Option<String>,
+    pub owner: Option<String>,
+    pub farm: Option<String>,
+}
+
+impl Pane {
+    /// A pane that hosts a harness or was claimed for a worker.
+    pub fn taken(&self) -> bool {
+        self.harness.is_some() || self.role.as_deref() == Some("worker")
+    }
+}
+
+/// Who a claim or a reconcile acts for. `None` fields do not narrow.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Scope {
+    pub owner: Option<String>,
+    pub farm: Option<String>,
+}
+
+/// The farm id of a workspace: the last component of the directory holding
+/// `runs/`, lowercased, outside `[a-z0-9_-]` replaced by `-`.
+pub fn farm_id(runs_dir: &std::path::Path) -> Option<String> {
+    let root = runs_dir
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .to_lowercase();
+    Some(
+        root.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect(),
+    )
+}
+
+impl Scope {
+    pub fn from_runs_dir(runs_dir: &std::path::Path) -> Scope {
+        Scope {
+            owner: std::env::var("QUAQUA_OWNER").ok().filter(|o| !o.is_empty()),
+            farm: farm_id(runs_dir),
+        }
+    }
+
+    /// Tokens only narrow: a CoS/Lead pane, or a pane of another owner or farm,
+    /// is never ours. An untagged pane passes (the DB record is what claims it).
+    pub fn admits(&self, p: &Pane) -> bool {
+        let same = |mine: &Option<String>, theirs: &Option<String>| match (mine, theirs) {
+            (Some(m), Some(t)) => m == t,
+            _ => true,
+        };
+        matches!(p.role.as_deref(), None | Some("worker"))
+            && same(&self.owner, &p.owner)
+            && same(&self.farm, &p.farm)
+    }
+}
+
+/// How a new pane is cut from its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Right,
+    Down,
+}
+
+impl Dir {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dir::Right => "right",
+            Dir::Down => "down",
+        }
+    }
 }
 
 /// The pane operations a placement and a release need. The real client gets
-/// them once the herdr seam is extended; tests implement them in memory.
+/// them from [`HerdrPanes`]; tests may implement them in memory.
 pub trait PaneOps {
     fn panes(&self) -> std::io::Result<Vec<Pane>>;
     /// Opens a tab and returns its first pane.
     fn create_tab(&self, label: &str) -> std::io::Result<Pane>;
     /// Splits `anchor` (a pane id) and returns the new pane.
-    fn split(&self, anchor: &str) -> std::io::Result<Pane>;
+    fn split(&self, anchor: &str, dir: Dir) -> std::io::Result<Pane>;
     fn close_pane(&self, id: &str) -> std::io::Result<()>;
+    /// Marks `pane` as a worker pane of `scope`.
+    fn claim(&self, pane: &str, scope: &Scope) -> std::io::Result<()>;
 }
 
-/// Occupancy of `repo`'s worker tabs, from the live panes (a pane counts when
-/// an agent runs in it).
+/// Occupancy of `repo`'s worker tabs, from the live panes.
 pub fn occupancy(repo: &str, panes: &[Pane]) -> Vec<usize> {
     let mut out = Vec::new();
     let mut i = 0;
     while panes.iter().any(|p| p.tab == tab_label(repo, i)) {
         let label = tab_label(repo, i);
-        out.push(
-            panes
-                .iter()
-                .filter(|p| p.tab == label && p.agent.is_some())
-                .count(),
-        );
+        out.push(panes.iter().filter(|p| p.tab == label && p.taken()).count());
         i += 1;
     }
     out
 }
 
-/// Returns a pane for the next worker of `repo`: an empty pane of a tab with
-/// room, else a split of that tab, else a new tab.
-pub fn acquire(ops: &dyn PaneOps, repo: &str) -> std::io::Result<String> {
+/// Where the n-th pane (0-based) of a tab is cut, as `(anchor index, dir)`:
+/// the 2x2 layout: right of the first, below the first, below the second.
+pub fn cut(n: usize) -> (usize, Dir) {
+    match n {
+        1 => (0, Dir::Right),
+        2 => (0, Dir::Down),
+        _ => (1, Dir::Down),
+    }
+}
+
+/// Returns a claimed pane for the next worker of `repo`: an untaken pane of a
+/// tab with room, else a cut of that tab, else a new tab. List, choice and
+/// claim happen under the grid lock held in `lock_dir`.
+pub fn acquire(
+    ops: &dyn PaneOps,
+    repo: &str,
+    scope: &Scope,
+    lock_dir: &std::path::Path,
+) -> std::io::Result<String> {
+    let _guard = lock::GridLock::take(lock_dir)?;
     let panes = ops.panes()?;
     let target = place(repo, &occupancy(repo, &panes));
-    if target.new_tab {
-        return Ok(ops.create_tab(&target.tab)?.id);
-    }
     let in_tab: Vec<&Pane> = panes.iter().filter(|p| p.tab == target.tab).collect();
-    if let Some(free) = in_tab.iter().find(|p| p.agent.is_none()) {
-        return Ok(free.id.clone());
-    }
-    match in_tab.last() {
-        Some(anchor) => Ok(ops.split(&anchor.id)?.id),
-        None => Ok(ops.create_tab(&target.tab)?.id),
-    }
+    let id = if target.new_tab || in_tab.is_empty() {
+        ops.create_tab(&target.tab)?.id
+    } else if let Some(free) = in_tab.iter().find(|p| !p.taken()) {
+        free.id.clone()
+    } else {
+        let (anchor, dir) = cut(in_tab.len());
+        let anchor = in_tab
+            .get(anchor)
+            .or(in_tab.last())
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        ops.split(&anchor, dir)?.id
+    };
+    ops.claim(&id, scope)?;
+    Ok(id)
 }
 
 /// What `grid reconcile` does about one pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// A pane whose agent the database has ended.
+    /// A pane recorded for an agent the database has ended.
     Close(String),
 }
 
-/// Panes still running an agent that the DB says ended (`live` = names of
-/// open agents). A pane with no agent is left alone; a repeat finds nothing.
-pub fn reconcile_plan(panes: &[Pane], live: &[String]) -> Vec<Op> {
+/// One spawn-recorded pane and whether an open agent still holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    pub pane: String,
+    pub open: bool,
+}
+
+/// Panes to close: live, recorded at spawn, held by no open agent, and
+/// admitted by `scope`. Everything else (a CoS, a human's shell, another
+/// farm's worker) is left alone; a repeat finds nothing.
+pub fn reconcile_plan(panes: &[Pane], recorded: &[Recorded], scope: &Scope) -> Vec<Op> {
     panes
         .iter()
-        .filter_map(|p| match &p.agent {
-            Some(a) if !live.contains(a) => Some(Op::Close(p.id.clone())),
-            _ => None,
+        .filter(|p| {
+            recorded.iter().any(|r| r.pane == p.id && !r.open)
+                && !recorded.iter().any(|r| r.pane == p.id && r.open)
+                && scope.admits(p)
         })
+        .map(|p| Op::Close(p.id.clone()))
         .collect()
 }
 
-/// Names of the agents the database holds open.
-pub fn live_agents(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
-    let mut st = conn.prepare("SELECT name FROM agent WHERE ended_ms IS NULL")?;
-    let rows = st.query_map([], |r| r.get(0))?;
+/// The panes the database recorded at spawn.
+pub fn recorded_panes(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Recorded>> {
+    let mut st = conn.prepare(
+        "SELECT pane_id, ended_ms IS NULL FROM agent WHERE pane_id IS NOT NULL AND pane_id != ''",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(Recorded {
+            pane: r.get(0)?,
+            open: r.get(1)?,
+        })
+    })?;
     rows.collect()
 }
 
 /// Applies [`reconcile_plan`] and returns the ops it ran.
-pub fn reconcile(ops: &dyn PaneOps, conn: &rusqlite::Connection) -> Result<Vec<Op>, String> {
+pub fn reconcile(
+    ops: &dyn PaneOps,
+    conn: &rusqlite::Connection,
+    scope: &Scope,
+) -> Result<Vec<Op>, String> {
     let panes = ops.panes().map_err(|e| e.to_string())?;
-    let live = live_agents(conn).map_err(|e| e.to_string())?;
-    let plan = reconcile_plan(&panes, &live);
+    let recorded = recorded_panes(conn).map_err(|e| e.to_string())?;
+    let plan = reconcile_plan(&panes, &recorded, scope);
     for op in &plan {
         match op {
             Op::Close(id) => ops.close_pane(id).map_err(|e| e.to_string())?,
@@ -147,55 +265,122 @@ fn reply_json(r: crate::herdr::Reply) -> std::io::Result<serde_json::Value> {
     serde_json::from_str(&r.body).map_err(std::io::Error::other)
 }
 
-fn pane_of(v: &serde_json::Value, ptr: &str, tab: &str) -> std::io::Result<Pane> {
-    let id = v
-        .pointer(&format!("{ptr}/pane_id"))
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::other("reply has no pane_id"))?;
-    Ok(Pane {
-        id: id.to_string(),
-        tab: tab.to_string(),
-        agent: None,
+fn text<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key)?.as_str().filter(|s| !s.is_empty())
+}
+
+fn pane_from(
+    p: &serde_json::Value,
+    labels: &std::collections::HashMap<String, String>,
+) -> Option<Pane> {
+    let tokens = p.get("tokens");
+    let token = |k: &str| tokens.and_then(|t| text(t, k)).map(String::from);
+    Some(Pane {
+        id: text(p, "pane_id")?.to_string(),
+        tab: text(p, "tab_id")
+            .and_then(|t| labels.get(t))
+            .cloned()
+            .unwrap_or_default(),
+        harness: text(p, "agent").map(String::from),
+        role: token("grid_role"),
+        owner: token("grid_owner"),
+        farm: token("grid_farm"),
     })
+}
+
+impl HerdrPanes<'_> {
+    fn tab_labels(&self) -> std::io::Result<std::collections::HashMap<String, String>> {
+        let v = reply_json(self.0.tab_list()?)?;
+        let tabs = v
+            .pointer("/result/tabs")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| std::io::Error::other("reply has no tabs"))?;
+        Ok(tabs
+            .iter()
+            .filter_map(|t| {
+                Some((
+                    text(t, "tab_id")?.to_string(),
+                    text(t, "label")?.to_string(),
+                ))
+            })
+            .collect())
+    }
+
+    fn find(&self, id: &str) -> std::io::Result<Option<Pane>> {
+        Ok(self.panes()?.into_iter().find(|p| p.id == id))
+    }
 }
 
 impl PaneOps for HerdrPanes<'_> {
     fn panes(&self) -> std::io::Result<Vec<Pane>> {
+        let labels = self.tab_labels()?;
         let v = reply_json(self.0.pane_list()?)?;
         let list = v
             .pointer("/result/panes")
             .and_then(|x| x.as_array())
             .ok_or_else(|| std::io::Error::other("reply has no panes"))?;
-        Ok(list
-            .iter()
-            .filter_map(|p| {
-                Some(Pane {
-                    id: p.get("pane_id")?.as_str()?.to_string(),
-                    tab: p.get("tab_label")?.as_str()?.to_string(),
-                    agent: p.get("agent").and_then(|a| a.as_str()).map(String::from),
-                })
-            })
-            .collect())
+        Ok(list.iter().filter_map(|p| pane_from(p, &labels)).collect())
     }
 
+    /// `tab create` returns the new tab; its first pane is `/result/root_pane`
+    /// or `/result/pane` when the reply carries one, else the one pane
+    /// `pane list` shows in that tab (the reply shape is not verified live).
     fn create_tab(&self, label: &str) -> std::io::Result<Pane> {
         let v = reply_json(self.0.tab_create(label)?)?;
-        pane_of(&v, "/result/root_pane", label)
+        let direct = ["/result/root_pane/pane_id", "/result/pane/pane_id"]
+            .iter()
+            .find_map(|p| v.pointer(p)?.as_str().map(String::from));
+        let id = match direct {
+            Some(id) => id,
+            None => {
+                let tab = v
+                    .pointer("/result/tab/tab_id")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| {
+                        std::io::Error::other("tab create reply has no pane or tab id")
+                    })?;
+                let list = reply_json(self.0.pane_list()?)?;
+                list.pointer("/result/panes")
+                    .and_then(|x| x.as_array())
+                    .and_then(|a| a.iter().find(|p| text(p, "tab_id") == Some(tab)))
+                    .and_then(|p| text(p, "pane_id").map(String::from))
+                    .ok_or_else(|| std::io::Error::other("new tab has no pane"))?
+            }
+        };
+        Ok(Pane {
+            id,
+            tab: label.to_string(),
+            ..Pane::default()
+        })
     }
 
-    fn split(&self, anchor: &str) -> std::io::Result<Pane> {
-        let tab = self
-            .panes()?
-            .into_iter()
-            .find(|p| p.id == anchor)
-            .map(|p| p.tab)
-            .unwrap_or_default();
-        let v = reply_json(self.0.pane_split(anchor, "right")?)?;
-        pane_of(&v, "/result/pane", &tab)
+    fn split(&self, anchor: &str, dir: Dir) -> std::io::Result<Pane> {
+        let tab = self.find(anchor)?.map(|p| p.tab).unwrap_or_default();
+        let v = reply_json(self.0.pane_split(anchor, dir.as_str())?)?;
+        let id = v
+            .pointer("/result/pane/pane_id")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| std::io::Error::other("reply has no pane_id"))?;
+        Ok(Pane {
+            id: id.to_string(),
+            tab,
+            ..Pane::default()
+        })
     }
 
     fn close_pane(&self, id: &str) -> std::io::Result<()> {
         reply_json(self.0.pane_close(id)?).map(|_| ())
+    }
+
+    fn claim(&self, pane: &str, scope: &Scope) -> std::io::Result<()> {
+        let mut tokens = vec![("grid_role", "worker")];
+        if let Some(o) = scope.owner.as_deref() {
+            tokens.push(("grid_owner", o));
+        }
+        if let Some(f) = scope.farm.as_deref() {
+            tokens.push(("grid_farm", f));
+        }
+        reply_json(self.0.pane_report_metadata(pane, "quaqua", &tokens, None)?).map(|_| ())
     }
 }
 

@@ -68,7 +68,36 @@ fn header_block(text: &str) -> &str {
 
 /// Validates a brief. `env_budget` is `PROMPT_WORKER_BUDGET_SEC` when set; it
 /// overrides the brief's own line. An `Err` is exit 1.
-pub fn check_brief(text: &str, env_budget: Option<u64>) -> Result<BriefOk, String> {
+/// A playbook is in `dir` as `<name>.md`, or as a file whose `name:` line says so.
+fn playbook_exists(dir: &Path, name: &str) -> bool {
+    if dir.join(format!("{name}.md")).is_file() {
+        return true;
+    }
+    let want = format!("name: {name}");
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+        .any(|e| {
+            std::fs::read_to_string(e.path())
+                .is_ok_and(|t| t.lines().take(20).any(|l| l.trim() == want))
+        })
+}
+
+/// `QUAQUA_PLAYBOOKS_DIR`, else `<workspace>/playbooks` beside `runs/`.
+pub fn playbooks_dir(runs_dir: &Path) -> Option<PathBuf> {
+    match std::env::var_os("QUAQUA_PLAYBOOKS_DIR").filter(|v| !v.is_empty()) {
+        Some(v) => Some(PathBuf::from(v)),
+        None => Some(runs_dir.parent()?.join("playbooks")),
+    }
+}
+
+pub fn check_brief(
+    text: &str,
+    env_budget: Option<u64>,
+    playbooks: Option<&Path>,
+) -> Result<BriefOk, String> {
     let head = header_block(text);
     match at_col1(head, "Topology:") {
         None => return Err("brief has no 'Topology:' header".into()),
@@ -89,10 +118,24 @@ pub fn check_brief(text: &str, env_budget: Option<u64>) -> Result<BriefOk, Strin
         Some(p) if p.contains('<') => {
             warnings.push("warning: 'Playbook:' still holds a '<…>' placeholder".into())
         }
-        Some(_) => {}
+        Some(name) => {
+            let name = name.split([',', ';', ' ']).next().unwrap_or(name);
+            if let Some(dir) = playbooks.filter(|d| d.is_dir()) {
+                if !playbook_exists(dir, name) {
+                    return Err(format!(
+                        "Playbook '{name}' is not in {} (`quaqua playbook list`)",
+                        dir.display()
+                    ));
+                }
+            }
+        }
     }
-    if at_col1(head, "Context:").is_none() {
-        warnings.push("warning: brief has no 'Context:' header".into());
+    match at_col1(head, "Context:") {
+        None => warnings.push("warning: brief has no 'Context:' header".into()),
+        Some(c) if c.contains('<') && c.contains('…') => {
+            warnings.push("warning: 'Context:' still holds a '<…>' placeholder".into())
+        }
+        Some(_) => {}
     }
     if let Some(v) = at_col1(text, "Must fix:") {
         if !SEVERITIES.contains(&v) {
@@ -720,6 +763,21 @@ fn provider_verdict(
     classify(cfg.harness, text)
 }
 
+/// Whether the database holds an open agent record for `name`.
+fn agent_open(runs: &Path, name: &str) -> bool {
+    crate::db::open(&runs.join(crate::db::path::DB_FILE))
+        .ok()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM agent WHERE name = ?1 AND ended_ms IS NULL",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+        })
+        .is_some_and(|n| n > 0)
+}
+
 /// The agent's status and pane: `gone` when herdr has no such agent.
 fn agent_state(herdr: &dyn HerdrClient, name: &str) -> (Option<String>, Option<String>) {
     let Ok(r) = herdr.agent_get(name) else {
@@ -760,8 +818,10 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
     let mut last_change = clock.now_sec();
     let mut idle_since: Option<u64> = None;
     let mut fingerprint = String::new();
-    let mut last_auto_hash = String::new();
-    let mut attempt: u32 = 0;
+    // The diff at wait start: auto-extension needs the deadline diff to differ.
+    let mut last_auto_hash = diff_hash(&cfg.worktree);
+    // `--resume` continues the retry count of the wait it resumes.
+    let mut attempt: u32 = read_u64(&retry_f).unwrap_or(0) as u32;
     loop {
         let now = clock.now_sec();
         let elapsed = now.saturating_sub(start);
@@ -769,9 +829,19 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
         let report = std::fs::read_to_string(&cfg.report).ok();
         let (status, pane) = agent_state(herdr, name);
         let hash = diff_hash(&cfg.worktree);
-        let fp = format!("{}|{hash}", status.as_deref().unwrap_or("?"));
+        // The pane tail is the second change signal; a working agent is progress.
+        let tail = pane
+            .as_deref()
+            .and_then(|p| herdr.pane_read(p, TAIL_LINES as u32).ok())
+            .filter(|r| r.ok)
+            .map(|r| r.body)
+            .unwrap_or_default();
+        let fp = format!("{}|{hash}|{tail}", status.as_deref().unwrap_or("?"));
         if fp != fingerprint {
             fingerprint = fp;
+            last_change = now;
+        }
+        if status.as_deref() == Some("working") {
             last_change = now;
         }
         match status.as_deref() {
@@ -786,7 +856,9 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
             report,
             blocked: status.as_deref() == Some("blocked"),
             agent_gone: status.as_deref() == Some("gone"),
-            core_died: false,
+            // Gone from herdr while the DB still holds it open: it died
+            // without an end record.
+            core_died: status.as_deref() == Some("gone") && agent_open(runs, name),
             since_change_sec: now.saturating_sub(last_change),
             idle_sec: idle_since.map_or(0, |t| now.saturating_sub(t)),
             provider_error: false,
@@ -852,7 +924,7 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                     "provider_retry",
                     json!({"attempt": attempt, "reason": reason, "delay_ms": delay, "harness_exhausted": d.exhausted}),
                 );
-                write_atomic(&retry_f, &format!("{now}\n"));
+                write_atomic(&retry_f, &format!("{attempt}\n"));
                 clock.sleep_ms(delay);
                 let _ = herdr.agent_prompt(name, "continue", None);
                 last_change = clock.now_sec();
@@ -1017,7 +1089,8 @@ pub fn prompt_run(
         let env_budget = std::env::var("PROMPT_WORKER_BUDGET_SEC")
             .ok()
             .and_then(|v| v.parse().ok());
-        let ok = check_brief(text, env_budget).map_err(|e| CliError::new(1, e))?;
+        let ok = check_brief(text, env_budget, playbooks_dir(runs).as_deref())
+            .map_err(|e| CliError::new(1, e))?;
         for w in &ok.warnings {
             eprintln!("{w}");
         }
@@ -1069,7 +1142,7 @@ pub fn prompt_run(
 
 fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
     let usage = || {
-        CliError::new(1, "usage: worker prompt <name> \"<brief>\" | prompt <name> --resume | prompt --check-brief <brief> | worker cleanup <name> | worker stop <name>")
+        CliError::new(1, "usage: worker prompt <name> \"<brief>\" | prompt <name> --resume | prompt --check-brief <brief> | worker cleanup <name> [--allow-dirty] | worker stop <name>")
     };
     match args.first().map(String::as_str) {
         Some("prompt") => match args.get(1).map(String::as_str) {
@@ -1078,7 +1151,8 @@ fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
                 let env_budget = std::env::var("PROMPT_WORKER_BUDGET_SEC")
                     .ok()
                     .and_then(|v| v.parse().ok());
-                let ok = check_brief(text, env_budget).map_err(|e| CliError::new(1, e))?;
+                let ok = check_brief(text, env_budget, playbooks_dir(&env.runs_dir).as_deref())
+                    .map_err(|e| CliError::new(1, e))?;
                 let mut out = ok.warnings.join("\n");
                 if !out.is_empty() {
                     out.push('\n');
@@ -1096,7 +1170,12 @@ fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
         },
         Some(verb @ ("cleanup" | "stop")) => {
             let name = args.get(1).ok_or_else(usage)?;
-            let v = crate::cli::rpc_call(env, &format!("worker.{verb}"), json!({ "name": name }))?;
+            let allow_dirty = verb == "cleanup" && args[2..].iter().any(|a| a == "--allow-dirty");
+            let v = crate::cli::rpc_call(
+                env,
+                &format!("worker.{verb}"),
+                json!({ "name": name, "allow_dirty": allow_dirty }),
+            )?;
             Ok(v.to_string())
         }
         _ => Err(usage()),

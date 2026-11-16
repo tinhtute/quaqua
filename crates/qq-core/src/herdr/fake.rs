@@ -37,8 +37,13 @@ struct State {
     tabs: BTreeMap<String, String>,
     /// pane id -> tab id.
     panes: BTreeMap<String, String>,
+    /// pane id -> harness of a pane seeded without an agent of ours (a CoS, a
+    /// human's shell, another farm's worker).
+    foreign: BTreeMap<String, String>,
     /// pane id -> merged tokens and display agent.
     meta: BTreeMap<String, (BTreeMap<String, String>, Option<String>)>,
+    /// `(anchor pane, direction)` of every split, in order.
+    splits: Vec<(String, String)>,
     next_id: u32,
 }
 
@@ -86,6 +91,57 @@ impl FakeHerdr {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Test control: a pane herdr knows that this fake has no agent for (a CoS,
+    /// a human's shell, another farm's worker), in tab `tab_label`, with the
+    /// harness `agent` reports and the tokens `pane list` shows.
+    pub fn seed_pane(
+        &self,
+        tab_label: &str,
+        harness: Option<&str>,
+        tokens: &[(&str, &str)],
+    ) -> String {
+        let mut st = self.lock();
+        let tab = match st.tabs.iter().find(|(_, l)| l.as_str() == tab_label) {
+            Some((t, _)) => t.clone(),
+            None => {
+                st.next_id += 1;
+                let t = format!("t{}", st.next_id);
+                st.tabs.insert(t.clone(), tab_label.to_string());
+                t
+            }
+        };
+        st.next_id += 1;
+        let id = format!("p{}", st.next_id);
+        st.panes.insert(id.clone(), tab);
+        if let Some(h) = harness {
+            st.foreign.insert(id.clone(), h.to_string());
+        }
+        let m = st.meta.entry(id.clone()).or_default();
+        for (k, v) in tokens {
+            m.0.insert((*k).into(), (*v).into());
+        }
+        id
+    }
+
+    /// The tokens `pane list` shows for `pane`.
+    pub fn tokens(&self, pane: &str) -> BTreeMap<String, String> {
+        self.lock()
+            .meta
+            .get(pane)
+            .map(|m| m.0.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every split so far as `(anchor pane, direction)`.
+    pub fn splits(&self) -> Vec<(String, String)> {
+        self.lock().splits.clone()
+    }
+
+    /// Whether herdr still has `pane`.
+    pub fn has_pane(&self, pane: &str) -> bool {
+        self.lock().panes.contains_key(pane)
     }
 
     /// What `pane_read` returns for `pane` (its whole scrollback).
@@ -296,8 +352,9 @@ impl HerdrClient for FakeHerdr {
         Ok(Reply::ok(r#"{"result":{"sent":true}}"#))
     }
 
-    fn pane_split(&self, target: &str, _dir: &str) -> io::Result<Reply> {
+    fn pane_split(&self, target: &str, dir: &str) -> io::Result<Reply> {
         let mut st = enter!(self, Verb::PaneSplit);
+        st.splits.push((target.to_string(), dir.to_string()));
         let Some(tab) = st.panes.get(target).cloned() else {
             return Ok(Reply::err("pane_not_found"));
         };
@@ -321,28 +378,55 @@ impl HerdrClient for FakeHerdr {
 
     fn pane_list(&self) -> io::Result<Reply> {
         let st = enter!(self, Verb::PaneList);
-        let items: Vec<String> = st
+        let items: Vec<serde_json::Value> = st
             .panes
             .iter()
             .map(|(id, tab)| {
-                let agent = st
-                    .agents
-                    .iter()
-                    .find(|(_, a)| &a.pane == id)
-                    .map(|(n, _)| n.clone());
+                let own = st.agents.values().find(|a| &a.pane == id);
+                let harness = own
+                    .map(|a| a.kind.clone())
+                    .or_else(|| st.foreign.get(id).cloned());
+                let status = own.map_or("unknown", |a| a.status.as_str());
+                let (tokens, display) = st.meta.get(id).cloned().unwrap_or_default();
                 serde_json::json!({
                     "pane_id": id,
                     "tab_id": tab,
-                    "tab_label": st.tabs.get(tab),
-                    "agent": agent,
+                    "workspace_id": "w1",
+                    "cwd": "/work",
+                    "agent": harness,
+                    "agent_status": status,
+                    "label": null,
+                    "display_agent": display,
+                    "tokens": tokens,
                 })
-                .to_string()
             })
             .collect();
-        Ok(Reply::ok(format!(
-            r#"{{"result":{{"panes":[{}]}}}}"#,
-            items.join(",")
-        )))
+        Ok(Reply::ok(
+            serde_json::json!({"result": {"panes": items}}).to_string(),
+        ))
+    }
+
+    fn tab_list(&self) -> io::Result<Reply> {
+        let st = enter!(self, Verb::TabList);
+        let items: Vec<serde_json::Value> = st
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, (id, label))| {
+                serde_json::json!({
+                    "tab_id": id,
+                    "label": label,
+                    "number": i + 1,
+                    "pane_count": st.panes.values().filter(|t| *t == id).count(),
+                    "workspace_id": "w1",
+                    "agent_status": "unknown",
+                    "focused": false,
+                })
+            })
+            .collect();
+        Ok(Reply::ok(
+            serde_json::json!({"result": {"tabs": items}}).to_string(),
+        ))
     }
 
     fn tab_create(&self, name: &str) -> io::Result<Reply> {

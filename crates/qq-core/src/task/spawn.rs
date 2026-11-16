@@ -136,15 +136,16 @@ pub fn spawn(
         Some((id, ..)) => id,
         None => {
             conn.execute(
-                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms, pane_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     spec.name,
                     spec.role.as_str(),
                     spec.kind,
                     spec.project_id,
                     spec.spawner_id,
-                    now_ms as i64
+                    now_ms as i64,
+                    spec.pane
                 ],
             )
             .map_err(SpawnError::Db)?;

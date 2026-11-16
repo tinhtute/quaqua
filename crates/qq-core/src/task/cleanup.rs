@@ -1,15 +1,15 @@
 //! `worker cleanup|stop` and `lead cleanup`. Every step reads the state that
 //! exists and applies only the difference, so a repeat (or a rerun after a
-//! crash between steps) converges.
+//! crash between steps) converges. The only panes closed are the ones the
+//! spawn recorded in `agent.pane_id` (tokens may narrow, never widen).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::daemon::Daemon;
-use crate::driver::{self, Registry as Drivers};
-use crate::grid::{HerdrPanes, PaneOps};
+use crate::grid::{HerdrPanes, PaneOps, Scope};
 use crate::herdr::HerdrClient;
 use crate::rpc::{self, Request, RpcError};
 use serde_json::json;
@@ -23,8 +23,14 @@ pub enum OpsError {
     NoAgent(String),
     /// The agent never reached idle; nothing was released.
     NotStopped(String),
+    /// The harness has no verified stop sequence; nothing was sent.
+    Unverified(String),
     /// The Lead still has open Peers.
     PeersOpen(Vec<String>),
+    /// The worktree has uncommitted paths; nothing was removed.
+    Dirty(Vec<String>),
+    /// The repo does not own this worker; nothing was touched (#170 F1).
+    WrongRepo(String),
     Git(String),
     Other(String),
 }
@@ -33,8 +39,20 @@ impl std::fmt::Display for OpsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpsError::NoAgent(n) => write!(f, "no open agent '{n}'"),
-            OpsError::NotStopped(n) => write!(f, "'{n}' did not stop; pane kept"),
+            OpsError::NotStopped(n) => write!(f, "'{n}' did not stop"),
+            OpsError::Unverified(h) => {
+                write!(
+                    f,
+                    "no verified stop sequence for harness '{h}'; nothing sent"
+                )
+            }
             OpsError::PeersOpen(p) => write!(f, "open peers: {}", p.join(", ")),
+            OpsError::Dirty(p) => write!(
+                f,
+                "worktree is dirty (pass --allow-dirty to discard): {}",
+                p.join(", ")
+            ),
+            OpsError::WrongRepo(m) => write!(f, "{m}"),
             OpsError::Git(m) | OpsError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -52,7 +70,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, OpsError> {
         .output()
         .map_err(|e| OpsError::Git(e.to_string()))?;
     if o.status.success() {
-        Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&o.stdout).trim_end().to_string())
     } else {
         Err(OpsError::Git(
             String::from_utf8_lossy(&o.stderr).trim().to_string(),
@@ -60,23 +78,128 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, OpsError> {
     }
 }
 
-/// Removes the worker's worktree and keeps its branch, then ends the agent.
-/// A worktree that is already gone is not an error.
+/// Where a cleanup acts.
+pub struct Target<'a> {
+    pub repo: &'a Path,
+    pub worktree: &'a Path,
+    pub runs_dir: &'a Path,
+    pub name: &'a str,
+    /// Discard uncommitted paths instead of refusing.
+    pub allow_dirty: bool,
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Closes the pane the spawn recorded for `name`, when herdr still has it,
+/// the scope admits it and no other open agent holds it.
+fn release_recorded(
+    conn: &Connection,
+    panes: &dyn PaneOps,
+    scope: &Scope,
+    name: &str,
+) -> Result<(), OpsError> {
+    let pane: Option<String> = conn
+        .query_row(
+            "SELECT pane_id FROM agent WHERE name = ?1 ORDER BY id DESC LIMIT 1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(other)?
+        .flatten();
+    let Some(pane) = pane.filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let shared: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent WHERE pane_id = ?1 AND ended_ms IS NULL AND name != ?2",
+            params![pane, name],
+            |r| r.get(0),
+        )
+        .map_err(other)?;
+    if shared > 0 {
+        return Ok(());
+    }
+    if let Some(p) = panes
+        .panes()
+        .map_err(other)?
+        .into_iter()
+        .find(|p| p.id == pane)
+    {
+        if scope.admits(&p) {
+            panes.close_pane(&p.id).map_err(other)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes `runs/.<name>.*` and `runs/<name>.base`.
+fn remove_sidecars(runs_dir: &Path, name: &str) {
+    let prefix = format!(".{name}.");
+    if let Ok(rd) = std::fs::read_dir(runs_dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(runs_dir.join(format!("{name}.base")));
+}
+
+/// Removes the worker's worktree, closes its recorded pane, drops its
+/// sidecars, keeps its branch and ends the agent. A dirty worktree is refused
+/// (listing the paths) unless `allow_dirty`; git is never run with `--force`.
+/// A repo that has neither the worktree nor the branch is refused untouched.
 pub fn cleanup_worker(
     conn: &Connection,
-    repo: &Path,
-    worktree: &Path,
-    name: &str,
+    panes: &dyn PaneOps,
+    scope: &Scope,
+    t: &Target,
     now_ms: u64,
 ) -> Result<(), OpsError> {
-    if worktree.exists() {
-        git(
-            repo,
-            &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-        )?;
+    let registered = git(t.repo, &["worktree", "list", "--porcelain"])?
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| canon(Path::new(p)) == canon(t.worktree));
+    let branch = format!("refs/heads/quaqua/{}", t.name);
+    let has_branch = git(t.repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
+    if !t.worktree.is_dir() && !registered && !has_branch {
+        return Err(OpsError::WrongRepo(format!(
+            "nothing to remove in {}: no worktree {} and no branch quaqua/{} (wrong repo?)",
+            t.repo.display(),
+            t.worktree.display(),
+            t.name
+        )));
     }
-    git(repo, &["worktree", "prune"])?;
-    end_agent(conn, name, now_ms).map_err(other)
+    let mut dirty = Vec::new();
+    if t.worktree.is_dir() {
+        dirty = git(
+            t.worktree,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?
+        .lines()
+        .map(|l| l.get(3..).unwrap_or(l).to_string())
+        .collect();
+        if !dirty.is_empty() && !t.allow_dirty {
+            return Err(OpsError::Dirty(dirty));
+        }
+    }
+    release_recorded(conn, panes, scope, t.name)?;
+    if t.worktree.is_dir() {
+        if dirty.is_empty() {
+            git(
+                t.repo,
+                &["worktree", "remove", &t.worktree.to_string_lossy()],
+            )?;
+        } else {
+            std::fs::remove_dir_all(t.worktree).map_err(other)?;
+        }
+    }
+    git(t.repo, &["worktree", "prune"])?;
+    remove_sidecars(t.runs_dir, t.name);
+    end_agent(conn, t.name, now_ms).map_err(other)
 }
 
 fn end_agent(conn: &Connection, name: &str, now_ms: u64) -> rusqlite::Result<()> {
@@ -98,43 +221,57 @@ fn open_agent(conn: &Connection, name: &str) -> Result<(i64, Option<String>), Op
     .ok_or_else(|| OpsError::NoAgent(name.to_string()))
 }
 
-/// Stops the agent with its driver's key sequences (`driver::stop`), then
-/// releases its pane and ends the agent. When nothing idles it, nothing is
-/// released and the caller sees `NotStopped`.
-pub fn stop_worker(
-    conn: &Connection,
-    herdr: &dyn HerdrClient,
-    panes: &dyn PaneOps,
-    drivers: &Drivers,
-    name: &str,
-    now_ms: u64,
-) -> Result<(), OpsError> {
+/// The verified stop key sequence of a harness (the old `Harness::stop_keys`):
+/// none for a harness without one (claude, pi). Never ctrl+c.
+pub fn stop_keys(harness: &str) -> Option<&'static [&'static str]> {
+    match harness {
+        "opencode" => Some(&["esc", "esc"]),
+        "omp" | "agy" => Some(&["esc"]),
+        _ => None,
+    }
+}
+
+/// Interrupts a working agent with its harness's verified keys and waits for
+/// idle. The worker stays alive: no pane is closed and the agent is not
+/// ended (`cleanup` does that). A harness without a verified sequence is
+/// refused before anything is sent, even when the agent is idle.
+pub fn stop_worker(conn: &Connection, herdr: &dyn HerdrClient, name: &str) -> Result<(), OpsError> {
     let (_, kind) = open_agent(conn, name)?;
     let kind = kind.ok_or_else(|| OpsError::Other(format!("'{name}' has no kind")))?;
     let target = crate::config::resolve_spawn(conn, &kind).map_err(|e| other(format!("{e:?}")))?;
-    let drv = drivers
-        .get(&target.harness.name)
-        .ok_or_else(|| OpsError::Other(format!("no driver for '{}'", target.harness.name)))?;
-    if !driver::stop(herdr, drv.as_ref(), name, SETTLE_MS).map_err(other)? {
-        return Err(OpsError::NotStopped(name.to_string()));
+    let harness = target.harness.name;
+    let keys = stop_keys(&harness).ok_or(OpsError::Unverified(harness))?;
+    debug_assert!(keys.iter().all(|k| !k.contains("ctrl+c")));
+    let idle = |r: &crate::herdr::Reply| {
+        serde_json::from_str::<serde_json::Value>(&r.body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/result/agent/agent_status")?
+                    .as_str()
+                    .map(String::from)
+            })
+            .as_deref()
+            == Some("idle")
+    };
+    if matches!(herdr.agent_get(name), Ok(r) if r.ok && idle(&r)) {
+        return Ok(());
     }
-    release_pane(panes, name)?;
-    end_agent(conn, name, now_ms).map_err(other)
+    match herdr.agent_send_keys(name, keys) {
+        Ok(r) if r.ok => {}
+        _ => return Err(OpsError::NotStopped(name.to_string())),
+    }
+    match herdr.agent_wait(name, &["idle"], SETTLE_MS) {
+        Ok(r) if r.ok => Ok(()),
+        _ => Err(OpsError::NotStopped(name.to_string())),
+    }
 }
 
-fn release_pane(panes: &dyn PaneOps, name: &str) -> Result<(), OpsError> {
-    for p in panes.panes().map_err(other)? {
-        if p.agent.as_deref() == Some(name) {
-            panes.close_pane(&p.id).map_err(other)?;
-        }
-    }
-    Ok(())
-}
-
-/// Ends the project's Lead and releases its pane; refused while Peers run.
+/// Ends the project's Lead and releases its recorded pane; refused while
+/// Peers run.
 pub fn cleanup_lead(
     conn: &Connection,
     panes: &dyn PaneOps,
+    scope: &Scope,
     project: &str,
     now_ms: u64,
 ) -> Result<(), OpsError> {
@@ -158,7 +295,7 @@ pub fn cleanup_lead(
         return Err(OpsError::PeersOpen(peers));
     }
     for (name, _) in rows.iter().filter(|r| r.1 == "lead") {
-        release_pane(panes, name)?;
+        release_recorded(conn, panes, scope, name)?;
         end_agent(conn, name, now_ms).map_err(other)?;
     }
     Ok(())
@@ -183,7 +320,8 @@ fn now_ms() -> u64 {
 /// and `grid.acquire` on the daemon, over its own herdr client.
 pub fn register(daemon: &mut Daemon) -> Result<(), String> {
     let herdr = daemon.herdr();
-    let db_path = daemon.runs_dir().join(crate::db::path::DB_FILE);
+    let runs = daemon.runs_dir().to_path_buf();
+    let db_path = runs.join(crate::db::path::DB_FILE);
     let open = move |p: &std::path::PathBuf| crate::db::open(p).map_err(rpc_err);
 
     let (h, p, o) = (herdr.clone(), db_path.clone(), open);
@@ -191,21 +329,13 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
         "worker.stop",
         Box::new(move |_, req| {
             let conn = o(&p)?;
-            let drivers = Drivers::native();
-            stop_worker(
-                &conn,
-                h.as_ref(),
-                &HerdrPanes(h.as_ref()),
-                &drivers,
-                arg(req, "name")?,
-                now_ms(),
-            )
-            .map_err(|e| RpcError::new("not_stopped", e.to_string()))?;
+            stop_worker(&conn, h.as_ref(), arg(req, "name")?)
+                .map_err(|e| RpcError::new("not_stopped", e.to_string()))?;
             Ok(json!({ "stopped": arg(req, "name")? }))
         }),
     )?;
 
-    let (p, o) = (db_path.clone(), open);
+    let (h, p, o, rd) = (herdr.clone(), db_path.clone(), open, runs.clone());
     daemon.register_verb(
         "worker.cleanup",
         Box::new(move |_, req| {
@@ -225,12 +355,27 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
                 RpcError::new("no_project", format!("'{name}' has no project repo"))
             })?);
             let wt = repo.parent().unwrap_or(&repo).join(".wt").join(name);
-            cleanup_worker(&conn, &repo, &wt, name, now_ms()).map_err(rpc_err)?;
+            let allow_dirty = req.args.get("allow_dirty").and_then(|v| v.as_bool()) == Some(true);
+            let target = Target {
+                repo: &repo,
+                worktree: &wt,
+                runs_dir: &rd,
+                name,
+                allow_dirty,
+            };
+            cleanup_worker(
+                &conn,
+                &HerdrPanes(h.as_ref()),
+                &Scope::from_runs_dir(&rd),
+                &target,
+                now_ms(),
+            )
+            .map_err(rpc_err)?;
             Ok(json!({ "cleaned": name }))
         }),
     )?;
 
-    let (h, p, o) = (herdr.clone(), db_path.clone(), open);
+    let (h, p, o, rd) = (herdr.clone(), db_path.clone(), open, runs.clone());
     daemon.register_verb(
         "lead.cleanup",
         Box::new(move |_, req| {
@@ -238,6 +383,7 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
             cleanup_lead(
                 &conn,
                 &HerdrPanes(h.as_ref()),
+                &Scope::from_runs_dir(&rd),
                 arg(req, "project")?,
                 now_ms(),
             )
@@ -246,12 +392,14 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
         }),
     )?;
 
-    let (h, p, o) = (herdr.clone(), db_path, open);
+    let (h, p, o, rd) = (herdr.clone(), db_path, open, runs.clone());
     daemon.register_verb(
         "grid.reconcile",
         Box::new(move |_, _| {
             let conn = o(&p)?;
-            let ops = crate::grid::reconcile(&HerdrPanes(h.as_ref()), &conn).map_err(rpc_err)?;
+            let ops =
+                crate::grid::reconcile(&HerdrPanes(h.as_ref()), &conn, &Scope::from_runs_dir(&rd))
+                    .map_err(rpc_err)?;
             Ok(json!({ "closed": ops.len() }))
         }),
     )?;
@@ -260,8 +408,13 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
     daemon.register_verb(
         "grid.acquire",
         Box::new(move |_, req| {
-            let pane = crate::grid::acquire(&HerdrPanes(h.as_ref()), arg(req, "repo")?)
-                .map_err(rpc_err)?;
+            let pane = crate::grid::acquire(
+                &HerdrPanes(h.as_ref()),
+                arg(req, "repo")?,
+                &Scope::from_runs_dir(&runs),
+                &runs,
+            )
+            .map_err(rpc_err)?;
             Ok(json!({ "pane": pane }))
         }),
     )
