@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
-use crate::cli::Registry;
+use crate::cli::{Install, Registry};
 use crate::daemon::{Ctx, Daemon};
 use crate::db::path::DB_FILE;
 use crate::rpc::{self, Request, RpcError};
@@ -41,6 +41,9 @@ pub fn install(_: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
 
 /// Most mail one `mail.inbox` call returns.
 const MAX_PAGE: i64 = 100;
+
+/// The entry `cli::MODULES` lists.
+pub const INSTALL: Install = install;
 
 type Op = fn(&Bus, &Ctx, &Request) -> Result<Value, RpcError>;
 
