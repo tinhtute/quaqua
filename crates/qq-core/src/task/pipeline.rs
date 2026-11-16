@@ -33,8 +33,9 @@ pub const REJECTED: i32 = 1;
 
 /// Pause codes (the `blocked <code>:` of the pause reason).
 pub const BLOCK_UNFINISHED: i32 = 5;
-/// The plan is written and waits for the Lead's `pipeline --resume` (legacy exit 5).
-pub const BLOCK_PLAN_READY: i32 = 5;
+/// The plan is written and waits for the Lead's `pipeline --resume`. Its own
+/// code (legacy shared exit 5 with unfinished), so a consumer needs no reason text.
+pub const BLOCK_PLAN_READY: i32 = 14;
 pub const BLOCK_BAD_REVIEW: i32 = 6;
 pub const BLOCK_BAD_SHA: i32 = 7;
 pub const BLOCK_SHA_MOVED: i32 = 8;

@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::pipeline::{self, PipelineFlow, PipelineInput, PipelineState};
 use super::spawn::{spawn, Role, SpawnError, SpawnSpec};
+use crate::authority::{self, Role as AuthRole};
 use crate::cli::{CliError, Command, Install, Registry as CliRegistry};
 use crate::config;
 use crate::daemon::supervisor::{Factory, Machine};
@@ -348,12 +349,54 @@ fn input_of(a: &Value, runs_dir: &Path) -> Result<PipelineInput, RpcError> {
         "pane": text(a, "pane")?,
         "runs_dir": runs_dir,
     });
+    // A new start plans first (the serde default stays false so a journaled
+    // flow replays as it started).
+    v["plan"] = json!(true);
     for k in ["project_id", "max_rounds", "timeout_ms", "check", "plan"] {
         if let Some(x) = a.get(k) {
             v[k] = x.clone();
         }
     }
     pipeline::input_from(&v).map_err(bad)
+}
+
+/// Who may approve a paused flow: the CoS and supervisors, and the Lead of the
+/// flow's own project. A peer (the builder included) and a caller the daemon
+/// could not name never approve their own pause.
+fn approve_resume(
+    ctx: &crate::daemon::Ctx,
+    runs_dir: &Path,
+    id: &str,
+    caller: Option<&str>,
+) -> Result<(), RpcError> {
+    let refuse = |why: String| Err(RpcError::new("refused", format!("resume {id}: {why}")));
+    let Some(caller) = caller else {
+        return refuse("no caller named".into());
+    };
+    let actor = ctx
+        .store
+        .with_conn(|c| {
+            authority::resolve(c, caller).map_err(|e| rusqlite::Error::InvalidParameterName(e.0))
+        })
+        .map_err(internal)?;
+    let Some(actor) = actor else {
+        return refuse(format!("{caller} is not an active agent"));
+    };
+    match actor.role {
+        AuthRole::Cos | AuthRole::Supervisor => Ok(()),
+        AuthRole::Lead => {
+            let db = runs_dir.join(crate::db::path::DB_FILE);
+            let project = journaled_input(&db, id)
+                .map_err(|e| internal(format!("{id}: cannot read the flow's project: {e}")))?
+                .project_id;
+            if project.is_some() && project == actor.project_id {
+                Ok(())
+            } else {
+                refuse(format!("{caller} leads another project"))
+            }
+        }
+        AuthRole::Peer => refuse(format!("{caller} is a peer; only the Lead approves")),
+    }
 }
 
 fn start_verb(deps: Arc<Deps>) -> Handler {
@@ -373,6 +416,7 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             if !ctx.supervisor.is_running(&id) {
                 return Err(RpcError::new("not_found", format!("{id} is not running")));
             }
+            approve_resume(ctx, &deps.runs_dir, &id, req.caller.as_deref())?;
             let payload = match req.args.get("rounds").and_then(Value::as_u64) {
                 Some(n) if n >= 1 => json!({ "rounds": n }),
                 Some(_) => return Err(bad("--rounds must be an integer >= 1".to_string())),
