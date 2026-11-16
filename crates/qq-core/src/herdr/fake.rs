@@ -20,6 +20,8 @@ struct Agent {
 
 #[derive(Default)]
 struct State {
+    /// pane id -> text `pane_read` returns.
+    text: BTreeMap<String, String>,
     agents: BTreeMap<String, Agent>,
     prompts: Vec<(String, String)>,
     keys: Vec<(String, Vec<String>)>,
@@ -84,6 +86,11 @@ impl FakeHerdr {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What `pane_read` returns for `pane` (its whole scrollback).
+    pub fn set_pane_text(&self, pane: &str, text: &str) {
+        self.lock().text.insert(pane.to_string(), text.to_string());
     }
 
     /// Test control: force an agent's status (`idle`, `working`, `blocked`, `done`).
@@ -368,6 +375,17 @@ impl HerdrClient for FakeHerdr {
         }
         st.agents.retain(|_, a| !gone.contains(&a.pane));
         Ok(Reply::ok(r#"{"result":{"closed":true}}"#))
+    }
+
+    fn pane_read(&self, pane: &str, lines: u32) -> io::Result<Reply> {
+        let st = enter!(self, Verb::PaneRead);
+        if !st.panes.contains_key(pane) && !st.text.contains_key(pane) {
+            return Ok(Reply::err("pane_not_found"));
+        }
+        let text = st.text.get(pane).cloned().unwrap_or_default();
+        let all: Vec<&str> = text.lines().collect();
+        let tail = &all[all.len().saturating_sub(lines as usize)..];
+        Ok(Reply::ok(tail.join("\n")))
     }
 
     fn pane_get(&self, pane: &str) -> io::Result<Reply> {

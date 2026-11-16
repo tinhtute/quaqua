@@ -13,7 +13,9 @@ use qq_core::grid::{self, HerdrPanes, PaneOps};
 use qq_core::herdr::{FakeHerdr, HerdrClient};
 use qq_core::status;
 use qq_core::task::cleanup::{self, OpsError};
-use qq_core::task::prompt::{self, Allowance, Clock, Exit, Observed, WaitCfg};
+use qq_core::task::prompt::{
+    self, Allowance, Clock, Exit, Observed, ProviderError, Shape, Tuning, WaitCfg,
+};
 use qq_core::task::spawn::{spawn, Role, SpawnSpec};
 use qq_core::task::worker_flow::place_pane;
 use rusqlite::Connection;
@@ -442,6 +444,7 @@ fn wait_cfg<'a>(
         poll_ms: 5_000,
         retry_base_ms: 60_000,
         retry_max: 4,
+        harness: None,
         journal,
     }
 }
@@ -508,13 +511,13 @@ fn prompt_wait_retries_a_provider_error_then_escalates() {
     let events = std::cell::RefCell::new(Vec::<String>::new());
     let journal = |k: &str, _: serde_json::Value| events.borrow_mut().push(k.to_string());
     let err = runs.join(".w.error");
-    std::fs::write(&err, "overloaded\n").unwrap();
+    std::fs::write(&err, "retryable 529 0\n").unwrap();
     let again = err.clone();
     // Each retry clears the verdict; the harness errors again after a sleep.
     let clock = FakeClock {
         now: 0.into(),
         on_sleep: Box::new(move |_| {
-            let _ = std::fs::write(&again, "overloaded\n");
+            let _ = std::fs::write(&again, "retryable 529 0\n");
         }),
     };
     let cfg = wait_cfg(&runs, &journal, 7200);
@@ -526,4 +529,159 @@ fn prompt_wait_retries_a_provider_error_then_escalates() {
         h.prompts().iter().filter(|(_, t)| t == "continue").count(),
         4
     );
+}
+
+#[test]
+fn provider_error_classifier_table() {
+    use prompt::classify;
+    let r = |h, pane| classify(h, pane).map(|d| (d.error, d.exhausted));
+    let (omp, pi, claude) = (Some(Shape::Omp), Some(Shape::Pi), Some(Shape::Claude));
+    let retry = |s| Some((ProviderError::Retryable(s), false));
+    let fatal = |s| Some((ProviderError::Fatal(s), false));
+    assert_eq!(
+        r(omp, "Error: 429 rate limit exceeded"),
+        retry("rate-limit")
+    );
+    assert_eq!(r(omp, "Error: 401 invalid api key"), fatal("signed-out"));
+    assert_eq!(r(omp, "Error: 402 payment required"), fatal("billing"));
+    assert_eq!(r(pi, "Error: 503: service unavailable"), retry("5xx"));
+    assert_eq!(
+        r(claude, "⎿ API Error: 529 overloaded_error"),
+        retry("overloaded")
+    );
+    assert_eq!(
+        r(claude, "Not logged in · Please run /login"),
+        fatal("signed-out")
+    );
+    // a spent harness ladder is flagged
+    assert_eq!(
+        r(
+            omp,
+            "Error: Retry budget exhausted after 10 retries: 529 overloaded"
+        ),
+        Some((ProviderError::Retryable("overloaded"), true))
+    );
+    // worker output that only mentions provider words never classifies
+    assert_eq!(r(omp, "429 tests run, 0 failed"), None);
+    assert_eq!(r(claude, "I fixed the API error handling"), None);
+    // fatal beats an earlier retryable one; only the last 15 lines count
+    assert_eq!(
+        r(omp, "Error: 529 overloaded\nError: 401 invalid api key"),
+        fatal("signed-out")
+    );
+    let old = format!("Error: 529 overloaded\n{}", "ok\n".repeat(15));
+    assert_eq!(r(omp, &old), None);
+    // structured record: fail closed, stale-free parse
+    assert_eq!(
+        prompt::parse_error_record("retryable 429 3").map(|d| (d.error, d.exhausted)),
+        Some((ProviderError::Retryable("rate-limit"), true))
+    );
+    assert_eq!(
+        prompt::parse_error_record("fatal 529 0").map(|d| d.error),
+        Some(ProviderError::Fatal("harness-fatal"))
+    );
+    assert!(prompt::parse_error_record("retryable x 0").is_none());
+}
+
+#[test]
+fn prompt_wait_classifies_the_pane_tail() {
+    let (runs, _c) = seeded("pane");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    h.set_pane_text("p1", "Error: 529 overloaded\n");
+    let events = std::cell::RefCell::new(Vec::<String>::new());
+    let journal = |k: &str, _: serde_json::Value| events.borrow_mut().push(k.to_string());
+    // The harness echoes our "continue" under the old error; nothing newer follows.
+    let echo = || h.set_pane_text("p1", "Error: 529 overloaded\ncontinue\n");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| echo()),
+    };
+    let mut cfg = wait_cfg(&runs, &journal, 7200);
+    cfg.harness = Some(Shape::Omp);
+    // idle 120s -> the pane reads retryable -> one provider_retry and one
+    // "continue"; the old error sits above the echo, so it never counts twice
+    // and the wait ends as a plain stall (exit 3).
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::Stalled);
+    assert_eq!(*events.borrow(), vec!["provider_retry".to_string()]);
+    assert_eq!(
+        h.prompts().iter().filter(|(_, t)| t == "continue").count(),
+        1
+    );
+}
+
+#[test]
+fn prompt_sends_the_brief_once_and_resume_sends_nothing() {
+    let (runs, _c) = seeded("send");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    let tuning = Tuning {
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+    };
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let report = runs.join("w.md");
+    let ready = || {
+        std::fs::write(
+            &report,
+            "Outcome: COMPLETE\n\n## Blockers\nnone\n\n## Lessons\nnone\n",
+        )
+    };
+    // stale counters of an earlier task are cleared by a fresh prompt
+    std::fs::write(runs.join(".w.nudged"), "").unwrap();
+
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {
+            ready().unwrap();
+        }),
+    };
+    let out = prompt::prompt_run(&h, &clock, &runs, &args(&["w", BRIEF]), &tuning).unwrap();
+    assert!(out.ends_with("w.md"), "{out}");
+    let sent = h.prompts();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].1.starts_with("Topology: solo"), "{}", sent[0].1);
+    assert!(sent[0].1.contains("~/quaqua/runs/w.md"));
+    assert!(!runs.join(".w.nudged").exists());
+    assert_eq!(
+        std::fs::read_to_string(runs.join(".w.budget"))
+            .unwrap()
+            .trim(),
+        "900"
+    );
+
+    // --resume re-enters the wait and sends nothing; --extend grows the allowance
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    prompt::prompt_run(
+        &h,
+        &clock,
+        &runs,
+        &args(&["w", "--resume", "--extend", "60"]),
+        &tuning,
+    )
+    .unwrap();
+    assert_eq!(h.prompts().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(runs.join(".w.budget"))
+            .unwrap()
+            .trim(),
+        "960"
+    );
+
+    // a resume that carries a brief, or a fresh prompt without one, is a usage error
+    for bad in [&["w", "--resume", BRIEF][..], &["w"][..]] {
+        let e = prompt::prompt_run(&h, &clock, &runs, &args(bad), &tuning).unwrap_err();
+        assert_eq!(e.code, 1);
+    }
+    // a brief that fails the check sends nothing
+    let e =
+        prompt::prompt_run(&h, &clock, &runs, &args(&["w", "no headers"]), &tuning).unwrap_err();
+    assert_eq!(e.code, 1);
+    assert_eq!(h.prompts().len(), 1);
 }

@@ -31,6 +31,7 @@ pub enum Verb {
     TabClose,
     PaneGet,
     PaneReportMetadata,
+    PaneRead,
 }
 
 use std::io;
@@ -135,6 +136,11 @@ pub trait HerdrClient: Send + Sync {
         _display: Option<&str>,
     ) -> io::Result<Reply> {
         Err(unsupported("pane report-metadata"))
+    }
+    /// `herdr pane read PANE --source recent-unwrapped --lines N`: the pane's
+    /// recent text. The reply body is the text itself, not JSON.
+    fn pane_read(&self, _pane: &str, _lines: u32) -> io::Result<Reply> {
+        Err(unsupported("pane read"))
     }
 }
 
@@ -289,6 +295,18 @@ impl HerdrClient for CliHerdr {
 
     fn pane_get(&self, pane: &str) -> io::Result<Reply> {
         self.run(&argv(&["pane", "get", pane]))
+    }
+
+    fn pane_read(&self, pane: &str, lines: u32) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "read",
+            pane,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            &lines.to_string(),
+        ]))
     }
 
     fn pane_report_metadata(
