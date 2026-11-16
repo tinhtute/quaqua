@@ -107,6 +107,11 @@ pub trait HerdrClient: Send + Sync {
     fn pane_split(&self, _target: &str, _dir: &str) -> io::Result<Reply> {
         Err(unsupported("pane split"))
     }
+    /// `herdr pane split TARGET --direction right|down --cwd CWD --no-focus`: the new
+    /// pane's shell starts in `cwd`. Default `Unsupported`.
+    fn pane_split_in(&self, _target: &str, _dir: &str, _cwd: &str) -> io::Result<Reply> {
+        Err(unsupported("pane split --cwd"))
+    }
     /// `herdr pane close PANE`.
     fn pane_close(&self, _pane: &str) -> io::Result<Reply> {
         Err(unsupported("pane close"))
@@ -278,6 +283,19 @@ impl HerdrClient for CliHerdr {
             target,
             "--direction",
             dir,
+            "--no-focus",
+        ]))
+    }
+
+    fn pane_split_in(&self, target: &str, dir: &str, cwd: &str) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "split",
+            target,
+            "--direction",
+            dir,
+            "--cwd",
+            cwd,
             "--no-focus",
         ]))
     }
