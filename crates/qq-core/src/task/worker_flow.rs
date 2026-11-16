@@ -506,14 +506,20 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             None => {}
         }
 
-        // Gate and attribute the spawn. A repeat for an agent that is already
-        // active skips the gate (it converges and spawns nothing new); a
-        // request with no caller is not gated (identity is client-asserted).
+        // Gate and attribute the spawn. The gate is skipped only for the open
+        // agent's own spawner retrying (it converges and spawns nothing new);
+        // any other caller goes through it. A request with no caller is not
+        // gated (identity is client-asserted).
         let caller = req.caller.as_deref();
-        let already_open = crate::authority::resolve(&conn, name)
-            .map_err(internal)?
-            .is_some();
-        if let (Some(caller), false) = (caller, already_open) {
+        let open = crate::authority::resolve(&conn, name).map_err(internal)?;
+        let own_retry = match (&open, caller) {
+            (Some(o), Some(c)) => {
+                let who = crate::authority::resolve(&conn, c).map_err(internal)?;
+                o.spawner_id.is_some() && who.map(|w| w.id) == o.spawner_id
+            }
+            _ => false,
+        };
+        if let (Some(caller), false) = (caller, own_retry) {
             let target = match role {
                 Role::Lead => crate::authority::Role::Lead,
                 Role::Peer => crate::authority::Role::Peer,

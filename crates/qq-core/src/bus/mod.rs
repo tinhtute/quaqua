@@ -3,8 +3,8 @@
 //! A send is stored once (a repeat with the same `dedupe_key` and content from
 //! the same sender returns the first mail; other content is a `conflict`),
 //! journaled in the same transaction under `mail:<id>`, and
-//! pushed as one `mail` Signal to the workflow named like the addressee, if
-//! that workflow runs. Nothing polls. Delivery reads the rows after the
+//! pushed as a `mail` Signal to the addressee's workflows (see [`workflows_of`]),
+//! if they run. Nothing polls. Delivery reads the rows after the
 //! recipient's cursor; with `advance: true` the cursor moves in the same
 //! transaction, so a re-read never redelivers. `ack` is the form that
 //! survives a lost response.
@@ -24,13 +24,16 @@ use crate::rpc::{self, Request, RpcError};
 ///
 /// Contract: a `mail` Signal is a push to a workflow running at send time. A
 /// workflow that goes live later (a start, or a recovery at daemon start) gets
-/// one `mail` Signal if unacked mail waits for it, so a restart signals again
-/// until the mail is acked. `mail.inbox` only peeks unless `advance: true`;
+/// a `mail` Signal if unacked mail waits for it, so a restart signals again
+/// until the mail is acked. Delivery is at-least-once: a send racing a start
+/// can signal one mail twice, so a consumer dedupes on the payload's mail `id`. `mail.inbox` only peeks unless `advance: true`;
 /// `mail.ack` is the retry-safe way to advance.
 pub fn install(_: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     daemon.on_workflow_live(Arc::new(|sup, store, id| {
-        if let Ok(Some(p)) = pending(store, id) {
-            let _ = sup.signal(id, "mail", "mail", p);
+        for who in recipients_of(id) {
+            if let Ok(Some(p)) = pending(store, who) {
+                let _ = sup.signal(id, "mail", "mail", p);
+            }
         }
     }));
     let bus = Arc::new(Bus);
@@ -65,6 +68,24 @@ impl Bus {
     ) -> Result<T, RpcError> {
         ctx.store.with_conn(f).map_err(internal)
     }
+}
+
+/// Workflow-id prefix of a worker's flow (`worker:<agent name>`).
+const WORKER_PREFIX: &str = "worker:";
+
+/// The one name→workflow mapping: the workflows that hear mail for agent
+/// `to` are the worker flow `worker:<to>` and a flow named `<to>` itself.
+fn workflows_of(to: &str) -> [String; 2] {
+    [format!("{WORKER_PREFIX}{to}"), to.to_string()]
+}
+
+/// The inverse: the mailboxes a workflow `id` listens on.
+fn recipients_of(id: &str) -> Vec<&str> {
+    let mut who = vec![id];
+    if let Some(name) = id.strip_prefix(WORKER_PREFIX) {
+        who.insert(0, name);
+    }
+    who
 }
 
 fn internal(e: impl ToString) -> RpcError {
@@ -181,19 +202,23 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         }
     };
 
-    // The push: only for a new mail, only if the addressee's workflow runs.
-    // The inbox is the record, so a missing workflow is not an error.
+    // The push: only for a new mail, only to the addressee's running
+    // workflows. The inbox is the record, so a missing workflow is not an error.
     let mut signalled = false;
-    if created && ctx.supervisor.is_running(to) {
-        signalled = ctx
-            .supervisor
-            .signal(
-                to,
-                "mail",
-                "mail",
-                json!({ "id": id, "from": from, "kind": kind }),
-            )
-            .is_ok();
+    if created {
+        for wf in workflows_of(to) {
+            if ctx.supervisor.is_running(&wf) {
+                signalled |= ctx
+                    .supervisor
+                    .signal(
+                        &wf,
+                        "mail",
+                        "mail",
+                        json!({ "id": id, "from": from, "kind": kind }),
+                    )
+                    .is_ok();
+            }
+        }
     }
     Ok(json!({ "id": id, "created": created, "signalled": signalled }))
 }

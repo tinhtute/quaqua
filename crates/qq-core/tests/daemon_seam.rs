@@ -394,3 +394,113 @@ fn spawner_id_recorded() {
     assert!(refusals(&ws).is_empty());
     daemon.stop().unwrap();
 }
+
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn publish_report(ws: &TestWorkspace, name: &str) {
+    let tmp = ws.runs_dir().join(format!(".{name}.tmp"));
+    std::fs::write(
+        &tmp,
+        format!("Outcome: COMPLETE\nVerified: unit-test-verified {SHA}\n\n## Blockers\nnone\n"),
+    )
+    .unwrap();
+    std::fs::rename(tmp, ws.runs_dir().join(format!("{name}.md"))).unwrap();
+}
+
+fn flow_state(ws: &TestWorkspace, id: &str) -> String {
+    let conn = db::open(&ws.db_path()).unwrap();
+    conn.query_row("SELECT state FROM workflow WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// Starts a worker flow under `lead-a` and waits until its prompt is out.
+fn start_worker(ws: &TestWorkspace, name: &str) -> (DaemonHandle, Arc<FakeHerdr>) {
+    let conn = seed(ws);
+    let lead = agent(&conn, "lead-a", "lead", None);
+    agent(&conn, "peer-a", "peer", Some(lead));
+    drop(conn);
+    let herdr = Arc::new(FakeHerdr::new());
+    let daemon = start(ws, herdr.clone());
+    ok(ws, Some("lead-a"), "task.start", task_args(name));
+    wait_for("the prompt", || !herdr.prompts().is_empty());
+    (daemon, herdr)
+}
+
+fn restarted(ws: &TestWorkspace) -> DaemonHandle {
+    start(ws, Arc::new(FakeHerdr::new()))
+}
+
+#[test]
+fn report_after_restart_reaches_flow() {
+    let ws = TestWorkspace::new("seam-report-after");
+    let (daemon, _) = start_worker(&ws, "w-after");
+    daemon.stop().unwrap();
+    let daemon = restarted(&ws);
+    assert_eq!(flow_state(&ws, "worker:w-after"), "running");
+    publish_report(&ws, "w-after");
+    wait_for("report signal after restart", || {
+        count(&ws, "worker:w-after", "report/appeared") == 1
+    });
+    wait_for("flow to settle", || {
+        flow_state(&ws, "worker:w-after") != "running"
+    });
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn report_written_while_down_is_seen_on_recover() {
+    let ws = TestWorkspace::new("seam-report-down");
+    let (daemon, _) = start_worker(&ws, "w-down");
+    daemon.stop().unwrap();
+    publish_report(&ws, "w-down");
+    let daemon = restarted(&ws);
+    wait_for("report signal on recover", || {
+        count(&ws, "worker:w-down", "report/appeared") == 1
+    });
+    wait_for("flow to settle", || {
+        flow_state(&ws, "worker:w-down") != "running"
+    });
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn task_start_on_open_name_gated_unless_own_spawner() {
+    let ws = TestWorkspace::new("seam-open-gate");
+    let (daemon, _) = start_worker(&ws, "w-open");
+    // A Peer cannot take over an open agent's name: refused and journaled.
+    let code = refusal(&ws, "peer-a", "task.start", task_args("w-open"));
+    assert_eq!(code, "refused");
+    assert_eq!(
+        refusals(&ws),
+        vec![("peer-a".into(), "spawn".into(), "peer".into())]
+    );
+    // The recorded spawner's retry converges, ungated.
+    ok(&ws, Some("lead-a"), "task.start", task_args("w-open"));
+    assert_eq!(refusals(&ws).len(), 1);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn mail_reaches_worker_flow() {
+    let ws = TestWorkspace::new("seam-worker-mail");
+    let (daemon, _) = start_worker(&ws, "w-mail");
+    let sent = ok(
+        &ws,
+        Some("lead-a"),
+        "mail.send",
+        json!({"to": "w-mail", "body": "hello"}),
+    );
+    assert_eq!(sent["signalled"], true);
+    wait_for("push to worker flow", || {
+        count(&ws, "worker:w-mail", "mail/mail") == 1
+    });
+    // Unacked mail is signalled again to the recovered worker flow.
+    daemon.stop().unwrap();
+    let daemon = restarted(&ws);
+    wait_for("signal after restart", || {
+        count(&ws, "worker:w-mail", "mail/mail") == 2
+    });
+    daemon.stop().unwrap();
+}

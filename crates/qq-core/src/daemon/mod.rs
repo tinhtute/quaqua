@@ -113,12 +113,36 @@ impl Ctx {
             .map_err(internal)
     }
 
-    /// Re-arms the remembered agent watch of every workflow whose loop runs.
-    /// A watch whose workflow is finished or gone is skipped.
+    /// Watches the report file `path` (already normalized) for `workflow` and
+    /// remembers the watch, so a restarted daemon re-arms it. A report that
+    /// already exists is seen at once; the flow treats `report/appeared` as
+    /// idempotent. A repeat changes nothing.
+    pub fn watch_report(&self, workflow: &str, path: &Path) -> Result<(), RpcError> {
+        self.add_watcher(
+            &format!("report:{workflow}:{}", path.display()),
+            workflow,
+            false,
+            |sup, stop| watch::watch_report(path.to_path_buf(), workflow.to_string(), sup, stop),
+        )?;
+        self.store
+            .remember_report_watch(workflow, path, now_ms())
+            .map_err(internal)
+    }
+
+    /// Re-arms the remembered agent and report watches of every workflow whose
+    /// loop runs. A watch whose workflow is finished or gone is skipped.
+    ///
+    /// Delivery is at-least-once: a re-armed agent watcher reports the current
+    /// status first, changed or not, so a restart can repeat the last status.
     fn rearm_watches(&self) -> Result<(), String> {
         for (workflow, agent) in self.store.agent_watches()? {
             if self.supervisor.is_running(&workflow) {
                 let _ = self.watch_agent(&workflow, &agent);
+            }
+        }
+        for (workflow, path) in self.store.report_watches()? {
+            if self.supervisor.is_running(&workflow) {
+                let _ = self.watch_report(&workflow, &path);
             }
         }
         Ok(())
@@ -317,10 +341,7 @@ impl Daemon {
                 let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let path = normalize(&ctx.runs_dir, str_arg(args, "path")?);
-                let key = format!("report:{wf}:{}", path.display());
-                ctx.add_watcher(&key, wf, false, |sup, stop| {
-                    watch::watch_report(path.clone(), wf.to_string(), sup, stop)
-                })?;
+                ctx.watch_report(wf, &path)?;
                 Ok(json!({ "watching": path }))
             }),
         );

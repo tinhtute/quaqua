@@ -43,8 +43,10 @@ impl Journal for SharedJournal {
     }
 }
 
-/// Journal stream prefix of remembered watches (never a workflow id).
+/// Journal stream prefixes of remembered watches (never a workflow id); the
+/// prefixes differ so an agent and a report watch can never share a row.
 const WATCH_STREAM: &str = "watch:";
+const REPORT_STREAM: &str = "watch-report:";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -121,24 +123,68 @@ impl Store {
         Ok(())
     }
 
-    /// Every remembered `(workflow, agent)` watch, oldest first.
-    pub fn agent_watches(&self) -> Result<Vec<(String, String)>, String> {
+    /// Remembers that the report file `path` is watched for `workflow`, so a
+    /// restart can re-arm it. One row per pair; a repeat changes nothing.
+    pub fn remember_report_watch(
+        &self,
+        workflow: &str,
+        path: &Path,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let path = path.to_string_lossy();
+        self.conn()
+            .execute(
+                "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) \
+                 VALUES (?1, 1, ?2, 'watch_report', ?3) ON CONFLICT DO NOTHING",
+                params![
+                    format!("{REPORT_STREAM}{workflow}:{path}"),
+                    now_ms as i64,
+                    json!({ "workflow": workflow, "path": path }).to_string()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Every remembered `(workflow, report path)` watch, oldest first.
+    pub fn report_watches(&self) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+        Ok(self
+            .watch_payloads("watch_report", REPORT_STREAM)?
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v["workflow"].as_str()?.to_string(),
+                    v["path"].as_str()?.into(),
+                ))
+            })
+            .collect())
+    }
+
+    fn watch_payloads(&self, kind: &str, prefix: &str) -> Result<Vec<Value>, String> {
         let conn = self.conn();
         let mut st = conn
             .prepare(
-                "SELECT payload_json FROM events WHERE kind = 'watch_agent' \
-                 AND workflow_id LIKE 'watch:%' ORDER BY ts_ms, workflow_id",
+                "SELECT payload_json FROM events WHERE kind = ?1 \
+                 AND substr(workflow_id, 1, length(?2)) = ?2 ORDER BY ts_ms, workflow_id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map(params![kind, prefix], |r| r.get::<_, String>(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(rows
             .iter()
-            .filter_map(|p| {
-                let v: Value = serde_json::from_str(p).ok()?;
+            .filter_map(|p| serde_json::from_str(p).ok())
+            .collect())
+    }
+
+    /// Every remembered `(workflow, agent)` watch, oldest first.
+    pub fn agent_watches(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(self
+            .watch_payloads("watch_agent", WATCH_STREAM)?
+            .iter()
+            .filter_map(|v| {
                 Some((
                     v["workflow"].as_str()?.to_string(),
                     v["agent"].as_str()?.to_string(),
