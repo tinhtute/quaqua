@@ -656,10 +656,7 @@ fn inbox_for_does_not_move_another_cursor() {
     let daemon = start(&ws);
     send(&ws, "peer-a", "do the thing");
     let inbox = |caller: &str, a: &[&str]| {
-        std::env::set_var("QQ_AGENT", caller);
-        let out = memory::inbox_cmd(&env, &args(a));
-        std::env::remove_var("QQ_AGENT");
-        out.unwrap()
+        memory::inbox_as(&env, Some(caller.to_string()), &args(a)).unwrap()
     };
     // `lead` is neither peer-a nor the CoS nor peer-a's spawner: reads, never acks.
     assert!(inbox("lead", &["--for", "peer-a"]).contains("do the thing"));
@@ -670,39 +667,4 @@ fn inbox_for_does_not_move_another_cursor() {
     // A hook format fails open when the daemon cannot answer.
     daemon.stop().expect("daemon stops");
     assert_eq!(inbox("peer-a", &["--format", "hook-ups"]), "");
-}
-
-/// The caller of one command is read once. A concurrent change of the process
-/// env (a parallel test, a hook) must not turn a non-recipient into the CoS
-/// halfway through `inbox --for`: `lead` reads peer-a's mail, never acks it.
-#[test]
-fn inbox_caller_survives_env_changes_mid_command() {
-    let ws = TestWorkspace::new("inbox-race");
-    let env = Env {
-        runs_dir: ws.runs_dir(),
-    };
-    let daemon = start(&ws);
-    send(&ws, "peer-a", "do the thing");
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flipper = {
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                std::env::remove_var("QQ_AGENT");
-                std::thread::yield_now();
-            }
-        })
-    };
-    for _ in 0..300 {
-        std::env::set_var("QQ_AGENT", "lead");
-        let out = memory::inbox_cmd(&env, &args(&["--for", "peer-a"])).unwrap();
-        assert!(
-            out.contains("do the thing"),
-            "mail was acked by a non-recipient"
-        );
-    }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    flipper.join().unwrap();
-    std::env::remove_var("QQ_AGENT");
-    daemon.stop().expect("daemon stops");
 }

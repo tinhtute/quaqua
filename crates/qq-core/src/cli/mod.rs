@@ -149,10 +149,20 @@ pub fn caller_claim() -> Option<String> {
 
 /// Sends one verb to the daemon: a refusal or a missing daemon is an error at once.
 pub fn rpc_call(env: &Env, verb: &str, args: Value) -> Result<Value, CliError> {
+    rpc_call_as(env, caller_claim(), verb, args)
+}
+
+/// [`rpc_call`] with the caller's claim already read: the daemon still names
+/// the caller from the socket peer, so the claim is a hint, never authority.
+pub fn rpc_call_as(
+    env: &Env,
+    claim: Option<String>,
+    verb: &str,
+    args: Value,
+) -> Result<Value, CliError> {
     let socket = rpc::socket_path(&env.runs_dir);
     let mut req = Request::new(verb, args);
-    // Client-asserted: the name comes from the calling agent's own env.
-    req.caller = caller_claim();
+    req.caller = claim;
     match rpc::call(&socket, &req) {
         Ok(resp) => resp
             .into_result()

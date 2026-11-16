@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use crate::cli::{rpc_call, CliError, Env};
+use crate::cli::{caller_claim, rpc_call_as, CliError, Env};
 
 /// Digest cap, overflow line included.
 const MAX_LINES: usize = 20;
@@ -28,6 +28,11 @@ fn usage() -> CliError {
 }
 
 pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+    inbox_as(env, caller_claim(), args)
+}
+
+/// `inbox` with the caller's claim read once by the caller of this function.
+pub fn inbox_as(env: &Env, claim: Option<String>, args: &[String]) -> Result<String, CliError> {
     let (mut to, mut peek, mut all, mut format) = (None, false, false, Format::Plain);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -56,7 +61,7 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     // `--for` moves another recipient's cursor, so only the recipient itself,
     // the CoS, or the recipient's spawner may; anyone else reads without acking.
     if let (Some(t), false) = (&to, peek) {
-        peek = !may_ack(env, t);
+        peek = !may_ack(env, claim.as_deref(), t);
     }
     let mut call = json!({ "limit": if all { PAGE } else { MAX_LINES + 1 } });
     if let Some(t) = &to {
@@ -64,7 +69,7 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     }
     let hook = format != Format::Plain;
     // A hook never fails the turn: with no answer it injects nothing.
-    let res = match rpc_call(env, "mail.inbox", call) {
+    let res = match rpc_call_as(env, claim.clone(), "mail.inbox", call) {
         Ok(r) => r,
         Err(_) if hook => return Ok(String::new()),
         Err(e) => return Err(e),
@@ -88,7 +93,7 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
         if let Some(t) = &to {
             ack["to"] = json!(t);
         }
-        match rpc_call(env, "mail.ack", ack) {
+        match rpc_call_as(env, claim.clone(), "mail.ack", ack) {
             Ok(_) => {}
             // Not acked: the mail is shown again next time, never lost.
             Err(_) if hook => {}
@@ -109,8 +114,8 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
 
 /// May the caller (`QQ_AGENT`) advance `to`'s cursor? No caller is the CoS's own
 /// shell and hook. Any database or lookup failure says no.
-fn may_ack(env: &Env, to: &str) -> bool {
-    let Some(caller) = std::env::var("QQ_AGENT").ok().filter(|n| !n.is_empty()) else {
+fn may_ack(env: &Env, claim: Option<&str>, to: &str) -> bool {
+    let Some(caller) = claim else {
         return true;
     };
     if caller == to {
@@ -119,7 +124,7 @@ fn may_ack(env: &Env, to: &str) -> bool {
     let Ok(conn) = crate::db::open(&env.runs_dir.join("qq.db")) else {
         return false;
     };
-    let Ok(Some(c)) = crate::authority::resolve(&conn, &caller) else {
+    let Ok(Some(c)) = crate::authority::resolve(&conn, caller) else {
         return false;
     };
     if c.role == crate::authority::Role::Cos {

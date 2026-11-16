@@ -10,7 +10,7 @@ pub use caps::*;
 pub use drift::{
     drift, drift_message, is_dispatch, session_start as record_session, snapshot, tracked,
 };
-pub use inbox::inbox_cmd;
+pub use inbox::{inbox_as, inbox_cmd};
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};

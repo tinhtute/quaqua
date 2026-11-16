@@ -928,8 +928,7 @@ fn live_with<T>(
         .filter_map(|k| config::harness(&conn, &k.harness).ok().flatten())
         .collect();
     let drivers = Drivers::from_config(&harnesses);
-    let caller = caller_of(&herdr, pid)?;
-    let _ = claim;
+    let caller = caller_of(&herdr, pid, claim)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -946,13 +945,25 @@ fn live_with<T>(
 
 /// Who this process is, named by herdr's pane of its pid (the same resolver the
 /// daemon uses for a socket peer): `None` is the CoS. A process in no pane, or
-/// in a pane with no agent, is refused: never taken for the CoS.
-fn caller_of(herdr: &Arc<dyn HerdrClient>, pid: i32) -> R<Option<String>> {
+/// in a pane with no agent, is refused: never taken for the CoS. A `QQ_AGENT`
+/// claim must match that pane's agent (`cos` for the CoS); it never names a
+/// process the pane does not, so a mismatch is refused.
+fn caller_of(
+    herdr: &Arc<dyn HerdrClient>,
+    pid: i32,
+    claim: Option<&str>,
+) -> R<Option<String>> {
     use crate::identity::peer::{HerdrPeers, PeerCred, PeerResolver};
     // The resolver keys on the pid; the uid is not part of the decision.
     let who = HerdrPeers::new(Arc::clone(herdr))
         .resolve(PeerCred { pid, uid: 0 })
         .map_err(|e| fail(e.message))?;
+    if let Some(c) = claim.filter(|c| *c != who.as_str()) {
+        return Err(fail(format!(
+            "QQ_AGENT claims '{c}' but this pane runs '{}'",
+            who.as_str()
+        )));
+    }
     Ok((who.as_str() != "cos").then_some(who.0))
 }
 
