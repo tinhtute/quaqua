@@ -23,6 +23,7 @@ pub enum Verb {
     List,
     Wait,
     Prompt,
+    SendKeys,
 }
 
 use std::io;
@@ -83,6 +84,15 @@ pub trait HerdrClient: Send + Sync {
         text: &str,
         wait: Option<(&[&str], u64)>,
     ) -> io::Result<Reply>;
+    /// `herdr agent send-keys NAME KEY...` (`esc` is the canonical Escape).
+    /// A client that cannot send keys reports `Unsupported`, so existing
+    /// implementors keep compiling.
+    fn agent_send_keys(&self, _name: &str, _keys: &[&str]) -> io::Result<Reply> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "agent send-keys not supported by this client",
+        ))
+    }
 }
 
 /// The real binary: `HERDR_BIN_PATH` when set and non-empty, else `herdr`.
@@ -191,6 +201,12 @@ impl HerdrClient for CliHerdr {
             args.push("--wait".into());
             wait_args(&mut args, until, timeout_ms);
         }
+        self.run(&args)
+    }
+
+    fn agent_send_keys(&self, name: &str, keys: &[&str]) -> io::Result<Reply> {
+        let mut args = argv(&["agent", "send-keys", name]);
+        args.extend(keys.iter().map(|k| k.to_string()));
         self.run(&args)
     }
 }
