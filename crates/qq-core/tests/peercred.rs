@@ -154,13 +154,33 @@ fn call(r: &Rig, verb: &str, claim: Option<&str>) -> Result<Value, rpc::RpcError
 }
 
 #[test]
-fn unmapped_same_uid_may_ping_but_not_act_as_an_agent() {
+fn unmapped_same_uid_is_refused_on_every_verb_lifecycle_and_read_only_included() {
     let r = rig("peer-human");
     unmapped(&r);
-    assert_eq!(call(&r, "ping", Some("cos")).unwrap()["pong"], true);
-    let e = call(&r, "mail.send", Some("cos")).unwrap_err();
-    assert_eq!(e.code, "unmapped_peer");
-    // Stop is lifecycle: the unmapped same-uid human may stop the daemon.
+    for v in ["ping", "status", "stop", "roster", "mail.inbox", "mail.send"] {
+        assert_eq!(
+            call(&r, v, Some("cos")).unwrap_err().code,
+            "unmapped_peer",
+            "{v}"
+        );
+    }
+    // The refused stop left the daemon up: a mapped peer still reaches it.
+    let pane = r.herdr.seed_pane("w", None, &[]);
+    r.herdr.agent_start("w-3", "claude", &pane, 0, &[]).unwrap();
+    r.herdr.set_pane_pids(&pane, me(), &[]);
+    assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
+    stop(r);
+}
+
+#[test]
+fn descendant_of_a_pane_process_may_ping_status_and_stop() {
+    let r = rig("peer-desc-lifecycle");
+    let pane = r.herdr.seed_pane("w", None, &[]);
+    r.herdr.agent_start("w-4", "claude", &pane, 0, &[]).unwrap();
+    let parent = parent_pid(me() as i32).expect("test process has a parent");
+    r.herdr.set_pane_pids(&pane, parent as u32, &[]);
+    assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
+    assert!(call(&r, "status", None).is_ok());
     call(&r, "stop", None).unwrap();
     r.daemon.stop().ok();
 }
