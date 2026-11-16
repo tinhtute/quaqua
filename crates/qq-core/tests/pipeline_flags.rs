@@ -552,3 +552,63 @@ fn resume_verb_signals_a_live_flow_and_refuses_the_rest() {
     }
     d.stop().unwrap();
 }
+
+#[test]
+fn wait_blocks_until_the_run_ends_and_exits_by_how_it_ended() {
+    let ws = TestWorkspace::new("pflags-wait");
+    let fx = Fixture::new("wait");
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    ws.seal_herdr();
+    let herdr = Arc::new(FakeHerdr::new());
+    Agents::seed(&conn, &herdr).become_agent("cos");
+    let d = daemon(&ws, herdr.clone());
+    let start = json!({
+        "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+        "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+        "integ": "integ", "pane": "p1", "project_id": 1, "plan": true,
+    });
+    assert!(call(&ws, start).ok);
+    let mut reg = CliRegistry::new();
+    let mut unused = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: Arc::new(FakeHerdr::new()),
+    });
+    (pipeline_io::INSTALL)(&mut reg, &mut unused).unwrap();
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let run = |a: &[&str]| {
+        let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+        reg.dispatch(&env, &args)
+    };
+    // Cancelled: --wait returns only once the flow has ended, and says 3.
+    assert_eq!(run(&["pipeline", "--cancel", "t1", "--wait"]), 3);
+    let row = |id: &str| {
+        let r = rpc::call(
+            &rpc::socket_path(&ws.runs_dir()),
+            &Request::new("status", Value::Null),
+        )
+        .unwrap();
+        r.result["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert!(!row("pipeline:t1")["finished_ms"].is_null());
+    // Without --wait nothing changes: the same repeat of a finished flow is
+    // answered at once (exit 0), and a repeat start with --wait reports how
+    // that finished run ended.
+    let again = serde_json::to_string(&json!({
+        "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+        "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+        "integ": "integ", "pane": "p1", "project_id": 1, "plan": true,
+    }))
+    .unwrap();
+    assert_eq!(run(&["pipeline", &again]), 0);
+    assert_eq!(run(&["pipeline", &again, "--wait"]), 3);
+    d.stop().unwrap();
+}

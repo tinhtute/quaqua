@@ -515,11 +515,28 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     merge::register(daemon)?;
     cli.register(Command {
         name: "pipeline",
-        help: "pipeline '<json>' [--rounds <N>] | --resume <task> [<repo>] [--rounds <N>] | --cancel <task>: build -> cross-harness review -> gate -> merge for one task",
+        help: "pipeline '<json>' [--rounds <N>] [--wait] | --resume <task> [<repo>] [--rounds <N>] [--wait] | --cancel <task> [--wait]: build -> cross-harness review -> gate -> merge for one task; --wait blocks until the run ends (exit 0 merged or no changes, 3 cancelled, 4 held or disputed, 1 failed)",
         run: |env, args| {
-            let call = pipeline_args(args)?;
-            crate::cli::rpc_call(env, VERB, call)
-                .map(|r| serde_json::to_string_pretty(&r).unwrap_or_default())
+            let (wait, rest) = split_wait(args);
+            let call = pipeline_args(&rest)?;
+            let mut r = crate::cli::rpc_call(env, VERB, call)?;
+            if wait {
+                let id = r
+                    .get("workflow")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CliError::new(1, "the daemon named no workflow to wait for"))?
+                    .to_string();
+                let done = wait_finished(&mut || probe(env, &id), &mut || {
+                    std::thread::sleep(POLL)
+                })?;
+                r["state"] = json!(done.state);
+                r["status"] = json!(done.status);
+                let out = serde_json::to_string_pretty(&r).unwrap_or_default();
+                return verdict(&done).map(|()| out.clone()).map_err(|e| {
+                    CliError::new(e.code, format!("{out}\n{}", e.message))
+                });
+            }
+            Ok(serde_json::to_string_pretty(&r).unwrap_or_default())
         },
     })?;
     cli.register(Command {
@@ -529,7 +546,88 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     })
 }
 
-const PIPELINE_USAGE: &str = "usage: pipeline '<json>' [--rounds <N>] | pipeline --resume <task> [<repo>] [--rounds <N>] | pipeline --cancel <task>";
+const PIPELINE_USAGE: &str = "usage: pipeline '<json>' [--rounds <N>] [--wait] | pipeline --resume <task> [<repo>] [--rounds <N>] [--wait] | pipeline --cancel <task> [--wait]";
+
+/// How long `--wait` sleeps between looks at the run.
+const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A run that reached a terminal state: the workflow row's `state`
+/// (`completed` or `failed`) and, when it completed, the pipeline's own
+/// `status` (`merged`, `no_changes`, `cancelled`, `held`, `disputed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Finished {
+    state: String,
+    status: Option<String>,
+}
+
+/// `--wait` is a client-side flag: it is taken out before the verb's request
+/// is built, so the daemon never sees it.
+fn split_wait(args: &[String]) -> (bool, Vec<String>) {
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--wait").cloned().collect();
+    (rest.len() != args.len(), rest)
+}
+
+/// The terminal facts of a workflow whose row says `state`, read from its
+/// journal: `workflow_completed` carries the pipeline's status.
+fn finished_of(state: &str, events: &[crate::engine::journal::EventRecord]) -> Finished {
+    let status = events
+        .iter()
+        .find(|e| e.kind == "workflow_completed")
+        .and_then(|e| serde_json::from_str::<Value>(&e.payload_json).ok())
+        .and_then(|v| v.get("status").and_then(Value::as_str).map(str::to_string));
+    Finished {
+        state: state.to_string(),
+        status,
+    }
+}
+
+/// One look at run `id`: `None` while it is still running. Re-reading is safe
+/// at any point, so a wait started after the run ended returns at once.
+fn probe(env: &crate::cli::Env, id: &str) -> Result<Option<Finished>, CliError> {
+    let status = crate::cli::rpc_call(env, "status", Value::Null)?;
+    let row = status
+        .get("workflows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.iter().find(|w| w["id"] == id))
+        .ok_or_else(|| CliError::new(1, format!("{id}: no such workflow")))?;
+    if row["finished_ms"].is_null() {
+        return Ok(None);
+    }
+    let state = row["state"].as_str().unwrap_or("completed");
+    let db = env.runs_dir.join(crate::db::path::DB_FILE);
+    let events = SqliteJournal::open(&db)
+        .and_then(|j| j.load_events(id, 1))
+        .map_err(|e| CliError::new(1, format!("{id}: cannot read the journal: {e}")))?;
+    Ok(Some(finished_of(state, &events)))
+}
+
+/// Looks until the run is terminal; `sleep` runs between looks. A look that
+/// fails (the daemon is gone) ends the wait with that error.
+fn wait_finished(
+    probe: &mut dyn FnMut() -> Result<Option<Finished>, CliError>,
+    sleep: &mut dyn FnMut(),
+) -> Result<Finished, CliError> {
+    loop {
+        if let Some(done) = probe()? {
+            return Ok(done);
+        }
+        sleep();
+    }
+}
+
+/// The exit status of a finished run: 0 when it merged (or had nothing to
+/// change), 3 cancelled, 4 ended without merging (held, disputed), 1 failed.
+fn verdict(f: &Finished) -> Result<(), CliError> {
+    if f.state == "failed" {
+        return Err(CliError::new(1, "pipeline failed"));
+    }
+    match f.status.as_deref() {
+        Some("merged") | Some("no_changes") => Ok(()),
+        Some("cancelled") => Err(CliError::new(3, "pipeline cancelled")),
+        Some(other) => Err(CliError::new(4, format!("pipeline ended: {other}"))),
+        None => Err(CliError::new(1, "pipeline ended with no recorded status")),
+    }
+}
 
 fn rounds_of(v: &str) -> Result<u64, CliError> {
     match v.parse::<u64>() {
@@ -613,5 +711,74 @@ mod tests {
             pipeline_args(&args(&["--resume", "t1"])).unwrap(),
             json!({ "resume": "t1" })
         );
+    }
+
+    fn fin(state: &str, status: Option<&str>) -> Finished {
+        Finished {
+            state: state.into(),
+            status: status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn wait_flag_is_stripped_and_absent_means_unchanged() {
+        let (wait, rest) = split_wait(&args(&["--cancel", "t1", "--wait"]));
+        assert!(wait);
+        assert_eq!(rest, args(&["--cancel", "t1"]));
+        let (wait, rest) = split_wait(&args(&["{\"task\":\"t1\"}", "--rounds", "2"]));
+        assert!(!wait);
+        assert_eq!(rest, args(&["{\"task\":\"t1\"}", "--rounds", "2"]));
+    }
+
+    #[test]
+    fn wait_polls_until_the_run_is_terminal_without_real_sleeps() {
+        let mut script = vec![None, None, Some(fin("completed", Some("merged")))].into_iter();
+        let mut sleeps = 0;
+        let got = wait_finished(&mut || Ok(script.next().unwrap()), &mut || sleeps += 1).unwrap();
+        assert_eq!(got.status.as_deref(), Some("merged"));
+        assert_eq!(sleeps, 2, "one sleep per poll that found it still running");
+        // A probe error (daemon gone) ends the wait at once, no more polling.
+        let mut sleeps = 0;
+        let e = wait_finished(
+            &mut || Err(CliError::new(1, "daemon not running")),
+            &mut || sleeps += 1,
+        )
+        .unwrap_err();
+        assert_eq!((e.code, sleeps), (1, 0));
+    }
+
+    #[test]
+    fn exit_status_tells_success_from_failure_and_cancel() {
+        assert!(verdict(&fin("completed", Some("merged"))).is_ok());
+        assert!(verdict(&fin("completed", Some("no_changes"))).is_ok());
+        let cancelled = verdict(&fin("completed", Some("cancelled"))).unwrap_err();
+        let held = verdict(&fin("completed", Some("held"))).unwrap_err();
+        let disputed = verdict(&fin("completed", Some("disputed"))).unwrap_err();
+        let failed = verdict(&fin("failed", None)).unwrap_err();
+        assert_eq!(cancelled.code, 3);
+        assert_eq!((held.code, disputed.code), (4, 4));
+        assert_eq!(failed.code, 1);
+        assert!(cancelled.message.contains("cancelled"));
+    }
+
+    #[test]
+    fn finished_comes_from_the_journaled_terminal_event() {
+        use crate::engine::journal::EventRecord;
+        let ev = |k: &str, p: &str| EventRecord::new(1, 0, k, p);
+        let running = [ev("activity_scheduled", "{}")];
+        assert_eq!(finished_of("completed", &running), fin("completed", None));
+        let done = [
+            ev("activity_scheduled", "{}"),
+            ev(
+                "workflow_completed",
+                r#"{"status":"cancelled","rounds":1,"candidate_sha":null,"merge_sha":null}"#,
+            ),
+        ];
+        assert_eq!(
+            finished_of("completed", &done),
+            fin("completed", Some("cancelled"))
+        );
+        let failed = [ev("workflow_failed", r#"{"code":2,"reason":"x"}"#)];
+        assert_eq!(finished_of("failed", &failed), fin("failed", None));
     }
 }
