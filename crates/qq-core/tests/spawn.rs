@@ -193,7 +193,10 @@ fn a_name_must_be_kind_dash_task() {
         assert!(fx.spawn(&[], bad, "tieude").is_err(), "{bad} was accepted");
         assert_eq!(fx.agents(bad), 0, "{bad}");
     }
-    assert_eq!(fx.spawn(&[], "tieude-ok-1", "tieude").unwrap(), "tieude-ok-1");
+    assert_eq!(
+        fx.spawn(&[], "tieude-ok-1", "tieude").unwrap(),
+        "tieude-ok-1"
+    );
 }
 
 // ---- --base ------------------------------------------------------------------
@@ -446,7 +449,9 @@ fn solo_with_a_reason_passes_the_gate_and_is_recorded() {
 #[test]
 fn a_short_solo_reason_is_refused() {
     let fx = Fx::new("solo-short");
-    let e = fx.spawn(&["--solo", "short"], "tieude-a", "tieude").unwrap_err();
+    let e = fx
+        .spawn(&["--solo", "short"], "tieude-a", "tieude")
+        .unwrap_err();
     assert!(e.contains("at least 10"), "{e}");
     assert_eq!(fx.agents("tieude-a"), 0);
 }
@@ -470,7 +475,10 @@ fn a_project_with_a_lead_is_not_gated() {
 
 // ---- lead spawn ----------------------------------------------------------------------
 
-fn lead(fx: &Fx, args: &[&str]) -> Result<qq_core::task::worker_flow::spawn_cmd::LeadSpawned, String> {
+fn lead(
+    fx: &Fx,
+    args: &[&str],
+) -> Result<qq_core::task::worker_flow::spawn_cmd::LeadSpawned, String> {
     let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     run_lead(&fx.ctx(None), &a).map_err(|e| e.message)
 }
@@ -499,9 +507,11 @@ fn lead_spawn_registers_the_project_lead_and_its_integ_branch() {
     );
     let integ: String = fx
         .conn
-        .query_row("SELECT integ_branch FROM project WHERE slug='alpha'", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT integ_branch FROM project WHERE slug='alpha'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(integ, "quaqua/alpha-integ");
 }
@@ -510,7 +520,9 @@ fn lead_spawn_registers_the_project_lead_and_its_integ_branch() {
 fn lead_spawn_refuses_what_legacy_refused() {
     let fx = Fx::new("lead-bad");
     fx.project("alpha");
-    assert!(lead(&fx, &["nope"]).unwrap_err().contains("unknown project"));
+    assert!(lead(&fx, &["nope"])
+        .unwrap_err()
+        .contains("unknown project"));
     assert!(lead(&fx, &["Bad_Slug"]).is_err());
     let long = "a".repeat(30);
     fx.project(&long);
@@ -530,7 +542,10 @@ fn lead_task_is_delivered_after_the_brief_and_without_it_the_next_step_is_printe
     let prompts = fx.herdr.prompts();
     assert_eq!(prompts.len(), 2, "brief then kickoff: {prompts:?}");
     assert!(prompts[0].1.contains("alpha"), "{prompts:?}");
-    assert_eq!(prompts[1], ("alpha-lead".to_string(), "KICKOFF-TEXT".to_string()));
+    assert_eq!(
+        prompts[1],
+        ("alpha-lead".to_string(), "KICKOFF-TEXT".to_string())
+    );
     let s = lead(&fx, &["beta"]).unwrap();
     assert!(!s.kickoff_sent);
     assert_eq!(
