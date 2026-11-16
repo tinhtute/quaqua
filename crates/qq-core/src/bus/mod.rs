@@ -9,25 +9,31 @@
 //! transaction, so a re-read never redelivers. `ack` is the form that
 //! survives a lost response.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
+use crate::authority::{self, Decision};
 use crate::cli::{Install, Registry};
+use crate::daemon::store::Store;
 use crate::daemon::{Ctx, Daemon};
-use crate::db::path::DB_FILE;
 use crate::rpc::{self, Request, RpcError};
 
 /// Registers the mail verbs. Called from `cli::MODULES`.
 ///
 /// Contract: a `mail` Signal is a push to a workflow running at send time. A
-/// workflow that starts later, or after a daemon restart, is not signalled for
-/// mail already stored, so it reads `mail.inbox` at start. `mail.inbox` only
-/// peeks unless `advance: true`; `mail.ack` is the retry-safe way to advance.
+/// workflow that goes live later (a start, or a recovery at daemon start) gets
+/// one `mail` Signal if unacked mail waits for it, so a restart signals again
+/// until the mail is acked. `mail.inbox` only peeks unless `advance: true`;
+/// `mail.ack` is the retry-safe way to advance.
 pub fn install(_: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
-    let bus = Arc::new(Bus::default());
+    daemon.on_workflow_live(Arc::new(|sup, store, id| {
+        if let Ok(Some(p)) = pending(store, id) {
+            let _ = sup.signal(id, "mail", "mail", p);
+        }
+    }));
+    let bus = Arc::new(Bus);
     for (name, f) in [
         ("mail.send", send as Op),
         ("mail.inbox", inbox as Op),
@@ -47,29 +53,17 @@ pub const INSTALL: Install = install;
 
 type Op = fn(&Bus, &Ctx, &Request) -> Result<Value, RpcError>;
 
-/// The bus's own connection to `runs/qq.db`, opened on first use (the daemon
-/// owns the directory, and the opener migrates to the mail schema).
-#[derive(Default)]
-struct Bus {
-    conn: Mutex<Option<Connection>>,
-}
+/// The bus holds no state of its own: every call runs on the daemon store's
+/// connection ([`crate::daemon::store::Store::with_conn`]).
+struct Bus;
 
 impl Bus {
     fn with<T>(
         &self,
-        runs_dir: &Path,
+        ctx: &Ctx,
         f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
     ) -> Result<T, RpcError> {
-        let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.is_none() {
-            let c = crate::db::open(&runs_dir.join(DB_FILE)).map_err(internal)?;
-            // The journal tables are the engine's; the idempotent DDL keeps the
-            // send transaction independent of who opened the file first.
-            c.execute_batch(crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL)
-                .map_err(internal)?;
-            *slot = Some(c);
-        }
-        f(slot.as_mut().expect("opened above")).map_err(internal)
+        ctx.store.with_conn(f).map_err(internal)
     }
 }
 
@@ -128,9 +122,22 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         .as_deref()
         .ok_or_else(|| bad("mail needs a caller to name the sender"))?;
 
+    // The edge check runs on the same connection, outside the transaction, so
+    // a refusal is journaled and never rolled back with a send.
+    let refused = ctx
+        .store
+        .with_conn(|c| authority::check_mail(c, from, to))
+        .map_err(internal)?;
+    if let Decision::Refused(r) = refused {
+        return Err(RpcError::new(
+            "refused",
+            format!("{} -> {}: {}", r.caller, r.target, r.reason),
+        ));
+    }
+
     // Row and journal line commit together, so a mail is never delivered
     // unjournaled; a retry finds both and writes neither.
-    let outcome = bus.with(&ctx.runs_dir, |c| {
+    let outcome = bus.with(ctx, |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms() as i64;
         let n = tx.execute(
@@ -191,6 +198,33 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     Ok(json!({ "id": id, "created": created, "signalled": signalled }))
 }
 
+/// The Signal payload for mail waiting past `who`'s cursor: the newest item's
+/// `{id, from, kind}` plus the `pending` count; `None` when nothing waits.
+fn pending(store: &Store, who: &str) -> rusqlite::Result<Option<Value>> {
+    store.with_conn(|c| {
+        let cursor = cursor_of(c, who)?;
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM mail WHERE recipient = ?1 AND id > ?2",
+            params![who, cursor],
+            |r| r.get(0),
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        c.query_row(
+            "SELECT id, sender, kind FROM mail WHERE recipient = ?1 AND id > ?2 \
+             ORDER BY id DESC LIMIT 1",
+            params![who, cursor],
+            |r| {
+                Ok(Some(json!({
+                    "id": r.get::<_, i64>(0)?, "from": r.get::<_, String>(1)?,
+                    "kind": r.get::<_, String>(2)?, "pending": n,
+                })))
+            },
+        )
+    })
+}
+
 fn inbox(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     let who = owner(req)?;
     let advance_cursor = req
@@ -203,7 +237,7 @@ fn inbox(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         .get("limit")
         .and_then(Value::as_i64)
         .map_or(MAX_PAGE, |l| l.clamp(1, MAX_PAGE));
-    let mail = bus.with(&ctx.runs_dir, |c| {
+    let mail = bus.with(ctx, |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cursor = cursor_of(&tx, who)?;
         let rows: Vec<Value> = {
@@ -238,7 +272,7 @@ fn ack(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         .get("upto")
         .and_then(Value::as_i64)
         .ok_or_else(|| bad("missing integer argument 'upto'"))?;
-    let cursor = bus.with(&ctx.runs_dir, |c| {
+    let cursor = bus.with(ctx, |c| {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Clamped to what exists, so a wild `upto` cannot swallow later mail.
         let newest: i64 = tx.query_row(

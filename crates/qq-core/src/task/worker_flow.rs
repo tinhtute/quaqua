@@ -506,6 +506,34 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             None => {}
         }
 
+        // Gate and attribute the spawn. A repeat for an agent that is already
+        // active skips the gate (it converges and spawns nothing new); a
+        // request with no caller is not gated (identity is client-asserted).
+        let caller = req.caller.as_deref();
+        let already_open = crate::authority::resolve(&conn, name)
+            .map_err(internal)?
+            .is_some();
+        if let (Some(caller), false) = (caller, already_open) {
+            let target = match role {
+                Role::Lead => crate::authority::Role::Lead,
+                Role::Peer => crate::authority::Role::Peer,
+            };
+            if let crate::authority::Decision::Refused(r) =
+                crate::authority::check_spawn(&conn, caller, target, project_id)
+                    .map_err(internal)?
+            {
+                return Err(RpcError::new(
+                    "refused",
+                    format!("{} -> {}: {}", r.caller, r.target, r.reason),
+                ));
+            }
+        }
+        let spawner_id = match caller {
+            Some(c) => crate::authority::resolve(&conn, c)
+                .map_err(internal)?
+                .map(|a| a.id),
+            None => None,
+        };
         let spawned = spawn(
             &conn,
             deps.herdr.as_ref(),
@@ -516,7 +544,7 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 role,
                 pane: text(a, "pane")?,
                 project_id,
-                spawner_id: None,
+                spawner_id,
             },
             now_ms(),
         )

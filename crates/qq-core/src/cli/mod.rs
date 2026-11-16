@@ -133,7 +133,10 @@ pub fn run() -> i32 {
 /// Sends one verb to the daemon: a refusal or a missing daemon is an error at once.
 pub fn rpc_call(env: &Env, verb: &str, args: Value) -> Result<Value, CliError> {
     let socket = rpc::socket_path(&env.runs_dir);
-    match rpc::call(&socket, &Request::new(verb, args)) {
+    let mut req = Request::new(verb, args);
+    // Client-asserted: the name comes from the calling agent's own env.
+    req.caller = std::env::var("QQ_AGENT").ok().filter(|n| !n.is_empty());
+    match rpc::call(&socket, &req) {
         Ok(resp) => resp
             .into_result()
             .map_err(|e| CliError::new(1, e.to_string())),
