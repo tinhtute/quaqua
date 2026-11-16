@@ -540,7 +540,11 @@ fn lead_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate:
             serde_json::json!({ "project": project }),
         )?
         .to_string()),
-        _ => Err(CliError::new(1, "usage: lead cleanup <project>")),
+        (Some("spawn"), _) => crate::task::worker_flow::spawn_cmd::lead_spawn_cli(env, &args[1..]),
+        _ => Err(CliError::new(
+            1,
+            "usage: lead spawn <slug> [--task <kickoff>] | lead cleanup <project>",
+        )),
     }
 }
 
@@ -552,12 +556,12 @@ fn install(cli: &mut crate::cli::Registry, d: &mut crate::daemon::Daemon) -> Res
     register_reconcile(d)?;
     cli.register(crate::cli::Command {
         name: "grid",
-        help: "reconcile | acquire <repo>",
+        help: "reconcile [--only <names>] [--tab <tab>] | acquire <repo>",
         run: grid_command,
     })?;
     cli.register(crate::cli::Command {
         name: "lead",
-        help: "cleanup <project>",
+        help: "spawn <slug> [--task <kickoff>] | cleanup <project>",
         run: lead_command,
     })
 }

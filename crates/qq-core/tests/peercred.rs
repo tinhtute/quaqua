@@ -30,6 +30,18 @@ fn rig(tag: &str) -> Rig {
         Box::new(|_, req| Ok(json!({ "caller": req.caller }))),
     )
     .unwrap();
+    // Stand-ins for verbs whose real handlers need more wiring: the peer gate
+    // runs before any handler, so a refusal here is the real refusal.
+    for v in [
+        "task.start",
+        "worker.stop",
+        "mail.inbox.x",
+        "pingx",
+        "status.all",
+    ] {
+        d.register_verb(v, Box::new(|_, _| Ok(json!({ "ran": true }))))
+            .unwrap();
+    }
     d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
     let daemon = d.spawn().unwrap();
     Rig {
@@ -126,5 +138,50 @@ fn herdr_failure_fails_closed() {
     );
     assert_eq!(whoami(&r, Some("w-1")).unwrap_err().code, "unmapped_peer");
     r.herdr.pane_close(&pane).unwrap();
+    stop(r);
+}
+
+/// A peer outside every pane, as a human shell is.
+fn unmapped(r: &Rig) {
+    let pane = r.herdr.seed_pane("w", None, &[]);
+    r.herdr.set_pane_pids(&pane, 1, &[]);
+}
+
+fn call(r: &Rig, verb: &str, claim: Option<&str>) -> Result<Value, rpc::RpcError> {
+    let mut req = Request::new(verb, Value::Null);
+    req.caller = claim.map(String::from);
+    rpc::call(&r.daemon.socket, &req).unwrap().into_result()
+}
+
+#[test]
+fn unmapped_same_uid_may_ping_but_not_act_as_an_agent() {
+    let r = rig("peer-human");
+    unmapped(&r);
+    assert_eq!(call(&r, "ping", Some("cos")).unwrap()["pong"], true);
+    let e = call(&r, "mail.send", Some("cos")).unwrap_err();
+    assert_eq!(e.code, "unmapped_peer");
+    // Stop is lifecycle: the unmapped same-uid human may stop the daemon.
+    call(&r, "stop", None).unwrap();
+    r.daemon.stop().ok();
+}
+
+#[test]
+fn unmapped_same_uid_is_refused_on_worker_spawn_and_on_lookalike_verbs() {
+    let r = rig("peer-human-spawn");
+    unmapped(&r);
+    // The allow-list is exact names: no prefix or catch-all match.
+    for v in [
+        "task.start",
+        "worker.stop",
+        "mail.inbox.x",
+        "pingx",
+        "status.all",
+    ] {
+        assert_eq!(call(&r, v, None).unwrap_err().code, "unmapped_peer", "{v}");
+    }
+    let pane = r.herdr.seed_pane("w", None, &[]);
+    r.herdr.agent_start("w-2", "claude", &pane, 0, &[]).unwrap();
+    r.herdr.set_pane_pids(&pane, me(), &[]);
+    assert_eq!(call(&r, "task.start", None).unwrap()["ran"], true);
     stop(r);
 }

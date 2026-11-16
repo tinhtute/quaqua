@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -28,8 +29,12 @@ const LEAD_NAME_MAX: usize = 32;
 const SOLO_MIN_CHARS: usize = 10;
 /// Open workers of a Lead that raise topology signal 1 (this spawn is the next).
 const GATE_LIVE_BUILDS: i64 = 2;
-/// `phases_left` of an active plan that raises topology signal 2.
-const GATE_PHASES_LEFT: u32 = 3;
+/// `phases_left` above this raises topology signal 2 (legacy: `left > 1`).
+const GATE_PHASES_LEFT: u32 = 1;
+/// Consecutive days of project memory above this raise topology signal 3.
+const GATE_MEMORY_DAYS: u32 = 1;
+/// Longest wait for a fresh Lead to be ready for input, ms (`QQ_LEAD_READY_MS`).
+const LEAD_READY_MS: u64 = 300_000;
 const DEFAULT_CAP: u64 = 8;
 const DEFAULT_MAX_PEERS: u64 = 4;
 
@@ -149,6 +154,11 @@ fn workspace_root(runs_dir: &Path) -> PathBuf {
     runs_dir.parent().unwrap_or(runs_dir).to_path_buf()
 }
 
+/// `<repo parent>/.wt/<name>`: where cleanup and the prompt watchdog look.
+fn worktree_of(repo: &Path, name: &str) -> PathBuf {
+    repo.parent().unwrap_or(repo).join(".wt").join(name)
+}
+
 fn base_name(p: &Path) -> String {
     p.file_name()
         .map_or_else(|| "repo".to_string(), |f| f.to_string_lossy().into_owned())
@@ -166,6 +176,65 @@ fn date_of(ms: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Today's local date, as `date +%F` prints it (legacy `today_local`); the UTC
+/// date only when `date` cannot run.
+fn today_local(now_ms: u64) -> String {
+    Command::new("date")
+        .arg("+%F")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|d| day_number(d).is_some())
+        .unwrap_or_else(|| date_of(now_ms))
+}
+
+/// Days since the epoch of a `YYYY-MM-DD` string.
+fn day_number(s: &str) -> Option<i64> {
+    let mut it = s.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// The longest run of consecutive days whose `memory/<date>.md` has a
+/// `- [<slug>]` line (legacy `memory_days_with_project`).
+fn memory_days(root: &Path, slug: &str) -> u32 {
+    let needle = format!("- [{slug}]");
+    let Ok(entries) = std::fs::read_dir(root.join("memory")) else {
+        return 0;
+    };
+    let mut days: Vec<i64> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let day = day_number(name.strip_suffix(".md")?)?;
+            let text = std::fs::read_to_string(e.path()).ok()?;
+            text.lines()
+                .any(|l| l.trim_start().starts_with(&needle))
+                .then_some(day)
+        })
+        .collect();
+    days.sort_unstable();
+    days.dedup();
+    let (mut best, mut run, mut prev) = (0u32, 0u32, None::<i64>);
+    for d in days {
+        run = if prev == Some(d - 1) { run + 1 } else { 1 };
+        best = best.max(run);
+        prev = Some(d);
+    }
+    best
 }
 
 fn valid_name(name: &str, kind: &str) -> Result<(), String> {
@@ -403,14 +472,13 @@ pub fn run_worker(ctx: &Ctx, args: &[String]) -> R<WorkerSpawned> {
     let reopening = open_agent(ctx.conn, name)?.is_some();
 
     if !reopening {
-        check_cap(ctx.conn, caller.as_ref(), &owner)?;
+        check_cap(ctx.conn, caller.as_ref(), &owner, &kind)?;
         if caller.is_none() {
             lead_gate(ctx, project_id, &slug, a.solo.as_deref())?;
         }
     }
 
-    let root = workspace_root(&ctx.runs_dir);
-    let wt = root.join(".wt").join(name);
+    let wt = worktree_of(&repo, name);
     let branch = format!("quaqua/{name}");
     ensure_worktree(&repo, &wt, &branch, a.base.as_deref().unwrap_or("HEAD"))?;
     block_push(&repo, &wt);
@@ -497,55 +565,93 @@ fn project_for(
     if let Some((id, slug)) = found {
         return Ok((Some(id), slug));
     }
-    let slug: String = base_name(repo)
+    let base: String = base_name(repo)
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    conn.execute(
-        "INSERT OR IGNORE INTO project (slug, repo_path, created_ms) VALUES (?1, ?2, ?3)",
-        params![slug, path, now_ms as i64],
-    )
-    .map_err(db)?;
-    let id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM project WHERE slug = ?1 AND repo_path = ?2",
-            params![slug, path],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(db)?;
-    Ok((id, slug))
+    // The slug is UNIQUE: a second repo with the same basename gets `-2`, `-3`...
+    for n in 1..=1000 {
+        let slug = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        let taken: Option<Option<String>> = conn
+            .query_row("SELECT repo_path FROM project WHERE slug = ?1", [&slug], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db)?;
+        match taken {
+            Some(p) if p.as_deref() == Some(path.as_str()) => {}
+            Some(_) => continue,
+            None => {
+                conn.execute(
+                    "INSERT INTO project (slug, repo_path, created_ms) VALUES (?1, ?2, ?3)",
+                    params![slug, path, now_ms as i64],
+                )
+                .map_err(db)?;
+            }
+        }
+        let id: i64 = conn
+            .query_row("SELECT id FROM project WHERE slug = ?1", [&slug], |r| {
+                r.get(0)
+            })
+            .map_err(db)?;
+        return Ok((Some(id), slug));
+    }
+    Err(fail(format!("no free project slug for '{base}'")))
 }
 
-/// Refuses one worker too many for `owner`: a Lead is held to
-/// `roles.lead.max_peers`, the CoS to `limits.max_workers_per_orchestrator`.
-fn check_cap(conn: &Connection, caller: Option<&authority::Actor>, owner: &str) -> R<()> {
-    let (key, default, open) = match caller {
-        Some(c) => (
-            "roles.lead.max_peers",
-            DEFAULT_MAX_PEERS,
-            conn.query_row(
-                "SELECT COUNT(*) FROM agent WHERE role = 'peer' AND ended_ms IS NULL AND spawner_id = ?1",
-                [c.id],
-                |r| r.get::<_, i64>(0),
-            ),
-        ),
-        None => (
-            "limits.max_workers_per_orchestrator",
-            DEFAULT_CAP,
-            conn.query_row(
-                "SELECT COUNT(*) FROM agent WHERE role = 'peer' AND ended_ms IS NULL AND spawner_id IS NULL",
-                [],
-                |r| r.get::<_, i64>(0),
-            ),
-        ),
+/// Slots one open worker of `kind` holds: `limits.weights.<kind>`, else
+/// `limits.weights.default`, else 1.
+fn weight(conn: &Connection, kind: &str) -> u64 {
+    let w = config::setting(conn, "limits.weights").ok().flatten();
+    let of = |k: &str| w.as_ref().and_then(|w| w.get(k)).and_then(Value::as_u64);
+    of(kind).or_else(|| of("default")).unwrap_or(1)
+}
+
+/// Refuses a spawn of `kind` that needs more weighted slots than `owner` has
+/// left. A Lead is held to `min(roles.lead.max_peers, global)`, anyone else to
+/// `limits.max_workers_per_orchestrator`.
+fn check_cap(
+    conn: &Connection,
+    caller: Option<&authority::Actor>,
+    owner: &str,
+    kind: &str,
+) -> R<()> {
+    let global = limit(conn, "limits.max_workers_per_orchestrator", DEFAULT_CAP);
+    let (max, key) = match caller {
+        Some(c) if c.role == authority::Role::Lead => {
+            let peers = limit(conn, "roles.lead.max_peers", DEFAULT_MAX_PEERS);
+            if peers <= global {
+                (peers, "roles.lead.max_peers")
+            } else {
+                (global, "limits.max_workers_per_orchestrator")
+            }
+        }
+        _ => (global, "limits.max_workers_per_orchestrator"),
     };
-    let open = open.map_err(db)?;
-    let max = limit(conn, key, default);
-    if open as u64 >= max {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind FROM agent WHERE role = 'peer' AND ended_ms IS NULL \
+             AND spawner_id IS ?1",
+        )
+        .map_err(db)?;
+    let kinds = stmt
+        .query_map([caller.map(|c| c.id)], |r| r.get::<_, Option<String>>(0))
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db)?;
+    let used: u64 = kinds
+        .iter()
+        .map(|k| weight(conn, k.as_deref().unwrap_or("")))
+        .sum();
+    let need = weight(conn, kind);
+    if used + need > max {
         return Err(fail(format!(
-            "worker cap exceeded: {owner} has {open} open workers (limit {max}, {key})"
+            "worker cap exceeded: {owner} holds {used} worker slots, this spawn needs {need} (limit {max}, {key})"
         )));
     }
     Ok(())
@@ -599,8 +705,12 @@ fn lead_gate(ctx: &Ctx, project: Option<i64>, slug: &str, solo: Option<&str>) ->
     if live >= GATE_LIVE_BUILDS {
         signals.push(format!("{} live build workers (this is the next)", live));
     }
-    if let Some(n) = phases_left(&root, slug).filter(|n| *n >= GATE_PHASES_LEFT) {
+    if let Some(n) = phases_left(&root, slug).filter(|n| *n > GATE_PHASES_LEFT) {
         signals.push(format!("{n} phases left in the active plan"));
+    }
+    let days = memory_days(&root, slug);
+    if days > GATE_MEMORY_DAYS {
+        signals.push(format!("{days} consecutive days of project memory"));
     }
     match (signals.len(), solo) {
         (0, _) => Ok(()),
@@ -617,7 +727,7 @@ fn lead_gate(ctx: &Ctx, project: Option<i64>, slug: &str, solo: Option<&str>) ->
                     let mut f = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(dir.join(format!("{}.md", date_of(ctx.now_ms))))?;
+                        .open(dir.join(format!("{}.md", today_local(ctx.now_ms))))?;
                     writeln!(f, "- [{slug}] solo override: {reason}")
                 })
                 .map_err(|e| fail(format!("cannot record the solo override in memory/: {e}")))
@@ -697,7 +807,7 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
     let caller = check_authority(ctx, authority::Role::Lead, Some(pid))?;
 
     let integ = format!("quaqua/{slug}-integ");
-    let wt = workspace_root(&ctx.runs_dir).join(".wt").join(&name);
+    let wt = worktree_of(&repo, &name);
     ensure_worktree(&repo, &wt, &integ, "HEAD")?;
     ctx.conn
         .execute(
@@ -749,6 +859,21 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
             )))
         }
     };
+    let ms = std::env::var("QQ_LEAD_READY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(LEAD_READY_MS);
+    let ready = ctx
+        .herdr
+        .agent_wait(&name, &["idle", "done"], ms)
+        .map(|r| r.ok)
+        .unwrap_or(false);
+    if !ready {
+        return Err(fail(format!(
+            "lead '{name}' was spawned but not ready within {ms} ms; send its brief yourself: `herdr agent prompt {name} \"<brief>\"`"
+        )));
+    }
     prompt(&brief(slug, &repo.to_string_lossy(), &integ))?;
     let (kickoff_sent, next) = match task {
         Some(t) => {
@@ -775,37 +900,68 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
 /// The live pieces: the workspace database, the herdr binary, the drivers of
 /// the roster's harnesses; the caller is the open agent living in this pane.
 fn live<T>(env: &Env, f: impl FnOnce(&Ctx) -> R<T>) -> R<T> {
+    let pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| !p.is_empty());
+    live_with(
+        env,
+        Arc::new(crate::herdr::CliHerdr::new()),
+        std::process::id() as i32,
+        pane,
+        f,
+    )
+}
+
+fn live_with<T>(
+    env: &Env,
+    herdr: Arc<dyn HerdrClient>,
+    pid: i32,
+    pane: Option<String>,
+    f: impl FnOnce(&Ctx) -> R<T>,
+) -> R<T> {
     let conn = crate::db::open(&env.runs_dir.join(crate::db::path::DB_FILE)).map_err(db)?;
-    let herdr = crate::herdr::CliHerdr::new();
     let harnesses: Vec<_> = config::roster(&conn)
         .map_err(cfg)?
         .iter()
         .filter_map(|k| config::harness(&conn, &k.harness).ok().flatten())
         .collect();
     let drivers = Drivers::from_config(&harnesses);
-    let pane = std::env::var("HERDR_PANE_ID")
-        .ok()
-        .filter(|p| !p.is_empty());
-    let caller: Option<String> = pane.as_deref().and_then(|p| {
-        conn.query_row(
-            "SELECT name FROM agent WHERE pane_id = ?1 AND ended_ms IS NULL ORDER BY id DESC LIMIT 1",
-            [p],
-            |r| r.get(0),
-        )
-        .ok()
-    });
+    let caller = caller_of(&herdr, pid)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     f(&Ctx {
         conn: &conn,
-        herdr: &herdr,
+        herdr: herdr.as_ref(),
         drivers: &drivers,
         runs_dir: env.runs_dir.clone(),
         caller: caller.as_deref(),
         anchor: pane.as_deref(),
         now_ms,
     })
+}
+
+/// Who this process is, named by herdr's pane of its pid (the same resolver the
+/// daemon uses for a socket peer): `None` is the CoS. A process in no pane, or
+/// in a pane with no agent, is refused: never taken for the CoS.
+fn caller_of(herdr: &Arc<dyn HerdrClient>, pid: i32) -> R<Option<String>> {
+    use crate::identity::peer::{HerdrPeers, PeerCred, PeerResolver};
+    // The resolver keys on the pid; the uid is not part of the decision.
+    let who = HerdrPeers::new(Arc::clone(herdr))
+        .resolve(PeerCred { pid, uid: 0 })
+        .map_err(|e| fail(e.message))?;
+    Ok((who.as_str() != "cos").then_some(who.0))
+}
+
+/// `worker spawn` with the herdr client, calling pid and anchor pane given.
+pub fn worker_spawn_with(
+    env: &Env,
+    herdr: Arc<dyn HerdrClient>,
+    pid: i32,
+    anchor: Option<String>,
+    args: &[String],
+) -> R<WorkerSpawned> {
+    live_with(env, herdr, pid, anchor, |ctx| run_worker(ctx, args))
 }
 
 /// `worker spawn ...` (the args after `spawn`): prints the result as JSON.

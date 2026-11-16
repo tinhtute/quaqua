@@ -8,12 +8,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use qq_core::config;
 use qq_core::db;
 use qq_core::driver::Registry;
 use qq_core::herdr::FakeHerdr;
-use qq_core::task::worker_flow::spawn_cmd::{run_lead, run_worker, Ctx};
+use qq_core::cli::Env;
+use qq_core::herdr::{HerdrClient, Reply, Verb};
+use qq_core::task::worker_flow::spawn_cmd::{run_lead, run_worker, worker_spawn_with, Ctx};
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
 
@@ -48,7 +51,8 @@ struct Fx {
 impl Fx {
     fn new(tag: &str) -> Self {
         let ws = TestWorkspace::new(tag);
-        let repo = ws.root().join("repo");
+        // The repo's parent is not the workspace root: worktrees go beside the repo.
+        let repo = ws.root().join("code").join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
         std::fs::write(repo.join("a.txt"), "a\n").unwrap();
@@ -107,7 +111,7 @@ impl Fx {
     }
 
     fn wt(&self, name: &str) -> PathBuf {
-        self.ws.root().join(".wt").join(name)
+        self.repo.parent().unwrap().join(".wt").join(name)
     }
 
     fn setting(&self, key: &str, json: &str) {
@@ -553,4 +557,217 @@ fn lead_task_is_delivered_after_the_brief_and_without_it_the_next_step_is_printe
         Some("NEXT: herdr agent prompt beta-lead \"<kickoff>\"")
     );
     assert_eq!(fx.herdr.prompts().len(), 3, "only the brief for beta");
+}
+
+// ---- spawn fixes (sude-spawnfix) ---------------------------------------------------------
+
+#[test]
+fn worktrees_live_beside_the_repo_where_cleanup_looks() {
+    let fx = Fx::new("wtpath");
+    fx.project("alpha");
+    let s = fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    assert_eq!(s, "tieude-a");
+    assert!(fx.wt("tieude-a").join("a.txt").exists());
+    assert!(!fx.ws.root().join(".wt").exists(), "nothing under the workspace");
+    let l = lead(&fx, &["alpha"]).unwrap();
+    assert!(fx.wt(&l.name).exists());
+    assert!(!fx.ws.root().join(".wt").exists());
+}
+
+fn pid() -> u32 {
+    std::process::id()
+}
+
+fn cli(fx: &Fx, herdr: &Arc<FakeHerdr>, args: &[&str]) -> Result<String, String> {
+    let repo = fx.repo.to_string_lossy().to_string();
+    let mut a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    a.push(repo);
+    let env = Env {
+        runs_dir: fx.ws.runs_dir(),
+    };
+    worker_spawn_with(
+        &env,
+        herdr.clone() as Arc<dyn HerdrClient>,
+        pid() as i32,
+        Some(fx.anchor.clone()),
+        &a,
+    )
+    .map(|s| s.name)
+    .map_err(|e| e.message)
+}
+
+#[test]
+fn a_spawn_from_an_unmapped_pane_is_refused_not_taken_for_the_cos() {
+    let fx = Fx::new("unmapped");
+    let herdr = Arc::new(FakeHerdr::new());
+    herdr.seed_pane("home", None, &[]);
+    // No pane runs this process.
+    let e = cli(&fx, &herdr, &["tieude-a", "tieude"]).unwrap_err();
+    assert!(e.contains("caller not identified"), "{e}");
+    assert_eq!(fx.agents("tieude-a"), 0);
+    assert!(!fx.wt("tieude-a").exists());
+}
+
+#[test]
+fn a_spawn_from_the_cos_pane_is_cos_owned_and_from_a_lead_pane_lead_owned() {
+    let fx = Fx::new("mapped");
+    fx.project("alpha");
+    let herdr = Arc::new(FakeHerdr::new());
+    let cos = herdr.seed_pane("home", None, &[("grid_role", "cos")]);
+    herdr.set_pane_pids(&cos, pid(), &[]);
+    // The anchor pane belongs to the test's own herdr.
+    let anchor = herdr.seed_pane("anchor", None, &[]);
+    let repo = fx.repo.to_string_lossy().to_string();
+    let env = Env {
+        runs_dir: fx.ws.runs_dir(),
+    };
+    let run = |h: &Arc<FakeHerdr>, name: &str| {
+        worker_spawn_with(
+            &env,
+            h.clone() as Arc<dyn HerdrClient>,
+            pid() as i32,
+            Some(anchor.clone()),
+            &[name.to_string(), "tieude".into(), repo.clone()],
+        )
+        .map_err(|e| e.message)
+    };
+    run(&herdr, "tieude-a").unwrap();
+    let spawner: Option<i64> = fx
+        .conn
+        .query_row("SELECT spawner_id FROM agent WHERE name='tieude-a'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(spawner, None);
+
+    // Now the same process sits in a Lead's pane.
+    fx.conn
+        .execute(
+            "INSERT INTO agent (name, role, project_id, started_ms) \
+             VALUES ('alpha-lead', 'lead', (SELECT id FROM project WHERE slug='alpha'), 1)",
+            [],
+        )
+        .unwrap();
+    let h2 = Arc::new(FakeHerdr::new());
+    let lp = h2.seed_pane("lead", None, &[]);
+    h2.agent_start("alpha-lead", "claude", &lp, 0, &[]).unwrap();
+    h2.set_pane_pids(&lp, pid(), &[]);
+    let anchor2 = h2.seed_pane("anchor", None, &[]);
+    worker_spawn_with(
+        &env,
+        h2.clone() as Arc<dyn HerdrClient>,
+        pid() as i32,
+        Some(anchor2),
+        &["tieude-b".to_string(), "tieude".into(), repo.clone()],
+    )
+    .unwrap();
+    let owner: String = fx
+        .conn
+        .query_row(
+            "SELECT s.name FROM agent a JOIN agent s ON s.id = a.spawner_id WHERE a.name='tieude-b'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, "alpha-lead");
+}
+
+#[test]
+fn the_gate_blocks_at_two_phases_left_like_legacy() {
+    let fx = Fx::new("gate2");
+    plan(&fx, 2);
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    fx.spawn(&[], "tieude-b", "tieude").unwrap();
+    let e = fx.spawn(&[], "tieude-c", "tieude").unwrap_err();
+    assert!(e.contains("needs a Lead"), "{e}");
+}
+
+fn memory_days(fx: &Fx, days: &[&str]) {
+    let dir = fx.ws.root().join("memory");
+    std::fs::create_dir_all(&dir).unwrap();
+    for d in days {
+        std::fs::write(dir.join(format!("{d}.md")), "- [repo] work\n").unwrap();
+    }
+}
+
+#[test]
+fn two_consecutive_memory_days_are_a_gate_signal() {
+    let fx = Fx::new("memdays");
+    memory_days(&fx, &["2026-11-14", "2026-11-15"]);
+    plan(&fx, 2);
+    // memory (signal) + phases_left 2 (signal) block with no live worker.
+    let e = fx.spawn(&[], "tieude-a", "tieude").unwrap_err();
+    assert!(e.contains("needs a Lead"), "{e}");
+    assert!(e.contains("memory"), "{e}");
+}
+
+#[test]
+fn memory_days_with_a_gap_are_not_a_run() {
+    let fx = Fx::new("memgap");
+    memory_days(&fx, &["2026-11-10", "2026-11-15"]);
+    plan(&fx, 2);
+    assert!(fx.spawn(&[], "tieude-a", "tieude").is_ok());
+}
+
+#[test]
+fn a_lead_cap_is_the_smaller_of_max_peers_and_the_global_cap() {
+    let fx = Fx::new("minleadcap");
+    fx.setting("roles.lead.max_peers", "4");
+    fx.setting("limits.max_workers_per_orchestrator", "1");
+    fx.project("alpha");
+    fx.conn
+        .execute(
+            "INSERT INTO agent (name, role, project_id, started_ms) \
+             VALUES ('alpha-lead', 'lead', (SELECT id FROM project WHERE slug='alpha'), 1)",
+            [],
+        )
+        .unwrap();
+    let repo = fx.repo.to_string_lossy().to_string();
+    fx.worker(Some("alpha-lead"), &["tieude-a", "tieude", &repo]).unwrap();
+    let e = fx
+        .worker(Some("alpha-lead"), &["tieude-b", "tieude", &repo])
+        .unwrap_err();
+    assert!(e.contains("worker cap exceeded"), "{e}");
+}
+
+#[test]
+fn the_cap_counts_weighted_slots() {
+    let fx = Fx::new("weights");
+    fx.setting("limits.max_workers_per_orchestrator", "3");
+    fx.setting("limits.weights", r#"{"default":1,"tieude":2}"#);
+    fx.spawn(&[], "tieude-a", "tieude").unwrap(); // 2 slots
+    fx.spawn(&[], "tieude-b", "tieude").unwrap_err(); // 2 + 2 > 3
+    assert_eq!(fx.agents("tieude-b"), 0);
+}
+
+#[test]
+fn a_second_repo_with_the_same_basename_keeps_its_own_project() {
+    let fx = Fx::new("slugclash");
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    let other = fx.ws.root().join("elsewhere").join("repo");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    std::fs::write(other.join("b.txt"), "b\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-q", "-m", "base"]);
+    fx.worker(None, &["tieude-b", "tieude", &other.to_string_lossy()])
+        .unwrap();
+    let pa: Option<i64> = fx
+        .conn
+        .query_row("SELECT project_id FROM agent WHERE name='tieude-a'", [], |r| r.get(0))
+        .unwrap();
+    let pb: Option<i64> = fx
+        .conn
+        .query_row("SELECT project_id FROM agent WHERE name='tieude-b'", [], |r| r.get(0))
+        .unwrap();
+    assert!(pb.is_some(), "the second repo has a project");
+    assert_ne!(pa, pb);
+}
+
+#[test]
+fn lead_spawn_prompts_nothing_until_the_lead_is_ready() {
+    let fx = Fx::new("leadready");
+    fx.project("alpha");
+    fx.herdr.set_reply(Verb::Wait, Reply::err("timeout"));
+    let e = lead(&fx, &["alpha", "--task", "GO"]).unwrap_err();
+    assert!(e.contains("ready"), "{e}");
+    assert!(fx.herdr.prompts().is_empty(), "{:?}", fx.herdr.prompts());
 }
