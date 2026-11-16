@@ -66,8 +66,32 @@ fn client(env: &Env, verb: &str, args: &[String]) -> Result<String, CliError> {
         .to_string())
 }
 
+/// Usage and the caller's own paths are settled here, before the call: the
+/// daemon runs in another cwd, so a file argument goes over as an absolute path.
 pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
-    client(env, "config", args)
+    let need = |n: usize, m: &str| {
+        if args.len() > n {
+            Ok(())
+        } else {
+            Err(usage(m))
+        }
+    };
+    let mut argv = args.to_vec();
+    match args.first().map(String::as_str) {
+        Some("get" | "validate") => {}
+        Some("set") => need(2, "set <key> <value>")?,
+        Some("import") => need(1, "import <team.toml>")?,
+        _ => {
+            return Err(usage(
+                "get [key] | set <key> <value> | import <file> | validate [file]",
+            ))
+        }
+    }
+    if matches!(args[0].as_str(), "import" | "validate") && args.len() > 1 {
+        let abs = std::path::absolute(&args[1]).map_err(fail)?;
+        argv[1] = abs.to_string_lossy().into_owned();
+    }
+    client(env, "config", &argv)
 }
 
 pub fn roster_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
@@ -332,14 +356,79 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
                 format!("unknown key '{key}': use kind.<name>[.field], purpose.<p>, reviewers or a team.toml setting"),
             ));
         }
-        tx.execute(
-            "INSERT INTO setting (key, value_json) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-            params![key, loose(raw).to_string()],
-        )
-        .map_err(fail)?;
+        set_setting(&tx, key, loose(raw))?;
     }
     tx.commit().map_err(fail)
+}
+
+fn put_setting(tx: &Transaction<'_>, key: &str, v: &Value) -> Result<(), CliError> {
+    tx.execute(
+        "INSERT INTO setting (key, value_json) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        params![key, v.to_string()],
+    )
+    .map_err(fail)?;
+    Ok(())
+}
+
+/// Store a setting the way the toml seed does: role settings are typed, and a
+/// role-valued `reports_to` is a topology edge, not a setting row.
+fn set_setting(tx: &Transaction<'_>, key: &str, v: Value) -> Result<(), CliError> {
+    let parts: Vec<&str> = key.split('.').collect();
+    let ["roles", role, field] = parts.as_slice() else {
+        return put_setting(tx, key, &v);
+    };
+    match *field {
+        "can_prompt" => {
+            let tv: toml::Value = serde_json::from_value(v).map_err(fail)?;
+            let list = super::role_list(key, &tv).map_err(fail)?;
+            put_setting(tx, key, &json!(list))
+        }
+        "max_peers" => match v.as_u64() {
+            Some(_) => put_setting(tx, key, &v),
+            None => Err(fail(ConfigError::BadType {
+                path: key.to_string(),
+                expected: "integer",
+            })),
+        },
+        "reports_to" => {
+            let to = v.as_str().ok_or_else(|| {
+                fail(ConfigError::BadType {
+                    path: key.to_string(),
+                    expected: "string",
+                })
+            })?;
+            let is_role = super::ROLES.contains(&to);
+            if !is_role && to != "owner" {
+                return Err(fail(ConfigError::UnknownRole {
+                    path: key.to_string(),
+                    role: to.to_string(),
+                }));
+            }
+            tx.execute(
+                "DELETE FROM topology_edge WHERE from_role = ?1 AND edge = 'report'",
+                [role],
+            )
+            .map_err(fail)?;
+            if is_role {
+                tx.execute("DELETE FROM setting WHERE key = ?1", [key])
+                    .map_err(fail)?;
+                tx.execute(
+                    "INSERT INTO topology_edge (from_role, to_role, edge) VALUES (?1, ?2, 'report')",
+                    params![role, to],
+                )
+                .map_err(fail)?;
+                Ok(())
+            } else {
+                put_setting(tx, key, &v)
+            }
+        }
+        _ => put_setting(tx, key, &v),
+    }
+}
+
+fn kind_name_ok(name: &str) -> bool {
+    !name.is_empty() && name == name.to_lowercase()
 }
 
 /// A key the toml seed maps to a `setting` row: a flat section key, or a role
@@ -375,7 +464,7 @@ fn upsert_kind(
     name: &str,
     patch: Map<String, Value>,
 ) -> Result<(), CliError> {
-    if name.is_empty() || name != name.to_lowercase() {
+    if !kind_name_ok(name) {
         return Err(CliError::new(
             2,
             format!("kind name '{name}' must be lowercase"),
@@ -549,6 +638,11 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
         .and_then(|v| v.as_table())
         .map(|t| t.keys().cloned().collect())
         .unwrap_or_default();
+    if let Some(bad) = named.iter().find(|n| !kind_name_ok(n)) {
+        return Err(ConfigError::Invalid(format!(
+            "kind name '{bad}' must be lowercase"
+        )));
+    }
     for name in &named {
         write_kind(&tx, name, &p.kinds[name])?;
     }

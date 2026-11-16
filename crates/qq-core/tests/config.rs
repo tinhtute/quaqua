@@ -401,3 +401,130 @@ fn config_boundary_rejects_unmapped() {
         Seeded::AlreadySeeded
     );
 }
+
+/// Child half of `config_import_relative_path`: a no-op unless the parent set
+/// the env, in which case it is a CLI client running in another cwd.
+#[test]
+fn relative_path_child() {
+    let Some(runs) = std::env::var_os("QQ_T40_RUNS") else {
+        return;
+    };
+    let env = Env {
+        runs_dir: runs.into(),
+    };
+    for verb in ["validate", "import"] {
+        config::config_cmd(&env, &strs(&[verb, "rel.toml"])).expect("relative path resolves");
+    }
+}
+
+#[test]
+fn config_import_relative_path() {
+    let ws = TestWorkspace::new("cfg-relpath");
+    let (_registry, daemon) = start(&ws);
+    std::fs::write(ws.root().join("rel.toml"), template_without_omp()).unwrap();
+    // The daemon runs in this process's cwd; the client runs in the workspace.
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .current_dir(ws.root())
+        .env("QQ_T40_RUNS", ws.runs_dir())
+        .args(["--exact", "relative_path_child", "--nocapture"])
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    assert_eq!(config::roster(&open(&ws)).unwrap().len(), 5);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn config_set_typed_and_usage() {
+    let ws = TestWorkspace::new("cfg-typed");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    std::fs::write(ws.team_toml(), template_without_omp()).unwrap();
+    assert_eq!(
+        run(&["config", "import", ws.team_toml().to_str().unwrap()]),
+        0
+    );
+
+    // reports_to with a role is an edge (as import does), not a setting row.
+    assert_eq!(
+        run(&["config", "set", "roles.lead.reports_to", "supervisor"]),
+        0
+    );
+    let conn = open(&ws);
+    let edges: Vec<_> = config::topology(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.from == "lead" && e.edge == "report")
+        .map(|e| e.to)
+        .collect();
+    assert_eq!(edges, ["supervisor"], "the old report edge is replaced");
+    assert!(config::setting(&conn, "roles.lead.reports_to")
+        .unwrap()
+        .is_none());
+    assert_eq!(run(&["config", "set", "roles.lead.reports_to", "owner"]), 0);
+    let conn = open(&ws);
+    assert!(config::topology(&conn)
+        .unwrap()
+        .iter()
+        .all(|e| !(e.from == "lead" && e.edge == "report")));
+    assert_eq!(
+        config::setting(&conn, "roles.lead.reports_to").unwrap(),
+        Some(serde_json::json!("owner"))
+    );
+    assert_eq!(
+        run(&["config", "set", "roles.lead.reports_to", "nobody"]),
+        1
+    );
+
+    // role settings are typed like import: bad values refused, good stored.
+    let before = config::setting(&conn, "roles.lead.max_peers").unwrap();
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "abc"]), 1);
+    assert_eq!(
+        run(&["config", "set", "roles.lead.can_prompt", r#"["wizard"]"#]),
+        1
+    );
+    assert_eq!(run(&["config", "set", "roles.lead.can_prompt", "[3]"]), 1);
+    assert_eq!(
+        config::setting(&open(&ws), "roles.lead.max_peers").unwrap(),
+        before
+    );
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "6"]), 0);
+    assert_eq!(
+        run(&["config", "set", "roles.lead.can_prompt", r#"["peer"]"#]),
+        0
+    );
+    let conn = open(&ws);
+    assert_eq!(
+        config::setting(&conn, "roles.lead.max_peers").unwrap(),
+        Some(serde_json::json!(6))
+    );
+    assert_eq!(
+        config::setting(&conn, "roles.lead.can_prompt").unwrap(),
+        Some(serde_json::json!(["peer"]))
+    );
+
+    // import holds kind names to the lowercase rule of set; nothing written.
+    let upper = ws.root().join("upper.toml");
+    std::fs::write(
+        &upper,
+        format!(
+            "{}\n[kinds.Scout]\nharness = \"claude\"\nmodel = \"m\"\n",
+            template_without_omp()
+        ),
+    )
+    .unwrap();
+    assert_eq!(run(&["config", "import", upper.to_str().unwrap()]), 1);
+    assert_eq!(count(&open(&ws), "kind"), 5);
+
+    // usage errors exit 2.
+    assert_eq!(run(&["config"]), 2);
+    assert_eq!(run(&["config", "bogus"]), 2);
+    assert_eq!(run(&["config", "set", "limits.depth"]), 2);
+    assert_eq!(run(&["config", "import"]), 2);
+    daemon.stop().unwrap();
+}
