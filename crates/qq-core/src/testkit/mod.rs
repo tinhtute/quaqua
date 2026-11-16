@@ -7,14 +7,29 @@ use std::sync::{Mutex, MutexGuard};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// The herdr variables a live pane exports. A test workspace must never act
+/// on that pane, so they are cleared while it lives.
+const HERDR_ENV: [&str; 6] = [
+    "HERDR_PANE",
+    "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_SESSION",
+    "HERDR_SOCKET_PATH",
+];
+
 /// A temp workspace dir with `runs/`, a `team.toml` and a DB path (path only:
 /// the schema is T32's, the kit never creates the file).
 /// While alive it holds the process-wide env lock and points
 /// `QUAQUA_TEAM_TOML` at its own team.toml; drop restores the old value and
-/// removes the dir.
+/// removes the dir. It also seals the test off from the live herdr: the pane
+/// variables are cleared and `HERDR_BIN_PATH` names a binary that does not
+/// exist, so a command that reaches herdr by accident fails instead of acting
+/// on the pane the suite runs in.
 pub struct TestWorkspace {
     root: PathBuf,
     prev_team_toml: Option<OsString>,
+    prev_herdr: Vec<(&'static str, Option<OsString>)>,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -24,11 +39,22 @@ impl TestWorkspace {
         let root = std::env::temp_dir().join(format!("qq-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("runs")).expect("create temp workspace");
+        let mut prev_herdr: Vec<_> = HERDR_ENV
+            .iter()
+            .chain(["HERDR_BIN_PATH"].iter())
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        prev_herdr.shrink_to_fit();
         let ws = TestWorkspace {
             prev_team_toml: std::env::var_os("QUAQUA_TEAM_TOML"),
+            prev_herdr,
             root,
             _lock: lock,
         };
+        for k in HERDR_ENV {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("HERDR_BIN_PATH", ws.root.join("no-herdr"));
         std::fs::write(ws.team_toml(), "").expect("write team.toml");
         std::env::set_var("QUAQUA_TEAM_TOML", ws.team_toml());
         ws
@@ -50,6 +76,12 @@ impl TestWorkspace {
         match &self.prev_team_toml {
             Some(v) => std::env::set_var("QUAQUA_TEAM_TOML", v),
             None => std::env::remove_var("QUAQUA_TEAM_TOML"),
+        }
+        for (k, v) in &self.prev_herdr {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }

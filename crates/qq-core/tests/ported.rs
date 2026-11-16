@@ -558,8 +558,22 @@ fn registered_cmds_report_exit_codes() {
     assert!(ws.root().join(".quaqua/pending/models.md").is_file());
 
     // The hooks fail open: no stdin, no answer, exit 0.
-    assert_eq!(code(memory::memory_cmd(&env, &args(&["hook", "pre"]))), 0);
-    assert_eq!(code(memory::memory_cmd(&env, &args(&["hook", "batch"]))), 0);
+    assert_eq!(
+        code(memory::memory_cmd_with(
+            &env,
+            &args(&["hook", "pre"]),
+            String::new
+        )),
+        0
+    );
+    assert_eq!(
+        code(memory::memory_cmd_with(
+            &env,
+            &args(&["hook", "batch"]),
+            String::new
+        )),
+        0
+    );
 }
 
 /// A test workspace must be sealed off from the live herdr: commands that

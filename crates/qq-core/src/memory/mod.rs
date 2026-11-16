@@ -12,7 +12,7 @@ pub use drift::{
 };
 pub use inbox::inbox_cmd;
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -37,13 +37,28 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     })
 }
 
+/// The hook's JSON. Claude Code hands it over on a pipe it closes; a terminal
+/// has no hook behind it, so nothing is read (a read would wait for typing).
 fn stdin_text() -> String {
     let mut s = String::new();
-    let _ = std::io::stdin().read_to_string(&mut s);
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let _ = stdin.lock().read_to_string(&mut s);
+    }
     s
 }
 
 pub fn memory_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+    memory_cmd_with(env, args, stdin_text)
+}
+
+/// [`memory_cmd`] with the hook input supplied by `input`, read only for a
+/// valid mode, so a caller that has no hook behind it never touches stdin.
+pub fn memory_cmd_with(
+    env: &Env,
+    args: &[String],
+    input: impl FnOnce() -> String,
+) -> Result<String, CliError> {
     let mode = match args {
         [h, m] if h == "hook" => m.as_str(),
         _ => {
@@ -53,7 +68,7 @@ pub fn memory_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
             ))
         }
     };
-    let input = stdin_text();
+    let input = input();
     let out = match mode {
         "pre" => pre_decision(&input).map(|v| v.to_string()),
         "batch" => batch_decision(&input).map(|v| v.to_string()),
