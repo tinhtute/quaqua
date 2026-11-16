@@ -97,6 +97,17 @@ pub type Install = fn(&mut Registry, &mut Daemon) -> Result<(), String>;
 pub const MODULES: &[Install] = &[
     crate::task::worker_flow::INSTALL,
     crate::bus::INSTALL,
+    crate::config::INSTALL,
+    crate::authority::INSTALL,
+    crate::task::pipeline_io::INSTALL,
+    crate::task::prompt::INSTALL,
+    crate::grid::INSTALL,
+    crate::status::INSTALL,
+    crate::playbook::INSTALL,
+    crate::memory::INSTALL,
+    crate::transcripts::INSTALL,
+    crate::identity::INSTALL,
+    crate::init::INSTALL,
 ];
 
 /// The CLI registry and the daemon, both filled from the core and [`MODULES`].
@@ -184,11 +195,6 @@ fn core_commands() -> Vec<Command> {
             name: "ping",
             help: "check that the daemon answers",
             run: |env, _| rpc_call(env, "ping", Value::Null).map(|v| pretty(&v)),
-        },
-        Command {
-            name: "status",
-            help: "list workflows from the daemon's database",
-            run: |env, _| rpc_call(env, "status", Value::Null).map(|v| pretty(&v)),
         },
         Command {
             name: "stop",

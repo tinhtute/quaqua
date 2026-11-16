@@ -30,6 +30,11 @@ if [ "$EVENT" = "Stop" ]; then
   fi
 fi
 
+# A Lead (or any non-CoS owner) never reads or acks the CoS inbox.
+if [ -n "${QUAQUA_OWNER:-}" ] && [ "$QUAQUA_OWNER" != "cos" ]; then
+  exit 0
+fi
+
 # Locate quaqua binary
 QUAQUA="${QUAQUA_BIN:-}"
 if [ -z "$QUAQUA" ] && command -v quaqua >/dev/null 2>&1; then

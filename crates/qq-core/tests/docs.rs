@@ -12,48 +12,40 @@ use qq_core::cli::{self, CliError, Command, Env, Install, Registry};
 /// that owns each. Delete an entry when its task lands; `pending_commands_are_still_missing`
 /// fails while an entry already exists in the registry.
 const PENDING: &[(&str, &str)] = &[
-    // T44 worker operations and farm views (spawn has no CLI owner in the plan:
-    // reported to the Lead).
-    ("worker spawn", "T44 (no CLI owner named in the plan)"),
-    ("worker prompt", "T44"),
-    ("worker cleanup", "T44"),
-    ("lead spawn", "T44 (no CLI owner named in the plan)"),
-    ("lead cleanup", "T44"),
-    ("grid reconcile", "T44"),
-    // T45 ported modules behind their verbs.
-    ("playbook list", "T45"),
-    ("playbook show", "T45"),
-    ("identity heal", "T45"),
-    (
-        "init",
-        "T45 (init has a library call, no CLI owner named in the plan)",
-    ),
-    ("memory hook", "T45"),
-    ("transcripts tail", "T45"),
-    ("inbox", "T45"),
-    // T43 task flow behind `pipeline` and `merge`.
-    ("pipeline", "T43"),
-    ("merge", "T43"),
     // The bus registers daemon verbs only; its CLI is the daemon seam task.
     ("mail send", "T42b"),
 ];
 
-/// Modules whose `INSTALL` exists on the branch but may not be in
-/// `cli::MODULES` yet. Add `task::pipeline_io::INSTALL` here once it merges.
-const UNLISTED_INSTALLS: &[Install] = &[qq_core::config::INSTALL, qq_core::authority::INSTALL];
+/// Modules whose `INSTALL` exists on the branch but is not in `cli::MODULES` yet.
+const UNLISTED_INSTALLS: &[Install] = &[];
 
 /// `--flag`s the documents put after a registered command. A command that is
 /// itself in [`PENDING`] owns its flags; a registered command's flags are either
 /// here (it accepts them) or in [`PENDING_FLAGS`] (its owning task adds them).
-const ACCEPTED_FLAGS: &[(&str, &str)] = &[("gate", "--json")];
+const ACCEPTED_FLAGS: &[(&str, &str)] = &[
+    ("gate", "--json"),
+    ("status", "--all"),
+    ("status", "--metrics"),
+    ("inbox", "--for"),
+    ("inbox", "--format"),
+    ("transcripts", "--last"),
+    ("transcripts", "--session"),
+    ("worker", "--check-brief"),
+    ("worker", "--extend"),
+    ("worker", "--resume"),
+];
 
 /// Flags documented for a registered command that its owning task adds later.
 /// Delete an entry when it lands (move it to [`ACCEPTED_FLAGS`]).
 const PENDING_FLAGS: &[(&str, &str, &str)] = &[
-    ("status", "--metrics", "T44"),
-    ("status", "--all", "T44"),
-    ("inbox", "--for", "T45"),
-    ("inbox", "--format", "T45"),
+    ("grid", "--only", "T44"),
+    ("grid", "--tab", "T44"),
+    ("lead", "--task", "T44 (lead spawn absent)"),
+    ("pipeline", "--resume", "T43"),
+    ("pipeline", "--rounds", "T43"),
+    ("worker", "--base", "T44 (worker spawn absent)"),
+    ("worker", "--purpose", "T44 (worker spawn absent)"),
+    ("worker", "--review", "T44 (worker spawn absent)"),
 ];
 
 /// Words no shipped document may name (R15, R25). `omp` and the removed
@@ -248,6 +240,19 @@ type Probe = fn(&Env, &[String]) -> Result<String, CliError>;
 /// the missing daemon (exit 1).
 const SUB_PROBES: &[(&str, Probe)] = &[("config", qq_core::config::config_cmd)];
 
+/// Commands that report a usage error with the same exit code as a missing
+/// daemon (or take no probeable args), so they cannot be probed through the
+/// command: their sub-verbs are listed here, as each module's usage text names them.
+const KNOWN_SUBS: &[(&str, &[&str])] = &[
+    ("grid", &["reconcile", "acquire"]),
+    ("lead", &["spawn", "cleanup"]),
+    ("worker", &["spawn", "prompt", "cleanup"]),
+    ("identity", &["heal"]),
+    ("memory", &["hook"]),
+    ("playbook", &["list", "show"]),
+    ("transcripts", &["tail"]),
+];
+
 /// Does the registry provide `key` (`verb` or `verb sub`)?
 fn provided(key: &str, top: &BTreeSet<String>, env: &Env) -> Result<bool, String> {
     let (verb, sub) = match key.split_once(' ') {
@@ -263,9 +268,12 @@ fn provided(key: &str, top: &BTreeSet<String>, env: &Env) -> Result<bool, String
             let args = [sub.to_string(), "x".to_string(), "x".to_string()];
             Ok(probe(env, &args).err().map(|e| e.code) != Some(2))
         }
-        None => Err(format!(
-            "`{key}`: `{verb}` exists but its sub-verb cannot be checked; add a SUB_PROBES entry"
-        )),
+        None => match KNOWN_SUBS.iter().find(|(v, _)| *v == verb) {
+            Some((_, subs)) => Ok(subs.contains(&sub)),
+            None => Err(format!(
+                "`{key}`: `{verb}` exists but its sub-verb cannot be checked; add a SUB_PROBES or KNOWN_SUBS entry"
+            )),
+        },
     }
 }
 

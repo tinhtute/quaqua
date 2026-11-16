@@ -3,9 +3,8 @@
 //! grid_farm=<farm>` after a herdr restart dropped them. Every step reads the
 //! pane first and writes only the difference, so a repeat is a no-op.
 //!
-//! Pane access goes through [`PaneOps`], two calls the wave-end commit wires to
-//! `HerdrClient` (T44's `pane_get` and `pane_report_metadata`). Until then the
-//! CLI uses [`Unwired`], which refuses at the first pane call.
+//! Pane access goes through [`PaneOps`], two calls the CLI forwards to
+//! `CliHerdr` (`pane_get` and `pane_report_metadata`).
 
 use std::path::{Component, Path};
 
@@ -13,6 +12,7 @@ use serde_json::Value;
 
 use crate::cli::{CliError, Command, Env, Install, Registry};
 use crate::daemon::Daemon;
+use crate::herdr::{CliHerdr, HerdrClient, Reply};
 
 pub const COS_IDENTITY_FILE: &str = "cos.identity.json";
 /// The `--source` herdr records the tokens under.
@@ -31,16 +31,29 @@ pub trait PaneOps {
     ) -> Result<(), String>;
 }
 
-/// The CLI's pane client until `HerdrClient` has the two methods.
-pub struct Unwired;
+impl PaneOps for CliHerdr {
+    fn pane_get(&self, pane: &str) -> Result<Value, String> {
+        reply_json(HerdrClient::pane_get(self, pane))
+    }
+    fn pane_report_metadata(
+        &self,
+        pane: &str,
+        source: &str,
+        tokens: &[(&str, &str)],
+    ) -> Result<(), String> {
+        reply_json(HerdrClient::pane_report_metadata(
+            self, pane, source, tokens, None,
+        ))
+        .map(|_| ())
+    }
+}
 
-impl PaneOps for Unwired {
-    fn pane_get(&self, _: &str) -> Result<Value, String> {
-        Err("herdr pane calls are not wired (HerdrClient pane_get / pane_report_metadata)".into())
+fn reply_json(r: std::io::Result<Reply>) -> Result<Value, String> {
+    let r = r.map_err(|e| e.to_string())?;
+    if !r.ok {
+        return Err(r.error_code().unwrap_or(r.body));
     }
-    fn pane_report_metadata(&self, _: &str, _: &str, _: &[(&str, &str)]) -> Result<(), String> {
-        Err("herdr pane calls are not wired (HerdrClient pane_get / pane_report_metadata)".into())
-    }
+    serde_json::from_str(&r.body).map_err(|e| e.to_string())
 }
 
 /// What a re-tag did to one pane.
@@ -146,10 +159,9 @@ pub fn pane_from_env() -> Option<String> {
     })
 }
 
-/// The single place the CLI picks its pane client; the wave-end commit swaps
-/// `Unwired` for `HerdrClient` here.
+/// The single place the CLI picks its pane client.
 pub fn cli_panes() -> Box<dyn PaneOps> {
-    Box::new(Unwired)
+    Box::new(CliHerdr::new())
 }
 
 fn agent_session(got: &Value) -> Option<String> {

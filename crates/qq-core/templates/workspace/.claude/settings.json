@@ -6,7 +6,8 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "d=${CLAUDE_PROJECT_DIR:-.}; [ -x \"$d/scripts/hooks/memory-compact.sh\" ] || exit 0; exec \"$d/scripts/hooks/memory-compact.sh\" --session-start" }
+          { "type": "command", "command": "d=${CLAUDE_PROJECT_DIR:-.}; [ -x \"$d/scripts/hooks/memory-compact.sh\" ] || exit 0; exec \"$d/scripts/hooks/memory-compact.sh\" --session-start" },
+          { "type": "command", "command": "q=${QUAQUA_BIN:-$(command -v quaqua || echo \"$HOME/.cargo/bin/quaqua\")}; [ -x \"$q\" ] || exit 0; exec \"$q\" memory hook session-start" }
         ]
       }
     ],
