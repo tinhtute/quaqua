@@ -32,9 +32,9 @@ const MAPPED_TOP: &[&str] = &["schema_version", "kinds", "purposes", "roles"];
 
 /// R15: the removed feature is not ported. Its top-level section and its
 /// `can_spawn` / `can_prompt` target are accepted in a team.toml and skipped
-/// on purpose. The name is built from two halves so the R15 grep over this
-/// crate stays empty.
-const NOT_PORTED: &str = concat!("task", "force");
+/// on purpose. The next line is the one documented R15 grep exemption (plan,
+/// `constraints`); the grep filter matches that line alone.
+const NOT_PORTED: &str = "taskforce";
 
 /// Keys a `[roles.<role>]` table may carry.
 const ROLE_KEYS: &[&str] = &["can_spawn", "can_prompt", "reports_to", "max_peers"];
