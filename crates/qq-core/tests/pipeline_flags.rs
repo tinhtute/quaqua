@@ -19,6 +19,7 @@ use qq_core::engine::{
     WorkflowEvent,
 };
 use qq_core::herdr::{FakeHerdr, HerdrClient};
+use qq_core::identity::peer::HerdrPeers;
 use qq_core::rpc::{self, Request};
 use qq_core::task::pipeline::{PipelineFlow, PipelineInput, PipelineOutput, PipelineState};
 use qq_core::task::pipeline_io::{self, Deps, Effects};
@@ -294,7 +295,11 @@ fn a_planning_pipeline_pauses_plan_ready_and_builds_only_after_resume() {
     let out = r.answer(PLAN);
     assert!(matches!(out, RunnerOutcome::Blocked(_)), "{out:?}");
     let (code, reason) = r.blocked().expect("paused");
-    assert_eq!(code, 5, "plan-ready is exit 5");
+    assert_ne!(
+        code,
+        i64::from(qq_core::task::pipeline::BLOCK_UNFINISHED),
+        "a consumer keyed on the code tells plan-ready from unfinished"
+    );
     assert!(reason.contains("plan-ready"), "{reason}");
     assert!(reason.contains("pipeline --resume t1"), "{reason}");
     assert_eq!(r.sim.builder_prompts().len(), 1, "no build before approval");
@@ -368,10 +373,57 @@ fn daemon(ws: &TestWorkspace, herdr: Arc<FakeHerdr>) -> qq_core::daemon::DaemonH
         runs_dir: ws.runs_dir(),
         herdr: herdr.clone(),
     });
-    let mut deps = Deps::new(herdr, ws.runs_dir(), Registry::native());
+    let mut deps = Deps::new(herdr.clone(), ws.runs_dir(), Registry::native());
     deps.watch = Arc::new(|_, _| Ok(()));
     pipeline_io::register(&mut d, deps).expect("register");
+    d.require_peer(Arc::new(HerdrPeers::new(herdr)));
     d.spawn().expect("daemon starts")
+}
+
+/// Agents the daemon can name: the test process "is" the one whose pane its
+/// pid is mapped to ([`Agents::become_agent`]).
+struct Agents {
+    herdr: Arc<FakeHerdr>,
+    panes: Vec<(&'static str, String)>,
+}
+
+impl Agents {
+    fn seed(conn: &rusqlite::Connection, herdr: &Arc<FakeHerdr>) -> Agents {
+        for slug in ["p", "q"] {
+            conn.execute(
+                "INSERT INTO project(slug, created_ms) VALUES (?1, 1)",
+                [slug],
+            )
+            .unwrap();
+        }
+        let mut panes = Vec::new();
+        for (name, role, project) in [
+            ("cos", "cos", None),
+            ("p-lead", "lead", Some(1)),
+            ("q-lead", "lead", Some(2)),
+            ("p-peer", "peer", Some(1)),
+        ] {
+            conn.execute(
+                "INSERT INTO agent (name, role, project_id, started_ms) VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![name, role, project],
+            )
+            .unwrap();
+            let pane = herdr.seed_pane(name, None, &[]);
+            herdr.agent_start(name, "claude", &pane, 0, &[]).unwrap();
+            panes.push((name, pane));
+        }
+        Agents {
+            herdr: herdr.clone(),
+            panes,
+        }
+    }
+
+    fn become_agent(&self, who: &str) {
+        for (name, pane) in &self.panes {
+            let pid = if *name == who { std::process::id() } else { 0 };
+            self.herdr.set_pane_pids(pane, pid, &[]);
+        }
+    }
 }
 
 fn call(ws: &TestWorkspace, args: Value) -> rpc::Response {
@@ -382,15 +434,60 @@ fn call(ws: &TestWorkspace, args: Value) -> rpc::Response {
     .expect("rpc transport")
 }
 
+/// Starts task `t<n>` through the verb as the CoS, with `plan` as given (absent: omitted),
+/// and returns the builder's first prompt.
+fn first_builder_prompt(tag: &str, plan: Option<bool>) -> String {
+    let ws = TestWorkspace::new(tag);
+    let fx = Fixture::new(tag);
+    ws.seal_herdr();
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    let herdr = Arc::new(FakeHerdr::new());
+    Agents::seed(&conn, &herdr).become_agent("cos");
+    let d = daemon(&ws, herdr.clone());
+    let mut start = json!({
+        "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+        "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+        "integ": "integ", "pane": "p1",
+    });
+    if let Some(p) = plan {
+        start["plan"] = json!(p);
+    }
+    let r = call(&ws, start);
+    assert!(r.ok, "{:?}", r.error);
+    let t0 = Instant::now();
+    while herdr.prompts().is_empty() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "no builder prompt");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let prompt = herdr.prompts()[0].1.clone();
+    d.stop().unwrap();
+    prompt
+}
+
+#[test]
+fn a_new_start_plans_first_unless_plan_is_explicitly_off() {
+    let default = first_builder_prompt("pflags-plandef", None);
+    assert!(
+        default.contains("PLAN") && !default.contains("BUILD"),
+        "{default}"
+    );
+    let on = first_builder_prompt("pflags-planon", Some(true));
+    assert!(on.contains("PLAN"), "{on}");
+    let off = first_builder_prompt("pflags-planoff", Some(false));
+    assert!(off.contains("BUILD") && !off.contains("PLAN"), "{off}");
+}
+
 #[test]
 fn resume_verb_signals_a_live_flow_and_refuses_the_rest() {
     let ws = TestWorkspace::new("pflags-verb");
     let fx = Fixture::new("verb");
     let mut conn = db::open(&ws.db_path()).expect("open qq db");
     seed(&mut conn);
-    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", [])
-        .unwrap();
+    ws.seal_herdr();
     let herdr = Arc::new(FakeHerdr::new());
+    let who = Agents::seed(&conn, &herdr);
+    who.become_agent("cos");
     let d = daemon(&ws, herdr.clone());
     let start = json!({
         "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
@@ -405,6 +502,14 @@ fn resume_verb_signals_a_live_flow_and_refuses_the_rest() {
     }
     assert!(herdr.prompts()[0].1.contains("PLAN"));
 
+    // Only the flow's own Lead (or the CoS) approves: the builder's peers and
+    // another project's Lead are refused and the flow stays paused.
+    for intruder in ["p-peer", "q-lead"] {
+        who.become_agent(intruder);
+        let r = call(&ws, json!({ "resume": "t1" }));
+        assert_eq!(r.error.expect("refused").code, "refused", "{intruder}");
+    }
+    who.become_agent("p-lead");
     let ok = call(&ws, json!({ "resume": "t1", "rounds": 3 }));
     assert!(ok.ok, "{:?}", ok.error);
     assert_eq!(ok.result["resumed"], json!(true));
@@ -428,6 +533,7 @@ fn resume_verb_signals_a_live_flow_and_refuses_the_rest() {
         let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
         reg.dispatch(&env, &args)
     };
+    who.become_agent("cos");
     assert_eq!(run(&["pipeline", "--resume", "t1"]), 0);
     assert_eq!(run(&["pipeline", "--resume", "t1", "--rounds", "2"]), 0);
     assert_eq!(

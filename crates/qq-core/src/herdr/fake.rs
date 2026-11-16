@@ -404,11 +404,7 @@ impl HerdrClient for FakeHerdr {
         if reply.ok {
             if let Some(id) = serde_json::from_str::<serde_json::Value>(&reply.body)
                 .ok()
-                .and_then(|v| {
-                    v.pointer("/result/pane/pane_id")?
-                        .as_str()
-                        .map(String::from)
-                })
+                .and_then(|v| v.pointer("/result/pane/pane_id")?.as_str().map(String::from))
             {
                 self.lock().split_cwds.push((id, cwd.to_string()));
             }
