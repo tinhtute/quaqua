@@ -980,7 +980,7 @@ fn verb_args(fx: &Fixture, builder: &str, reviewer: &str, brief: &str) -> Value 
     json!({
         "task": "t1", "builder_kind": builder, "reviewer_kind": reviewer,
         "brief": brief, "repo": fx.repo.to_string_lossy(), "branch": "t1",
-        "integ": "integ", "pane": "p1", "project_id": 1,
+        "integ": "integ", "pane": "p1", "project_id": 1, "plan": false,
     })
 }
 
