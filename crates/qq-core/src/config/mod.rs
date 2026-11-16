@@ -13,6 +13,9 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
+mod verbs;
+pub use verbs::{config_cmd, roster_cmd, INSTALL};
+
 /// The closed harness registry: name and driver. Anything else is rejected.
 /// `opencode` has no native driver and goes through the generic one.
 pub const HARNESSES: &[(&str, Driver)] = &[
