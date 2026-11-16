@@ -24,6 +24,15 @@ pub enum Verb {
     Wait,
     Prompt,
     SendKeys,
+    PaneSplit,
+    PaneClose,
+    PaneList,
+    TabCreate,
+    TabClose,
+    TabList,
+    PaneGet,
+    PaneReportMetadata,
+    PaneRead,
 }
 
 use std::io;
@@ -93,6 +102,58 @@ pub trait HerdrClient: Send + Sync {
             "agent send-keys not supported by this client",
         ))
     }
+    /// `herdr pane split TARGET --direction right|down --no-focus`.
+    /// Default `Unsupported`, like `agent_send_keys`.
+    fn pane_split(&self, _target: &str, _dir: &str) -> io::Result<Reply> {
+        Err(unsupported("pane split"))
+    }
+    /// `herdr pane close PANE`.
+    fn pane_close(&self, _pane: &str) -> io::Result<Reply> {
+        Err(unsupported("pane close"))
+    }
+    /// `herdr pane list`.
+    fn pane_list(&self) -> io::Result<Reply> {
+        Err(unsupported("pane list"))
+    }
+    /// `herdr tab create --label NAME --no-focus`.
+    fn tab_create(&self, _name: &str) -> io::Result<Reply> {
+        Err(unsupported("tab create"))
+    }
+    /// `herdr tab close TAB`.
+    fn tab_close(&self, _tab: &str) -> io::Result<Reply> {
+        Err(unsupported("tab close"))
+    }
+    /// `herdr tab list`: `{"result":{"tabs":[{tab_id,label,...}]}}`.
+    fn tab_list(&self) -> io::Result<Reply> {
+        Err(unsupported("tab list"))
+    }
+    /// `herdr pane get PANE`.
+    fn pane_get(&self, _pane: &str) -> io::Result<Reply> {
+        Err(unsupported("pane get"))
+    }
+    /// `herdr pane report-metadata PANE --source SOURCE [--token K=V]...
+    /// [--display-agent TEXT]`. herdr merges tokens, so a repeat converges.
+    fn pane_report_metadata(
+        &self,
+        _pane: &str,
+        _source: &str,
+        _tokens: &[(&str, &str)],
+        _display: Option<&str>,
+    ) -> io::Result<Reply> {
+        Err(unsupported("pane report-metadata"))
+    }
+    /// `herdr pane read PANE --source recent-unwrapped --lines N`: the pane's
+    /// recent text. The reply body is the text itself, not JSON.
+    fn pane_read(&self, _pane: &str, _lines: u32) -> io::Result<Reply> {
+        Err(unsupported("pane read"))
+    }
+}
+
+fn unsupported(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{what} not supported by this client"),
+    )
 }
 
 /// The real binary: `HERDR_BIN_PATH` when set and non-empty, else `herdr`.
@@ -207,6 +268,72 @@ impl HerdrClient for CliHerdr {
     fn agent_send_keys(&self, name: &str, keys: &[&str]) -> io::Result<Reply> {
         let mut args = argv(&["agent", "send-keys", name]);
         args.extend(keys.iter().map(|k| k.to_string()));
+        self.run(&args)
+    }
+
+    fn pane_split(&self, target: &str, dir: &str) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "split",
+            target,
+            "--direction",
+            dir,
+            "--no-focus",
+        ]))
+    }
+
+    fn pane_close(&self, pane: &str) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "close", pane]))
+    }
+
+    fn pane_list(&self) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "list"]))
+    }
+
+    fn tab_create(&self, name: &str) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "create", "--label", name, "--no-focus"]))
+    }
+
+    fn tab_close(&self, tab: &str) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "close", tab]))
+    }
+
+    fn tab_list(&self) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "list"]))
+    }
+
+    fn pane_get(&self, pane: &str) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "get", pane]))
+    }
+
+    fn pane_read(&self, pane: &str, lines: u32) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "read",
+            pane,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            &lines.to_string(),
+        ]))
+    }
+
+    fn pane_report_metadata(
+        &self,
+        pane: &str,
+        source: &str,
+        tokens: &[(&str, &str)],
+        display: Option<&str>,
+    ) -> io::Result<Reply> {
+        let mut args = argv(&["pane", "report-metadata", pane, "--source", source]);
+        for (k, v) in tokens {
+            args.push("--token".into());
+            args.push(format!("{k}={v}"));
+        }
+        if let Some(d) = display {
+            args.push("--display-agent".into());
+            args.push(d.into());
+        }
         self.run(&args)
     }
 }

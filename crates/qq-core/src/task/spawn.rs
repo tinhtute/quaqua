@@ -4,7 +4,8 @@
 //! Steps, each safe to repeat: resolve the kind from SQLite, find the driver
 //! of its harness, `herdr agent start` (herdr converges on the same name,
 //! kind and pane), then record the agent unless an open one with that name
-//! exists. A pane is an input: herdr 0.9.5's client has no pane split.
+//! exists. The pane is an input; `task.start` fills a missing one from grid
+//! placement (`worker_flow::place_pane`) before it gets here.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -135,15 +136,16 @@ pub fn spawn(
         Some((id, ..)) => id,
         None => {
             conn.execute(
-                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms, pane_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     spec.name,
                     spec.role.as_str(),
                     spec.kind,
                     spec.project_id,
                     spec.spawner_id,
-                    now_ms as i64
+                    now_ms as i64,
+                    spec.pane
                 ],
             )
             .map_err(SpawnError::Db)?;

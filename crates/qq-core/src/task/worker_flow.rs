@@ -387,6 +387,47 @@ fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .ok_or_else(|| bad(format!("missing string argument '{key}'")))
 }
 
+/// The pane for a spawn that named none. A worker herdr already knows keeps
+/// its pane (a retry places nothing new); otherwise grid placement picks one
+/// by the project's repo, four agents to a tab.
+pub fn place_pane(
+    conn: &rusqlite::Connection,
+    herdr: &dyn HerdrClient,
+    name: &str,
+    project_id: Option<i64>,
+) -> Result<String, RpcError> {
+    if let Ok(r) = herdr.agent_get(name) {
+        if let Some(p) = serde_json::from_str::<Value>(&r.body).ok().and_then(|v| {
+            v.pointer("/result/agent/pane_id")?
+                .as_str()
+                .map(String::from)
+        }) {
+            return Ok(p);
+        }
+    }
+    let id = project_id.ok_or_else(|| bad("a spawn needs 'pane' or a 'project_id' to place it"))?;
+    let repo: String = conn
+        .query_row("SELECT repo_path FROM project WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .map_err(|_| bad(format!("no project {id} to place '{name}'")))?;
+    let repo = std::path::Path::new(&repo)
+        .file_name()
+        .map_or_else(|| repo.clone(), |f| f.to_string_lossy().into_owned());
+    let runs = conn
+        .path()
+        .and_then(|p| Path::new(p).parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| bad("no runs dir to place '".to_string() + name + "' in"))?;
+    crate::grid::acquire(
+        &crate::grid::HerdrPanes(herdr),
+        &repo,
+        &crate::grid::Scope::from_runs_dir(&runs),
+        &runs,
+    )
+    .map_err(|e| RpcError::new("place_failed", e.to_string()))
+}
+
 /// The input `task.start` journaled for `id`, read from the replay base.
 fn journaled_input(
     store: &crate::daemon::store::Store,
@@ -441,7 +482,7 @@ fn settle_run(
     record_end(journal, db_path, id)
 }
 
-/// `task.start {name, kind, role, pane, prompt, report, [timeout_ms, base,
+/// `task.start {name, kind, role, [pane: else grid-placed from project_id], prompt, report, [timeout_ms, base,
 /// project_id, task_id]}`: runs one task on one agent. The workflow id is
 /// `worker:<name>`. A repeat with the same input converges; a different input
 /// for an existing id is a `conflict`; a new task whose report path already
@@ -540,6 +581,10 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 .map(|a| a.id),
             None => None,
         };
+        let pane = match a.get("pane").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => place_pane(&conn, deps.herdr.as_ref(), name, project_id)?,
+        };
         let spawned = spawn(
             &conn,
             deps.herdr.as_ref(),
@@ -548,7 +593,7 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 name,
                 kind,
                 role,
-                pane: text(a, "pane")?,
+                pane: &pane,
                 project_id,
                 spawner_id,
             },
