@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::pipeline::{self, PipelineFlow, PipelineInput, PipelineOutput, PipelineState};
+use super::pipeline::{self, PipelineFlow, PipelineInput, PipelineState};
 use super::spawn::{spawn, Role, SpawnError, SpawnSpec};
 use crate::cli::{CliError, Command, Install, Registry as CliRegistry};
 use crate::config;
@@ -351,6 +351,3 @@ fn forward(env: &crate::cli::Env, verb: &str, args: &[String]) -> Result<String,
         serde_json::from_str(raw).map_err(|e| CliError::new(1, format!("bad json: {e}")))?;
     crate::cli::rpc_call(env, verb, v).map(|r| serde_json::to_string_pretty(&r).unwrap_or_default())
 }
-
-#[allow(dead_code)]
-type _Out = PipelineOutput;
