@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -775,17 +776,32 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
 /// The live pieces: the workspace database, the herdr binary, the drivers of
 /// the roster's harnesses; the caller is the open agent living in this pane.
 fn live<T>(env: &Env, f: impl FnOnce(&Ctx) -> R<T>) -> R<T> {
+    let pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| !p.is_empty());
+    live_with(
+        env,
+        Arc::new(crate::herdr::CliHerdr::new()),
+        std::process::id() as i32,
+        pane,
+        f,
+    )
+}
+
+fn live_with<T>(
+    env: &Env,
+    herdr: Arc<dyn HerdrClient>,
+    _pid: i32,
+    pane: Option<String>,
+    f: impl FnOnce(&Ctx) -> R<T>,
+) -> R<T> {
     let conn = crate::db::open(&env.runs_dir.join(crate::db::path::DB_FILE)).map_err(db)?;
-    let herdr = crate::herdr::CliHerdr::new();
     let harnesses: Vec<_> = config::roster(&conn)
         .map_err(cfg)?
         .iter()
         .filter_map(|k| config::harness(&conn, &k.harness).ok().flatten())
         .collect();
     let drivers = Drivers::from_config(&harnesses);
-    let pane = std::env::var("HERDR_PANE_ID")
-        .ok()
-        .filter(|p| !p.is_empty());
     let caller: Option<String> = pane.as_deref().and_then(|p| {
         conn.query_row(
             "SELECT name FROM agent WHERE pane_id = ?1 AND ended_ms IS NULL ORDER BY id DESC LIMIT 1",
@@ -799,13 +815,24 @@ fn live<T>(env: &Env, f: impl FnOnce(&Ctx) -> R<T>) -> R<T> {
         .map_or(0, |d| d.as_millis() as u64);
     f(&Ctx {
         conn: &conn,
-        herdr: &herdr,
+        herdr: herdr.as_ref(),
         drivers: &drivers,
         runs_dir: env.runs_dir.clone(),
         caller: caller.as_deref(),
         anchor: pane.as_deref(),
         now_ms,
     })
+}
+
+/// `worker spawn` with the herdr client, calling pid and anchor pane given.
+pub fn worker_spawn_with(
+    env: &Env,
+    herdr: Arc<dyn HerdrClient>,
+    pid: i32,
+    anchor: Option<String>,
+    args: &[String],
+) -> R<WorkerSpawned> {
+    live_with(env, herdr, pid, anchor, |ctx| run_worker(ctx, args))
 }
 
 /// `worker spawn ...` (the args after `spawn`): prints the result as JSON.

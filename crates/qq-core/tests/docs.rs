@@ -11,10 +11,7 @@ use qq_core::cli::{self, CliError, Command, Env, Install, Registry};
 /// Commands the documents name that no built task provides yet, with the task
 /// that owns each. Delete an entry when its task lands; `pending_commands_are_still_missing`
 /// fails while an entry already exists in the registry.
-const PENDING: &[(&str, &str)] = &[
-    // The bus registers daemon verbs only; its CLI is the daemon seam task.
-    ("mail send", "T42b"),
-];
+const PENDING: &[(&str, &str)] = &[];
 
 /// Modules whose `INSTALL` exists on the branch but is not in `cli::MODULES` yet.
 const UNLISTED_INSTALLS: &[Install] = &[];
@@ -33,20 +30,19 @@ const ACCEPTED_FLAGS: &[(&str, &str)] = &[
     ("worker", "--check-brief"),
     ("worker", "--extend"),
     ("worker", "--resume"),
+    ("worker", "--base"),
+    ("worker", "--purpose"),
+    ("worker", "--review"),
+    ("lead", "--task"),
+    ("grid", "--only"),
+    ("grid", "--tab"),
+    ("pipeline", "--resume"),
+    ("pipeline", "--rounds"),
 ];
 
 /// Flags documented for a registered command that its owning task adds later.
 /// Delete an entry when it lands (move it to [`ACCEPTED_FLAGS`]).
-const PENDING_FLAGS: &[(&str, &str, &str)] = &[
-    ("grid", "--only", "T44"),
-    ("grid", "--tab", "T44"),
-    ("lead", "--task", "T44 (lead spawn absent)"),
-    ("pipeline", "--resume", "T43"),
-    ("pipeline", "--rounds", "T43"),
-    ("worker", "--base", "T44 (worker spawn absent)"),
-    ("worker", "--purpose", "T44 (worker spawn absent)"),
-    ("worker", "--review", "T44 (worker spawn absent)"),
-];
+const PENDING_FLAGS: &[(&str, &str, &str)] = &[];
 
 /// Words no shipped document may name (R15, R25). `omp` and the removed
 /// task-force name are covered by the phase-check grep over the templates.
@@ -248,6 +244,7 @@ const KNOWN_SUBS: &[(&str, &[&str])] = &[
     ("lead", &["spawn", "cleanup"]),
     ("worker", &["spawn", "prompt", "cleanup"]),
     ("identity", &["heal"]),
+    ("mail", &["send"]),
     ("memory", &["hook"]),
     ("playbook", &["list", "show"]),
     ("transcripts", &["tail"]),
