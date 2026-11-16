@@ -149,7 +149,7 @@ lane: high-risk
   | outer 3 (product) | idea inbox: one markdown file per idea in `inbox/ideas/` | inbox parse and duplicate check | CoS triage, anh iu's decision on high risk |
 
 - phase_slug: `foundation`
-  status: planned
+  status: done
   - goal: R1, R2, R7, R15, R20 | depends_on: none
   - surfaces: `Cargo.toml` workspace members, `crates/qq-core/` (skeleton, `src/db/`, `src/engine/`, `src/herdr/`, `src/testkit/`), `tests/qq-test.sh` | avoided: `crates/quaqua/`, `templates/`, `.github/`, `~/quaqua`
   - escalate_when: a ported engine file needs a journal schema change, `cargo build --locked -p quaqua` breaks from the workspace change, or the phase pull request to `main` is ready (anh iu approves the push and the merge)
@@ -161,7 +161,7 @@ lane: high-risk
     - T34 `HerdrClient` trait over the herdr CLI with an in-memory fake, the shared test kit (temp workspace, `QUAQUA_TEAM_TOML` temp DB), and the port of `liveness` onto that trait (the old file imports `crate::herdr::HerdrOps`) (owner: Peer C, writes `crates/qq-core/src/herdr/`, `crates/qq-core/src/testkit/`, `crates/qq-core/tests/herdr.rs` only) — output: the fake replays `agent start`, `agent get`, `agent wait`, `agent prompt` and a busy-pane error — check: `bash tests/qq-test.sh herdr_fake_contract` — stop_if: a needed herdr verb is not in `herdr --help` for 0.9.5
   - phase check: `cargo build --locked -p qq-core && cargo build --locked -p quaqua && cargo clippy --locked --all-targets -- -D warnings && bash tests/qq-test.sh ontology_schema_relations legacy_omp_sude_rows_read daemon_idle_worker_adds_no_poll_events herdr_fake_contract && test -d crates/qq-core/src && test -z "$(git grep -n -i -E 'taskforce|telemetry_otel|mod (gui|legacy)|bus_migrate|layout_migrate' -- crates/qq-core)"`
 - phase_slug: `walking-skeleton`
-  status: planned
+  status: active
   - goal: R2, R3, R6, R7, R19 | depends_on: foundation
   - surfaces: `crates/qq-core/src/{config,daemon,rpc,cli,driver,task,run,bus}/`, `tests/manual/` | avoided: `crates/quaqua/`, `templates/`, the live `~/quaqua`
   - escalate_when: caller identity cannot be verified on the daemon side, a seam (`HarnessDriver`, RPC message shape, `Signal`, the command registry) needs a shape the Goal or `seams:` does not cover, or the phase pull request to `main` is ready
@@ -240,6 +240,7 @@ lane: high-risk
   - phase check: `cargo test --locked -p qq-core && cargo clippy --locked --all-targets -- -D warnings && test -d crates/qq-core/templates/workspace && test -z "$(git grep -n -i -E 'taskforce|telemetry_otel|mod (gui|legacy)|bus_migrate|layout_migrate' -- crates/qq-core)" && test -z "$(git grep -n -i -w -E 'omp|taskforce' -- crates/qq-core/templates/workspace)"`, plus the T66 output in `## Validation`
 
 ## Log
+- 2026-11-16: foundation done (T31–T34 merged to `main` as PR #274, phase check green on 8196406). Lead decision for walking-skeleton: wave Peers must not write `lib.rs`, so one scaffold commit declares `pub mod config; daemon; rpc; cli; driver; task; run; bus;` with an empty `mod.rs` each (`task/mod.rs` declares `pub mod spawn; pub mod worker_flow;` over empty files) and no dependency change; `main.rs` stays `fn main() {}` and T36, which owns the CLI, may replace its body to call `cli`.
 - 2026-11-15: anh iu confirmed the three seams from research ("còn seam hãy theo ý em đề xuất"): `WorkflowEvent::Signal { source, name, payload }`, the clock pair `next_deadline()` / `fire_due(now)` and the `HerdrClient` trait with one in-memory fake. The CoS recommendation he followed: the real risk is the three-field shape of `Signal`, which is inferred from research and has no running code yet (T33's test of 3 Signals with kill and resume is its proof), and the seams freeze only at the end of `walking-skeleton`. Wave 2 of `foundation` is no longer held. The two seams "new in this plan" (command registry, `full_pipeline.sh` arguments) are still not confirmed. No task line and no check command changed.
 - 2026-11-15: readiness check before work started (anh iu: "check lại plan software factory đã ready to implement chưa"), read-only, then anh iu approved the fixes by question tool ("Sửa luôn"). Measured at 43a60bd: `liveness.rs:8` imports `crate::herdr::HerdrOps`, which T34 writes in the same wave as T33; the DDL of `events` and `snapshots` is in `engine/journal_sqlite.rs:245,254` while T32 owned the schema and the DB outline had no `snapshots`; `journal_sqlite.rs` and `sqlite.rs` call `worker::cleanup::default_runs_dir` and `workspace::live_db_open_refused`; the R15 grep and clippy ran only at the phase check and the pattern `mod (gui|legacy)` matches `mod legacy_rows`. Changed: `liveness` moves from T33 to T34; T33 keeps the journal DDL and takes the database path from the caller; T32 owns `workflow`, the default path and the live-database guard; a new constraint names the R15 traps and has the Lead run clippy and the grep on each Peer branch; the stale "three live Leads" wording is now two. No check command changed. Not decided: anh iu chose to review the seams of the `seams:` line "not yet confirmed" (`Signal`, the clock pair, `HerdrClient`) before wave 2 is spawned; T31 does not depend on them. PR #272 is behind by these lines.
 - 2026-11-15: anh iu: "chỉnh lại pipeline cho phép tạm thời đi", "bỏ budget tạm thời, mvp k cần", "đóng design lead tập trung vào plan software factory". The old binary gets a fix so that `quaqua pipeline` follows `strategy.builder_reviewer_differ` at run time (worker tieude-differkind on `main`, outside this plan's phases); briefs carry no cost budget and no time cap during the MVP; design-lead was closed, so two projects, not three, have a Lead to pause before T51.
@@ -271,8 +272,8 @@ lane: high-risk
 ## Validation
 
 ## Current State and Next Action
-- active_phase: none
-- lifecycle_status: planned
+- active_phase: walking-skeleton
+- lifecycle_status: active
 - blockers: none
-- open_items: the old binary must follow `builder_reviewer_differ` at run time before a pipeline can run on the all-claude roster (fix f009647 in PR #273, reviewed with no must-fix; its main merge and the reinstall each need anh iu's approval); anh iu allowed the same-harness pair for now only, and no requirement here says what `qq pipeline` does (the switch signal's cross-harness review covers the E2E only); spawn `quaqua-rs-lead` and create `quaqua/quaqua-rs-integ` before work starts (CoS); T39, T48, T60, T66 need anh iu as runner; the two Leads (baroiplayer, zbrain) pause before T51; PR #272 carries this plan since 2026-11-15 and its merge to `main` needs anh iu
-- exact_next_action: work full phase foundation
+- open_items: the reinstall of the old binary with the `builder_reviewer_differ` fix (f009647, merged in PR #273) needs anh iu's approval; anh iu allowed the same-harness pair for now only, and no requirement here says what `qq pipeline` does (the switch signal's cross-harness review covers the E2E only); T39, T48, T60, T66 need anh iu as runner; the two Leads (baroiplayer, zbrain) pause before T51
+- exact_next_action: work walking-skeleton wave 1: T35 (config seed) and T36 (daemon core) in parallel
