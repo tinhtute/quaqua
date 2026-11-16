@@ -1,4 +1,12 @@
+pub mod bus;
+pub mod cli;
+pub mod config;
+pub mod daemon;
 pub mod db;
+pub mod driver;
 pub mod engine;
 pub mod herdr;
+pub mod rpc;
+pub mod run;
+pub mod task;
 pub mod testkit;

@@ -68,5 +68,12 @@ pub fn open_conn(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     // mode change bypasses the busy handler (see `retry_while_busy`).
     retry_while_busy(|| conn.pragma_update(None, "journal_mode", "WAL"))?;
 
+    // In WAL a commit under FULL fsyncs the log while holding the write lock,
+    // so every other writer waits out that fsync; a slow disk then stretches
+    // the queue past the busy timeout. NORMAL syncs at checkpoints instead:
+    // an app crash loses nothing, a power cut may lose the last commits but
+    // never corrupts the file.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+
     Ok(conn)
 }

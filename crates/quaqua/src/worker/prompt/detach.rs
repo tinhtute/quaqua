@@ -92,8 +92,23 @@ struct StartLock(#[allow(dead_code)] Option<File>);
 
 /// A filesystem that cannot lock (NFS without lockd: ENOLCK; no flock: EOPNOTSUPP).
 fn lock_unsupported(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(37) | Some(95))
+    e.raw_os_error()
+        .is_some_and(|n| n == ENOLCK || n == EOPNOTSUPP || n == ENOTSUP)
 }
+
+// errno values differ per platform (no libc dep).
+#[cfg(target_os = "macos")]
+const ENOLCK: i32 = 77;
+#[cfg(target_os = "macos")]
+const EOPNOTSUPP: i32 = 102;
+#[cfg(target_os = "macos")]
+const ENOTSUP: i32 = 45;
+#[cfg(not(target_os = "macos"))]
+const ENOLCK: i32 = 37;
+#[cfg(not(target_os = "macos"))]
+const EOPNOTSUPP: i32 = 95;
+#[cfg(not(target_os = "macos"))]
+const ENOTSUP: i32 = 95;
 
 impl StartLock {
     /// Blocks until held. Where locking is unsupported it warns and proceeds
@@ -291,14 +306,15 @@ mod tests {
     #[test]
     fn test_detach_lock_unsupported_errnos_proceed_unlocked() {
         // ENOLCK and EOPNOTSUPP mean "cannot lock here"; anything else is a real error.
-        assert!(lock_unsupported(&std::io::Error::from_raw_os_error(37)));
-        assert!(lock_unsupported(&std::io::Error::from_raw_os_error(95)));
+        for n in [ENOLCK, EOPNOTSUPP, ENOTSUP] {
+            assert!(lock_unsupported(&std::io::Error::from_raw_os_error(n)));
+        }
         assert!(!lock_unsupported(&std::io::Error::from_raw_os_error(9)));
     }
 
     #[test]
     fn test_detach_parent_reports_a_panicking_core_as_died() {
-        let dir = std::env::temp_dir().join(format!("qq-detach-panic-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qq-detach-panic-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&dir).unwrap();
         for s in ["out", "err"] {
             std::fs::write(log_path(&dir, "w", s), "").unwrap();

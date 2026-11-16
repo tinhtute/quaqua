@@ -109,7 +109,7 @@ impl Drop for TempDb {
 }
 
 #[test]
-fn daemon_idle_worker_adds_no_poll_events() {
+fn engine_stub_idle_no_poll_rows() {
     let db = TempDb::new("idle");
     let mut activities = NoActivities;
     let expected: Vec<String> = ["working", "blocked", "idle"].map(String::from).to_vec();
