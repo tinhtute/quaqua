@@ -133,7 +133,18 @@ pub fn drift(root: &Path, session_id: &str) -> Vec<String> {
     changed
 }
 
-/// True when any segment runs `quaqua worker …` or `quaqua lead …`.
+/// True when any segment runs `quaqua|qq worker …` or `quaqua|qq lead …`.
+pub fn is_dispatch(segs: &[Vec<String>]) -> bool {
+    let bin =
+        |w: &str| matches!(w, "quaqua" | "qq") || w.ends_with("/quaqua") || w.ends_with("/qq");
+    segs.iter().any(|seg| {
+        seg.iter()
+            .position(|w| bin(w))
+            .is_some_and(|i| matches!(seg.get(i + 1).map(String::as_str), Some("worker" | "lead")))
+    })
+}
+
+/// The warning text for the rule files in `changed`.
 pub fn drift_message(changed: &[String]) -> String {
     format!(
         "Rule files changed since this session started: {}. Re-read them before this spawn/prompt; your loaded rules may be stale (issue #72).",

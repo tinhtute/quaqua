@@ -53,11 +53,22 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
             _ => return Err(usage()),
         }
     }
+    // `--for` moves another recipient's cursor, so only the recipient itself,
+    // the CoS, or the recipient's spawner may; anyone else reads without acking.
+    if let (Some(t), false) = (&to, peek) {
+        peek = !may_ack(env, t);
+    }
     let mut call = json!({ "limit": if all { PAGE } else { MAX_LINES + 1 } });
     if let Some(t) = &to {
         call["to"] = json!(t);
     }
-    let res = rpc_call(env, "mail.inbox", call)?;
+    let hook = format != Format::Plain;
+    // A hook never fails the turn: with no answer it injects nothing.
+    let res = match rpc_call(env, "mail.inbox", call) {
+        Ok(r) => r,
+        Err(_) if hook => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
     let mail = res["mail"].as_array().cloned().unwrap_or_default();
     if mail.is_empty() {
         return Ok(String::new());
@@ -77,7 +88,12 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
         if let Some(t) = &to {
             ack["to"] = json!(t);
         }
-        rpc_call(env, "mail.ack", ack)?;
+        match rpc_call(env, "mail.ack", ack) {
+            Ok(_) => {}
+            // Not acked: the mail is shown again next time, never lost.
+            Err(_) if hook => {}
+            Err(e) => return Err(e),
+        }
     }
     let text = lines.join("\n");
     Ok(match format {
@@ -89,6 +105,27 @@ pub fn inbox_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
             "hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}})
         .to_string(),
     })
+}
+
+/// May the caller (`QQ_AGENT`) advance `to`'s cursor? No caller is the CoS's own
+/// shell and hook. Any database or lookup failure says no.
+fn may_ack(env: &Env, to: &str) -> bool {
+    let Some(caller) = std::env::var("QQ_AGENT").ok().filter(|n| !n.is_empty()) else {
+        return true;
+    };
+    if caller == to {
+        return true;
+    }
+    let Ok(conn) = crate::db::open(&env.runs_dir.join("qq.db")) else {
+        return false;
+    };
+    let Ok(Some(c)) = crate::authority::resolve(&conn, &caller) else {
+        return false;
+    };
+    if c.role == crate::authority::Role::Cos {
+        return true;
+    }
+    matches!(crate::authority::resolve(&conn, to), Ok(Some(t)) if t.spawner_id == Some(c.id))
 }
 
 /// `#<id> <from> [<kind>] <first line of the body, 100 chars>`.

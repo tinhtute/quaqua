@@ -7,14 +7,23 @@
 //!   missing → write; equal → record; untouched since the lock → overwrite;
 //!   changed locally, or no lock entry → keep it, save the new template to
 //!   `.quaqua/pending/<path>`, and exit 3.
+//! - seed files (`memory/rules.md`, `projects/INDEX.md`, `projects/_template.md`,
+//!   `USER.md`) are written only when absent, never overwritten.
+//! - plain `init` in a git repo installs the portable-paths pre-commit gate
+//!   (`core.hooksPath`); `--git-hooks <repo>` does only that.
+//! - `--update` merges the memory hook entries into `.claude/settings.json`
+//!   (marker `# qq-managed`, idempotent) and keeps the rest of the file.
 //! - `--dry-run` reports the decisions and writes nothing.
 //!
 //! Idempotent: a second run finds every file equal to the template and writes
 //! nothing. The lock format is the one the live workspaces already carry.
 
+mod hooks;
 mod md5;
+mod seeds;
 mod table;
 
+pub use hooks::run_git_hooks;
 pub use md5::md5_hex;
 
 use std::collections::BTreeMap;
@@ -41,24 +50,36 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     })
 }
 
-fn init_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
-    let (mut dir, mut update, mut dry) = (None, false, false);
+const USAGE: &str = "usage: qq init [DIR] [--update] [--dry-run] | qq init --git-hooks <repo>";
+
+pub fn init_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+    let (mut dir, mut update, mut dry, mut git_hooks) = (None, false, false, false);
     for a in args {
         match a.as_str() {
             "--update" => update = true,
             "--dry-run" => dry = true,
-            s if s.starts_with("--") => {
-                return Err(CliError::new(
-                    2,
-                    "usage: qq init [DIR] [--update] [--dry-run]",
-                ))
-            }
+            "--git-hooks" => git_hooks = true,
+            s if s.starts_with("--") => return Err(CliError::new(2, USAGE)),
             s => dir = Some(PathBuf::from(s)),
         }
     }
+    if git_hooks {
+        let repo = dir.ok_or_else(|| CliError::new(2, USAGE))?;
+        return run_git_hooks(&repo).map_err(|e| CliError::new(1, e));
+    }
     let target = dir.or_else(|| env.runs_dir.parent().map(Path::to_path_buf));
     let target = target.ok_or_else(|| CliError::new(2, "init: no target directory"))?;
-    let (report, conflicts) = run(&target, update, dry).map_err(|e| CliError::new(1, e))?;
+    let (mut report, conflicts) = run(&target, update, dry).map_err(|e| CliError::new(1, e))?;
+    if !update && !dry {
+        // The CoS pane of this workspace gets its tokens and identity record.
+        let panes = crate::identity::cli_panes();
+        let pane = crate::identity::pane_from_env();
+        match crate::identity::session_retag(panes.as_ref(), pane.as_deref(), &target, &target) {
+            Some(Ok(crate::identity::Retag::Tagged)) => report.push_str("\ntagged the CoS pane"),
+            Some(Err(e)) => report.push_str(&format!("\ncos pane not tagged: {e}")),
+            _ => {}
+        }
+    }
     if conflicts > 0 {
         Err(CliError::new(3, report))
     } else {
@@ -163,13 +184,45 @@ pub fn run(root: &Path, update: bool, dry: bool) -> Result<(String, usize), Stri
         } else if update {
             conflicts += 1;
             let pending = format!(".quaqua/pending/{rel}");
-            log.push(format!("conflict {rel} -> {pending}"));
+            let differ = differing_lines(&dst, bytes);
+            log.push(format!(
+                "conflict {rel} -> {pending} ({differ} lines differ; diff {rel} {pending})"
+            ));
             if !dry {
                 write_file(&root.join(&pending), bytes, *mode)?;
             }
         }
         // Plain init, existing and different: left alone and out of the lock,
         // so the first `--update` reports it instead of overwriting it.
+    }
+
+    for (rel, body) in seeds::SEEDS {
+        if root.join(rel).exists() {
+            continue;
+        }
+        log.push(format!(
+            "{} seed {rel}",
+            if dry { "would write" } else { "write" }
+        ));
+        if !dry {
+            write_file(&root.join(rel), body.as_bytes(), 0o644)?;
+        }
+    }
+
+    if !update && !dry {
+        match hooks::wire(root) {
+            Ok(Some(line)) if !line.is_empty() => log.push(line),
+            Ok(_) => {}
+            Err(e) => log.push(format!("git hooks not installed: {e}")),
+        }
+    }
+
+    if update {
+        match merge_memory_hooks(root, dry, &mut lock) {
+            Ok(Some(line)) => log.push(line),
+            Ok(None) => {}
+            Err(e) => log.push(e),
+        }
     }
 
     if update {
@@ -190,6 +243,138 @@ pub fn run(root: &Path, update: bool, dry: bool) -> Result<(String, usize), Stri
         }
     }
     Ok((log.join("\n"), conflicts))
+}
+
+/// Lines of `new` that are not line-for-line the same as the file at `path`.
+fn differing_lines(path: &Path, new: &[u8]) -> usize {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let new = String::from_utf8_lossy(new);
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    (0..a.len().max(b.len()))
+        .filter(|i| a.get(*i) != b.get(*i))
+        .count()
+}
+
+const SETTINGS_REL: &str = ".claude/settings.json";
+/// Trailing shell comment that marks a handler `qq init --update` added.
+const MARKER: &str = "# qq-managed";
+
+/// `(event, matcher, needle, command)`: a handler whose command holds `needle`
+/// (any binary path, marker or not) counts as present.
+fn memory_hooks() -> [(&'static str, Option<&'static str>, &'static str, String); 2] {
+    [
+        (
+            "PreToolUse",
+            Some("Write|Edit|MultiEdit"),
+            "memory hook pre",
+            format!("qq memory hook pre {MARKER}"),
+        ),
+        (
+            "PostToolBatch",
+            None,
+            "memory hook batch",
+            format!("qq memory hook batch {MARKER}"),
+        ),
+    ]
+}
+
+fn has_command(groups: &[serde_json::Value], needle: &str) -> bool {
+    groups.iter().any(|g| {
+        g.get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hs| {
+                hs.iter().any(|h| {
+                    h.get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|c| c.contains(needle))
+                })
+            })
+    })
+}
+
+/// Adds the handler to `hooks[event]` (the group with `matcher`, or a new one)
+/// unless one running `needle` is there. True when the document changed.
+fn ensure_hook(
+    doc: &mut serde_json::Value,
+    (event, matcher, needle, command): &(&str, Option<&str>, &str, String),
+) -> bool {
+    use serde_json::{json, Map, Value};
+    let Some(hooks) = doc
+        .as_object_mut()
+        .map(|o| o.entry("hooks").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(groups) = hooks
+        .entry(*event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    else {
+        return false;
+    };
+    if has_command(groups, needle) {
+        return false;
+    }
+    let handler = json!({ "type": "command", "command": command });
+    let slot = groups.iter_mut().find(|g| match matcher {
+        Some(m) => g.get("matcher").and_then(Value::as_str) == Some(*m),
+        None => g.get("matcher").is_none(),
+    });
+    match slot
+        .and_then(|g| g.get_mut("hooks"))
+        .and_then(Value::as_array_mut)
+    {
+        Some(handlers) => handlers.push(handler),
+        None => {
+            let mut group = Map::new();
+            if let Some(m) = matcher {
+                group.insert("matcher".into(), json!(m));
+            }
+            group.insert("hooks".into(), json!([handler]));
+            groups.push(Value::Object(group));
+        }
+    }
+    true
+}
+
+/// `--update`: puts the memory hook entries into a settings file the user
+/// modified, so a kept (conflicting) file still runs them. Idempotent; a file
+/// that is not a JSON object is reported and left alone.
+fn merge_memory_hooks(root: &Path, dry: bool, lock: &mut Lock) -> Result<Option<String>, String> {
+    let path = root.join(SETTINGS_REL);
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let mut doc: serde_json::Value = serde_json::from_str(&body)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .ok_or_else(|| format!("{SETTINGS_REL} is not a JSON object — memory hooks not merged"))?;
+    let mut changed = false;
+    for h in memory_hooks() {
+        changed |= ensure_hook(&mut doc, &h);
+    }
+    if !changed {
+        return Ok(None);
+    }
+    if dry {
+        return Ok(Some(format!(
+            "would merge memory hooks into {SETTINGS_REL}"
+        )));
+    }
+    let mut out = serde_json::to_string_pretty(&doc).map_err(|e| format!("init: {e}"))?;
+    out.push('\n');
+    write_file(&path, out.as_bytes(), 0o644)?;
+    // Only a file still equal to its lock entry was ours; recording the merge
+    // keeps the next `--update` from calling it a local edit. A user-modified
+    // file keeps its old lock entry, so the next `--update` still reports it
+    // and never overwrites it.
+    if let Some(e) = lock.files.get_mut(SETTINGS_REL) {
+        if e.md5 == md5_hex(body.as_bytes()) {
+            e.md5 = md5_hex(out.as_bytes());
+        }
+    }
+    Ok(Some(format!("merged memory hooks into {SETTINGS_REL}")))
 }
 
 fn md5_file(path: &Path) -> Result<Option<String>, String> {
@@ -249,8 +434,17 @@ mod tests {
         on_disk.sort();
         let embedded: Vec<String> = table::TABLE.iter().map(|(r, ..)| r.to_string()).collect();
         assert_eq!(on_disk, embedded);
-        for (rel, _, bytes) in table::TABLE {
+        for (rel, mode, bytes) in table::TABLE {
             assert_eq!(&std::fs::read(base.join(rel)).unwrap(), bytes, "{rel}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let disk = std::fs::metadata(base.join(rel))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(disk & 0o111 != 0, mode & 0o111 != 0, "{rel}: exec bit");
+            }
         }
     }
 }

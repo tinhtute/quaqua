@@ -30,7 +30,7 @@ fn usage() -> CliError {
     )
 }
 
-fn transcripts_cmd(_env: &Env, args: &[String]) -> Result<String, CliError> {
+pub fn transcripts_cmd(_env: &Env, args: &[String]) -> Result<String, CliError> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(usage());
     };

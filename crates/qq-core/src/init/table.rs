@@ -1,6 +1,6 @@
 // Generated: every file under `templates/workspace/`, embedded in the binary.
 // A test (`table_matches_directory`) fails when this drifts from the directory;
-// regenerate with the `find` one-liner in that test's message.
+// regenerate by walking `templates/workspace` (sorted, 0o755 for executables).
 
 pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
     (

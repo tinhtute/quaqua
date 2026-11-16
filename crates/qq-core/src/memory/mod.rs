@@ -7,7 +7,9 @@ mod drift;
 mod inbox;
 
 pub use caps::*;
-pub use drift::{drift, drift_message, session_start as record_session, snapshot, tracked};
+pub use drift::{
+    drift, drift_message, is_dispatch, session_start as record_session, snapshot, tracked,
+};
 pub use inbox::inbox_cmd;
 
 use std::io::Read;
@@ -41,7 +43,7 @@ fn stdin_text() -> String {
     s
 }
 
-fn memory_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+pub fn memory_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     let mode = match args {
         [h, m] if h == "hook" => m.as_str(),
         _ => {
@@ -61,8 +63,8 @@ fn memory_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let pane = std::env::var("HERDR_PANE_ID").ok();
-            session_start(&ws, &input, &identity::Unwired, pane.as_deref())
+            let pane = identity::pane_from_env();
+            session_start(&ws, &input, identity::cli_panes().as_ref(), pane.as_deref())
         }
         _ => {
             return Err(CliError::new(

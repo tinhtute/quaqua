@@ -20,7 +20,6 @@
 set -uo pipefail
 
 bin=${QUAQUA_BIN:-quaqua}
-# No SessionStart mode: the old rule-drift baseline / re-read list and the CoS-pane auto-tag are dropped; the CoS decides an owner.
 if command -v "$bin" >/dev/null 2>&1; then
   # The hook JSON stays on stdin; `quaqua gate` blocks (exit 2) on empty or unparseable input.
   exec "$bin" gate

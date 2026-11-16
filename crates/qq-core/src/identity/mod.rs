@@ -116,9 +116,82 @@ fn is_worker_worktree(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == ".wt") || path.join(".git").is_file()
 }
 
+/// Old `gate::is_eligible_workspace`: never a worker worktree, and `cwd` is the
+/// workspace itself (marked by `projects/INDEX.md`) or a CoS directory with
+/// its own `identity.md` / `projects/INDEX.md` (also under `.cos/`).
+pub fn is_eligible_workspace(cwd: &Path, ws_root: &Path) -> bool {
+    if is_worker_worktree(cwd) || is_worker_worktree(ws_root) {
+        return false;
+    }
+    let same = match (cwd.canonicalize(), ws_root.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => cwd == ws_root,
+    };
+    if same && ws_root.join("projects/INDEX.md").is_file() {
+        return true;
+    }
+    cwd.join("identity.md").is_file()
+        || cwd.join(".cos/identity.md").is_file()
+        || cwd.join("projects/INDEX.md").is_file()
+        || cwd.join(".cos/projects/INDEX.md").is_file()
+}
+
+/// The pane this process runs in: `$HERDR_PANE`, then `$HERDR_PANE_ID`.
+pub fn pane_from_env() -> Option<String> {
+    ["HERDR_PANE", "HERDR_PANE_ID"].iter().find_map(|k| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// The single place the CLI picks its pane client; the wave-end commit swaps
+/// `Unwired` for `HerdrClient` here.
+pub fn cli_panes() -> Box<dyn PaneOps> {
+    Box::new(Unwired)
+}
+
+fn agent_session(got: &Value) -> Option<String> {
+    got.pointer("/result/pane/agent_session/value")
+        .or_else(|| got.pointer("/result/pane/agent_session"))
+        .and_then(Value::as_str)
+        .map(String::from)
+        .filter(|s| !s.is_empty())
+}
+
+/// Old `record_cos_identity_if_present`: writes `runs/cos.identity.json` as
+/// `{agent_session, pane_id}` (pretty, tmp + rename, only when it differs).
+/// A pane with no agent session removes a record that names this same pane and
+/// leaves a record for another pane alone. Returns whether a record exists for
+/// `pane` afterwards.
+pub fn record_identity(panes: &dyn PaneOps, pane: &str, runs_dir: &Path) -> Result<bool, String> {
+    let session = agent_session(&panes.pane_get(pane)?);
+    let path = runs_dir.join(COS_IDENTITY_FILE);
+    let Some(session) = session else {
+        if load_cos_identity(runs_dir).is_some_and(|(_, p)| p == pane) {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Ok(false);
+    };
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "agent_session": session,
+        "pane_id": pane,
+    }))
+    .map_err(|e| e.to_string())?;
+    if std::fs::read_to_string(&path).is_ok_and(|cur| cur == body) {
+        return Ok(true);
+    }
+    std::fs::create_dir_all(runs_dir).map_err(|e| format!("{}: {e}", runs_dir.display()))?;
+    let tmp = runs_dir.join(format!(".{COS_IDENTITY_FILE}.tmp"));
+    std::fs::write(&tmp, body).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
 /// The SessionStart twin of `heal`: re-tags the pane the session runs in when
-/// `cwd` is the workspace itself (not a worker worktree). `pane` is
-/// `$HERDR_PANE_ID`. Returns the re-tag, or `None` when not eligible.
+/// `cwd` is an eligible CoS workspace, and records `cos.identity.json` for it.
+/// A pane carrying another role is left alone entirely. `None` when not eligible.
 pub fn session_retag(
     panes: &dyn PaneOps,
     pane: Option<&str>,
@@ -126,14 +199,15 @@ pub fn session_retag(
     ws_root: &Path,
 ) -> Option<Result<Retag, String>> {
     let pane = pane.map(str::trim).filter(|p| !p.is_empty())?;
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    };
-    if is_worker_worktree(cwd) || !same(cwd, ws_root) {
+    if !is_eligible_workspace(cwd, ws_root) {
         return None;
     }
-    Some(retag_cos(panes, pane, &farm_of(ws_root)))
+    Some(retag_cos(panes, pane, &farm_of(ws_root)).and_then(|r| {
+        if !matches!(r, Retag::Skipped(_)) {
+            record_identity(panes, pane, &ws_root.join("runs"))?;
+        }
+        Ok(r)
+    }))
 }
 
 /// The CoS identity `runs/cos.identity.json` records: `(agent_session, pane_id)`.
@@ -164,11 +238,7 @@ pub fn heal(panes: &dyn PaneOps, runs_dir: &Path) -> Result<Vec<String>, String>
         .map(farm_of)
         .ok_or_else(|| format!("{} has no workspace parent", runs_dir.display()))?;
     let got = panes.pane_get(&pane)?;
-    let live = got
-        .pointer("/result/pane/agent_session/value")
-        .or_else(|| got.pointer("/result/pane/agent_session"))
-        .and_then(Value::as_str);
-    if live != Some(session.as_str()) {
+    if agent_session(&got).as_deref() != Some(session.as_str()) {
         return Ok(vec![]);
     }
     Ok(match retag_cos(panes, &pane, &farm)? {
@@ -188,11 +258,11 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     })
 }
 
-fn identity_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+pub fn identity_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     if args != ["heal"] {
         return Err(CliError::new(2, "usage: qq identity heal"));
     }
-    let actions = heal(&Unwired, &env.runs_dir).map_err(|e| CliError::new(1, e))?;
+    let actions = heal(cli_panes().as_ref(), &env.runs_dir).map_err(|e| CliError::new(1, e))?;
     Ok(if actions.is_empty() {
         "identity heal: nothing to heal".to_string()
     } else {

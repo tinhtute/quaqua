@@ -397,3 +397,221 @@ fn session_start_rereads_and_retags() {
     // Hooks fail open: garbage in, nothing out.
     assert!(memory::session_start(root, "not json", &elsewhere, None).is_none());
 }
+
+/// Runs a workspace's git with a fixed identity, failing the test on error.
+fn git(dir: &Path, a: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(a)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {a:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn init_seeds_hooks_and_cos_identity() {
+    let ws = TestWorkspace::new("init-seeds");
+    let root = ws.root();
+    git(root, &["init", "-q"]);
+    write(&root.join("USER.md"), "mine\n");
+
+    let (report, conflicts) = init::run(root, false, false).expect("init");
+    assert_eq!(conflicts, 0);
+    // Seeds: written when absent, never overwritten.
+    for f in [
+        "memory/rules.md",
+        "projects/INDEX.md",
+        "projects/_template.md",
+    ] {
+        assert!(
+            !std::fs::read_to_string(root.join(f)).unwrap().is_empty(),
+            "{f}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("USER.md")).unwrap(),
+        "mine\n"
+    );
+    assert!(report.contains("seed memory/rules.md"), "{report}");
+    write(&root.join("memory/rules.md"), "- edited\n");
+    init::run(root, false, false).expect("rerun");
+    assert_eq!(
+        std::fs::read_to_string(root.join("memory/rules.md")).unwrap(),
+        "- edited\n"
+    );
+
+    // The pre-commit gate rejects an added machine path and passes a clean line.
+    let hooks = git(root, &["config", "--get", "core.hooksPath"]);
+    assert!(hooks.ends_with("quaqua-hooks"), "{hooks}");
+    let bad = format!("see {}\n", ["/home", "someone", "x"].join("/"));
+    write(&root.join("note.md"), &bad);
+    git(root, &["add", "note.md"]);
+    let rejected = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success(), "machine path must be rejected");
+    write(&root.join("note.md"), "clean\n");
+    git(root, &["add", "note.md"]);
+    git(root, &["commit", "-qm", "ok"]);
+
+    // `--git-hooks` alone wires a second repo and refuses a foreign hooksPath.
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    let ok = init::init_cmd(&env, &args(&["--git-hooks", other.to_str().unwrap()])).unwrap();
+    assert!(ok.contains("git hooks"), "{ok}");
+    assert!(!other.join("projects").exists(), "no workspace dirs");
+    git(&other, &["config", "core.hooksPath", "/elsewhere"]);
+    let err = init::init_cmd(&env, &args(&["--git-hooks", other.to_str().unwrap()])).unwrap_err();
+    assert_eq!(err.code, 1);
+    assert_eq!(
+        git(&other, &["config", "--get", "core.hooksPath"]),
+        "/elsewhere"
+    );
+
+    // heal works on a workspace `qq init` made: the session re-tag records the
+    // identity, and a later heal restores tokens a herdr restart dropped.
+    let live = FakePane::new(Some("sess-1"), &[]);
+    let r = identity::session_retag(&live, Some("p1"), root, root).expect("eligible");
+    assert_eq!(r.unwrap(), identity::Retag::Tagged);
+    let rec: Value = serde_json::from_str(
+        &std::fs::read_to_string(ws.runs_dir().join("cos.identity.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rec, json!({"agent_session": "sess-1", "pane_id": "p1"}));
+    let restarted = FakePane::new(Some("sess-1"), &[]);
+    let done = identity::heal(&restarted, &ws.runs_dir()).unwrap();
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(restarted.token("grid_role").as_deref(), Some("cos"));
+    // A pane without a session removes only its own record.
+    let sessionless = FakePane::new(None, &[]);
+    identity::record_identity(&sessionless, "other-pane", &ws.runs_dir()).unwrap();
+    assert!(ws.runs_dir().join("cos.identity.json").is_file());
+    identity::record_identity(&sessionless, "p1", &ws.runs_dir()).unwrap();
+    assert!(!ws.runs_dir().join("cos.identity.json").exists());
+}
+
+#[test]
+fn a_worker_worktree_pane_stays_untagged() {
+    let ws = TestWorkspace::new("worker-wt");
+    let root = ws.root();
+    init::run(root, false, false).unwrap();
+    let wt = root.join(".wt/w1");
+    write(&wt.join("projects/INDEX.md"), "idx\n");
+    let pane = FakePane::new(Some("s"), &[]);
+    assert!(identity::session_retag(&pane, Some("p"), &wt, root).is_none());
+    // A linked worktree marks itself with a `.git` file.
+    let linked = root.join("linked");
+    write(&linked.join(".git"), "gitdir: /x\n");
+    write(&linked.join("projects/INDEX.md"), "idx\n");
+    assert!(identity::session_retag(&pane, Some("p"), &linked, root).is_none());
+    assert_eq!(*pane.writes.borrow(), 0);
+    assert!(!ws.runs_dir().join("cos.identity.json").exists());
+}
+
+#[test]
+fn registered_cmds_report_exit_codes() {
+    let ws = TestWorkspace::new("cmd-codes");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let code = |r: Result<String, qq_core::cli::CliError>| r.map(|_| 0).unwrap_or_else(|e| e.code);
+    assert_eq!(code(init::init_cmd(&env, &args(&["--bogus"]))), 2);
+    assert_eq!(code(init::init_cmd(&env, &args(&["--git-hooks"]))), 2);
+    assert_eq!(code(memory::memory_cmd(&env, &args(&["hook"]))), 2);
+    assert_eq!(code(memory::inbox_cmd(&env, &args(&["--nope"]))), 2);
+    assert_eq!(code(identity::identity_cmd(&env, &args(&["x"]))), 2);
+    assert_eq!(code(transcripts::transcripts_cmd(&env, &args(&[]))), 2);
+    assert_eq!(code(playbook::playbook_cmd(&env, &args(&["nope"]))), 2);
+
+    // init: a locally changed template file is a conflict -> exit 3, kept, pending copy.
+    assert_eq!(code(init::init_cmd(&env, &[])), 0);
+    write(&ws.root().join("models.md"), "mine\n");
+    let lock = std::fs::read_to_string(ws.root().join(".quaqua/template.lock")).unwrap();
+    assert!(lock.contains("models.md"));
+    assert_eq!(code(init::init_cmd(&env, &args(&["--update"]))), 3);
+    assert_eq!(
+        std::fs::read_to_string(ws.root().join("models.md")).unwrap(),
+        "mine\n"
+    );
+    assert!(ws.root().join(".quaqua/pending/models.md").is_file());
+
+    // The hooks fail open: no stdin, no answer, exit 0.
+    assert_eq!(code(memory::memory_cmd(&env, &args(&["hook", "pre"]))), 0);
+    assert_eq!(code(memory::memory_cmd(&env, &args(&["hook", "batch"]))), 0);
+}
+
+#[test]
+fn update_merges_memory_hooks_into_a_modified_settings() {
+    let ws = TestWorkspace::new("settings-merge");
+    let root = ws.root();
+    init::run(root, false, false).unwrap();
+    let settings = root.join(".claude/settings.json");
+    write(
+        &settings,
+        r#"{"permissions":{"allow":["x"]},"hooks":{"Stop":[]}}"#,
+    );
+    let (report, c) = init::run(root, true, false).unwrap();
+    assert!(
+        c >= 1 && report.contains("conflict .claude/settings.json"),
+        "{report}"
+    );
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(doc["permissions"]["allow"][0], "x", "user keys stay");
+    let text = doc.to_string();
+    assert!(
+        text.contains("memory hook pre") && text.contains("memory hook batch"),
+        "{text}"
+    );
+    assert!(text.contains("# qq-managed"));
+    // Idempotent: a second update changes nothing.
+    let before = std::fs::read_to_string(&settings).unwrap();
+    init::run(root, true, false).unwrap();
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+}
+
+#[test]
+fn inbox_for_does_not_move_another_cursor() {
+    let ws = TestWorkspace::new("inbox-guard");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let daemon = start(&ws);
+    send(&ws, "peer-a", "do the thing");
+    let inbox = |caller: &str, a: &[&str]| {
+        std::env::set_var("QQ_AGENT", caller);
+        let out = memory::inbox_cmd(&env, &args(a));
+        std::env::remove_var("QQ_AGENT");
+        out.unwrap()
+    };
+    // `lead` is neither peer-a nor the CoS nor peer-a's spawner: reads, never acks.
+    assert!(inbox("lead", &["--for", "peer-a"]).contains("do the thing"));
+    assert!(inbox("peer-a", &["--for", "peer-a", "--peek"]).contains("do the thing"));
+    // The recipient itself acks.
+    assert!(inbox("peer-a", &["--for", "peer-a"]).contains("do the thing"));
+    assert_eq!(inbox("peer-a", &["--for", "peer-a"]), "");
+    // A hook format fails open when the daemon cannot answer.
+    daemon.stop().expect("daemon stops");
+    assert_eq!(inbox("peer-a", &["--format", "hook-ups"]), "");
+}

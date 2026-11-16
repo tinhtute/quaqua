@@ -345,14 +345,43 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
     Verdict::Allow
 }
 
-fn run(_: &Env, args: &[String]) -> Result<String, CliError> {
-    let verdict = match args {
-        [flag, json] if flag == "--json" => evaluate(json),
-        [] => evaluate_reader(std::io::stdin()),
+/// The rule-drift warning for an allowed `quaqua|qq worker|lead` dispatch from a
+/// session whose rule files changed since it started (issue #72): which files
+/// to re-read. `None` when the command is no dispatch, the hook JSON names no
+/// session, or nothing changed. Never blocks; the caller prints it.
+fn drift_warning(ws_root: &std::path::Path, hook_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(hook_json).ok()?;
+    let cmd = v.get("tool_input")?.get("command")?.as_str()?;
+    if !crate::memory::is_dispatch(&tokenize(cmd)) {
+        return None;
+    }
+    let sid = v.get("session_id")?.as_str()?;
+    let changed = crate::memory::drift(ws_root, sid);
+    (!changed.is_empty()).then(|| crate::memory::drift_message(&changed))
+}
+
+fn run(env: &Env, args: &[String]) -> Result<String, CliError> {
+    let json = match args {
+        [flag, json] if flag == "--json" => json.clone(),
+        [] => {
+            let mut s = String::new();
+            match std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
+                Ok(_) => s,
+                // A read error blocks, like any input the gate cannot read.
+                Err(_) => return Err(CliError::new(BLOCK_EXIT, PANE_MESSAGE)),
+            }
+        }
         _ => return Err(CliError::new(2, "usage: qq gate [--json <hook-json>]")),
     };
-    match verdict {
-        Verdict::Allow => Ok(String::new()),
+    match evaluate(&json) {
+        Verdict::Allow => {
+            if let Some(ws) = env.runs_dir.parent() {
+                if let Some(msg) = drift_warning(ws, &json) {
+                    eprintln!("qq: {msg}");
+                }
+            }
+            Ok(String::new())
+        }
         Verdict::Block(msg) => Err(CliError::new(BLOCK_EXIT, msg)),
     }
 }
@@ -362,5 +391,41 @@ pub(super) fn command() -> Command {
         name: "gate",
         help: "PreToolUse hook: block pane spawn/move and git push",
         run,
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn a_dispatch_from_a_drifted_session_is_warned_and_still_allowed() {
+        let ws = std::env::temp_dir().join(format!("qq-gate-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("rules/_all")).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "v1").unwrap();
+        crate::memory::record_session(&ws, "s1", "startup");
+        let hook = |c: &str| {
+            serde_json::json!({"session_id": "s1", "tool_input": {"command": c}}).to_string()
+        };
+        std::fs::write(ws.join("rules/_all/new.md"), "rule").unwrap();
+        assert!(
+            drift_warning(&ws, &hook("qq status")).is_none(),
+            "not a dispatch"
+        );
+        let msg = drift_warning(&ws, &hook("cd x && quaqua worker spawn a b c")).unwrap();
+        assert!(msg.contains("rules/_all/new.md"), "{msg}");
+        assert!(
+            drift_warning(&ws, &hook("qq lead prompt a")).is_none(),
+            "warned once"
+        );
+        // The verdict and the exit code do not depend on the warning.
+        std::fs::write(ws.join("AGENTS.md"), "v2").unwrap();
+        let env = Env {
+            runs_dir: ws.join("runs"),
+        };
+        let out = run(&env, &["--json".into(), hook("quaqua lead prompt a")]);
+        assert_eq!(out.unwrap(), "");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -571,7 +571,7 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     })
 }
 
-fn playbook_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+pub fn playbook_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     let usage = || {
         CliError::new(
             2,
