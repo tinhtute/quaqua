@@ -34,8 +34,6 @@ fi
 QUAQUA="${QUAQUA_BIN:-}"
 if [ -z "$QUAQUA" ] && command -v quaqua >/dev/null 2>&1; then
   QUAQUA="quaqua"
-elif [ -z "$QUAQUA" ] && [ -n "${CARGO_MANIFEST_DIR:-}" ]; then
-  QUAQUA="$(dirname "$CARGO_MANIFEST_DIR")/../target/debug/quaqua"
 elif [ -z "$QUAQUA" ] && [ -x "$HOME/.cargo/bin/quaqua" ]; then
   QUAQUA="$HOME/.cargo/bin/quaqua"
 fi

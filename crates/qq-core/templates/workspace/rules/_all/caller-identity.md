@@ -18,6 +18,6 @@ Identity quaqua reads back is the pane's herdr token set; `quaqua identity heal`
 
 ## Farm id
 
-- `farm_id` is the last component of the canonicalized workspace root, lowercased, every character outside `[a-z0-9_-]` replaced by `-` (`~/quaqua` → `quaqua`, `~/Work/TTDVKH` → `ttdvkh`); `farm_of_runs_dir(runs)` applies it to the directory holding `runs/`. It comes from the filesystem — never from `team.toml`, and never from herdr `workspace_id`, because one farm spans several herdr workspaces (one per SLP team).
+- `farm_id` is the last component of the canonicalized workspace root, lowercased, every character outside `[a-z0-9_-]` replaced by `-` (`~/Work/Acme` → `acme`, `~/Work/Acme Web` → `acme-web`); `farm_of_runs_dir(runs)` applies it to the directory holding `runs/`. It comes from the filesystem — never from `team.toml`, and never from herdr `workspace_id`, because one farm spans several herdr workspaces (one per SLP team).
 - A pane without a `grid_farm` token falls back to its `cwd`: under the farm root → local; a `cwd` ancestor with `runs/<name>.owner` (a worker worktree, subdirectories included) → local; otherwise foreign. herdr `pane get` exits 0 even for a dead pane, so the answer comes from the `pane_not_found` body.
 - `HERDR_PANE_ID` short-circuits the CoS's own-pane resolution; unset it when reproducing an identity or attribution bug — 2026-10-29, runs/tieude-farmdoc.md

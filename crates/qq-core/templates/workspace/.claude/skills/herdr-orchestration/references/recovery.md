@@ -18,7 +18,7 @@ Long answer not visible in read → ask the worker to publish a file atomically 
 
 ## CoS pane protection & recovery
 
-`worker cleanup`, `grid reconcile`, and the PreToolUse `gate` refuse to close or move a pane carrying `grid_role=cos`. A manual close from the herdr UI cannot be intercepted or blocked by quaqua (herdr lacks pane pinning). Recovery if closed manually:
+The PreToolUse `gate` blocks every `herdr pane close` (and pane move/split); only the daemon closes panes. A manual close from the herdr UI cannot be intercepted or blocked by quaqua (herdr lacks pane pinning). Recovery if closed manually:
 1. Open a new shell in the checkout root.
 2. Run `claude --resume` to restore the CoS session.
 

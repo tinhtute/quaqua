@@ -42,15 +42,29 @@ const PENDING: &[(&str, &str)] = &[
 /// `cli::MODULES` yet. Add `task::pipeline_io::INSTALL` here once it merges.
 const UNLISTED_INSTALLS: &[Install] = &[qq_core::config::INSTALL, qq_core::authority::INSTALL];
 
-/// Words no shipped document may name (R15, R25).
-const REMOVED_WORDS: &[&str] = &["omp", concat!("task", "force")];
+/// `--flag`s the documents put after a registered command. A command that is
+/// itself in [`PENDING`] owns its flags; a registered command's flags are either
+/// here (it accepts them) or in [`PENDING_FLAGS`] (its owning task adds them).
+const ACCEPTED_FLAGS: &[(&str, &str)] = &[("gate", "--json")];
+
+/// Flags documented for a registered command that its owning task adds later.
+/// Delete an entry when it lands (move it to [`ACCEPTED_FLAGS`]).
+const PENDING_FLAGS: &[(&str, &str, &str)] = &[
+    ("status", "--metrics", "T44"),
+    ("status", "--all", "T44"),
+    ("inbox", "--for", "T45"),
+    ("inbox", "--format", "T45"),
+];
+
+/// Words no shipped document may name (R15, R25). `omp` and the removed
+/// task-force name are covered by the phase-check grep over the templates.
+const REMOVED_WORDS: &[&str] = &["auditor", "layout_shadow"];
 
 /// Paths no shipped workspace may contain (R17, T47).
 const REMOVED_PATHS: &[&str] = &[
     "scripts/auditor",
     "scripts/github-ci-poll",
     "scripts/hooks/omp-worker-state.ts",
-    concat!("rules/_all/task", "force.md"),
 ];
 
 fn workspace() -> PathBuf {
@@ -107,8 +121,20 @@ fn is_word(tok: &str) -> bool {
         && t.chars().all(|c| c.is_ascii_lowercase() || c == '-')
 }
 
-/// `verb` or `verb sub` for every command word in `text`.
-fn commands_in(text: &str, out: &mut BTreeMap<String, BTreeSet<String>>, file: &str) {
+type Found = BTreeMap<String, BTreeSet<String>>;
+
+/// The `--flag` name of a token (`--for`, `--format="x"` -> `--format`).
+fn flag_of(tok: &str) -> Option<String> {
+    let t = clean(tok).split('=').next()?;
+    let name = t.strip_prefix("--")?;
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+        .then(|| t.to_string())
+}
+
+/// `verb` or `verb sub` for every command word in `text`; every `--flag` that
+/// follows it (up to the next command word or shell separator) goes in `flags`
+/// as `<verb> <flag>` for the command's top-level verb.
+fn commands_in(text: &str, out: &mut Found, flags: &mut Found, file: &str) {
     let toks: Vec<&str> = text.split_whitespace().collect();
     for (i, t) in toks.iter().enumerate() {
         if !is_command_word(t) {
@@ -122,14 +148,27 @@ fn commands_in(text: &str, out: &mut BTreeMap<String, BTreeSet<String>>, file: &
             Some(sub) => format!("{verb} {}", clean(sub)),
             None => verb.to_string(),
         };
+        let top = key.split(' ').next().unwrap().to_string();
+        let skip = 2 + usize::from(key.contains(' '));
+        for tok in toks[i + 1..].iter().skip(skip - 1) {
+            if is_command_word(tok) || matches!(*tok, "|" | "||" | "&&" | ";") {
+                break;
+            }
+            if let Some(f) = flag_of(tok) {
+                flags
+                    .entry(format!("{top} {f}"))
+                    .or_default()
+                    .insert(file.to_string());
+            }
+        }
         out.entry(key).or_default().insert(file.to_string());
     }
 }
 
 /// Markdown and toml name commands in code spans and fenced blocks; prose
 /// ("the quaqua binary") is not a command. Shell and json name them in code.
-fn documented() -> BTreeMap<String, BTreeSet<String>> {
-    let mut out = BTreeMap::new();
+fn documented() -> (Found, Found) {
+    let (mut out, mut flags) = (Found::new(), Found::new());
     for p in all_files() {
         let text = std::fs::read_to_string(&p).unwrap();
         let file = rel(&p);
@@ -145,17 +184,17 @@ fn documented() -> BTreeMap<String, BTreeSet<String>> {
             let t = line.trim_start();
             let comment = ext == "sh" && (t.starts_with('#') || t.starts_with("echo"));
             if fenced || (code_file && !comment) {
-                commands_in(line, &mut out, &file);
+                commands_in(line, &mut out, &mut flags, &file);
                 continue;
             }
             for (n, span) in line.split('`').enumerate() {
                 if n % 2 == 1 {
-                    commands_in(span, &mut out, &file);
+                    commands_in(span, &mut out, &mut flags, &file);
                 }
             }
         }
     }
-    out
+    (out, flags)
 }
 
 // ---- registry --------------------------------------------------------------
@@ -239,7 +278,7 @@ fn words(keys: impl Iterator<Item = String>) -> BTreeSet<String> {
 
 #[test]
 fn workspace_docs_name_only_existing_commands() {
-    let docs = documented();
+    let (docs, _) = documented();
     assert!(docs.len() >= 5, "extraction found too little: {docs:?}");
     let (mut reg, env) = registry();
     let top = registered(&mut reg, &words(docs.keys().cloned()));
@@ -257,6 +296,49 @@ fn workspace_docs_name_only_existing_commands() {
         bad.is_empty(),
         "documents name commands that do not exist (add the verb, fix the text, or list it in PENDING with its task):\n{}",
         bad.join("\n")
+    );
+}
+
+#[test]
+fn workspace_docs_name_only_accepted_flags() {
+    let (docs, flags) = documented();
+    assert!(
+        flags.len() >= 5,
+        "flag extraction found too little: {flags:?}"
+    );
+    let (mut reg, _) = registry();
+    let top = registered(&mut reg, &words(docs.keys().cloned()));
+    let pending_cmd: BTreeSet<&str> = PENDING.iter().map(|(c, _)| *c).collect();
+    let mut bad = Vec::new();
+    for (pair, in_files) in &flags {
+        let (verb, flag) = pair.split_once(' ').unwrap();
+        // A command that does not exist yet owns its flags; `docs` keys are
+        // `verb` or `verb sub`, so match any pending key under this verb.
+        let verb_pending = pending_cmd
+            .iter()
+            .any(|c| c.split(' ').next() == Some(verb) && !top.contains(verb));
+        let accepted = ACCEPTED_FLAGS.contains(&(verb, flag));
+        let pending = PENDING_FLAGS
+            .iter()
+            .any(|(c, f, _)| (*c, *f) == (verb, flag));
+        if !(verb_pending || accepted || pending) {
+            bad.push(format!("`quaqua {pair}` in {in_files:?}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "documents name flags no registered command accepts (fix the text, add to ACCEPTED_FLAGS, or list in PENDING_FLAGS with its task):\n{}",
+        bad.join("\n")
+    );
+    let landed: Vec<String> = PENDING_FLAGS
+        .iter()
+        .filter(|(c, f, _)| ACCEPTED_FLAGS.contains(&(*c, *f)))
+        .map(|(c, f, o)| format!("`{c} {f}` ({o})"))
+        .collect();
+    assert!(
+        landed.is_empty(),
+        "now accepted; delete from PENDING_FLAGS: {}",
+        landed.join(", ")
     );
 }
 
