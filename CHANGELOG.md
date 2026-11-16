@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.7.0] - 2026-11-13
+## [2.7.0] - 2026-11-16
 
 ### Superagent Bus
 - **Trigger digest and `quaqua mail inbox`**: unified inbox delivery on `deliver_page` with one cursor writer, removed the legacy `inbox.md`, `mail ack` and ack columns, and fixed cursor advance, legacy `msg_key`/`reply_to` migration and dry-run trigger ids (#225, #226).
