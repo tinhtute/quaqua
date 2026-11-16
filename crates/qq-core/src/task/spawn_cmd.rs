@@ -908,6 +908,7 @@ fn live<T>(env: &Env, f: impl FnOnce(&Ctx) -> R<T>) -> R<T> {
         Arc::new(crate::herdr::CliHerdr::new()),
         std::process::id() as i32,
         pane,
+        crate::cli::caller_claim().as_deref(),
         f,
     )
 }
@@ -917,6 +918,7 @@ fn live_with<T>(
     herdr: Arc<dyn HerdrClient>,
     pid: i32,
     pane: Option<String>,
+    claim: Option<&str>,
     f: impl FnOnce(&Ctx) -> R<T>,
 ) -> R<T> {
     let conn = crate::db::open(&env.runs_dir.join(crate::db::path::DB_FILE)).map_err(db)?;
@@ -927,6 +929,7 @@ fn live_with<T>(
         .collect();
     let drivers = Drivers::from_config(&harnesses);
     let caller = caller_of(&herdr, pid)?;
+    let _ = claim;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -961,7 +964,20 @@ pub fn worker_spawn_with(
     anchor: Option<String>,
     args: &[String],
 ) -> R<WorkerSpawned> {
-    live_with(env, herdr, pid, anchor, |ctx| run_worker(ctx, args))
+    worker_spawn_as(env, herdr, pid, anchor, None, args)
+}
+
+/// [`worker_spawn_with`] plus the caller's `QQ_AGENT` claim, already read by
+/// the CLI boundary: a claim the pane does not back is refused.
+pub fn worker_spawn_as(
+    env: &Env,
+    herdr: Arc<dyn HerdrClient>,
+    pid: i32,
+    anchor: Option<String>,
+    claim: Option<&str>,
+    args: &[String],
+) -> R<WorkerSpawned> {
+    live_with(env, herdr, pid, anchor, claim, |ctx| run_worker(ctx, args))
 }
 
 /// `worker spawn ...` (the args after `spawn`): prints the result as JSON.

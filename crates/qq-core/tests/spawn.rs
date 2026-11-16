@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use qq_core::cli::Env;
 use qq_core::config;
 use qq_core::db;
 use qq_core::driver::Registry;
 use qq_core::herdr::FakeHerdr;
-use qq_core::cli::Env;
 use qq_core::herdr::{HerdrClient, Reply, Verb};
-use qq_core::task::worker_flow::spawn_cmd::{run_lead, run_worker, worker_spawn_with, Ctx};
+use qq_core::task::worker_flow::spawn_cmd::{
+    run_lead, run_worker, worker_spawn_as, worker_spawn_with, Ctx,
+};
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
 
@@ -568,7 +570,10 @@ fn worktrees_live_beside_the_repo_where_cleanup_looks() {
     let s = fx.spawn(&[], "tieude-a", "tieude").unwrap();
     assert_eq!(s, "tieude-a");
     assert!(fx.wt("tieude-a").join("a.txt").exists());
-    assert!(!fx.ws.root().join(".wt").exists(), "nothing under the workspace");
+    assert!(
+        !fx.ws.root().join(".wt").exists(),
+        "nothing under the workspace"
+    );
     let l = lead(&fx, &["alpha"]).unwrap();
     assert!(fx.wt(&l.name).exists());
     assert!(!fx.ws.root().join(".wt").exists());
@@ -634,7 +639,11 @@ fn a_spawn_from_the_cos_pane_is_cos_owned_and_from_a_lead_pane_lead_owned() {
     run(&herdr, "tieude-a").unwrap();
     let spawner: Option<i64> = fx
         .conn
-        .query_row("SELECT spawner_id FROM agent WHERE name='tieude-a'", [], |r| r.get(0))
+        .query_row(
+            "SELECT spawner_id FROM agent WHERE name='tieude-a'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(spawner, None);
 
@@ -721,7 +730,8 @@ fn a_lead_cap_is_the_smaller_of_max_peers_and_the_global_cap() {
         )
         .unwrap();
     let repo = fx.repo.to_string_lossy().to_string();
-    fx.worker(Some("alpha-lead"), &["tieude-a", "tieude", &repo]).unwrap();
+    fx.worker(Some("alpha-lead"), &["tieude-a", "tieude", &repo])
+        .unwrap();
     let e = fx
         .worker(Some("alpha-lead"), &["tieude-b", "tieude", &repo])
         .unwrap_err();
@@ -752,11 +762,19 @@ fn a_second_repo_with_the_same_basename_keeps_its_own_project() {
         .unwrap();
     let pa: Option<i64> = fx
         .conn
-        .query_row("SELECT project_id FROM agent WHERE name='tieude-a'", [], |r| r.get(0))
+        .query_row(
+            "SELECT project_id FROM agent WHERE name='tieude-a'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     let pb: Option<i64> = fx
         .conn
-        .query_row("SELECT project_id FROM agent WHERE name='tieude-b'", [], |r| r.get(0))
+        .query_row(
+            "SELECT project_id FROM agent WHERE name='tieude-b'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(pb.is_some(), "the second repo has a project");
     assert_ne!(pa, pb);
@@ -770,4 +788,109 @@ fn lead_spawn_prompts_nothing_until_the_lead_is_ready() {
     let e = lead(&fx, &["alpha", "--task", "GO"]).unwrap_err();
     assert!(e.contains("ready"), "{e}");
     assert!(fx.herdr.prompts().is_empty(), "{:?}", fx.herdr.prompts());
+}
+
+// ---- QQ_AGENT is a claim, the pane is the authority (sude-g4agent) ----------------------
+
+/// A herdr whose pane for this process runs agent `name` (the `home` pane is the CoS).
+fn pane_of_agent(fx: &Fx, name: Option<&str>) -> Arc<FakeHerdr> {
+    let h = Arc::new(FakeHerdr::new());
+    let p = match name {
+        Some(n) => {
+            fx.conn
+                .execute(
+                    "INSERT INTO agent (name, role, project_id, started_ms) \
+                     VALUES (?1, 'lead', (SELECT id FROM project WHERE slug='alpha'), 1)",
+                    [n],
+                )
+                .unwrap();
+            let p = h.seed_pane(n, None, &[]);
+            h.agent_start(n, "claude", &p, 0, &[]).unwrap();
+            p
+        }
+        None => h.seed_pane("home", None, &[("grid_role", "cos")]),
+    };
+    h.set_pane_pids(&p, pid(), &[]);
+    h
+}
+
+fn spawn_claiming(
+    fx: &Fx,
+    h: &Arc<FakeHerdr>,
+    claim: Option<&str>,
+    name: &str,
+) -> Result<String, String> {
+    let env = Env {
+        runs_dir: fx.ws.runs_dir(),
+    };
+    let anchor = h.seed_pane("anchor", None, &[]);
+    worker_spawn_as(
+        &env,
+        h.clone() as Arc<dyn HerdrClient>,
+        pid() as i32,
+        Some(anchor),
+        claim,
+        &[
+            name.to_string(),
+            "tieude".into(),
+            fx.repo.to_string_lossy().to_string(),
+        ],
+    )
+    .map(|s| s.name)
+    .map_err(|e| e.message)
+}
+
+#[test]
+fn a_claim_the_pane_does_not_back_is_refused() {
+    let fx = Fx::new("claim-mismatch");
+    fx.project("alpha");
+    // A CoS pane claiming to be a Lead: nothing is spawned.
+    let cos = pane_of_agent(&fx, None);
+    let e = spawn_claiming(&fx, &cos, Some("alpha-lead"), "tieude-a").unwrap_err();
+    assert!(e.contains("QQ_AGENT"), "{e}");
+    assert_eq!(fx.agents("tieude-a"), 0);
+    // A Lead pane claiming another agent: refused too.
+    let lead = pane_of_agent(&fx, Some("alpha-lead"));
+    let e = spawn_claiming(&fx, &lead, Some("someone-else"), "tieude-b").unwrap_err();
+    assert!(e.contains("QQ_AGENT"), "{e}");
+    assert_eq!(fx.agents("tieude-b"), 0);
+}
+
+#[test]
+fn a_claim_the_pane_backs_spawns_as_that_pane() {
+    let fx = Fx::new("claim-match");
+    fx.project("alpha");
+    let lead = pane_of_agent(&fx, Some("alpha-lead"));
+    spawn_claiming(&fx, &lead, Some("alpha-lead"), "tieude-a").unwrap();
+    let owner: String = fx
+        .conn
+        .query_row(
+            "SELECT s.name FROM agent a JOIN agent s ON s.id = a.spawner_id WHERE a.name='tieude-a'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, "alpha-lead");
+    // No claim at all still works: the pane decides.
+    spawn_claiming(&fx, &lead, None, "tieude-b").unwrap();
+    assert_eq!(fx.agents("tieude-b"), 1);
+}
+
+#[test]
+fn a_claim_never_names_an_unmapped_process() {
+    let fx = Fx::new("claim-unmapped");
+    fx.project("alpha");
+    fx.conn
+        .execute(
+            "INSERT INTO agent (name, role, project_id, started_ms) \
+             VALUES ('alpha-lead', 'lead', (SELECT id FROM project WHERE slug='alpha'), 1)",
+            [],
+        )
+        .unwrap();
+    // No pane runs this process; the claim does not rescue it.
+    let h = Arc::new(FakeHerdr::new());
+    h.seed_pane("home", None, &[]);
+    let e = spawn_claiming(&fx, &h, Some("alpha-lead"), "tieude-a").unwrap_err();
+    assert!(e.contains("caller not identified"), "{e}");
+    assert_eq!(fx.agents("tieude-a"), 0);
 }

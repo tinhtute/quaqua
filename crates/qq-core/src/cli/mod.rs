@@ -141,12 +141,18 @@ pub fn run() -> i32 {
     }
 }
 
+/// The `QQ_AGENT` claim of this process, `None` when unset or empty. The one
+/// place the env is read; a command reads it once and passes the value down.
+pub fn caller_claim() -> Option<String> {
+    std::env::var("QQ_AGENT").ok().filter(|n| !n.is_empty())
+}
+
 /// Sends one verb to the daemon: a refusal or a missing daemon is an error at once.
 pub fn rpc_call(env: &Env, verb: &str, args: Value) -> Result<Value, CliError> {
     let socket = rpc::socket_path(&env.runs_dir);
     let mut req = Request::new(verb, args);
     // Client-asserted: the name comes from the calling agent's own env.
-    req.caller = std::env::var("QQ_AGENT").ok().filter(|n| !n.is_empty());
+    req.caller = caller_claim();
     match rpc::call(&socket, &req) {
         Ok(resp) => resp
             .into_result()
