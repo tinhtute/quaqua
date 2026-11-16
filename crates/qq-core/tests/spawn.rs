@@ -697,7 +697,10 @@ fn two_consecutive_memory_days_are_a_gate_signal() {
     let e = fx.spawn(&[], "tieude-a", "tieude").unwrap_err();
     assert!(e.contains("needs a Lead"), "{e}");
     assert!(e.contains("memory"), "{e}");
-    // Non-consecutive days are one project-day, not a run.
+}
+
+#[test]
+fn memory_days_with_a_gap_are_not_a_run() {
     let fx = Fx::new("memgap");
     memory_days(&fx, &["2026-11-10", "2026-11-15"]);
     plan(&fx, 2);

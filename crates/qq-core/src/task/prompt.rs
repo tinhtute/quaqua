@@ -1168,6 +1168,7 @@ fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
                 &Tuning::from_env(),
             ),
         },
+        Some("spawn") => super::worker_flow::spawn_cmd::worker_spawn_cli(env, &args[1..]),
         Some(verb @ ("cleanup" | "stop")) => {
             let name = args.get(1).ok_or_else(usage)?;
             let allow_dirty = verb == "cleanup" && args[2..].iter().any(|a| a == "--allow-dirty");
@@ -1187,7 +1188,7 @@ pub const INSTALL: Install = install;
 fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     cli.register(Command {
         name: "worker",
-        help: "prompt --check-brief | cleanup | stop",
+        help: "spawn | prompt --check-brief | cleanup | stop",
         run: worker_command,
     })?;
     cleanup::register(daemon)
