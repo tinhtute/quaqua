@@ -20,6 +20,9 @@ use crate::daemon::store::Store;
 use crate::daemon::{Ctx, Daemon};
 use crate::rpc::{self, Request, RpcError};
 
+pub mod cli;
+mod inbox_md;
+
 /// Registers the mail verbs. Called from `cli::MODULES`.
 ///
 /// Contract: a `mail` Signal is a push to a workflow running at send time. A
@@ -28,7 +31,8 @@ use crate::rpc::{self, Request, RpcError};
 /// until the mail is acked. Delivery is at-least-once: a send racing a start
 /// can signal one mail twice, so a consumer dedupes on the payload's mail `id`. `mail.inbox` only peeks unless `advance: true`;
 /// `mail.ack` is the retry-safe way to advance.
-pub fn install(_: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
+pub fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
+    registry.register(cli::command())?;
     daemon.on_workflow_live(Arc::new(|sup, store, id| {
         for who in recipients_of(id) {
             if let Ok(Some(p)) = pending(store, who) {
@@ -201,6 +205,11 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             ))
         }
     };
+
+    // The markdown copy of a Lead -> CoS mail. Written after the commit and
+    // on a retry too, so a send that died between the two is repaired by the
+    // client's next attempt.
+    inbox_md::mirror(&ctx.runs_dir, id, from, to, kind, body, now_ms()).map_err(internal)?;
 
     // The push: only for a new mail, only to the addressee's running
     // workflows. The inbox is the record, so a missing workflow is not an error.
