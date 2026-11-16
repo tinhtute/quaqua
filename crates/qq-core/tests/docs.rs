@@ -266,7 +266,7 @@ fn pending_commands_are_still_missing() {
     let top = registered(&mut reg, &words(PENDING.iter().map(|(c, _)| c.to_string())));
     let built: Vec<String> = PENDING
         .iter()
-        .filter(|(c, _)| provided(c, &top, &env) == Ok(true))
+        .filter(|(c, _)| provided(c, &top, &env) != Ok(false))
         .map(|(c, owner)| format!("`{c}` ({owner})"))
         .collect();
     assert!(

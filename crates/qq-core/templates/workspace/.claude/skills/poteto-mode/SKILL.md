@@ -50,8 +50,6 @@ Active triggers:
 
 Deferred routes with quaqua mappings (P2):
 
-- Nontrivial change, contested architecture decision, or technical fork (P2): spawn a read-only design worker with `quaqua worker spawn --purpose design` before any builder.
-- Code crossing a function boundary (P2): spawn a design worker (`quaqua worker spawn --purpose design`) to explore the design before implementing (maps pstack `architect`).
 - Parallel fan-out (P2): routes to worker fan-out per `models.md` kinds and grid layout (maps pstack `swarm`).
 - Contested design (P2): routes to cross-harness reviewer on a different model (maps pstack `interrogate`).
 - Docs, RFCs, readmes, PR descriptions, or commit messages (P2): deferred to P2 documentation skill (maps pstack `technical-writing`).

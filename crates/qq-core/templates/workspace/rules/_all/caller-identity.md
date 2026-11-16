@@ -10,11 +10,11 @@ Identity quaqua reads back is the pane's herdr token set; `quaqua identity heal`
 
 | Token | Written by | Meaning |
 | --- | --- | --- |
-| `grid_role` | `worker spawn` (`worker`), `lead spawn` (`orchestrator`), `identity heal` (`cos`) | pane class; cleanup, reconcile and pipeline move refuse a `cos` pane |
-| `grid_owner` | `worker spawn` (`QUAQUA_OWNER`), `lead spawn` (`<slug>-lead`), `identity heal` (`cos`) | owner stamped on each incident, so it decides which Lead sees it |
+| `grid_role` | `worker spawn` (`worker`), `lead spawn` (`orchestrator`) | pane class; cleanup, reconcile and pipeline move refuse a `cos` pane |
+| `grid_owner` | `worker spawn` (`QUAQUA_OWNER`), `lead spawn` (`<slug>-lead`) | owner stamped on each incident, so it decides which Lead sees it |
 | `grid_group` | `worker spawn` (repo name) | project group |
 | `grid_tab` | `worker spawn` | the `<repo>-workers` tab label the planner accepts |
-| `grid_farm` | `worker spawn`, `lead spawn`, `identity heal` (Leads and workers; **not** the CoS pane) | farm id of the workspace that spawned the pane |
+| `grid_farm` | `worker spawn`, `lead spawn`, `identity heal` | farm id of the workspace that spawned the pane |
 
 ## Farm id
 

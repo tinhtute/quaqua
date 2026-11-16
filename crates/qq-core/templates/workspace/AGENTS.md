@@ -45,7 +45,7 @@ Authority comes from role, not persona. Brief format: `rules/_all/brief.md`.
 
 ## Workers
 
-Routing and model settings live in `models.md`; configuration is authoritative in `team.toml`. Do not change worker kind, model, or effort ad hoc.
+Routing and model settings live in `models.md`; configuration is authoritative in the config database (`quaqua config get`; `team.toml` only seeds it). Do not change worker kind, model, or effort ad hoc.
 
 - Task worker: `<kind>-<task>`, one task, own worktree, cleaned up after outcome.
 - Project Lead: `<slug>-lead`, long-lived project state and task workers; it does not count against the task-worker cap.

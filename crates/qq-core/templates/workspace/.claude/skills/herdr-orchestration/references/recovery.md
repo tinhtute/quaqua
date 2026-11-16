@@ -21,6 +21,4 @@ Long answer not visible in read → ask the worker to publish a file atomically 
 `worker cleanup`, `grid reconcile`, and the PreToolUse `gate` refuse to close or move a pane carrying `grid_role=cos`. A manual close from the herdr UI cannot be intercepted or blocked by quaqua (herdr lacks pane pinning). Recovery if closed manually:
 1. Open a new shell in the checkout root.
 2. Run `claude --resume` to restore the CoS session.
-3. Run `quaqua identity heal` to restore the pane tokens (`grid_role=cos`, owner, farm).
 
-- A resumed session is healed from the identity herdr persisted; a brand-new (non-resume) session changes the session id and needs `quaqua identity heal`.
