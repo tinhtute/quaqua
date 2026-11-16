@@ -562,6 +562,49 @@ fn registered_cmds_report_exit_codes() {
     assert_eq!(code(memory::memory_cmd(&env, &args(&["hook", "batch"]))), 0);
 }
 
+/// A test workspace must be sealed off from the live herdr: commands that
+/// retag or inspect panes run against whatever `HERDR_*` the test process
+/// inherited (a CoS pane's, when the suite runs from one). A recording herdr
+/// stands in for the live one; nothing may call it.
+#[test]
+fn workspace_commands_never_reach_the_inherited_herdr() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("live-herdr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let calls = dir.join("calls");
+    let fake = dir.join("herdr");
+    write(
+        &fake,
+        &format!("#!/bin/sh\necho \"$@\" >> {}\nexit 1\n", calls.display()),
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // What a live pane exports; set before the workspace takes the env lock.
+    std::env::set_var("HERDR_BIN_PATH", &fake);
+    std::env::set_var("HERDR_PANE_ID", "w9:p9");
+    let ws = TestWorkspace::new("live-herdr");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let _ = init::init_cmd(&env, &[]);
+    let _ = identity::identity_cmd(&env, &args(&["heal"]));
+    let _ = memory::session_start(
+        ws.root(),
+        "{}",
+        identity::cli_panes().as_ref(),
+        identity::pane_from_env().as_deref(),
+    );
+    let seen = std::fs::read_to_string(&calls).unwrap_or_default();
+    drop(ws);
+    std::env::remove_var("HERDR_BIN_PATH");
+    std::env::remove_var("HERDR_PANE_ID");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(seen, "", "the live herdr was called");
+}
+
 #[test]
 fn update_merges_memory_hooks_into_a_modified_settings() {
     let ws = TestWorkspace::new("settings-merge");

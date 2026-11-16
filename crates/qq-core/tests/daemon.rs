@@ -717,3 +717,28 @@ fn lock_refuses_a_second_daemon_when_the_socket_file_is_gone() {
     std::fs::rename(&aside, &sock).unwrap();
     daemon.stop().unwrap();
 }
+
+/// A restart overlaps the old daemon's last moments: a lock another holder
+/// releases shortly after must not refuse the new daemon. (In a threaded
+/// process a forked child briefly shares the lock's open file; under load that
+/// made restarts fail at random.)
+#[test]
+fn a_lock_released_during_startup_does_not_refuse_the_daemon() {
+    let ws = TestWorkspace::new("daemon-lock-handoff");
+    let db = ws.db_path();
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&db)
+        .unwrap();
+    holder.try_lock().expect("test takes the lock first");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(holder);
+    });
+    let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).expect("daemon waits for the lock");
+    release.join().unwrap();
+    daemon.stop().expect("clean stop");
+}
