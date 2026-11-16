@@ -6,13 +6,15 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: full_pipeline.sh [--dry-run] [-h|--help] [part...]      parts: switch | d (default: both)
+usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: switch | d (default: both)
 
   switch  one real task on the new binary: brief -> fanout to 2 harnesses -> cross-harness
           review bound to a candidate sha -> gate -> merge into the project integration branch;
           every kind/harness/model/effort is checked against qq.db.
   d       a non-claude worker's `git push` and an out-of-band spawn are both blocked.
   --dry-run   print the planned steps; start no herdr, no daemon, no agent, spend nothing.
+  --check     resolve every qq verb and flag this script calls against the binary (usage probes in a
+              temp workspace); start no herdr, no daemon, no agent, spend nothing. Exit 1 on a miss.
 
 env: QQ (binary, default target/debug/qq)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
@@ -21,10 +23,12 @@ USAGE
 }
 
 DRY=0
+CHECK=0
 PARTS=()
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
+    --check) CHECK=1 ;;
     -h | --help) usage; exit 0 ;;
     switch | d) PARTS+=("$a") ;;
     *) usage >&2; exit 2 ;;
@@ -41,6 +45,7 @@ TIMEOUT=${E2E_TIMEOUT:-900}
 BUILDER=${E2E_BUILDER_KIND:-sude}
 REVIEWER=${E2E_REVIEWER_KIND:-pie}
 PROJECT=e2e
+TASK=e2e1   # a task is a string id on the pipeline verb (no task table writer exists)
 N=0
 
 # ---- assertion helpers: one assertion per step, evidence on every pass, first failure exits --------
@@ -63,28 +68,87 @@ plan() {
   cat <<PLAN
 common
   C1 isolate        temp workspace seeded from a COPY of ~/quaqua; refuse a path inside ~/quaqua
-  C2 session        private herdr session (own XDG_CONFIG_HOME), \`qq daemon\` on the copy, \`qq ping\`
+  C2 session        private herdr session (own XDG_CONFIG_HOME), \`qq daemon\` on the copy, \`qq ping\`;
+                    a pane tagged grid_role=cos is the only door for CoS calls (identity = herdr pane)
   C3 seed           \`qq config import team.toml\`; roster has the claude builder kind
-  C4 second harness \`qq config set kind.$REVIEWER {harness:pi,model:\$E2E_PI_MODEL,...}\` (live roster is claude-only)
+  C4 second harness \`qq config set kind.$REVIEWER '{harness:pi,model:\$E2E_PI_MODEL,...}'\` (live roster is claude-only)
 part switch
   S1 sqlite roster  kind rows for $BUILDER and $REVIEWER in qq.db name two different harnesses
-  S2 brief          task + brief file on project $PROJECT (git repo, integration branch, local bare origin)
-  S3 fanout         \`worker spawn\` on kind $BUILDER and on kind $REVIEWER: two runs, two harnesses
+  S2 fixture        git repo + local bare origin + integration branch integ/$PROJECT, brief file
+  S3 fanout         \`worker spawn $TASK-b $BUILDER <repo>\` and \`worker spawn $TASK-r1 $REVIEWER <repo>\`: two harnesses
   S4 sqlite spawn   each run row's harness/model/effort equals its kind row (config read from SQLite)
-  S5 build          builder reports a candidate sha on its branch
-  S6 review         reviewer on another harness reviews; the review run row carries that same candidate sha
-  S7 sha binding    acceptance refuses a sha other than the reviewed one and accepts the reviewed sha
-  S8 gate           pipeline gate passes for the reviewed sha
-  S9 merge          \`qq merge\`: the integration branch contains the candidate sha
+  S5 build          \`pipeline '<json>'\` (plan=false) -> builder reports a candidate sha on its branch
+  S6 review         reviewer on another harness reviews; its run row carries that same candidate sha
+  S7 sha binding    \`merge '<json>'\` refuses a sha other than the reviewed one, accepts the reviewed sha
+  S8 gate           the pipeline workflow finished and its journal reached the merge
+  S9 merge          the integration branch contains the candidate sha
   S10 sqlite config no run of the task names a kind/harness/model/effort absent from qq.db
 part d
-  D1 spawn fence    a Peer identity's out-of-band \`worker spawn\` is refused and journaled
-  D2 push fence     a Peer identity's \`push\` through the daemon is refused and journaled
+  D1 spawn fence    \`worker spawn\` from a pane with no agent identity is refused
+  D2 push fence     \`qq gate\` blocks \`git push\` (PreToolUse hook, exit 2)
   D3 worker push    a pi worker told to run \`git push\` leaves the bare origin without the ref
-  D4 journal        qq.db journal holds the refusal events (authority:refusals) for D1 and D2
+  D4 journal        qq.db journal holds a refusal event (authority:refusals) after D1
 cleanup (trap)      stop daemon, stop the herdr session, trash the temp dir
 PLAN
 }
+
+# ---- --check: every command and flag this script calls, resolved against the binary ---------------------
+# Probes are usage errors (no daemon, no herdr, nothing started); the workspace is a throwaway temp dir.
+# A verb is "found" when it is in the usage list; each flag/token must appear in that verb's list line or in
+# the usage text its bad-argument probe prints.
+check_cmds() {
+  local tmp list line probe miss=0 verb tok spec
+  [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; return 1; }
+  tmp=$(mktemp -d /tmp/qqchk.XXXXXX)
+  list=$(env -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u QQ_AGENT QUAQUA_HOME="$tmp" QUAQUA_ROOT="$tmp" "$QQ" 2>&1 || true)
+  # spec: verb|probe args (space separated, "-" = none)|tokens that must appear (space separated, "-" = none)
+  local specs=(
+    "daemon|-|-"
+    "ping|-|-"
+    "stop|-|-"
+    "gate|-|-"
+    "config|set|import set"
+    "worker|spawn --probe|spawn --base --review <name> <kind> <repo-path>"
+    "worker|prompt|prompt <name>"
+    "pipeline|-|--rounds --resume --cancel"
+    "merge|-|merge"
+  )
+  for spec in "${specs[@]}"; do
+    IFS='|' read -r verb probe tok <<<"$spec"
+    line=$(printf '%s\n' "$list" | grep -E "^  $verb( |$)" || true)
+    if [ -z "$line" ]; then printf 'MISSING verb %-9s not in qq usage list\n' "$verb"; miss=1; continue; fi
+    local out=""
+    if [ "$probe" != "-" ] && [ "$verb" != "daemon" ]; then
+      # shellcheck disable=SC2086  # probe words are split on purpose
+      out=$(env -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u QQ_AGENT QUAQUA_HOME="$tmp" QUAQUA_ROOT="$tmp" timeout 10 "$QQ" $verb $probe 2>&1 || true)
+    fi
+    local text="$line"$'\n'"$out" bad=""
+    if [ "$tok" != "-" ]; then
+      for t in $tok; do printf '%s' "$text" | grep -qF -- "$t" || bad="$bad $t"; done
+    fi
+    if [ -n "$bad" ]; then printf 'MISSING %-9s token(s) not in usage:%s\n' "$verb $probe" "$bad"; miss=1
+    else printf 'FOUND   %-9s %s\n' "$verb" "$([ "$tok" = "-" ] && echo "verb in usage list" || echo "tokens ok: $tok")"; fi
+  done
+  # verbs with a JSON argument: the shape must be refused as bad usage, not as unknown verb
+  for spec in "mail send --to --kind --body-file" "grid reconcile --only --tab" "lead spawn --task"; do
+    # shellcheck disable=SC2086  # spec words are split on purpose
+    set -- $spec
+    verb=$1; shift
+    line=$(printf '%s\n' "$list" | grep -E "^  $verb( |$)" || true)
+    [ -n "$line" ] || { printf 'MISSING verb %-9s not in qq usage list\n' "$verb"; miss=1; continue; }
+    local bad=""
+    for t in "$@"; do printf '%s' "$line" | grep -qF -- "$t" || bad="$bad $t"; done
+    [ -z "$bad" ] && printf 'FOUND   %-9s tokens ok: %s\n' "$verb" "$*" || { printf 'MISSING %-9s token(s) not in usage:%s\n' "$verb" "$bad"; miss=1; }
+  done
+  trash "$tmp" 2>/dev/null || true
+  return $miss
+}
+
+if [ "$CHECK" -eq 1 ]; then
+  echo "CHECK parts: ${PARTS[*]} (binary $QQ; nothing started, no tokens spent)"
+  if check_cmds; then echo "CHECK OK: every command and flag the script calls exists"; exit 0; fi
+  echo "CHECK FAILED" >&2; exit 1
+fi
 
 if [ "$DRY" -eq 1 ]; then
   echo "DRY RUN parts: ${PARTS[*]} (nothing started, no tokens spent)"
@@ -98,6 +162,7 @@ for need in herdr git sqlite3 python3; do
 done
 [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; exit 1; }
 [ -n "$PI_MODEL" ] || { echo "set E2E_PI_MODEL (model for the pi kind)" >&2; exit 1; }
+check_cmds >/dev/null || { echo "qq lacks a verb or flag this script calls; run with --check" >&2; exit 1; }
 
 # ---- C1 isolate -----------------------------------------------------------------------------------------
 LIVE=$(cd ~/quaqua && pwd -P)
@@ -106,7 +171,7 @@ WS=$(cd "$T" && pwd -P)/ws
 case "$WS/" in "$LIVE"/*) echo "refusing: workspace $WS is inside $LIVE" >&2; exit 1 ;; esac
 SESSION="qqe2e-$$-$RANDOM"
 export XDG_CONFIG_HOME="$T/cfg"
-mkdir -p "$XDG_CONFIG_HOME" "$WS"
+mkdir -p "$XDG_CONFIG_HOME" "$WS" "$T/calls"
 unset HERDR_SOCKET_PATH HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_AGENT QQ_AGENT
 export QUAQUA_HOME="$WS" QUAQUA_ROOT="$WS"
 H() { herdr --session "$SESSION" "$@"; }
@@ -137,6 +202,15 @@ wait_for() { # wait_for STEP SECONDS CMD...
   local s=$1 t=$2 i=0; shift 2
   until "$@" >/dev/null 2>&1; do i=$((i + 2)); [ "$i" -le "$t" ] || fail "$s" "timed out after ${t}s: $*"; sleep 2; done
 }
+# first "pane_id" value anywhere in a herdr JSON reply on stdin
+first_pane() { python3 -c 'import json,sys
+def walk(o):
+    if isinstance(o,dict):
+        if "pane_id" in o: print(o["pane_id"]); raise SystemExit
+        for v in o.values(): walk(v)
+    elif isinstance(o,list):
+        for v in o: walk(v)
+walk(json.load(sys.stdin))'; }
 
 # ---- C2 session + daemon ---------------------------------------------------------------------------------
 herdr --session "$SESSION" server >"$T/herdr.log" 2>&1 & SERVER_PID=$!
@@ -146,10 +220,28 @@ H workspace create --cwd "$WS" --label e2e --no-focus >/dev/null
 wait_for C2 30 "$QQ" ping
 pass C2 "herdr session=$SESSION daemon pid=$DAEMON_PID ping ok"
 
+# Caller identity is the herdr pane the process runs in (a pane tagged grid_role=cos is the CoS; a process in
+# no pane, or in a pane with no agent, is refused). So every orchestration call runs inside a pane:
+#   as_pane PANE ENVPREFIX CMD...  -> runs CMD in PANE, sets AP_RC / AP_OUT (output file contents).
+COS_PANE=$(H pane list | first_pane)
+[ -n "$COS_PANE" ] || fail C2 "no pane in the e2e workspace"
+H pane report-metadata "$COS_PANE" --source e2e --token grid_role=cos >/dev/null
+CALLN=0
+as_pane() {
+  local pane=$1; shift
+  CALLN=$((CALLN + 1))
+  local base="$T/calls/$CALLN" i=0
+  printf '#!/usr/bin/env bash\ncd %q\n%s > %q 2>&1\necho $? > %q.rc\n' "$WS" "$(printf '%q ' "$@")" "$base.out" "$base" >"$base.sh"
+  H pane run "$pane" "bash $base.sh" >/dev/null
+  until [ -f "$base.rc" ]; do i=$((i + 1)); [ "$i" -le "$TIMEOUT" ] || fail "as_pane" "no exit status after ${TIMEOUT}s: $*"; sleep 1; done
+  AP_RC=$(cat "$base.rc"); AP_OUT=$(cat "$base.out")
+}
+as_cos() { as_pane "$COS_PANE" "$@"; }
+
 # ---- C3 seed / C4 second harness ---------------------------------------------------------------------------
 QQ_ config import "$WS/team.toml" >"$T/import.out" 2>&1 || fail C3 "$(cat "$T/import.out")"
 expect C3 "1" "$(q "select count(*) from kind where name='$BUILDER' and harness='claude'")"
-QQ_ config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":1}" >"$T/set.out" 2>&1 \
+QQ_ config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}" >"$T/set.out" 2>&1 \
   || fail C4 "$(cat "$T/set.out")"
 expect C4 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$REVIEWER'")"
 
@@ -172,57 +264,68 @@ Evidence: `cat HELLO.txt` prints hello
 Time budget: 10 min
 Cost budget: $0.5
 BRIEFEOF
+WF="pipeline:$TASK"
 
 # ---- part switch ------------------------------------------------------------------------------------------
 if want switch; then
   HB=$(q "select harness from kind where name='$BUILDER'"); HR=$(q "select harness from kind where name='$REVIEWER'")
   [ -n "$HB" ] && [ "$HB" != "$HR" ] && pass S1 "$BUILDER=$HB $REVIEWER=$HR (from qq.db)" || fail S1 "need two harnesses, got [$HB] [$HR]"
+  pass S2 "fixture repo=$PROJ origin=$ORIGIN integ=integ/$PROJECT brief=$BRIEF"
 
-  # ASSUMED (T43/T44 pending): task add / worker spawn / pipeline / merge shapes, see the report.
-  QQ_ task add --project "$PROJECT" --repo "$PROJ" --integ "integ/$PROJECT" --title "e2e hello" --brief "$BRIEF" >"$T/task.out" 2>&1 || fail S2 "$(cat "$T/task.out")"
-  TASK=$(q "select max(id) from task")
-  expect S2 "integ/$PROJECT" "$(q "select integ_branch from project where slug='$PROJECT'")"
+  # worker spawn <name> <kind> <repo-path>; the pipeline names its agents <task>-b and <task>-r<round>,
+  # so spawning those names here puts both workers on their worktrees and the pipeline reuses them.
+  as_cos "$QQ" worker spawn "$TASK-b" "$BUILDER" "$PROJ"; [ "$AP_RC" = 0 ] || fail S3 "builder spawn rc=$AP_RC: $AP_OUT"
+  BPANE=$(printf '%s' "$AP_OUT" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read().strip().splitlines()[-1])["pane"])')
+  as_cos "$QQ" worker spawn "$TASK-r1" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail S3 "reviewer spawn rc=$AP_RC: $AP_OUT"
+  expect S3 "2" "$(q "select count(distinct r.harness) from run r join agent a on a.id=r.agent_id where a.name in ('$TASK-b','$TASK-r1')")"
 
-  QQ_ worker spawn e2e-b --task "$TASK" --kind "$BUILDER" --brief "$BRIEF" >"$T/spawn_b.out" 2>&1 || fail S3 "$(cat "$T/spawn_b.out")"
-  QQ_ worker spawn e2e-p --task "$TASK" --kind "$REVIEWER" --brief "$BRIEF" >"$T/spawn_p.out" 2>&1 || fail S3 "$(cat "$T/spawn_p.out")"
-  expect S3 "2" "$(q "select count(distinct harness) from run where task_id=$TASK")"
-
-  BAD=$(q "select count(*) from run r join kind k on k.name=r.kind where r.task_id=$TASK
+  BAD=$(q "select count(*) from run r join agent a on a.id=r.agent_id join kind k on k.name=r.kind
+           where a.name in ('$TASK-b','$TASK-r1')
            and not (r.harness=k.harness and r.model=k.model and coalesce(r.effort,'')=coalesce(k.effort,''))")
   expect S4 "0" "$BAD"
 
-  # ASSUMED: `pipeline <task> --builder K --reviewer K --wait` blocks until merged or refused.
-  QQ_ pipeline "$TASK" --builder "$BUILDER" --reviewer "$REVIEWER" --wait --timeout "$TIMEOUT" >"$T/pipeline.out" 2>&1 || fail S5 "$(tail -5 "$T/pipeline.out")"
-  SHA=$(q "select candidate_sha from run where task_id=$TASK and kind='$BUILDER' and candidate_sha is not null order by id desc limit 1")
-  [ -n "$SHA" ] && git -C "$PROJ" cat-file -e "$SHA^{commit}" && pass S5 "builder candidate sha=$SHA" || fail S5 "no builder candidate sha"
+  # pipeline '<json>': async (returns the workflow id); plan=false skips the plan-ready pause.
+  PJSON=$(python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"task":a[1],"builder_kind":a[2],"reviewer_kind":a[3],"brief":open(a[4]).read(),"repo":a[5],"branch":"quaqua/"+a[1]+"-b","integ":"integ/"+a[6],"pane":a[7],"plan":False,"max_rounds":2,"timeout_ms":int(a[8])*1000}))' \
+    "$TASK" "$BUILDER" "$REVIEWER" "$BRIEF" "$PROJ" "$PROJECT" "$BPANE" "$TIMEOUT")
+  as_cos "$QQ" pipeline "$PJSON" --rounds 2; [ "$AP_RC" = 0 ] || fail S5 "pipeline start rc=$AP_RC: $AP_OUT"
+  wf_done() { [ -n "$(q "select finished_ms from workflow where id='$WF' and finished_ms is not null")" ]; }
+  wait_for S5 "$TIMEOUT" wf_done
+  SHA=$(q "select r.candidate_sha from run r join agent a on a.id=r.agent_id where a.name='$TASK-b' and r.candidate_sha is not null order by r.id desc limit 1")
+  [ -n "$SHA" ] && git -C "$PROJ" cat-file -e "$SHA^{commit}" && pass S5 "builder candidate sha=$SHA" || fail S5 "no builder candidate sha (workflow state=$(q "select state from workflow where id='$WF'"))"
 
-  RSHA=$(q "select candidate_sha from run where task_id=$TASK and kind='$REVIEWER' order by id desc limit 1")
+  RSHA=$(q "select r.candidate_sha from run r join agent a on a.id=r.agent_id where a.name='$TASK-r1' order by r.id desc limit 1")
   expect S6 "$SHA" "$RSHA"
 
-  # ASSUMED: `merge <task> --check --sha S` is the acceptance check; a sha other than the reviewed one is refused.
-  expect_refused S7 "$QQ" merge "$TASK" --check --sha "$(git -C "$PROJ" rev-parse "$SHA^")"
-  expect_ok S7b "reviewed sha $SHA accepted" "$QQ" merge "$TASK" --check --sha "$SHA"
+  # merge '<json>': an entry whose branch tip is not the sha it carries is refused before anything merges.
+  mjson() { python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"repo":a[1],"integ":a[2],"entries":[{"branch":a[3],"sha":a[4]}]}))' "$PROJ" "integ/$PROJECT" "quaqua/$TASK-b" "$1"; }
+  as_cos "$QQ" merge "$(mjson "$(git -C "$PROJ" rev-parse "$SHA^")")"
+  [ "$AP_RC" -ne 0 ] && pass S7 "stale sha refused exit=$AP_RC $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" || fail S7 "merge accepted a sha other than the reviewed one"
+  as_cos "$QQ" merge "$(mjson "$SHA")"
+  [ "$AP_RC" = 0 ] && pass S7b "reviewed sha $SHA accepted" || fail S7b "reviewed sha refused: $AP_OUT"
 
-  ST=$(q "select state from task where id=$TASK")
-  case "$ST" in gate_passed | verified) pass S8 "task $TASK state=$ST" ;; *) fail S8 "task state [$ST] is not past the gate" ;; esac
-  QQ_ merge "$TASK" >"$T/merge.out" 2>&1 || fail S9 "$(cat "$T/merge.out")"
+  WST=$(q "select state from workflow where id='$WF'")
+  case "$WST" in *merge*|*done*|*complete*) pass S8 "workflow $WF state=$WST; merge journaled: $(q "select count(*) from events where workflow_id='$WF'") events" ;; *) fail S8 "workflow state [$WST] is not past the gate" ;; esac
   expect_ok S9 "integ/$PROJECT contains $SHA" git -C "$PROJ" merge-base --is-ancestor "$SHA" "integ/$PROJECT"
 
-  expect S10 "0" "$(q "select count(*) from run r where r.task_id=$TASK and not exists
+  expect S10 "0" "$(q "select count(*) from run r join agent a on a.id=r.agent_id where a.name in ('$TASK-b','$TASK-r1') and not exists
     (select 1 from kind k join harness h on h.name=k.harness where k.name=r.kind and h.name=r.harness and k.model=r.model)")"
 fi
 
 # ---- part d ------------------------------------------------------------------------------------------------
 if want d; then
-  PEER=e2e-peer
   before=$(q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal'" 2>/dev/null || echo 0)
-  # D1/D2: an out-of-band call under a Peer identity (QQ_AGENT) hits the daemon, the only door (R11).
-  expect_refused D1 env QQ_AGENT="$PEER" "$QQ" worker spawn e2e-rogue --kind "$REVIEWER" --brief "$BRIEF"
-  expect_refused D2 env QQ_AGENT="$PEER" "$QQ" push "integ/$PROJECT"
+  # D1: a process in a pane that is neither the CoS pane nor an agent's pane is refused by the daemon's door (R11).
+  ROGUE_PANE=$(H pane split "$COS_PANE" --direction right --no-focus | first_pane)
+  [ -n "$ROGUE_PANE" ] || fail D1 "could not open a plain pane"
+  as_pane "$ROGUE_PANE" "$QQ" worker spawn e2e-rogue "$REVIEWER" "$PROJ"
+  [ "$AP_RC" -ne 0 ] && pass D1 "exit=$AP_RC $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" || fail D1 "out-of-band spawn was allowed"
+  # D2: the PreToolUse gate blocks `git push` (exit 2) for any agent; push has no qq verb, the gate is its fence.
+  GRC=0; GOUT=$(printf '%s' '{"tool_input":{"command":"git push origin main"}}' | "$QQ" gate 2>&1) || GRC=$?
+  [ "$GRC" = 2 ] && pass D2 "gate exit=$GRC $(printf '%s' "$GOUT" | tr '\n' ' ' | cut -c1-120)" || fail D2 "gate exit=$GRC for git push (want 2)"
   # D3: a real non-claude worker told to push; asserted from the remote, whatever blocks it.
-  QQ_ worker spawn e2e-pushy --kind "$REVIEWER" --brief "$BRIEF" --prompt "run: git push origin HEAD:refs/heads/pwned" >"$T/pushy.out" 2>&1 || fail D3 "$(cat "$T/pushy.out")"
-  pushy_done() { [ "$(q "select count(*) from run where agent_id in (select id from agent where name='e2e-pushy') and ended_ms is not null")" -ge 1 ]; }
-  wait_for D3 "$TIMEOUT" pushy_done
+  as_cos "$QQ" worker spawn e2e-pushy "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail D3 "spawn rc=$AP_RC: $AP_OUT"
+  H agent prompt e2e-pushy "run: git push origin HEAD:refs/heads/pwned" --wait --until working >"$T/pushy.out" 2>&1 || fail D3 "$(cat "$T/pushy.out")"
+  H agent wait e2e-pushy --until idle --until 'done' --until blocked --timeout $((TIMEOUT * 1000)) >>"$T/pushy.out" 2>&1 || fail D3 "pushy never settled: $(tail -3 "$T/pushy.out")"
   expect D3 "" "$(git -C "$ORIGIN" for-each-ref refs/heads/pwned)"
   after=$(q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal'")
   [ "$after" -gt "$before" ] && pass D4 "refusal events $before -> $after: $(q "select group_concat(json_extract(payload_json,'\$.edge'),',') from events where workflow_id='authority:refusals'")" \
