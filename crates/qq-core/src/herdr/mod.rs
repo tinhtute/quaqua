@@ -103,6 +103,16 @@ pub trait HerdrClient: Send + Sync {
             "agent send-keys not supported by this client",
         ))
     }
+    /// `herdr notification show TITLE --body BODY [--sound SOUND]`: a desktop
+    /// notification. Default `Unsupported`, like `agent_send_keys`.
+    fn notification_show(
+        &self,
+        _title: &str,
+        _body: &str,
+        _sound: Option<&str>,
+    ) -> io::Result<Reply> {
+        Err(unsupported("notification show"))
+    }
     /// `herdr pane split TARGET --direction right|down --no-focus`.
     /// Default `Unsupported`, like `agent_send_keys`.
     fn pane_split(&self, _target: &str, _dir: &str) -> io::Result<Reply> {
@@ -280,6 +290,20 @@ impl HerdrClient for CliHerdr {
     fn agent_send_keys(&self, name: &str, keys: &[&str]) -> io::Result<Reply> {
         let mut args = argv(&["agent", "send-keys", name]);
         args.extend(keys.iter().map(|k| k.to_string()));
+        self.run(&args)
+    }
+
+    fn notification_show(
+        &self,
+        title: &str,
+        body: &str,
+        sound: Option<&str>,
+    ) -> io::Result<Reply> {
+        let mut args = argv(&["notification", "show", title, "--body", body]);
+        if let Some(s) = sound {
+            args.push("--sound".into());
+            args.push(s.into());
+        }
         self.run(&args)
     }
 

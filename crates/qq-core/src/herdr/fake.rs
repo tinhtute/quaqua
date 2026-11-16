@@ -25,6 +25,8 @@ struct State {
     agents: BTreeMap<String, Agent>,
     prompts: Vec<(String, String)>,
     keys: Vec<(String, Vec<String>)>,
+    /// `(title, body, sound)` of every desktop notification.
+    notifications: Vec<(String, String, Option<String>)>,
     /// Per agent: the key sequence that idles it (anything else changes nothing).
     idle_on: BTreeMap<String, Vec<String>>,
     /// When set, the next call (any verb) fails with this transport error kind.
@@ -225,6 +227,11 @@ impl FakeHerdr {
         self.lock().keys.clone()
     }
 
+    /// Every desktop notification shown, in order: (title, body, sound).
+    pub fn notifications(&self) -> Vec<(String, String, Option<String>)> {
+        self.lock().notifications.clone()
+    }
+
     /// The agent goes idle when sent exactly `keys`; other sequences do nothing.
     pub fn idle_on_keys(&self, name: &str, keys: &[&str]) {
         self.lock().idle_on.insert(
@@ -367,6 +374,20 @@ impl HerdrClient for FakeHerdr {
         }
         st.keys.push((name.to_string(), keys));
         Ok(Reply::ok(r#"{"result":{"sent":true}}"#))
+    }
+
+    fn notification_show(
+        &self,
+        title: &str,
+        body: &str,
+        sound: Option<&str>,
+    ) -> io::Result<Reply> {
+        self.lock().notifications.push((
+            title.to_string(),
+            body.to_string(),
+            sound.map(String::from),
+        ));
+        Ok(Reply::ok(r#"{"result":{"shown":true}}"#))
     }
 
     fn pane_split(&self, target: &str, dir: &str) -> io::Result<Reply> {
