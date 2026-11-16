@@ -4,7 +4,8 @@
 //! Steps, each safe to repeat: resolve the kind from SQLite, find the driver
 //! of its harness, `herdr agent start` (herdr converges on the same name,
 //! kind and pane), then record the agent unless an open one with that name
-//! exists. A pane is an input: herdr 0.9.5's client has no pane split.
+//! exists. The pane is an input; `task.start` fills a missing one from grid
+//! placement (`worker_flow::place_pane`) before it gets here.
 
 use rusqlite::{params, Connection, OptionalExtension};
 

@@ -13,7 +13,9 @@ use qq_core::grid::{self, HerdrPanes, PaneOps};
 use qq_core::herdr::{FakeHerdr, HerdrClient};
 use qq_core::status;
 use qq_core::task::cleanup::{self, OpsError};
-use qq_core::task::prompt::{self, Allowance, Exit, Observed};
+use qq_core::task::prompt::{self, Allowance, Clock, Exit, Observed, WaitCfg};
+use qq_core::task::spawn::{spawn, Role, SpawnSpec};
+use qq_core::task::worker_flow::place_pane;
 use rusqlite::Connection;
 
 const BRIEF: &str = "Topology: solo — one unit\nPlaybook: feature\nContext: none, test\n\
@@ -296,11 +298,37 @@ fn grid_four_per_tab() {
     let herdr = FakeHerdr::new();
     let panes = HerdrPanes(&herdr);
     let mut got = Vec::new();
+    // five spawns with no pane named: each lands where grid placement says
+    let (_sd, sconn) = seeded("spawnplace");
+    sconn
+        .execute(
+            "INSERT INTO project (slug, repo_path, created_ms) VALUES ('repo', '/x/repo', 1)",
+            [],
+        )
+        .unwrap();
+    let drivers = Registry::native();
     for i in 0..5 {
-        let id = grid::acquire(&panes, "repo").unwrap();
-        occupy(&herdr, &id, &format!("w{i}"));
+        let name = format!("w{i}");
+        let id = place_pane(&sconn, &herdr, &name, Some(1)).unwrap();
+        spawn(
+            &sconn,
+            &herdr,
+            &drivers,
+            &SpawnSpec {
+                name: &name,
+                kind: "tieude",
+                role: Role::Peer,
+                pane: &id,
+                project_id: Some(1),
+                spawner_id: None,
+            },
+            2,
+        )
+        .unwrap();
         got.push(id);
     }
+    // a repeat of a spawn keeps its pane rather than placing a new one
+    assert_eq!(place_pane(&sconn, &herdr, "w2", Some(1)).unwrap(), got[2]);
     assert_eq!(tabs(&herdr), vec!["repo-workers", "repo-workers-2"]);
     let per_tab = |t: &str| panes.panes().unwrap().iter().filter(|p| p.tab == t).count();
     assert_eq!((per_tab("repo-workers"), per_tab("repo-workers-2")), (4, 1));
@@ -382,4 +410,120 @@ fn pane_metadata_merges_and_repeats() {
     );
     assert!(got.body.contains("\"display_agent\":\"L\""));
     assert!(!herdr.pane_get("nope").unwrap().ok);
+}
+
+/// A clock the test owns: sleeping advances it and runs `on_sleep(now)`.
+struct FakeClock<'a> {
+    now: std::cell::Cell<u64>,
+    on_sleep: Box<dyn Fn(u64) + 'a>,
+}
+
+impl Clock for FakeClock<'_> {
+    fn now_sec(&self) -> u64 {
+        self.now.get()
+    }
+    fn sleep_ms(&self, ms: u64) {
+        self.now.set(self.now.get() + ms / 1000);
+        (self.on_sleep)(self.now.get());
+    }
+}
+
+fn wait_cfg<'a>(
+    runs: &'a Path,
+    journal: &'a dyn Fn(&str, serde_json::Value),
+    budget_sec: u64,
+) -> WaitCfg<'a> {
+    WaitCfg {
+        name: "w",
+        runs_dir: runs,
+        report: runs.join("w.md"),
+        worktree: None,
+        budget_sec,
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+        journal,
+    }
+}
+
+#[test]
+fn prompt_wait_exits_on_report_and_on_timebox() {
+    let (runs, _c) = seeded("wait");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    let journal = |_: &str, _: serde_json::Value| {};
+
+    // A report appears at t=20: exit 0, and no nudge was due (budget 100).
+    let r = runs.join("w.md");
+    let clock = FakeClock {
+        now: 1000.into(),
+        on_sleep: Box::new(|now| {
+            if now >= 1020 {
+                std::fs::write(
+                    &r,
+                    "Outcome: COMPLETE\n\n## Blockers\nnone\n\n## Lessons\nnone\n",
+                )
+                .unwrap();
+            }
+        }),
+    };
+    let cfg = wait_cfg(&runs, &journal, 100);
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::ReportReady);
+    assert!(h.prompts().is_empty());
+    std::fs::remove_file(&r).unwrap();
+    for f in [".w.budget", ".w.elapsed", ".w.nudged"] {
+        let _ = std::fs::remove_file(runs.join(f));
+    }
+
+    // Silence past the budget: one 80% nudge, then exit 4.
+    let clock = FakeClock {
+        now: 5000.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    let cfg = wait_cfg(&runs, &journal, 60);
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::BudgetExceeded);
+    assert_eq!(clock.now_sec() - 5000, 60);
+    let nudges: Vec<_> = h
+        .prompts()
+        .into_iter()
+        .filter(|(_, t)| t.starts_with("Time check"))
+        .collect();
+    assert_eq!(nudges.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(runs.join(".w.budget"))
+            .unwrap()
+            .trim(),
+        "60"
+    );
+    assert!(runs.join(".w.nudged").exists());
+}
+
+#[test]
+fn prompt_wait_retries_a_provider_error_then_escalates() {
+    let (runs, _c) = seeded("retry");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    let events = std::cell::RefCell::new(Vec::<String>::new());
+    let journal = |k: &str, _: serde_json::Value| events.borrow_mut().push(k.to_string());
+    let err = runs.join(".w.error");
+    std::fs::write(&err, "overloaded\n").unwrap();
+    let again = err.clone();
+    // Each retry clears the verdict; the harness errors again after a sleep.
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(move |_| {
+            let _ = std::fs::write(&again, "overloaded\n");
+        }),
+    };
+    let cfg = wait_cfg(&runs, &journal, 7200);
+    assert_eq!(prompt::wait(&h, &clock, &cfg), Exit::ProviderError);
+    let ev = events.borrow();
+    assert_eq!(ev.iter().filter(|k| *k == "provider_retry").count(), 4);
+    assert_eq!(ev.last().map(String::as_str), Some("provider_escalate"));
+    assert_eq!(
+        h.prompts().iter().filter(|(_, t)| t == "continue").count(),
+        4
+    );
 }
