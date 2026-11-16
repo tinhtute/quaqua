@@ -91,6 +91,36 @@ pub trait HarnessDriver: Send + Sync {
     }
 }
 
+/// Stops a working agent: sends each of the driver's stop sequences in order,
+/// waiting `settle_ms` for idle after each, and stops at the first that works.
+/// Already idle converges with no keys sent. `false`: no sequence idled it
+/// (the caller falls back to `herdr agent stop`).
+pub fn stop(
+    client: &dyn HerdrClient,
+    driver: &dyn HarnessDriver,
+    name: &str,
+    settle_ms: u64,
+) -> io::Result<bool> {
+    let idle = |c: &dyn HerdrClient| -> io::Result<bool> {
+        Ok(c.agent_wait(name, &["idle"], settle_ms)?.ok)
+    };
+    if let Ok(r) = client.agent_get(name) {
+        if r.ok && r.body.contains(r#""agent_status":"idle""#) {
+            return Ok(true);
+        }
+    }
+    for seq in driver.stop_sequences() {
+        let keys: Vec<&str> = seq.iter().map(String::as_str).collect();
+        if !client.agent_send_keys(name, &keys)?.ok {
+            continue;
+        }
+        if idle(client)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Starts `driver`'s agent. A transport error is retried (start converges on
 /// a same-name, same-pane agent, so a repeat is safe); a busy pane is
 /// reported as is, and no other driver is ever tried.

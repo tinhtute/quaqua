@@ -22,6 +22,9 @@ struct Agent {
 struct State {
     agents: BTreeMap<String, Agent>,
     prompts: Vec<(String, String)>,
+    keys: Vec<(String, Vec<String>)>,
+    /// Per agent: the key sequence that idles it (anything else changes nothing).
+    idle_on: BTreeMap<String, Vec<String>>,
     /// When set, the next call (any verb) fails with this transport error kind.
     fail_next: Option<io::ErrorKind>,
     /// Sticky per-verb transport errors, until [`FakeHerdr::clear`].
@@ -131,6 +134,19 @@ impl FakeHerdr {
     }
 
     /// The agent args the agent was started with (after the `--`).
+    /// Every `send-keys` call, in order: (agent, keys).
+    pub fn keys(&self) -> Vec<(String, Vec<String>)> {
+        self.lock().keys.clone()
+    }
+
+    /// The agent goes idle when sent exactly `keys`; other sequences do nothing.
+    pub fn idle_on_keys(&self, name: &str, keys: &[&str]) {
+        self.lock().idle_on.insert(
+            name.to_string(),
+            keys.iter().map(|k| k.to_string()).collect(),
+        );
+    }
+
     pub fn start_args(&self, name: &str) -> Vec<String> {
         self.lock()
             .agents
@@ -248,5 +264,21 @@ impl HerdrClient for FakeHerdr {
             None => Reply::ok(r#"{"result":{"submitted":true}}"#),
             Some((until, _)) => wait_in(a, name, until),
         })
+    }
+
+    fn agent_send_keys(&self, name: &str, keys: &[&str]) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::SendKeys);
+        let st = &mut *st;
+        if !st.agents.contains_key(name) {
+            return Ok(Reply::err("agent_not_found"));
+        }
+        let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        if st.idle_on.get(name) == Some(&keys) {
+            if let Some(a) = st.agents.get_mut(name) {
+                a.status = "idle".into();
+            }
+        }
+        st.keys.push((name.to_string(), keys));
+        Ok(Reply::ok(r#"{"result":{"sent":true}}"#))
     }
 }

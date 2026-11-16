@@ -1,6 +1,6 @@
 use qq_core::authority::Fence;
 use qq_core::config::{Driver, Harness};
-use qq_core::driver::{start, Registry, StartError};
+use qq_core::driver::{start, stop, Registry, StartError};
 use qq_core::herdr::{FakeHerdr, HerdrClient, Verb};
 use qq_core::testkit::TestWorkspace;
 use std::io::ErrorKind;
@@ -125,4 +125,38 @@ fn native_hook_installed_per_driver() {
     );
     assert!((u.cost_usd - 0.75).abs() < 1e-9);
     assert!(claude.usage(&jsonl).unwrap().is_none());
+}
+
+#[test]
+fn stop_sequence_sent_in_order() {
+    let reg = Registry::native();
+    let pi = reg.get("pi").unwrap();
+    let f = FakeHerdr::new();
+    start(&f, &*pi, "w", "%1", 1000, "m", None).unwrap();
+    f.set_status("w", "working");
+    // only the third sequence (esc esc) idles this agent.
+    f.idle_on_keys("w", &["esc", "esc"]);
+    assert!(stop(&f, &*pi, "w", 10).unwrap());
+    let sent: Vec<Vec<String>> = f.keys().into_iter().map(|(_, k)| k).collect();
+    let want: Vec<Vec<&str>> = vec![vec!["esc"], vec!["ctrl+c"], vec!["esc", "esc"]];
+    assert_eq!(sent, want);
+
+    // already idle: converges, nothing sent.
+    assert!(stop(&f, &*pi, "w", 10).unwrap());
+    assert_eq!(f.keys().len(), 3);
+
+    // nothing works: every sequence tried once, then false.
+    f.set_status("w", "working");
+    f.idle_on_keys("w", &["never"]);
+    assert!(!stop(&f, &*pi, "w", 10).unwrap());
+    assert_eq!(f.keys().len(), 3 + 4);
+
+    // generic has no sequences: no keys, false.
+    let g = Registry::from_config(&[harness("kimi", Driver::Generic)])
+        .get("kimi")
+        .unwrap();
+    start(&f, &*g, "k", "%2", 1000, "m", None).unwrap();
+    f.set_status("k", "working");
+    assert!(!stop(&f, &*g, "k", 10).unwrap());
+    assert_eq!(f.keys().len(), 7);
 }
