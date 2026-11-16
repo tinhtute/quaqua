@@ -549,6 +549,17 @@ fn acceptance_binds_candidate_sha() {
     );
     assert_eq!(r3.sim.saw("merge"), 0, "the moved tip is not merged");
     assert_eq!(git(&fx3.repo, &["rev-parse", "integ"]), before);
+    // a watcher re-registered after a restart fires again for the report that
+    // was already taken: the paused flow does not read it twice
+    let (prompts, spawns) = (r3.sim.saw("prompt"), r3.sim.saw("spawn"));
+    let again = r3.report();
+    r3.signal_with("report", "appeared", json!({ "path": again }));
+    assert_eq!(r3.blocked(), Some((8, Some(moved.clone()))), "still paused");
+    assert_eq!(
+        (r3.sim.saw("prompt"), r3.sim.saw("spawn")),
+        (prompts, spawns),
+        "no second read, no new work"
+    );
 
     // Approval re-reviews the new tip (a fresh reviewer); the second gate
     // re-reads git and the merge takes the newly reviewed sha, not the first.
