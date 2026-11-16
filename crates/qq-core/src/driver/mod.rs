@@ -2,9 +2,8 @@
 //! crate asks the [`Registry`] for the driver of a kind's harness and never
 //! branches on a harness name.
 //!
-//! A driver is data: the herdr agent kind it starts, an args template with
-//! `{model}` and `{effort}` slots, and how a roster model name becomes the
-//! harness's model id. Readiness is herdr's `agent start` (it returns once the
+//! A driver names the herdr agent kind it starts and builds the launch args
+//! (model id and effort in the harness's own spelling). Readiness is herdr's `agent start` (it returns once the
 //! agent is up). Stop and cost parsing arrive with T41; until then a run's
 //! cost is recorded as unknown.
 
@@ -13,41 +12,21 @@ mod claude;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// What a harness needs to be launched, as data.
-pub struct HarnessDriver {
+/// Everything the engine asks of one harness. Implementations are small and
+/// stateless; behaviour that differs per harness lives only in them.
+pub trait HarnessDriver: Send + Sync {
     /// The harness name as config spells it (`harness.name`).
-    pub harness: String,
+    fn harness(&self) -> &str;
     /// The agent kind `herdr agent start --kind` is given.
-    pub herdr_kind: String,
-    /// Args after herdr's `--`, with `{model}` and `{effort}` slots.
-    pub args: Vec<String>,
-    /// Roster model name -> the id the harness's CLI takes.
-    pub model_id: fn(&str) -> String,
-}
-
-impl HarnessDriver {
-    /// The launch args for `model` and `effort`. With no effort the
-    /// `{effort}` slot is dropped together with the flag before it.
-    pub fn launch_args(&self, model: &str, effort: Option<&str>) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for a in &self.args {
-            match (a.as_str(), effort) {
-                ("{effort}", None) => {
-                    out.pop();
-                }
-                ("{effort}", Some(e)) => out.push(e.to_string()),
-                ("{model}", _) => out.push((self.model_id)(model)),
-                _ => out.push(a.clone()),
-            }
-        }
-        out
-    }
+    fn herdr_kind(&self) -> &str;
+    /// Args after herdr's `--` for a roster `model` and optional `effort`.
+    fn launch_args(&self, model: &str, effort: Option<&str>) -> Vec<String>;
 }
 
 /// Drivers by harness name.
 #[derive(Default, Clone)]
 pub struct Registry {
-    by_harness: BTreeMap<String, Arc<HarnessDriver>>,
+    by_harness: BTreeMap<String, Arc<dyn HarnessDriver>>,
 }
 
 impl Registry {
@@ -59,16 +38,16 @@ impl Registry {
     /// join with T41.
     pub fn native() -> Self {
         let mut r = Self::new();
-        r.register(claude::driver());
+        r.register(claude::Claude);
         r
     }
 
     /// Adds a driver; the harness name is the key, a repeat replaces.
-    pub fn register(&mut self, d: HarnessDriver) {
-        self.by_harness.insert(d.harness.clone(), Arc::new(d));
+    pub fn register(&mut self, d: impl HarnessDriver + 'static) {
+        self.by_harness.insert(d.harness().to_string(), Arc::new(d));
     }
 
-    pub fn get(&self, harness: &str) -> Option<Arc<HarnessDriver>> {
+    pub fn get(&self, harness: &str) -> Option<Arc<dyn HarnessDriver>> {
         self.by_harness.get(harness).cloned()
     }
 }

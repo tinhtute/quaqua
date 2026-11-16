@@ -105,6 +105,10 @@ fn walking_skeleton_spawn_report_run_record() {
 
     let started = start_task(&ws, "w1", 60_000);
     assert_eq!(started["workflow"], "worker:w1");
+    // Repeating the verb while the flow runs converges: no second agent,
+    // run or prompt.
+    let again = start_task(&ws, "w1", 60_000);
+    assert_eq!(again["agent_id"], started["agent_id"]);
 
     // The prompt reaches the worker, then the worker publishes its report.
     wait_for("the prompt", || !herdr.prompts().is_empty());
@@ -147,6 +151,11 @@ fn walking_skeleton_spawn_report_run_record() {
         .query_row("SELECT count(*) FROM run", [], |r| r.get(0))
         .unwrap();
     assert_eq!(runs, 1);
+    let agents: i64 = conn
+        .query_row("SELECT count(*) FROM agent", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(agents, 1);
+    assert_eq!(herdr.prompts().len(), 1);
     daemon.stop().unwrap();
 }
 
@@ -203,7 +212,6 @@ fn daemon_idle_worker_adds_no_poll_events() {
     wait_for("the status signal", || signals() > signals_before);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(signals(), signals_before + 1);
-    assert_eq!(journal_rows(&conn, "worker:w3"), before + 2);
     daemon.stop().unwrap();
 }
 

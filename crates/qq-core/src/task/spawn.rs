@@ -99,7 +99,7 @@ pub fn spawn(
     let reply = herdr
         .agent_start(
             spec.name,
-            &driver.herdr_kind,
+            driver.herdr_kind(),
             spec.pane,
             START_TIMEOUT_MS,
             &arg_refs,
