@@ -31,6 +31,13 @@ struct State {
     faults: BTreeMap<Verb, io::ErrorKind>,
     /// Sticky per-verb canned replies, until [`FakeHerdr::clear`].
     replies: BTreeMap<Verb, Reply>,
+    /// tab id -> label.
+    tabs: BTreeMap<String, String>,
+    /// pane id -> tab id.
+    panes: BTreeMap<String, String>,
+    /// pane id -> merged tokens and display agent.
+    meta: BTreeMap<String, (BTreeMap<String, String>, Option<String>)>,
+    next_id: u32,
 }
 
 #[derive(Default)]
@@ -280,5 +287,121 @@ impl HerdrClient for FakeHerdr {
         }
         st.keys.push((name.to_string(), keys));
         Ok(Reply::ok(r#"{"result":{"sent":true}}"#))
+    }
+
+    fn pane_split(&self, target: &str, _dir: &str) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::PaneSplit);
+        let Some(tab) = st.panes.get(target).cloned() else {
+            return Ok(Reply::err("pane_not_found"));
+        };
+        st.next_id += 1;
+        let id = format!("p{}", st.next_id);
+        st.panes.insert(id.clone(), tab.clone());
+        Ok(Reply::ok(format!(
+            r#"{{"result":{{"pane":{{"pane_id":"{id}","tab_id":"{tab}"}}}}}}"#
+        )))
+    }
+
+    fn pane_close(&self, pane: &str) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::PaneClose);
+        if st.panes.remove(pane).is_none() {
+            return Ok(Reply::err("pane_not_found"));
+        }
+        // Closing a pane ends the agent in it.
+        st.agents.retain(|_, a| a.pane != pane);
+        Ok(Reply::ok(r#"{"result":{"closed":true}}"#))
+    }
+
+    fn pane_list(&self) -> io::Result<Reply> {
+        let st = enter!(self, Verb::PaneList);
+        let items: Vec<String> = st
+            .panes
+            .iter()
+            .map(|(id, tab)| {
+                let agent = st
+                    .agents
+                    .iter()
+                    .find(|(_, a)| &a.pane == id)
+                    .map(|(n, _)| n.clone());
+                serde_json::json!({
+                    "pane_id": id,
+                    "tab_id": tab,
+                    "tab_label": st.tabs.get(tab),
+                    "agent": agent,
+                })
+                .to_string()
+            })
+            .collect();
+        Ok(Reply::ok(format!(
+            r#"{{"result":{{"panes":[{}]}}}}"#,
+            items.join(",")
+        )))
+    }
+
+    fn tab_create(&self, name: &str) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::TabCreate);
+        st.next_id += 1;
+        let tab = format!("t{}", st.next_id);
+        st.next_id += 1;
+        let pane = format!("p{}", st.next_id);
+        st.tabs.insert(tab.clone(), name.to_string());
+        st.panes.insert(pane.clone(), tab.clone());
+        Ok(Reply::ok(format!(
+            r#"{{"result":{{"tab":{{"tab_id":"{tab}","label":{}}},"root_pane":{{"pane_id":"{pane}","tab_id":"{tab}"}}}}}}"#,
+            serde_json::json!(name)
+        )))
+    }
+
+    fn tab_close(&self, tab: &str) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::TabClose);
+        if st.tabs.remove(tab).is_none() {
+            return Ok(Reply::err("tab_not_found"));
+        }
+        let gone: Vec<String> = st
+            .panes
+            .iter()
+            .filter(|(_, t)| t.as_str() == tab)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in &gone {
+            st.panes.remove(p);
+        }
+        st.agents.retain(|_, a| !gone.contains(&a.pane));
+        Ok(Reply::ok(r#"{"result":{"closed":true}}"#))
+    }
+
+    fn pane_get(&self, pane: &str) -> io::Result<Reply> {
+        let st = enter!(self, Verb::PaneGet);
+        let Some(tab) = st.panes.get(pane) else {
+            return Ok(Reply::err("pane_not_found"));
+        };
+        let (tokens, display) = st.meta.get(pane).cloned().unwrap_or_default();
+        Ok(Reply::ok(
+            serde_json::json!({"result":{"pane":{
+                "pane_id": pane, "tab_id": tab, "tokens": tokens, "display_agent": display,
+            }}})
+            .to_string(),
+        ))
+    }
+
+    fn pane_report_metadata(
+        &self,
+        pane: &str,
+        _source: &str,
+        tokens: &[(&str, &str)],
+        display: Option<&str>,
+    ) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::PaneReportMetadata);
+        if !st.panes.contains_key(pane) {
+            return Ok(Reply::err("pane_not_found"));
+        }
+        let m = st.meta.entry(pane.to_string()).or_default();
+        for (k, v) in tokens {
+            m.0.insert((*k).into(), (*v).into());
+        }
+        if let Some(d) = display {
+            m.1 = Some(d.into());
+        }
+        Ok(Reply::ok(r#"{"result":{"reported":true}}"#))
     }
 }
