@@ -67,6 +67,8 @@ pub enum SpawnError {
     Herdr(String),
     Io(std::io::Error),
     Db(rusqlite::Error),
+    /// An open agent of that name exists with a different role, kind or project.
+    Conflict(String),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -77,6 +79,7 @@ impl std::fmt::Display for SpawnError {
             SpawnError::Herdr(e) => write!(f, "herdr refused the start: {e}"),
             SpawnError::Io(e) => write!(f, "herdr could not be run: {e}"),
             SpawnError::Db(e) => write!(f, "database: {e}"),
+            SpawnError::Conflict(m) => write!(f, "{m}"),
         }
     }
 }
@@ -94,6 +97,26 @@ pub fn spawn(
     let driver = drivers
         .get(&target.harness.name)
         .ok_or_else(|| SpawnError::NoDriver(target.harness.name.clone()))?;
+    type Open = (i64, String, Option<String>, Option<i64>);
+    let open: Option<Open> = conn
+        .query_row(
+            "SELECT id, role, kind, project_id FROM agent WHERE name = ?1 AND ended_ms IS NULL",
+            [spec.name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(SpawnError::Db)?;
+    if let Some((_, role, kind, project)) = &open {
+        if (role.as_str(), kind.as_deref(), *project)
+            != (spec.role.as_str(), Some(spec.kind), spec.project_id)
+        {
+            return Err(SpawnError::Conflict(format!(
+                "agent '{}' is already open as {role}/{}/project {project:?}",
+                spec.name,
+                kind.as_deref().unwrap_or("-")
+            )));
+        }
+    }
     let args = driver.launch_args(&target.model, target.effort.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let reply = herdr
@@ -108,16 +131,8 @@ pub fn spawn(
     if !reply.ok {
         return Err(SpawnError::Herdr(reply.error_code().unwrap_or(reply.body)));
     }
-    let open: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM agent WHERE name = ?1 AND ended_ms IS NULL",
-            [spec.name],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(SpawnError::Db)?;
     let agent_id = match open {
-        Some(id) => id,
+        Some((id, ..)) => id,
         None => {
             conn.execute(
                 "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms) \

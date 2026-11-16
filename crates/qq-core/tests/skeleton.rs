@@ -11,7 +11,7 @@ use qq_core::driver::Registry;
 use qq_core::herdr::FakeHerdr;
 use qq_core::rpc::{self, Request};
 use qq_core::run;
-use qq_core::task::spawn::{spawn, Role, SpawnSpec};
+use qq_core::task::spawn::{spawn, Role, SpawnError, SpawnSpec};
 use qq_core::task::worker_flow::{self, Deps};
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
@@ -83,17 +83,28 @@ fn journal_rows(conn: &Connection, id: &str) -> i64 {
     .unwrap()
 }
 
+fn start_args(name: &str, timeout_ms: u64) -> Value {
+    json!({
+        "name": name, "kind": "ni", "role": "peer", "pane": "p1",
+        "prompt": "do the thing", "report": format!("{name}.md"),
+        "timeout_ms": timeout_ms, "base": "main",
+        "project_id": 1, "task_id": 1,
+    })
+}
+
 fn start_task(ws: &TestWorkspace, name: &str, timeout_ms: u64) -> Value {
-    rpc_ok(
-        ws,
-        "task.start",
-        json!({
-            "name": name, "kind": "ni", "role": "peer", "pane": "p1",
-            "prompt": "do the thing", "report": format!("{name}.md"),
-            "timeout_ms": timeout_ms, "base": "main",
-            "project_id": 1, "task_id": 1,
-        }),
+    rpc_ok(ws, "task.start", start_args(name, timeout_ms))
+}
+
+/// The error code `task.start` refuses with.
+fn refused(ws: &TestWorkspace, args: Value) -> String {
+    let r = rpc::call(
+        &rpc::socket_path(&ws.runs_dir()),
+        &Request::new("task.start", args),
     )
+    .expect("rpc transport");
+    assert!(!r.ok, "task.start must refuse");
+    r.error.unwrap().code
 }
 
 #[test]
@@ -256,4 +267,110 @@ fn lead_and_peer_share_spawn_path() {
     // A repeat converges on the same agent row.
     let again = go("peer-a", Role::Peer, "pane-2");
     assert_eq!(again.agent_id, peer.agent_id);
+}
+
+#[test]
+fn task_start_refuses_a_stale_report() {
+    let ws = TestWorkspace::new("skeleton-stale");
+    let (conn, _) = seeded(&ws);
+    let herdr = Arc::new(FakeHerdr::new());
+    let daemon = start_daemon(&ws, herdr.clone());
+    std::fs::write(
+        ws.runs_dir().join("old.md"),
+        format!("Outcome: COMPLETE\nVerified: unit-test-verified {SHA}\n"),
+    )
+    .unwrap();
+    assert_eq!(refused(&ws, start_args("old", 60_000)), "report_exists");
+    // Nothing was spawned, recorded or prompted.
+    assert!(herdr.prompts().is_empty());
+    assert!(herdr.start_args("old").is_empty());
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM run", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn task_start_refuses_a_reused_name_with_another_task() {
+    let ws = TestWorkspace::new("skeleton-conflict");
+    let (conn, _) = seeded(&ws);
+    let herdr = Arc::new(FakeHerdr::new());
+    let daemon = start_daemon(&ws, herdr.clone());
+    start_task(&ws, "w5", 60_000);
+    wait_for("the prompt", || !herdr.prompts().is_empty());
+
+    // Same input stays idempotent; a changed prompt, report or kind conflicts.
+    start_task(&ws, "w5", 60_000);
+    for (key, val) in [
+        ("prompt", "other"),
+        ("report", "other.md"),
+        ("kind", "sude"),
+    ] {
+        let mut args = start_args("w5", 60_000);
+        args[key] = json!(val);
+        assert_eq!(refused(&ws, args), "conflict", "{key}");
+    }
+
+    // Also once the first task has ended: no silent `finished`.
+    std::fs::write(ws.runs_dir().join("w5.md"), "Outcome: NO_CHANGES\n").unwrap();
+    wait_for("the run to close", || {
+        run::by_workflow(&conn, "worker:w5")
+            .unwrap()
+            .is_some_and(|r| r.ended_ms.is_some())
+    });
+    let mut args = start_args("w5", 60_000);
+    args["prompt"] = json!("other");
+    assert_eq!(refused(&ws, args), "conflict");
+
+    // A finished repeat restores a run row lost in a crash window.
+    conn.execute("DELETE FROM run_artifact", []).unwrap();
+    conn.execute("DELETE FROM run", []).unwrap();
+    assert_eq!(start_task(&ws, "w5", 60_000)["finished"], true);
+    let r = run::by_workflow(&conn, "worker:w5").unwrap().unwrap();
+    assert_eq!(r.outcome.as_deref(), Some("no_changes"));
+    assert!(r.ended_ms.is_some());
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn spawn_refuses_an_open_agent_with_another_role_kind_or_project() {
+    let ws = TestWorkspace::new("skeleton-spawn-conflict");
+    let (conn, _) = seeded(&ws);
+    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('q', 1)", [])
+        .unwrap();
+    let herdr = FakeHerdr::new();
+    let drivers = Registry::native();
+    let go = |role: Role, kind: &str, project: i64| {
+        spawn(
+            &conn,
+            &herdr,
+            &drivers,
+            &SpawnSpec {
+                name: "dup",
+                kind,
+                role,
+                pane: "pane-1",
+                project_id: Some(project),
+                spawner_id: None,
+            },
+            1,
+        )
+    };
+    let first = go(Role::Peer, "ni", 1).expect("first spawn");
+    assert_eq!(go(Role::Peer, "ni", 1).unwrap().agent_id, first.agent_id);
+    for (role, kind, project) in [
+        (Role::Lead, "ni", 1),
+        (Role::Peer, "suhuynh", 1),
+        (Role::Peer, "ni", 2),
+    ] {
+        assert!(
+            matches!(go(role, kind, project), Err(SpawnError::Conflict(_))),
+            "{role:?} {kind} {project}"
+        );
+    }
+    let agents: i64 = conn
+        .query_row("SELECT count(*) FROM agent", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(agents, 1);
 }

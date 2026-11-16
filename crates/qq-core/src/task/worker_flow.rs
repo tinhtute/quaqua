@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::spawn::{spawn, Role, SpawnSpec};
+use super::spawn::{spawn, Role, SpawnError, SpawnSpec};
 use crate::cli::{Install, Registry as CliRegistry};
 use crate::daemon::supervisor::{Factory, Machine, Progress, WorkflowDriver};
 use crate::daemon::{Daemon, Handler};
@@ -58,6 +58,7 @@ fn outcome_of(code: i32) -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInput {
     pub name: String,
+    pub kind: String,
     pub prompt: String,
     /// Absolute path of the report the worker publishes.
     pub report: String,
@@ -111,33 +112,45 @@ fn field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// Verified = a recognised `Outcome:` and, for COMPLETE, a candidate sha taken
-/// from the `Verified:` line, else the `Snapshot:` line. The sha is what the
-/// worker claims; no git runs here.
+/// Levels of a `Verified: <level> <sha>` line that count as a pass. Any other
+/// level (verifier-failed, verifier-blocked, inconclusive, unknown) does not.
+const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
+
+/// `verified` = `Outcome: COMPLETE` plus a `Verified:` line with a passing
+/// level and a sha: the worker reported a passing level, nothing more. The sha
+/// is the worker's claim; no git runs here. `Outcome: no changes` counts as
+/// NO_CHANGES.
 fn judge(report: &str) -> Result<WorkerOutput, (i32, String)> {
-    let word = field(report, "Outcome:")
-        .and_then(|v| v.split_whitespace().next())
-        .unwrap_or("");
-    match word {
-        "NO_CHANGES" => Ok(WorkerOutput {
+    let value = field(report, "Outcome:").unwrap_or("");
+    let whole = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_uppercase();
+    let word = value.split_whitespace().next().unwrap_or("");
+    if whole == "NO_CHANGES" {
+        return Ok(WorkerOutput {
             outcome: "no_changes".into(),
             candidate_sha: None,
-        }),
+        });
+    }
+    match word {
         "COMPLETE" => {
-            let sha = field(report, "Verified:")
-                .and_then(|v| v.split_whitespace().nth(1))
-                .filter(|s| is_sha(s))
-                .or_else(|| {
-                    field(report, "Snapshot:")
-                        .and_then(|v| v.split_whitespace().find(|s| is_sha(s)))
-                });
-            match sha {
-                Some(s) => Ok(WorkerOutput {
-                    outcome: "verified".into(),
-                    candidate_sha: Some(s.to_string()),
-                }),
-                None => Err((UNVERIFIED, "COMPLETE report names no candidate sha".into())),
+            let mut parts = field(report, "Verified:").unwrap_or("").split_whitespace();
+            let (level, sha) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            if !PASSING_LEVELS.contains(&level) {
+                return Err((
+                    UNVERIFIED,
+                    format!("no passing Verified level (got '{level}')"),
+                ));
             }
+            if !is_sha(sha) {
+                return Err((UNVERIFIED, "COMPLETE report names no candidate sha".into()));
+            }
+            Ok(WorkerOutput {
+                outcome: "verified".into(),
+                candidate_sha: Some(sha.to_string()),
+            })
         }
         "BLOCKED" | "DISPUTED" | "REOPEN_REQUEST" | "DEPENDENCY_REQUEST" => {
             Err((REPORTED_BLOCKED, format!("worker reported {word}")))
@@ -374,45 +387,79 @@ fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .ok_or_else(|| bad(format!("missing string argument '{key}'")))
 }
 
+/// The input `task.start` journaled for `id`, read from the replay base.
+fn journaled_input(
+    store: &crate::daemon::store::Store,
+    id: &str,
+) -> Result<Option<WorkerInput>, String> {
+    let snap = store
+        .journal()
+        .load_latest_snapshot(id)
+        .map_err(|e| e.to_string())?;
+    Ok(snap
+        .and_then(|s| serde_json::from_str::<Value>(&s.state_json).ok())
+        .and_then(|v| v.get("input").cloned())
+        .and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Makes sure the run of `id` exists (agent looked up by name) and is closed
+/// when the workflow already ended. Both steps repeat safely.
+fn settle_run(
+    conn: &mut rusqlite::Connection,
+    journal: &dyn Journal,
+    db_path: &Path,
+    id: &str,
+    input: &WorkerInput,
+    base: Option<&str>,
+    task_id: Option<i64>,
+) -> Result<(), String> {
+    let agent_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM agent WHERE name = ?1 ORDER BY id DESC LIMIT 1",
+            [&input.name],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(agent_id) = agent_id {
+        let t = crate::config::resolve_spawn(conn, &input.kind).map_err(|e| format!("{e:?}"))?;
+        crate::run::open(
+            conn,
+            &crate::run::NewRun {
+                workflow_id: id,
+                agent_id,
+                task_id,
+                kind: &input.kind,
+                harness: &t.harness.name,
+                model: &t.model,
+                effort: t.effort.as_deref(),
+                base,
+                now_ms: now_ms(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    record_end(journal, db_path, id)
+}
+
 /// `task.start {name, kind, role, pane, prompt, report, [timeout_ms, base,
 /// project_id, task_id]}`: runs one task on one agent. The workflow id is
-/// `worker:<name>`.
+/// `worker:<name>`. A repeat with the same input converges; a different input
+/// for an existing id is a `conflict`; a new task whose report path already
+/// holds a file is refused (`report_exists`), so an old report cannot verify it.
 fn start_verb(deps: Arc<Deps>) -> Handler {
     Box::new(move |ctx, req| {
         let a = &req.args;
         let name = text(a, "name")?;
+        let kind = text(a, "kind")?;
         let role = Role::parse(text(a, "role")?).ok_or_else(|| bad("role must be lead or peer"))?;
         let id = format!("worker:{name}");
-        if ctx
-            .store
-            .workflow(&id)
-            .map_err(internal)?
-            .is_some_and(|w| w.finished_ms.is_some())
-        {
-            return Ok(json!({ "workflow": id, "finished": true }));
-        }
         let project_id = a.get("project_id").and_then(Value::as_i64);
         let task_id = a.get("task_id").and_then(Value::as_i64);
-        let db_path = deps.runs_dir.join(crate::db::path::DB_FILE);
-        let mut conn = crate::db::open(&db_path).map_err(internal)?;
-        let spawned = spawn(
-            &conn,
-            deps.herdr.as_ref(),
-            &deps.drivers,
-            &SpawnSpec {
-                name,
-                kind: text(a, "kind")?,
-                role,
-                pane: text(a, "pane")?,
-                project_id,
-                spawner_id: None,
-            },
-            now_ms(),
-        )
-        .map_err(|e| RpcError::new("spawn_failed", e.to_string()))?;
+        let base = a.get("base").and_then(Value::as_str);
         let report = deps.runs_dir.join(text(a, "report")?);
         let input = WorkerInput {
             name: name.to_string(),
+            kind: kind.to_string(),
             prompt: text(a, "prompt")?.to_string(),
             report: report.to_string_lossy().into_owned(),
             timeout_ms: a
@@ -420,26 +467,77 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_TIMEOUT_MS),
         };
+        let db_path = deps.runs_dir.join(crate::db::path::DB_FILE);
+        let mut conn = crate::db::open(&db_path).map_err(internal)?;
+
+        let existing = ctx.store.workflow(&id).map_err(internal)?;
+        match &existing {
+            Some(w) => {
+                if let Some(old) = journaled_input(&ctx.store, &id).map_err(internal)? {
+                    if (&old.prompt, &old.report, &old.kind)
+                        != (&input.prompt, &input.report, &input.kind)
+                    {
+                        return Err(RpcError::new(
+                            "conflict",
+                            format!("{id} already runs a different task"),
+                        ));
+                    }
+                }
+                if w.finished_ms.is_some() {
+                    settle_run(
+                        &mut conn,
+                        &ctx.store.journal(),
+                        &db_path,
+                        &id,
+                        &input,
+                        base,
+                        task_id,
+                    )
+                    .map_err(internal)?;
+                    return Ok(json!({ "workflow": id, "finished": true }));
+                }
+            }
+            None if report.exists() => {
+                return Err(RpcError::new(
+                    "report_exists",
+                    format!("{} already exists; archive it first", report.display()),
+                ));
+            }
+            None => {}
+        }
+
+        let spawned = spawn(
+            &conn,
+            deps.herdr.as_ref(),
+            &deps.drivers,
+            &SpawnSpec {
+                name,
+                kind,
+                role,
+                pane: text(a, "pane")?,
+                project_id,
+                spawner_id: None,
+            },
+            now_ms(),
+        )
+        .map_err(|e| match e {
+            SpawnError::Conflict(m) => RpcError::new("conflict", m),
+            e => RpcError::new("spawn_failed", e.to_string()),
+        })?;
         ctx.supervisor
             .start(KIND, &id, &json!(input))
             .map_err(|e| RpcError::new("workflow_start_refused", e))?;
-        crate::run::open(
+        // Opens the run, and closes it when the flow already ended.
+        settle_run(
             &mut conn,
-            &crate::run::NewRun {
-                workflow_id: &id,
-                agent_id: spawned.agent_id,
-                task_id,
-                kind: text(a, "kind")?,
-                harness: &spawned.harness,
-                model: &spawned.model,
-                effort: spawned.effort.as_deref(),
-                base: a.get("base").and_then(Value::as_str),
-                now_ms: now_ms(),
-            },
+            &ctx.store.journal(),
+            &db_path,
+            &id,
+            &input,
+            base,
+            task_id,
         )
         .map_err(internal)?;
-        // A flow that ended before its run existed closes it now.
-        record_end(&ctx.store.journal(), &db_path, &id).map_err(internal)?;
         if ctx.supervisor.is_running(&id) {
             // Repeats are ignored by the flow once it is past `Armed`.
             let _ = ctx.supervisor.signal(&id, "task", "launched", Value::Null);
@@ -477,4 +575,70 @@ fn install(_cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
             drivers: Drivers::native(),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA: &str = "0123abc4567def890123abc4567def890123abcd";
+
+    fn complete(verified: &str) -> String {
+        format!("Outcome: COMPLETE\n{verified}\n\n## Blockers\nnone\n")
+    }
+
+    /// (outcome name, candidate sha) of a verdict; failures map through
+    /// `outcome_of`.
+    fn verdict(report: &str) -> (String, Option<String>) {
+        match judge(report) {
+            Ok(o) => (o.outcome, o.candidate_sha),
+            Err((code, _)) => (outcome_of(code).to_string(), None),
+        }
+    }
+
+    #[test]
+    fn judge_maps_every_end_state() {
+        let ok = |l: &str| complete(&format!("Verified: {l} {SHA}"));
+        let cases: Vec<(String, &str, Option<&str>)> = vec![
+            (ok("unit-test-verified"), "verified", Some(SHA)),
+            (ok("type-check-only"), "verified", Some(SHA)),
+            (ok("review-clean"), "verified", Some(SHA)),
+            (ok("verifier-failed"), "unverified", None),
+            (ok("verifier-blocked"), "unverified", None),
+            (ok("inconclusive"), "unverified", None),
+            (ok("made-up-level"), "unverified", None),
+            // no Verified line, a bad sha, or the level alone
+            (
+                complete(&format!("Snapshot: {SHA} on b")),
+                "unverified",
+                None,
+            ),
+            (
+                complete("Verified: unit-test-verified zzzz"),
+                "unverified",
+                None,
+            ),
+            (complete("Verified: unit-test-verified"), "unverified", None),
+            ("Outcome: NO_CHANGES\n".into(), "no_changes", None),
+            ("Outcome: no changes\n".into(), "no_changes", None),
+            ("Outcome:   No   Changes \n".into(), "no_changes", None),
+            ("Outcome: BLOCKED\n".into(), "reported_blocked", None),
+            ("Outcome: DISPUTED\n".into(), "reported_blocked", None),
+            ("Outcome: REOPEN_REQUEST\n".into(), "reported_blocked", None),
+            (
+                "Outcome: DEPENDENCY_REQUEST\n".into(),
+                "reported_blocked",
+                None,
+            ),
+            ("Outcome: DONE\n".into(), "unverified", None),
+            ("no outcome line\n".into(), "unverified", None),
+        ];
+        for (report, outcome, sha) in cases {
+            assert_eq!(
+                verdict(&report),
+                (outcome.to_string(), sha.map(String::from)),
+                "{report}"
+            );
+        }
+    }
 }
