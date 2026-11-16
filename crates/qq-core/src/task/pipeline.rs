@@ -33,6 +33,8 @@ pub const REJECTED: i32 = 1;
 
 /// Pause codes (the `blocked <code>:` of the pause reason).
 pub const BLOCK_UNFINISHED: i32 = 5;
+/// The plan is written and waits for the Lead's `pipeline --resume` (legacy exit 5).
+pub const BLOCK_PLAN_READY: i32 = 5;
 pub const BLOCK_BAD_REVIEW: i32 = 6;
 pub const BLOCK_BAD_SHA: i32 = 7;
 pub const BLOCK_SHA_MOVED: i32 = 8;
@@ -70,6 +72,10 @@ pub struct PipelineInput {
     /// The check the merge queue runs after the merge; none merges unchecked.
     #[serde(default)]
     pub check: Option<String>,
+    /// The builder writes a plan first and the flow pauses (`plan-ready`)
+    /// until the Lead resumes it; off, the flow builds straight away.
+    #[serde(default)]
+    pub plan: bool,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
     #[serde(default = "default_timeout")]
@@ -99,6 +105,7 @@ impl PipelineInput {
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Armed,
+    Plan,
     Build,
     SpawnReview,
     Review,
@@ -113,6 +120,8 @@ pub enum Stage {
 pub enum BlockKind {
     /// Approval re-runs the stage that blocked.
     Restart,
+    /// The plan is accepted; approval starts the build.
+    Plan,
     /// Approval grants one more round.
     RoundsExhausted,
     /// The tip moved after review; approval re-reviews the new tip.
@@ -161,6 +170,9 @@ pub struct PipelineState {
     pub review_path: String,
     pub findings: u32,
     pub blocked: Option<Blocked>,
+    /// The plan report the Lead approved; the build follows it.
+    #[serde(default)]
+    pub plan_report: Option<String>,
 }
 
 impl PipelineState {
@@ -184,6 +196,7 @@ impl PipelineState {
             review_path: String::new(),
             findings: 0,
             blocked: None,
+            plan_report: None,
         }
     }
 }
@@ -252,11 +265,29 @@ fn enter_prompt(s: &mut PipelineState, stage: Stage, to: String, text: String) -
     )
 }
 
+fn enter_plan(s: &mut PipelineState) -> Decision {
+    let report = next_report(s, "plan");
+    let i = &s.input;
+    let text = format!(
+        "{}\n\nPipeline phase: PLAN. Write no code and make no commit. Write your plan to {report} \
+         and stop; the Lead approves it before the build. A wrong premise is disputed under \
+         '## Challenge' with evidence.",
+        i.brief
+    );
+    let to = i.builder();
+    enter_prompt(s, Stage::Plan, to, text)
+}
+
 fn enter_build(s: &mut PipelineState) -> Decision {
     let report = next_report(s, "build");
     let i = &s.input;
+    let plan = s
+        .plan_report
+        .as_deref()
+        .map(|p| format!(" Follow the approved plan in {p}."))
+        .unwrap_or_default();
     let text = format!(
-        "{}\n\nPipeline phase: BUILD. Commit on branch {} (repo {}). Write your report to {report}. \
+        "{}\n\nPipeline phase: BUILD.{plan} Commit on branch {} (repo {}). Write your report to {report}. \
          End it with `Verified: <level> <full 40-hex sha of your last commit>`. A wrong premise is \
          disputed under '## Challenge' with evidence; a task already satisfied says 'Outcome: NO_CHANGES'.",
         i.brief, i.branch, i.repo
@@ -340,7 +371,10 @@ fn same_file(a: &str, b: &str) -> bool {
 }
 
 fn read_if_ready(s: &mut PipelineState) -> Decision {
-    let waiting = matches!(s.stage, Stage::Build | Stage::Review | Stage::Fix);
+    let waiting = matches!(
+        s.stage,
+        Stage::Plan | Stage::Build | Stage::Review | Stage::Fix
+    );
     if waiting && s.prompted && s.report_seen && !s.reading {
         s.reading = true;
         let path = s.report.clone();
@@ -359,6 +393,7 @@ fn resume(s: &mut PipelineState) -> Decision {
     };
     match b.kind {
         BlockKind::Restart => match b.from {
+            Stage::Plan => enter_plan(s),
             Stage::Build => enter_build(s),
             Stage::Fix => enter_fix(s),
             Stage::Review => begin_review(s),
@@ -368,6 +403,7 @@ fn resume(s: &mut PipelineState) -> Decision {
             }
             _ => enter_gate(s),
         },
+        BlockKind::Plan => enter_build(s),
         BlockKind::RoundsExhausted => {
             s.input.max_rounds = s.input.max_rounds.max(s.round + 1);
             enter_fix(s)
@@ -380,6 +416,17 @@ fn resume(s: &mut PipelineState) -> Decision {
         }
         BlockKind::Hold => done("held", s, None),
     }
+}
+
+/// Leaves a pause: the deadline fired into the pause and was dropped, so a
+/// resumed flow gets a fresh one.
+fn reopen(s: &mut PipelineState, ctx: &mut WorkflowContext) -> Decision {
+    s.deadline_gen += 1;
+    ctx.schedule_timer(
+        format!("deadline-{}", s.deadline_gen),
+        Duration::from_millis(s.input.timeout_ms),
+    );
+    resume(s)
 }
 
 /// `"<branch tip> <integration tip>"` as the CurrentSha activity returns it.
@@ -417,10 +464,18 @@ impl PipelineFlow {
                 }
             };
         }
-        // Build or Fix report.
         if let Some(why) = unfinished(content) {
             return block(s, from, BlockKind::Restart, BLOCK_UNFINISHED, why);
         }
+        if s.stage == Stage::Plan {
+            let why = format!(
+                "plan-ready: approve {} then resume: quaqua pipeline --resume {}",
+                s.report, s.input.task
+            );
+            s.plan_report = Some(s.report.clone());
+            return block(s, from, BlockKind::Plan, BLOCK_PLAN_READY, why);
+        }
+        // Build or Fix report.
         if s.stage == Stage::Build && outcome_is_no_changes(content) {
             return done("no_changes", s, None);
         }
@@ -472,7 +527,25 @@ impl Workflow for PipelineFlow {
                 name,
                 payload,
             }) => match (source.as_str(), name.as_str()) {
-                ("pipeline", "start") if s.stage == Stage::Armed => enter_build(s),
+                ("pipeline", "start") if s.stage == Stage::Armed => {
+                    if s.input.plan {
+                        enter_plan(s)
+                    } else {
+                        enter_build(s)
+                    }
+                }
+                // `pipeline --resume`: the approval of a paused flow, with the
+                // command line's round cap when given (it wins over the brief).
+                ("pipeline", "resume") => {
+                    if let Some(n) = payload.get("rounds").and_then(Value::as_u64) {
+                        s.input.max_rounds = n.clamp(1, u32::MAX as u64) as u32;
+                    }
+                    if s.stage == Stage::Blocked {
+                        reopen(s, ctx)
+                    } else {
+                        StepDecision::Continue
+                    }
+                }
                 ("pipeline", "cancel") => done("cancelled", s, None),
                 ("report", "appeared") => {
                     let path = payload.get("path").and_then(Value::as_str).unwrap_or("");
@@ -494,14 +567,7 @@ impl Workflow for PipelineFlow {
                         reason: reason.unwrap_or_else(|| "blocked gate aborted".into()),
                     };
                 }
-                // The deadline fired into the pause and was dropped: a resumed
-                // flow gets a fresh one.
-                s.deadline_gen += 1;
-                ctx.schedule_timer(
-                    format!("deadline-{}", s.deadline_gen),
-                    Duration::from_millis(s.input.timeout_ms),
-                );
-                resume(s)
+                reopen(s, ctx)
             }
             Some(WorkflowEvent::TimerFired { id }) if id.starts_with("deadline-") => {
                 if s.stage == Stage::Blocked || id != format!("deadline-{}", s.deadline_gen) {
