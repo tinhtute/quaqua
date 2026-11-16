@@ -541,3 +541,33 @@ fn forward(env: &crate::cli::Env, verb: &str, args: &[String]) -> Result<String,
         serde_json::from_str(raw).map_err(|e| CliError::new(1, format!("bad json: {e}")))?;
     crate::cli::rpc_call(env, verb, v).map(|r| serde_json::to_string_pretty(&r).unwrap_or_default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rounds_on_the_command_line_wins_over_the_json_on_start() {
+        let v =
+            pipeline_args(&args(&[r#"{"task":"t1","max_rounds":9}"#, "--rounds", "3"])).unwrap();
+        assert_eq!(v["max_rounds"], json!(3));
+        let v = pipeline_args(&args(&["--rounds=4", r#"{"task":"t1"}"#])).unwrap();
+        assert_eq!(v["max_rounds"], json!(4));
+        let v = pipeline_args(&args(&[r#"{"task":"t1","max_rounds":9}"#])).unwrap();
+        assert_eq!(v["max_rounds"], json!(9), "no flag leaves the JSON alone");
+    }
+
+    #[test]
+    fn resume_carries_the_cap_and_ignores_the_legacy_repo() {
+        let v = pipeline_args(&args(&["--resume", "t1", "/repo", "--rounds", "2"])).unwrap();
+        assert_eq!(v, json!({ "resume": "t1", "rounds": 2 }));
+        assert_eq!(
+            pipeline_args(&args(&["--resume", "t1"])).unwrap(),
+            json!({ "resume": "t1" })
+        );
+    }
+}

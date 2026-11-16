@@ -11,6 +11,7 @@ use qq_core::daemon::{Config, Daemon, DaemonHandle};
 use qq_core::db;
 use qq_core::grid;
 use qq_core::herdr::FakeHerdr;
+use qq_core::task::cleanup;
 use qq_core::testkit::TestWorkspace;
 
 /// Three ended agents, one pane each: `wa` and `wb` in `repo-workers`, `wc` in
@@ -61,6 +62,7 @@ impl World {
             herdr: herdr.clone(),
         });
         let mut reg = CliRegistry::new();
+        cleanup::register(&mut d).expect("worker verbs");
         (grid::INSTALL)(&mut reg, &mut d).expect("install grid");
         let env = Env {
             runs_dir: ws.runs_dir(),

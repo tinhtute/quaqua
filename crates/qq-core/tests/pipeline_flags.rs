@@ -305,7 +305,9 @@ fn a_planning_pipeline_pauses_plan_ready_and_builds_only_after_resume() {
     assert!(all[1].contains("BUILD"), "{}", all[1]);
     assert!(r.blocked().is_none() || r.blocked().unwrap().0 != 5);
 
-    // a resume of a flow that is not paused is a no-op
+    assert!(all[1].contains("Follow the approved plan"), "{}", all[1]);
+
+    // a resume of a flow that is not paused starts nothing
     r.signal("pipeline", "resume", Value::Null);
     assert_eq!(r.sim.builder_prompts().len(), 2);
 }

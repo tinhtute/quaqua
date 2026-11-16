@@ -170,6 +170,9 @@ pub struct PipelineState {
     pub review_path: String,
     pub findings: u32,
     pub blocked: Option<Blocked>,
+    /// The plan report the Lead approved; the build follows it.
+    #[serde(default)]
+    pub plan_report: Option<String>,
 }
 
 impl PipelineState {
@@ -193,6 +196,7 @@ impl PipelineState {
             review_path: String::new(),
             findings: 0,
             blocked: None,
+            plan_report: None,
         }
     }
 }
@@ -277,8 +281,13 @@ fn enter_plan(s: &mut PipelineState) -> Decision {
 fn enter_build(s: &mut PipelineState) -> Decision {
     let report = next_report(s, "build");
     let i = &s.input;
+    let plan = s
+        .plan_report
+        .as_deref()
+        .map(|p| format!(" Follow the approved plan in {p}."))
+        .unwrap_or_default();
     let text = format!(
-        "{}\n\nPipeline phase: BUILD. Commit on branch {} (repo {}). Write your report to {report}. \
+        "{}\n\nPipeline phase: BUILD.{plan} Commit on branch {} (repo {}). Write your report to {report}. \
          End it with `Verified: <level> <full 40-hex sha of your last commit>`. A wrong premise is \
          disputed under '## Challenge' with evidence; a task already satisfied says 'Outcome: NO_CHANGES'.",
         i.brief, i.branch, i.repo
@@ -463,6 +472,7 @@ impl PipelineFlow {
                 "plan-ready: approve {} then resume: quaqua pipeline --resume {}",
                 s.report, s.input.task
             );
+            s.plan_report = Some(s.report.clone());
             return block(s, from, BlockKind::Plan, BLOCK_PLAN_READY, why);
         }
         // Build or Fix report.
@@ -526,11 +536,15 @@ impl Workflow for PipelineFlow {
                 }
                 // `pipeline --resume`: the approval of a paused flow, with the
                 // command line's round cap when given (it wins over the brief).
-                ("pipeline", "resume") if s.stage == Stage::Blocked => {
+                ("pipeline", "resume") => {
                     if let Some(n) = payload.get("rounds").and_then(Value::as_u64) {
                         s.input.max_rounds = n.clamp(1, u32::MAX as u64) as u32;
                     }
-                    reopen(s, ctx)
+                    if s.stage == Stage::Blocked {
+                        reopen(s, ctx)
+                    } else {
+                        StepDecision::Continue
+                    }
                 }
                 ("pipeline", "cancel") => done("cancelled", s, None),
                 ("report", "appeared") => {
