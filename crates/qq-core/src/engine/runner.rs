@@ -2419,6 +2419,68 @@ mod tests {
         assert_eq!(fresh_clock.now_ms(), 1000 + 500 * 1000);
     }
 
+    /// Resuming a blocked workflow that received nothing new changes nothing:
+    /// it blocks again, on the same single snapshot, instead of erroring on a
+    /// second snapshot at the seq the first already claimed.
+    #[test]
+    fn test_resume_with_no_new_event_is_idempotent_on_sqlite() {
+        use crate::engine::journal_sqlite::SqliteJournal;
+
+        let path = std::env::temp_dir().join(format!(
+            "quaqua-resume-idem-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut journal = SqliteJournal::open(&path).expect("open journal");
+        let workflow = ApprovalCountWorkflow;
+        let mut activities = MockActivityRegistry::new();
+        let mut clock = VirtualClock::new(1000);
+
+        let first = run_until_blocked(
+            &workflow,
+            "idem_wf",
+            Some(ApprovalCountState::default()),
+            &mut journal,
+            &mut activities,
+            &mut clock,
+            &RunnerOptions::default(),
+            Vec::new(),
+        )
+        .expect("first run blocks");
+        assert!(matches!(first, RunnerOutcome::Blocked(_)));
+        let snap_before = journal
+            .load_latest_snapshot("idem_wf")
+            .expect("load snapshot")
+            .expect("snapshot at blocked");
+
+        for _ in 0..2 {
+            let again = resume(
+                &workflow,
+                "idem_wf",
+                &mut journal,
+                &mut activities,
+                &mut VirtualClock::new(1000),
+                Vec::new(),
+            )
+            .expect("resume with nothing new must not error");
+            assert!(matches!(again, RunnerOutcome::Blocked(_)));
+        }
+
+        let snap_after = journal
+            .load_latest_snapshot("idem_wf")
+            .expect("load snapshot")
+            .expect("snapshot still there");
+        assert_eq!(snap_after, snap_before);
+
+        drop(journal);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Test Workflow 8: Pending Timers Across Mid-run Snapshot (Findings 2 & 5)
     // ------------------------------------------------------------------------
