@@ -537,6 +537,7 @@ fn serve_conn(
     };
     // Read once: the peer of a connected socket never changes.
     let cred = peers.map(|_| peer::peer_cred(&stream));
+    let own_uid = peer::own_uid();
     let mut reader = BufReader::new(stream);
     while let Ok(Some(line)) = rpc::read_line(&mut reader) {
         if line.trim().is_empty() {
@@ -544,7 +545,7 @@ fn serve_conn(
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             Err(e) => Response::err(RpcError::new(rpc::BAD_REQUEST, e.to_string())),
-            Ok(req) => match identify(req, peers, cred.as_ref()) {
+            Ok(req) => match identify(req, peers, cred.as_ref(), own_uid) {
                 Err(e) => Response::err(e),
                 Ok(req) => match verbs.get(&req.verb) {
                     None => Response::err(RpcError::new(
@@ -565,11 +566,14 @@ fn serve_conn(
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
-/// client's claim is dropped); an unreadable or unmapped peer is refused.
+/// client's claim is dropped). A peer of another uid is refused outright. An
+/// unmapped peer of the daemon's uid is refused unless the verb is
+/// [`peer::Need::SameUid`], which then runs with no caller.
 fn identify(
     mut req: Request,
     peers: Option<&dyn PeerResolver>,
     cred: Option<&io::Result<peer::PeerCred>>,
+    own_uid: u32,
 ) -> Result<Request, RpcError> {
     let (Some(peers), Some(cred)) = (peers, cred) else {
         return Ok(req);
@@ -580,6 +584,46 @@ fn identify(
             format!("caller not identified: socket peer unreadable: {e}"),
         )
     })?;
-    req.caller = Some(peers.resolve(*cred)?.0);
+    if cred.uid != own_uid {
+        return Err(RpcError::new(
+            peer::FOREIGN_UID,
+            format!("peer uid {} is not the daemon's uid {own_uid}", cred.uid),
+        ));
+    }
+    req.caller = match peers.resolve(*cred) {
+        Ok(c) => Some(c.0),
+        Err(_) if peer::need(&req.verb) == peer::Need::SameUid => None,
+        Err(e) => return Err(e),
+    };
     Ok(req)
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+    use crate::identity::peer::{CallerId, PeerCred};
+
+    struct Fixed(Result<&'static str, ()>);
+    impl PeerResolver for Fixed {
+        fn resolve(&self, _: peer::PeerCred) -> Result<CallerId, RpcError> {
+            self.0
+                .map(|n| CallerId(n.into()))
+                .map_err(|()| RpcError::new(peer::UNMAPPED_PEER, "no pane"))
+        }
+    }
+
+    fn run(verb: &str, who: Result<&'static str, ()>, uid: u32) -> Result<Request, RpcError> {
+        let mut req = Request::new(verb, Value::Null);
+        req.caller = Some("spoof".into());
+        let cred = Ok(PeerCred { pid: 1, uid });
+        identify(req, Some(&Fixed(who)), Some(&cred), 1000)
+    }
+
+    #[test]
+    fn other_uid_is_refused_for_every_verb_even_when_mapped() {
+        for v in ["ping", "stop", "mail.send"] {
+            let e = run(v, Ok("w-1"), 0).unwrap_err();
+            assert_eq!(e.code, peer::FOREIGN_UID, "{v}");
+        }
+    }
 }
