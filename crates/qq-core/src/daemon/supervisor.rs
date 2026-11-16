@@ -3,6 +3,7 @@
 //! due; it never wakes on a tick, so an idle workflow adds no journal rows.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -161,6 +162,8 @@ pub struct Supervisor {
     store: Arc<Store>,
     kinds: HashMap<String, Factory>,
     loops: Mutex<HashMap<String, Slot>>,
+    /// Set by `shutdown` under the `loops` lock: no loop starts after it.
+    closed: AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -173,6 +176,7 @@ impl Supervisor {
             store,
             kinds,
             loops: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -189,6 +193,9 @@ impl Supervisor {
             .ok_or_else(|| format!("unknown workflow kind '{kind}'"))?;
         // One lock from the check to the insert: two starts of one id cannot both pass.
         let mut loops = self.loops();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("daemon is shutting down".to_string());
+        }
         if loops.contains_key(id) {
             return Ok(false);
         }
@@ -197,9 +204,19 @@ impl Supervisor {
                 return Ok(false);
             }
         }
-        let driver = factory(id, Some(input))?;
+        let mut driver = factory(id, Some(input))?;
+        // The first advance writes the replay base. It comes before the row,
+        // so `recover` never meets a row that has no base to resume from.
+        let progress = driver.advance(&mut self.store.journal(), Vec::new())?;
         self.store.register_workflow(id, kind, now_ms())?;
-        self.spawn_loop(&mut loops, id, driver);
+        match progress {
+            Progress::Running => self.spawn_loop(&mut loops, id, driver),
+            Progress::Completed => self.store.finish_workflow(id, "completed", now_ms())?,
+            Progress::Failed(reason) => {
+                eprintln!("qq daemon: workflow {id} failed: {reason}");
+                self.store.finish_workflow(id, "failed", now_ms())?;
+            }
+        }
         Ok(true)
     }
 
@@ -250,7 +267,11 @@ impl Supervisor {
     /// Stops every loop and waits for it. Workflows stay unfinished in the
     /// database, so the next start resumes them.
     pub fn shutdown(&self) {
-        let slots: Vec<Slot> = self.loops().drain().map(|(_, s)| s).collect();
+        let slots: Vec<Slot> = {
+            let mut loops = self.loops();
+            self.closed.store(true, Ordering::SeqCst);
+            loops.drain().map(|(_, s)| s).collect()
+        };
         for s in &slots {
             let _ = s.tx.send(Msg::Stop);
         }

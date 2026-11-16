@@ -4,7 +4,8 @@
 //!
 //! Polling paths (none is journaled):
 //! * herdr: a blocking `agent wait` for any status other than the last seen,
-//!   re-armed after a timeout or error with a short backoff.
+//!   re-armed after a timeout; other errors back off, capped at [`BACKOFF_MAX`].
+//!   The watcher ends when the agent is gone or its workflow is not running.
 //! * report file: an existence check every [`REPORT_POLL`] until it appears.
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use crate::herdr::HerdrClient;
 pub const REPORT_POLL: Duration = Duration::from_millis(200);
 const WAIT_TIMEOUT_MS: u64 = 30_000;
 const BACKOFF: Duration = Duration::from_millis(100);
+const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const STATUSES: [&str; 4] = ["idle", "working", "blocked", "done"];
 
 fn agent_status(body: &str) -> Option<String> {
@@ -50,7 +52,8 @@ pub fn watch_agent(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last: Option<String> = None;
-        while !stop.load(Ordering::SeqCst) {
+        let mut delay = BACKOFF;
+        while !stop.load(Ordering::SeqCst) && sup.is_running(&workflow) {
             let reply = match &last {
                 None => herdr.agent_get(&agent),
                 Some(seen) => {
@@ -58,11 +61,29 @@ pub fn watch_agent(
                     herdr.agent_wait(&agent, &until, WAIT_TIMEOUT_MS)
                 }
             };
-            let status = reply
-                .ok()
-                .filter(|r| r.ok)
-                .and_then(|r| agent_status(&r.body));
-            match status {
+            let reply = match reply {
+                Ok(r) => r,
+                Err(_) => {
+                    nap(&stop, delay);
+                    delay = (delay * 2).min(BACKOFF_MAX);
+                    continue;
+                }
+            };
+            if !reply.ok {
+                match reply.error_code().as_deref() {
+                    // The agent no longer exists: nothing left to watch.
+                    Some("agent_not_found") => return,
+                    // A wait that ran out is the normal re-arm, not a fault.
+                    Some("timeout") => nap(&stop, BACKOFF),
+                    _ => {
+                        nap(&stop, delay);
+                        delay = (delay * 2).min(BACKOFF_MAX);
+                    }
+                }
+                continue;
+            }
+            delay = BACKOFF;
+            match agent_status(&reply.body) {
                 Some(s) if last.as_deref() != Some(&s) => {
                     let payload = json!({ "agent": agent, "status": s });
                     if sup.signal(&workflow, "herdr", "status", payload).is_err() {
@@ -85,7 +106,7 @@ pub fn watch_report(
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
+        while !stop.load(Ordering::SeqCst) && sup.is_running(&workflow) {
             if let Ok(meta) = std::fs::metadata(&path) {
                 let payload = json!({ "path": path, "bytes": meta.len() });
                 let _ = sup.signal(&workflow, "report", "appeared", payload);

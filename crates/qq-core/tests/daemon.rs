@@ -2,12 +2,16 @@
 //! Workflows are driven only by pushed Signals and real deadlines.
 
 use std::collections::BTreeSet;
+use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+use qq_core::daemon::store::Store;
+use qq_core::daemon::supervisor::Supervisor;
 use qq_core::daemon::supervisor::{Factory, Machine};
 use qq_core::daemon::{Config, Daemon, DaemonError, DaemonHandle};
 use qq_core::engine::journal::Journal;
@@ -16,7 +20,7 @@ use qq_core::engine::{
     Activity, ActivityError, ActivityRequest, ActivityResult, StepDecision, Workflow,
     WorkflowContext, WorkflowEvent,
 };
-use qq_core::herdr::{FakeHerdr, HerdrClient};
+use qq_core::herdr::{FakeHerdr, HerdrClient, Reply};
 use qq_core::rpc::{self, Request};
 use qq_core::testkit::TestWorkspace;
 use serde::{Deserialize, Serialize};
@@ -97,7 +101,7 @@ fn start_daemon(
         runs_dir: ws.runs_dir(),
         herdr,
     });
-    d.register_kind("collector", collector_factory());
+    d.register_kind("collector", collector_factory()).unwrap();
     d.register_verb(
         "whoami",
         Box::new(|_, req| Ok(json!({ "caller": req.caller }))),
@@ -406,4 +410,310 @@ fn acknowledged_signal_survives_immediate_stop() {
     // No wait: stop right behind the acknowledgements.
     daemon.stop().unwrap();
     assert_eq!(count(&journal_rows(&ws, "wf"), "signal"), 3);
+}
+
+/// `agent get` answers `working`; `agent wait` blocks until released, as the
+/// real binary does (herdr cannot cancel a wait).
+struct BlockingHerdr {
+    waiting: AtomicBool,
+    release: AtomicBool,
+}
+
+impl BlockingHerdr {
+    fn new() -> Self {
+        BlockingHerdr {
+            waiting: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        }
+    }
+}
+
+impl HerdrClient for BlockingHerdr {
+    fn agent_start(&self, _: &str, _: &str, _: &str, _: u32, _: &[&str]) -> io::Result<Reply> {
+        Ok(Reply::err("unsupported"))
+    }
+    fn agent_get(&self, _: &str) -> io::Result<Reply> {
+        Ok(Reply::ok(
+            r#"{"result":{"agent":{"agent_status":"working"}}}"#,
+        ))
+    }
+    fn agent_list(&self) -> io::Result<Reply> {
+        Ok(Reply::err("unsupported"))
+    }
+    fn agent_wait(&self, _: &str, _: &[&str], _: u64) -> io::Result<Reply> {
+        self.waiting.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Reply::err("timeout"))
+    }
+    fn agent_prompt(&self, _: &str, _: &str, _: Option<(&[&str], u64)>) -> io::Result<Reply> {
+        Ok(Reply::err("unsupported"))
+    }
+}
+
+/// A [`FakeHerdr`] that counts the status reads a watcher makes.
+struct CountingHerdr {
+    inner: FakeHerdr,
+    reads: AtomicUsize,
+}
+
+impl HerdrClient for CountingHerdr {
+    fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane: &str,
+        timeout_ms: u32,
+        args: &[&str],
+    ) -> io::Result<Reply> {
+        self.inner.agent_start(name, kind, pane, timeout_ms, args)
+    }
+    fn agent_get(&self, name: &str) -> io::Result<Reply> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.agent_get(name)
+    }
+    fn agent_list(&self) -> io::Result<Reply> {
+        self.inner.agent_list()
+    }
+    fn agent_wait(&self, name: &str, until: &[&str], timeout_ms: u64) -> io::Result<Reply> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.agent_wait(name, until, timeout_ms)
+    }
+    fn agent_prompt(
+        &self,
+        name: &str,
+        text: &str,
+        wait: Option<(&[&str], u64)>,
+    ) -> io::Result<Reply> {
+        self.inner.agent_prompt(name, text, wait)
+    }
+}
+
+#[test]
+fn stop_frees_the_socket_while_a_watcher_is_blocked() {
+    let ws = TestWorkspace::new("stopblock");
+    let herdr = Arc::new(BlockingHerdr::new());
+    let old = start_daemon(&ws, herdr.clone()).unwrap();
+    rpc_ok(
+        &ws,
+        "workflow.start",
+        json!({"kind": "collector", "id": "wf"}),
+    );
+    rpc_ok(&ws, "watch.agent", json!({"workflow": "wf", "agent": "a"}));
+    wait_for("watcher blocks in agent wait", || {
+        herdr.waiting.load(Ordering::SeqCst)
+    });
+
+    // Stop through the socket; the watcher stays blocked the whole time.
+    let sock = rpc::socket_path(&ws.runs_dir());
+    rpc_ok(&ws, "stop", Value::Null);
+    let t = Instant::now();
+    wait_for("socket removed", || !sock.exists());
+    let new = loop {
+        match start_daemon(&ws, Arc::new(FakeHerdr::new())) {
+            Ok(d) => break d,
+            // Only while the loops finish their last write.
+            Err(DaemonError::AlreadyRunning(_)) if t.elapsed() < Duration::from_secs(3) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(e) => panic!("restart refused: {e}"),
+        }
+    };
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "restart waited on the watcher"
+    );
+    assert!(
+        !herdr.release.load(Ordering::SeqCst),
+        "the watcher was still blocked"
+    );
+    assert_eq!(rpc_ok(&ws, "ping", Value::Null)["pong"], true);
+
+    new.stop().unwrap();
+    herdr.release.store(true, Ordering::SeqCst);
+    old.stop().unwrap();
+}
+
+#[test]
+fn missing_agent_leaves_no_live_watcher() {
+    let ws = TestWorkspace::new("ghost");
+    let herdr = Arc::new(CountingHerdr {
+        inner: FakeHerdr::new(),
+        reads: AtomicUsize::new(0),
+    });
+    let daemon = start_daemon(&ws, herdr.clone()).unwrap();
+    rpc_ok(
+        &ws,
+        "workflow.start",
+        json!({"kind": "collector", "id": "wf"}),
+    );
+    let watch = || {
+        rpc_ok(
+            &ws,
+            "watch.agent",
+            json!({"workflow": "wf", "agent": "late"}),
+        )
+    };
+    watch();
+    wait_for("first read", || herdr.reads.load(Ordering::SeqCst) >= 1);
+    // agent_not_found ends the watcher: no retry loop keeps reading.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(herdr.reads.load(Ordering::SeqCst), 1);
+
+    // The ended watcher is pruned, so the same watch starts afresh once the
+    // agent exists.
+    herdr
+        .inner
+        .agent_start("late", "claude", "pane-1", 1000, &[])
+        .unwrap();
+    watch();
+    wait_for("status signal", || {
+        count(&journal_rows(&ws, "wf"), "signal") == 1
+    });
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn watcher_ends_with_its_workflow() {
+    let ws = TestWorkspace::new("wfend");
+    let herdr = Arc::new(CountingHerdr {
+        inner: FakeHerdr::new(),
+        reads: AtomicUsize::new(0),
+    });
+    herdr
+        .inner
+        .agent_start("w", "claude", "pane-1", 1000, &[])
+        .unwrap();
+    let daemon = start_daemon(&ws, herdr.clone()).unwrap();
+    rpc_ok(
+        &ws,
+        "workflow.start",
+        json!({"kind": "collector", "id": "wf"}),
+    );
+    rpc_ok(&ws, "watch.agent", json!({"workflow": "wf", "agent": "w"}));
+    wait_for("first status", || {
+        count(&journal_rows(&ws, "wf"), "signal") == 1
+    });
+    rpc_ok(&ws, "signal", json!({"workflow": "wf", "name": "done"}));
+    wait_for("workflow completes", || {
+        workflow_state(&ws, "wf").as_deref() == Some("completed")
+    });
+    // The watcher notices on its next turn and stops reading herdr.
+    std::thread::sleep(Duration::from_millis(400));
+    let reads = herdr.reads.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(herdr.reads.load(Ordering::SeqCst), reads);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn concurrent_starts_leave_one_daemon() {
+    let ws = TestWorkspace::new("race");
+    for round in 0..5 {
+        let gate = Barrier::new(2);
+        let results: Vec<_> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        gate.wait();
+                        start_daemon(&ws, Arc::new(FakeHerdr::new()))
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (won, lost): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        assert_eq!(won.len(), 1, "round {round}: exactly one daemon runs");
+        assert!(matches!(
+            lost.into_iter().next().unwrap().err(),
+            Some(DaemonError::AlreadyRunning(_))
+        ));
+        assert_eq!(rpc_ok(&ws, "ping", Value::Null)["pong"], true);
+        won.into_iter().next().unwrap().unwrap().stop().unwrap();
+    }
+}
+
+#[test]
+fn started_workflow_has_its_base_before_the_ack() {
+    let ws = TestWorkspace::new("base");
+    let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).unwrap();
+    rpc_ok(
+        &ws,
+        "workflow.start",
+        json!({"kind": "collector", "id": "wf"}),
+    );
+    // The reply is out: the replay base is already in the journal.
+    let j = SqliteJournal::open(&ws.db_path()).unwrap();
+    assert!(j.load_latest_snapshot("wf").unwrap().is_some());
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn supervisor_refuses_starts_after_shutdown() {
+    let ws = TestWorkspace::new("closed");
+    let store = Arc::new(Store::open(&ws.db_path()).unwrap());
+    let kinds = [("collector".to_string(), collector_factory())].into();
+    let sup = Supervisor::new(store, kinds);
+    assert!(sup.start("collector", "a", &json!({})).unwrap());
+    sup.shutdown();
+    let err = sup.start("collector", "b", &json!({})).unwrap_err();
+    assert!(err.contains("shutting down"), "{err}");
+}
+
+#[test]
+fn registrations_refuse_duplicates() {
+    let ws = TestWorkspace::new("dups");
+    let mut d = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: Arc::new(FakeHerdr::new()),
+    });
+    d.register_kind("collector", collector_factory()).unwrap();
+    assert!(d.register_kind("collector", collector_factory()).is_err());
+    assert!(d
+        .register_verb("ping", Box::new(|_, _| Ok(Value::Null)))
+        .is_err());
+}
+
+#[test]
+fn watch_report_dedupes_on_the_normalized_path() {
+    let ws = TestWorkspace::new("norm");
+    let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).unwrap();
+    rpc_ok(
+        &ws,
+        "workflow.start",
+        json!({"kind": "collector", "id": "wf"}),
+    );
+    let abs = ws.runs_dir().join("r.md");
+    // Four spellings of one file: absolute, runs-relative, dotted, parent hop.
+    for p in [
+        abs.to_string_lossy().into_owned(),
+        "r.md".to_string(),
+        "./r.md".to_string(),
+        "sub/../r.md".to_string(),
+    ] {
+        rpc_ok(&ws, "watch.report", json!({"workflow": "wf", "path": p}));
+    }
+    std::fs::write(&abs, "Outcome: COMPLETE\n").unwrap();
+    wait_for("report signal", || {
+        count(&journal_rows(&ws, "wf"), "signal") >= 1
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(&journal_rows(&ws, "wf"), "signal"), 1);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn lock_refuses_a_second_daemon_when_the_socket_file_is_gone() {
+    let ws = TestWorkspace::new("lockonly");
+    let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).unwrap();
+    // The socket path no longer answers, yet the first daemon still runs.
+    let sock = rpc::socket_path(&ws.runs_dir());
+    let aside = ws.runs_dir().join("aside.sock");
+    std::fs::rename(&sock, &aside).unwrap();
+    let second = start_daemon(&ws, Arc::new(FakeHerdr::new()));
+    assert!(matches!(second, Err(DaemonError::AlreadyRunning(_))));
+    std::fs::rename(&aside, &sock).unwrap();
+    daemon.stop().unwrap();
 }

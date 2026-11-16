@@ -11,10 +11,12 @@ pub mod supervisor;
 pub mod watch;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -26,6 +28,13 @@ use crate::rpc::{self, Request, Response, RpcError};
 use store::Store;
 use supervisor::{Factory, Supervisor};
 
+/// A live watcher: kept so a repeat of its key is a no-op while it runs.
+struct WatcherSlot {
+    workflow: String,
+    restart_finished: bool,
+    handle: JoinHandle<()>,
+}
+
 /// What a verb handler can reach.
 pub struct Ctx {
     pub runs_dir: PathBuf,
@@ -35,14 +44,14 @@ pub struct Ctx {
     pub herdr: Arc<dyn HerdrClient>,
     shutdown: Arc<AtomicBool>,
     stop_watchers: Arc<AtomicBool>,
-    watchers: Mutex<HashMap<String, JoinHandle<()>>>,
+    watchers: Mutex<HashMap<String, WatcherSlot>>,
 }
 
 impl Ctx {
     /// Starts a watcher under `key`; a repeat of a live key is a no-op, so two
-    /// calls never journal one change twice. A finished agent watcher is
-    /// replaced (`restart_finished`); a finished report watcher stays, since
-    /// its one Signal is already out.
+    /// calls never journal one change twice. `restart_finished` marks an agent
+    /// watcher, which a later call replaces once it ends; a report watcher
+    /// stays until its workflow ends, since its one Signal is already out.
     fn add_watcher(
         &self,
         key: &str,
@@ -57,16 +66,28 @@ impl Ctx {
             ));
         }
         let mut watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(h) = watchers.get(key) {
-            if !(restart_finished && h.is_finished()) {
-                return Ok(());
-            }
+        // Prune the finished: an agent watcher ends for good (agent gone or
+        // workflow done); a report watcher is kept only while its workflow
+        // runs, so a repeat of its key cannot signal the same file twice.
+        watchers.retain(|_, w| {
+            !w.handle.is_finished()
+                || (!w.restart_finished && self.supervisor.is_running(&w.workflow))
+        });
+        if watchers.contains_key(key) {
+            return Ok(());
         }
-        let h = spawn(
+        let handle = spawn(
             Arc::clone(&self.supervisor),
             Arc::clone(&self.stop_watchers),
         );
-        watchers.insert(key.to_string(), h);
+        watchers.insert(
+            key.to_string(),
+            WatcherSlot {
+                workflow: workflow.to_string(),
+                restart_finished,
+                handle,
+            },
+        );
         Ok(())
     }
 
@@ -149,8 +170,13 @@ impl Daemon {
         Ok(())
     }
 
-    pub fn register_kind(&mut self, kind: &str, factory: Factory) {
+    /// Adds a workflow kind; a name that is already taken is refused.
+    pub fn register_kind(&mut self, kind: &str, factory: Factory) -> Result<(), String> {
+        if self.kinds.contains_key(kind) {
+            return Err(format!("workflow kind '{kind}' is already registered"));
+        }
         self.kinds.insert(kind.to_string(), factory);
+        Ok(())
     }
 
     fn register_builtin(&mut self) {
@@ -240,9 +266,10 @@ impl Daemon {
             Box::new(|ctx, req| {
                 let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
-                let path = str_arg(args, "path")?;
-                ctx.add_watcher(&format!("report:{wf}:{path}"), wf, false, |sup, stop| {
-                    watch::watch_report(PathBuf::from(path), wf.to_string(), sup, stop)
+                let path = normalize(&ctx.runs_dir, str_arg(args, "path")?);
+                let key = format!("report:{wf}:{}", path.display());
+                ctx.add_watcher(&key, wf, false, |sup, stop| {
+                    watch::watch_report(path.clone(), wf.to_string(), sup, stop)
                 })?;
                 Ok(json!({ "watching": path }))
             }),
@@ -252,12 +279,18 @@ impl Daemon {
     /// Runs until a `stop` verb arrives. Unfinished workflows stay in the
     /// database and resume at the next start.
     pub fn serve(self) -> Result<(), DaemonError> {
+        self.run(None)
+    }
+
+    /// `ready` is told once the socket is bound and the workflows revived.
+    fn run(self, ready: Option<mpsc::Sender<()>>) -> Result<(), DaemonError> {
         let Daemon { cfg, verbs, kinds } = self;
-        let store = Arc::new(
-            Store::open(&cfg.runs_dir.join(crate::db::path::DB_FILE))
-                .map_err(DaemonError::Store)?,
-        );
         let socket = rpc::socket_path(&cfg.runs_dir);
+        std::fs::create_dir_all(&cfg.runs_dir)?;
+        let db_path = cfg.runs_dir.join(crate::db::path::DB_FILE);
+        // Held to the end of the run: a second daemon on this workspace fails here.
+        let lock = lock_workspace(&db_path, &socket)?;
+        let store = Arc::new(Store::open(&db_path).map_err(DaemonError::Store)?);
         let listener = bind_socket(&socket)?;
         let supervisor = Supervisor::new(Arc::clone(&store), kinds);
         supervisor.recover().map_err(DaemonError::Store)?;
@@ -272,6 +305,9 @@ impl Daemon {
             watchers: Mutex::new(HashMap::new()),
         });
         let verbs = Arc::new(verbs);
+        if let Some(tx) = ready {
+            let _ = tx.send(());
+        }
         for conn in listener.incoming() {
             if ctx.shutdown.load(Ordering::SeqCst) {
                 break;
@@ -280,46 +316,81 @@ impl Daemon {
             let (ctx, verbs) = (Arc::clone(&ctx), Arc::clone(&verbs));
             std::thread::spawn(move || serve_conn(stream, &ctx, &verbs));
         }
+        // Stopping: close the door first, so a new daemon is not kept out by
+        // a watcher blocked in `agent wait` (herdr cannot cancel it).
+        drop(listener);
+        let _ = std::fs::remove_file(&socket);
         ctx.stop_watchers.store(true, Ordering::SeqCst);
         ctx.supervisor.shutdown();
+        // The loops are quiet: the next daemon may own the database now.
+        drop(lock);
         let watchers: Vec<_> = ctx
             .watchers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .drain()
-            .map(|(_, h)| h)
+            .map(|(_, w)| w.handle)
             .collect();
         for w in watchers {
             let _ = w.join();
         }
-        let _ = std::fs::remove_file(&socket);
         Ok(())
     }
 
-    /// Runs [`Daemon::serve`] on a thread and returns once the socket answers.
+    /// Runs [`Daemon::serve`] on a thread and returns once it is listening.
     pub fn spawn(self) -> Result<DaemonHandle, DaemonError> {
         let socket = rpc::socket_path(&self.cfg.runs_dir);
-        if UnixStream::connect(&socket).is_ok() {
-            return Err(DaemonError::AlreadyRunning(socket));
-        }
-        let thread = std::thread::spawn(move || self.serve());
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || self.run(Some(tx)));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if thread.is_finished() {
-                return match thread.join() {
-                    Ok(Err(e)) => Err(e),
-                    _ => Err(DaemonError::Io(io::Error::other("daemon exited at start"))),
-                };
-            }
-            if UnixStream::connect(&socket).is_ok() {
-                return Ok(DaemonHandle { socket, thread });
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(()) => return Ok(DaemonHandle { socket, thread }),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return match thread.join() {
+                        Ok(Err(e)) => Err(e),
+                        _ => Err(DaemonError::Io(io::Error::other("daemon exited at start"))),
+                    };
+                }
             }
             if std::time::Instant::now() > deadline {
                 return Err(DaemonError::Io(io::Error::other("daemon never listened")));
             }
-            std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// An exclusive advisory lock on the database file itself, so the one-daemon
+/// rule needs no sidecar file. The OS drops it when the process dies.
+fn lock_workspace(db: &Path, socket: &Path) -> Result<File, DaemonError> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(db)?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(TryLockError::WouldBlock) => Err(DaemonError::AlreadyRunning(socket.to_path_buf())),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// `path` made absolute under `runs_dir` with `.` and `..` folded out, so two
+/// spellings of one file share one watcher key. Lexical: touches no disk.
+fn normalize(runs_dir: &Path, path: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in runs_dir.join(path).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub struct DaemonHandle {

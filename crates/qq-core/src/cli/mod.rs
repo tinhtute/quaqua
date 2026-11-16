@@ -1,6 +1,6 @@
 //! The `qq` command line: a client of the daemon plus the `daemon` verb that
-//! runs it. Verbs live in a [`Registry`] so a module adds its own with one
-//! `register` call in [`Registry::builtin`]; the dispatch below never changes.
+//! runs it. A module adds its commands and daemon verbs with one `install`
+//! function and one line in [`MODULES`]; the dispatch below never changes.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -61,15 +61,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Every command this build ships. Each module adds one line here.
-    pub fn builtin() -> Self {
-        let mut r = Registry::new();
-        for c in core_commands() {
-            r.register(c).expect("core command names are unique");
-        }
-        r
-    }
-
     fn usage(&self) -> String {
         let mut s = String::from("usage: qq <command> [args]\n");
         for c in self.commands.values() {
@@ -99,13 +90,41 @@ impl Registry {
     }
 }
 
+/// A module's seam: registers its CLI commands and its daemon verbs and kinds.
+pub type Install = fn(&mut Registry, &mut Daemon) -> Result<(), String>;
+
+/// Every module's install. Each module adds exactly one line here.
+pub const MODULES: &[Install] = &[];
+
+/// The CLI registry and the daemon, both filled from the core and [`MODULES`].
+pub fn assemble(env: &Env) -> Result<(Registry, Daemon), String> {
+    let mut registry = Registry::new();
+    for c in core_commands() {
+        registry.register(c)?;
+    }
+    let mut daemon = Daemon::new(Config {
+        runs_dir: env.runs_dir.clone(),
+        herdr: Arc::new(CliHerdr::new()),
+    });
+    for install in MODULES {
+        install(&mut registry, &mut daemon)?;
+    }
+    Ok((registry, daemon))
+}
+
 /// Entry point of the `qq` binary.
 pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let env = Env {
         runs_dir: crate::db::path::default_runs_dir(),
     };
-    Registry::builtin().dispatch(&env, &args)
+    match assemble(&env) {
+        Ok((registry, _)) => registry.dispatch(&env, &args),
+        Err(e) => {
+            eprintln!("qq: {e}");
+            1
+        }
+    }
 }
 
 /// Sends one verb to the daemon: a refusal or a missing daemon is an error at once.
@@ -148,13 +167,11 @@ fn core_commands() -> Vec<Command> {
             name: "daemon",
             help: "run the farm daemon in the foreground",
             run: |env, _| {
-                Daemon::new(Config {
-                    runs_dir: env.runs_dir.clone(),
-                    herdr: Arc::new(CliHerdr::new()),
-                })
-                .serve()
-                .map(|_| String::new())
-                .map_err(|e| CliError::new(1, e.to_string()))
+                let (_, daemon) = assemble(env).map_err(|e| CliError::new(1, e))?;
+                daemon
+                    .serve()
+                    .map(|_| String::new())
+                    .map_err(|e| CliError::new(1, e.to_string()))
             },
         },
         Command {
