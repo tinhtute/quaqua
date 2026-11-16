@@ -246,6 +246,7 @@ lane: high-risk
 - 2026-11-16: Lead: T40 config import merges (no converge mode); T42 gate reductions accepted after its fix round.
 - 2026-11-16: Lead: config emits no mail/question edges; authority treats spawn/report edges as mail carriers (revisit with the config owner).
 - 2026-11-16: anh iu: daemon caller identity = peer-cred (SO_PEERCRED/LOCAL_PEERPID → pid → herdr pane → agent name); unmapped is refused; never fall back to Request.caller; own task T42c.
+- 2026-11-16: anh iu rejected the same-uid relaxation (CoS #3873): the daemon refuses every peer that maps to no herdr pane, same uid included, for every verb (ping, stop, status, mail.inbox, roster too); descendants of a pane process still map (T42c, sude-pcrevert).
 - 2026-11-16 CoS ruling: HerdrClient += pane_split, pane_close, pane_list, tab_create, tab_close, tab_list, pane_get, pane_report_metadata, pane_read (additive, defaults Unsupported)
 - 2026-11-16 CoS: HerdrClient += agent_send_keys (additive)
 - 2026-11-16: switch-ready: Lead added the nine phase module declarations to lib.rs in one scaffold commit before wave 1 (seam file, additive), so wave Peers share no file; each Peer exposes `pub const INSTALL` and the Lead's wave-end commit adds the `cli::MODULES` lines.

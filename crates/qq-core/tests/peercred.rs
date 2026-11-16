@@ -157,7 +157,14 @@ fn call(r: &Rig, verb: &str, claim: Option<&str>) -> Result<Value, rpc::RpcError
 fn unmapped_same_uid_is_refused_on_every_verb_lifecycle_and_read_only_included() {
     let r = rig("peer-human");
     unmapped(&r);
-    for v in ["ping", "status", "stop", "roster", "mail.inbox", "mail.send"] {
+    for v in [
+        "ping",
+        "status",
+        "stop",
+        "roster",
+        "mail.inbox",
+        "mail.send",
+    ] {
         assert_eq!(
             call(&r, v, Some("cos")).unwrap_err().code,
             "unmapped_peer",
@@ -189,7 +196,7 @@ fn descendant_of_a_pane_process_may_ping_status_and_stop() {
 fn unmapped_same_uid_is_refused_on_worker_spawn_and_on_lookalike_verbs() {
     let r = rig("peer-human-spawn");
     unmapped(&r);
-    // The allow-list is exact names: no prefix or catch-all match.
+    // Refused for every verb name, lookalikes included.
     for v in [
         "task.start",
         "worker.stop",

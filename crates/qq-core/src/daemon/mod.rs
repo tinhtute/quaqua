@@ -566,9 +566,8 @@ fn serve_conn(
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
-/// client's claim is dropped). A peer of another uid is refused outright. An
-/// unmapped peer of the daemon's uid is refused unless the verb is
-/// [`peer::Need::SameUid`], which then runs with no caller.
+/// client's claim is dropped). A peer of another uid is refused outright, and
+/// so is an unmapped peer of the daemon's uid, whatever the verb.
 fn identify(
     mut req: Request,
     peers: Option<&dyn PeerResolver>,
@@ -590,11 +589,7 @@ fn identify(
             format!("peer uid {} is not the daemon's uid {own_uid}", cred.uid),
         ));
     }
-    req.caller = match peers.resolve(*cred) {
-        Ok(c) => Some(c.0),
-        Err(_) if peer::need(&req.verb) == peer::Need::SameUid => None,
-        Err(e) => return Err(e),
-    };
+    req.caller = Some(peers.resolve(*cred)?.0);
     Ok(req)
 }
 
@@ -624,6 +619,14 @@ mod peer_tests {
         for v in ["ping", "stop", "mail.send"] {
             let e = run(v, Ok("w-1"), 0).unwrap_err();
             assert_eq!(e.code, peer::FOREIGN_UID, "{v}");
+        }
+    }
+
+    #[test]
+    fn unmapped_same_uid_is_refused_for_every_verb() {
+        for v in ["ping", "stop", "status", "mail.send"] {
+            let e = run(v, Err(()), 1000).unwrap_err();
+            assert_eq!(e.code, peer::UNMAPPED_PEER, "{v}");
         }
     }
 }

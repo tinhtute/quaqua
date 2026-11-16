@@ -25,26 +25,6 @@ const MAX_DEPTH: usize = 64;
 /// Refusal code for a peer owned by another uid than the daemon.
 pub const FOREIGN_UID: &str = "foreign_uid";
 
-/// What a verb needs of its caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Need {
-    /// Acts as an agent (records a caller, mutates on its behalf): an unmapped
-    /// peer is refused.
-    Agent,
-    /// Lifecycle or read-only: a peer of the daemon's own uid may call it
-    /// unmapped, with no caller.
-    SameUid,
-}
-
-/// The requirement table. A verb not listed needs an [`Need::Agent`], so a new
-/// verb fails closed until someone names it here.
-pub fn need(verb: &str) -> Need {
-    match verb {
-        "ping" | "stop" | "status" | "mail.inbox" | "roster" => Need::SameUid,
-        _ => Need::Agent,
-    }
-}
-
 /// The daemon's own effective uid.
 pub fn own_uid() -> u32 {
     extern "C" {
