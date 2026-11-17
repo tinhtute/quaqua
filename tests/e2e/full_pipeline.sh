@@ -11,7 +11,7 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
   switch  one real task on the new binary: brief -> fanout to 2 harnesses -> cross-harness
           review bound to a candidate sha -> gate -> merge into the project integration branch;
           every kind/harness/model/effort is checked against qq.db.
-  d       a non-claude worker's `git push` and an out-of-band spawn are both blocked.
+  d       a non-claude worker's `git push`, an out-of-band spawn and a Peer's `qq push` are all refused.
   --dry-run   print the planned steps; start no herdr, no daemon, no agent, spend nothing.
   --check     resolve every qq verb and flag this script calls against the binary (usage probes in a
               temp workspace); start no herdr, no daemon, no agent, spend nothing. Exit 1 on a miss.
@@ -45,7 +45,7 @@ TIMEOUT=${E2E_TIMEOUT:-900}
 BUILDER=${E2E_BUILDER_KIND:-sude}
 REVIEWER=${E2E_REVIEWER_KIND:-pie}
 PROJECT=e2e
-TASK=e2e1   # a task is a string id on the pipeline verb (no task table writer exists)
+TASK=e2e1   # the pipeline's task id (a string); its task row is made with `qq task create` in S2b
 N=0
 
 # ---- assertion helpers: one assertion per step, evidence on every pass, first failure exits --------
@@ -75,9 +75,12 @@ common
 part switch
   S1 sqlite roster  kind rows for $BUILDER and $REVIEWER in qq.db name two different harnesses
   S2 fixture        git repo + local bare origin + integration branch integ/$PROJECT, brief file
+  S2b task row      \`qq task create $PROJECT '<title>' --kind $BUILDER --repo <repo>\` writes a task row (project, title,
+                    kind, state open); the same call again returns that row (created=false)
   S3 fanout         \`worker spawn $TASK-b $BUILDER <repo>\` and \`worker spawn $TASK-r1 $REVIEWER <repo>\`: two harnesses
   S4 sqlite spawn   each run row's harness/model/effort equals its kind row (config read from SQLite)
-  S5 build          \`pipeline '<json>'\` (plan=false) -> builder reports a candidate sha on its branch
+  S5 build          \`pipeline '<json>' --wait\` (plan=false) returns exit 0 (merged); exit 5 = paused for approval ->
+                    \`pipeline --resume $TASK --wait\` and wait again (at most 3 pauses); builder reports a candidate sha
   S6 review         reviewer on another harness reviews; its run row carries that same candidate sha
   S7 sha binding    \`merge '<json>'\` refuses a sha other than the reviewed one, accepts the reviewed sha
   S8 gate           the pipeline workflow finished and its journal reached the merge
@@ -88,6 +91,9 @@ part d
   D2 push fence     \`qq gate\` blocks \`git push\` (PreToolUse hook, exit 2)
   D3 worker push    a pi worker told to run \`git push\` leaves the bare origin without the ref
   D4 journal        qq.db journal holds a refusal event (authority:refusals) after D1
+  D5 qq push fence  \`qq push\` from a pane with no agent identity is refused; the same \`qq push\` run by the pi
+                    worker (a Peer) leaves the bare origin without the ref and journals a refusal on edge
+                    push/orchestration naming that worker
 cleanup (trap)      stop daemon, stop the herdr session, trash the temp dir
 PLAN
 }
@@ -110,7 +116,9 @@ check_cmds() {
     "config|set|import set"
     "worker|spawn --probe|spawn --base --review <name> <kind> <repo-path>"
     "worker|prompt|prompt <name>"
-    "pipeline|-|--rounds --resume --cancel"
+    "pipeline|-|--rounds --resume --cancel --wait"
+    "task|create|task create --kind --disposition --repo"
+    "push|-|push <repo> <remote> <branch>"
     "merge|-|merge"
   )
   for spec in "${specs[@]}"; do
@@ -272,6 +280,14 @@ if want switch; then
   [ -n "$HB" ] && [ "$HB" != "$HR" ] && pass S1 "$BUILDER=$HB $REVIEWER=$HR (from qq.db)" || fail S1 "need two harnesses, got [$HB] [$HR]"
   pass S2 "fixture repo=$PROJ origin=$ORIGIN integ=integ/$PROJECT brief=$BRIEF"
 
+  # S2b: the task row, made through the daemon's task.create before any worker exists.
+  TITLE="$TASK hello file"
+  as_cos "$QQ" task create "$PROJECT" "$TITLE" --kind "$BUILDER" --repo "$PROJ"; [ "$AP_RC" = 0 ] || fail S2b "task create rc=$AP_RC: $AP_OUT"
+  TASK_ID=$(printf '%s' "$AP_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["created"] is True; print(d["task_id"])') || fail S2b "first create not created=true: $AP_OUT"
+  expect S2b "$PROJECT|$TITLE|$BUILDER|open" "$(q "select p.slug||'|'||t.title||'|'||t.kind||'|'||t.state from task t join project p on p.id=t.project_id where t.id=$TASK_ID")"
+  as_cos "$QQ" task create "$PROJECT" "$TITLE" --kind "$BUILDER"; [ "$AP_RC" = 0 ] || fail S2b "repeat rc=$AP_RC: $AP_OUT"
+  expect S2b2 "$TASK_ID|False|1" "$(printf '%s' "$AP_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["task_id"],d["created"],sep="|",end="|")')$(q "select count(*) from task where project_id=(select id from project where slug='$PROJECT') and title='$TITLE'")"
+
   # worker spawn <name> <kind> <repo-path>; the pipeline names its agents <task>-b and <task>-r<round>,
   # so spawning those names here puts both workers on their worktrees and the pipeline reuses them.
   as_cos "$QQ" worker spawn "$TASK-b" "$BUILDER" "$PROJ"; [ "$AP_RC" = 0 ] || fail S3 "builder spawn rc=$AP_RC: $AP_OUT"
@@ -287,9 +303,17 @@ if want switch; then
   # pipeline '<json>': async (returns the workflow id); plan=false skips the plan-ready pause.
   PJSON=$(python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"task":a[1],"builder_kind":a[2],"reviewer_kind":a[3],"brief":open(a[4]).read(),"repo":a[5],"branch":"quaqua/"+a[1]+"-b","integ":"integ/"+a[6],"pane":a[7],"plan":False,"max_rounds":2,"timeout_ms":int(a[8])*1000}))' \
     "$TASK" "$BUILDER" "$REVIEWER" "$BRIEF" "$PROJ" "$PROJECT" "$BPANE" "$TIMEOUT")
-  as_cos "$QQ" pipeline "$PJSON" --rounds 2; [ "$AP_RC" = 0 ] || fail S5 "pipeline start rc=$AP_RC: $AP_OUT"
-  wf_done() { [ -n "$(q "select finished_ms from workflow where id='$WF' and finished_ms is not null")" ]; }
-  wait_for S5 "$TIMEOUT" wf_done
+  # --wait exits 0 merged|no_changes, 3 cancelled, 4 held|disputed, 1 failed|loop stopped, 5 paused for approval
+  # (the JSON names the pause): approve with --resume and wait again.
+  PAUSES=0
+  as_cos "$QQ" pipeline "$PJSON" --rounds 2 --wait
+  while [ "$AP_RC" = 5 ]; do
+    PAUSES=$((PAUSES + 1)); [ "$PAUSES" -le 3 ] || fail S5 "flow paused $PAUSES times: $AP_OUT"
+    printf 'NOTE S5 pause %s: %s\n' "$PAUSES" "$(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)"
+    as_cos "$QQ" pipeline --resume "$TASK" --wait
+  done
+  [ "$AP_RC" = 0 ] || fail S5 "pipeline --wait exit=$AP_RC (want 0): $AP_OUT"
+  pass S5w "pipeline --wait exit=0 after $PAUSES approved pause(s): $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-120)"
   SHA=$(q "select r.candidate_sha from run r join agent a on a.id=r.agent_id where a.name='$TASK-b' and r.candidate_sha is not null order by r.id desc limit 1")
   [ -n "$SHA" ] && git -C "$PROJ" cat-file -e "$SHA^{commit}" && pass S5 "builder candidate sha=$SHA" || fail S5 "no builder candidate sha (workflow state=$(q "select state from workflow where id='$WF'"))"
 
@@ -319,7 +343,7 @@ if want d; then
   [ -n "$ROGUE_PANE" ] || fail D1 "could not open a plain pane"
   as_pane "$ROGUE_PANE" "$QQ" worker spawn e2e-rogue "$REVIEWER" "$PROJ"
   [ "$AP_RC" -ne 0 ] && pass D1 "exit=$AP_RC $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" || fail D1 "out-of-band spawn was allowed"
-  # D2: the PreToolUse gate blocks `git push` (exit 2) for any agent; push has no qq verb, the gate is its fence.
+  # D2: the PreToolUse gate blocks `git push` (exit 2) for any agent; `qq push` (D5) is the daemon's one door.
   GRC=0; GOUT=$(printf '%s' '{"tool_input":{"command":"git push origin main"}}' | "$QQ" gate 2>&1) || GRC=$?
   [ "$GRC" = 2 ] && pass D2 "gate exit=$GRC $(printf '%s' "$GOUT" | tr '\n' ' ' | cut -c1-120)" || fail D2 "gate exit=$GRC for git push (want 2)"
   # D3: a real non-claude worker told to push; asserted from the remote, whatever blocks it.
@@ -327,6 +351,17 @@ if want d; then
   H agent prompt e2e-pushy "run: git push origin HEAD:refs/heads/pwned" --wait --until working >"$T/pushy.out" 2>&1 || fail D3 "$(cat "$T/pushy.out")"
   H agent wait e2e-pushy --until idle --until 'done' --until blocked --timeout $((TIMEOUT * 1000)) >>"$T/pushy.out" 2>&1 || fail D3 "pushy never settled: $(tail -3 "$T/pushy.out")"
   expect D3 "" "$(git -C "$ORIGIN" for-each-ref refs/heads/pwned)"
+  # D5: `qq push` is refused for a caller with no identity and for the Peer (the pi worker), by the daemon.
+  as_pane "$ROGUE_PANE" "$QQ" push "$PROJ" origin e2e-pwn2
+  [ "$AP_RC" -ne 0 ] && pass D5a "no-identity push exit=$AP_RC $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" || fail D5a "push from an unidentified pane was allowed"
+  PEDGE="select count(*) from events where workflow_id='authority:refusals' and kind='refusal' and json_extract(payload_json,'\$.caller')='e2e-pushy' and json_extract(payload_json,'\$.edge') in ('push','orchestration')"
+  pbefore=$(q "$PEDGE")
+  H agent prompt e2e-pushy "run exactly: $QQ push $PROJ origin e2e-pwn2" --wait --until working >"$T/pushy2.out" 2>&1 || fail D5 "$(cat "$T/pushy2.out")"
+  H agent wait e2e-pushy --until idle --until 'done' --until blocked --timeout $((TIMEOUT * 1000)) >>"$T/pushy2.out" 2>&1 || fail D5 "pushy never settled: $(tail -3 "$T/pushy2.out")"
+  expect D5b "" "$(git -C "$ORIGIN" for-each-ref refs/heads/e2e-pwn2)"
+  pafter=$(q "$PEDGE")
+  [ "$pafter" -gt "$pbefore" ] && pass D5 "peer push refused and journaled ($pbefore -> $pafter): $(q "select json_extract(payload_json,'\$.edge')||': '||json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.caller')='e2e-pushy' order by seq desc limit 1")" \
+    || fail D5 "journal has no push/orchestration refusal for e2e-pushy ($pbefore -> $pafter)"
   after=$(q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal'")
   [ "$after" -gt "$before" ] && pass D4 "refusal events $before -> $after: $(q "select group_concat(json_extract(payload_json,'\$.edge'),',') from events where workflow_id='authority:refusals'")" \
     || fail D4 "journal gained no refusal ($before -> $after)"
