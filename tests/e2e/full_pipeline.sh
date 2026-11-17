@@ -409,6 +409,8 @@ if want switch; then
   done
   [ "$AP_RC" = 0 ] || fail S5 "pipeline --wait exit=$AP_RC (want 0): $AP_OUT"
   pass S5w "pipeline --wait exit=0 after $PAUSES approved pause(s): $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-120)"
+  # exit 0 also covers no_changes (nothing built, nothing reviewed): only a merged run counts as the pass.
+  expect S5s "merged" "$(q "select json_extract(payload_json,'\$.status') from events where workflow_id='$WF' and kind='workflow_completed'")"
   expect S3 "$BUILDER|$REVIEWER" "$(q "select (select kind from agent where name='$TASK-b')||'|'||(select kind from agent where name='$TASK-r1')")"
   # The pipeline drives its builder and reviewer itself (no `task.start`), so no `run` rows exist for them: the roster
   # check reads the agent rows (kind -> harness) against the kind table instead.

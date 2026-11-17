@@ -117,7 +117,15 @@ fn field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
 
 /// Levels of a `Verified: <level> <sha>` line that count as a pass. Any other
 /// level (verifier-failed, verifier-blocked, inconclusive, unknown) does not.
-const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
+pub(crate) const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
+
+/// The `Verified:` line a brief asks for, with the levels that pass spelled out.
+pub(crate) fn verified_line_ask() -> String {
+    format!(
+        "`Verified: <level> <full 40-hex sha of your last commit>` where <level> is exactly one of {}",
+        PASSING_LEVELS.join(" | ")
+    )
+}
 
 /// `verified` = `Outcome: COMPLETE` plus a `Verified:` line with a passing
 /// level and a sha: the worker reported a passing level, nothing more. The sha

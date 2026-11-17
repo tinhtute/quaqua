@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::worker_flow::{verified_line_ask, PASSING_LEVELS};
 use crate::engine::activity::{
     GitRequest, GitResult, HerdrRequest, HerdrResult, ReportFileRequest, ReportFileResult,
 };
@@ -174,6 +175,10 @@ pub struct PipelineState {
     /// The plan report the Lead approved; the build follows it.
     #[serde(default)]
     pub plan_report: Option<String>,
+    /// A NO_CHANGES build is being bound to the branch tip: whatever an earlier
+    /// attempt committed is the candidate (there is no claimed sha to match).
+    #[serde(default)]
+    pub adopt_tip: bool,
 }
 
 impl PipelineState {
@@ -198,6 +203,7 @@ impl PipelineState {
             findings: 0,
             blocked: None,
             plan_report: None,
+            adopt_tip: false,
         }
     }
 }
@@ -289,9 +295,9 @@ fn enter_build(s: &mut PipelineState) -> Decision {
         .unwrap_or_default();
     let text = format!(
         "{}\n\nPipeline phase: BUILD.{plan} Commit on branch {} (repo {}). Write your report to {report}. \
-         End it with `Verified: <level> <full 40-hex sha of your last commit>`. A wrong premise is \
+         End it with {}. A wrong premise is \
          disputed under '## Challenge' with evidence; a task already satisfied says 'Outcome: NO_CHANGES'.",
-        i.brief, i.branch, i.repo
+        i.brief, i.branch, i.repo, verified_line_ask()
     );
     let to = i.builder();
     enter_prompt(s, Stage::Build, to, text)
@@ -338,8 +344,8 @@ fn enter_fix(s: &mut PipelineState) -> Decision {
     let text = format!(
         "Pipeline phase: FIX (after review round {round}). Resolve the {} blocking findings in {review} \
          on branch {}; commit each fix; a wrong finding is disputed under '## Challenge'. \
-         Write your report to {report} and end it with `Verified: <level> <full 40-hex sha of your last commit>`.",
-        s.findings, i.branch
+         Write your report to {report} and end it with {}.",
+        s.findings, i.branch, verified_line_ask()
     );
     let to = i.builder();
     enter_prompt(s, Stage::Fix, to, text)
@@ -354,8 +360,8 @@ fn enter_merge_fix(s: &mut PipelineState, why: &str) -> Decision {
     let text = format!(
         "Pipeline phase: FIX (merge refused). Merging {} into {} failed: {why}. Bring {} up to date \
          with {} (resolve conflicts, make the check pass), commit, and write your report to {report}; \
-         end it with `Verified: <level> <full 40-hex sha of your last commit>`.",
-        i.branch, i.integ, i.branch, i.integ
+         end it with {}.",
+        i.branch, i.integ, i.branch, i.integ, verified_line_ask()
     );
     let to = i.builder();
     enter_prompt(s, Stage::Fix, to, text)
@@ -477,8 +483,16 @@ impl PipelineFlow {
             return block(s, from, BlockKind::Plan, BLOCK_PLAN_READY, why);
         }
         // Build or Fix report.
+        // "Nothing to do" is judged by git, not by the answer: an earlier attempt
+        // (paused before its report was accepted) may have committed already, and
+        // that tip is the candidate. Nothing ahead of the integration branch ends
+        // the flow as no_changes at the bind.
         if s.stage == Stage::Build && outcome_is_no_changes(content) {
-            return done("no_changes", s, None);
+            s.adopt_tip = true;
+            return activity(
+                &format!("bind-{}", s.seq),
+                ActivityRequest::Git(GitRequest::CurrentSha),
+            );
         }
         match verified_sha(content) {
             Err((code, why)) => block(s, from, BlockKind::Restart, code, why),
@@ -649,11 +663,12 @@ impl Workflow for PipelineFlow {
                         let from = s.stage;
                         let (tip, base) = tips(&pair);
                         let claimed = s.claimed.clone().unwrap_or_default();
+                        let adopting = std::mem::take(&mut s.adopt_tip);
                         if !crate::merge::is_full_sha(tip) {
                             let why = format!("cannot read the tip of {}", s.input.branch);
                             return block(s, from, BlockKind::Restart, BLOCK_BAD_SHA, why);
                         }
-                        if !tip.eq_ignore_ascii_case(&claimed) {
+                        if !adopting && !tip.eq_ignore_ascii_case(&claimed) {
                             let why = format!(
                                 "claimed sha {claimed} is not the tip {tip} of {}",
                                 s.input.branch
@@ -773,8 +788,6 @@ fn unfinished(text: &str) -> Option<String> {
     }
     None
 }
-
-const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
 
 /// The sha of a `Verified: <level> <sha>` line with a passing level. The sha
 /// is the worker's claim; the flow binds it to git afterwards.
