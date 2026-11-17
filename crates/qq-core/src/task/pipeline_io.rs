@@ -210,9 +210,9 @@ impl Activity for Effects {
                     HerdrResult::Unknown
                 }))
             }
-            ActivityRequest::ReportFile(ReportFileRequest::Exists { path }) => Ok(
-                ActivityResult::ReportFile(self.arm(path)),
-            ),
+            ActivityRequest::ReportFile(ReportFileRequest::Exists { path }) => {
+                Ok(ActivityResult::ReportFile(self.arm(path)))
+            }
             ActivityRequest::ReportFile(ReportFileRequest::Read { path }) => Ok(
                 ActivityResult::ReportFile(match std::fs::read_to_string(path) {
                     Ok(text) => ReportFileResult::Content(text),

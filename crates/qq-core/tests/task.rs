@@ -858,7 +858,7 @@ fn production_effects_encode_git_facts_refusals_and_watchers() {
         .unwrap();
     assert_eq!(
         down,
-        ActivityResult::ReportFile(ReportFileResult::Exists(false))
+        ActivityResult::ReportFile(ReportFileResult::ArmFailed("daemon down".into()))
     );
 }
 

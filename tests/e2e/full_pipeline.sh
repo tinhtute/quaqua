@@ -19,6 +19,10 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
 env: QQ (binary, default target/debug/qq)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
+     E2E_STUB=1 (default off, test-only: runs the whole `switch` flow arm -> prompt -> report -> review -> gate ->
+                     merge on STUB harnesses: an executable named after each kind's harness, first on PATH of the herdr
+                     server, that reads one prompt, commits HELLO.txt (builder) or says `Verdict: clean` (reviewer) and
+                     writes the report. No model, no tokens; E2E_PI_MODEL is not needed; part `d` is skipped.)
      E2E_STOP_AFTER (C2 | C3 | C4 | S2b: end cleanly after that step; starts no agent, spends no tokens.
                      S2d: the pipeline places the builder (pane, worktree, agent row; starts ONE real builder-kind
                      agent, sends it NO prompt, starts no flow), asserts that, and ends; needs E2E_PI_MODEL)
@@ -39,11 +43,14 @@ for a in "$@"; do
 done
 case "${E2E_STOP_AFTER:-}" in "" | C2 | C3 | C4 | S2b | S2d) ;; *) echo "unknown E2E_STOP_AFTER '${E2E_STOP_AFTER}' (C2 | C3 | C4 | S2b | S2d)" >&2; exit 2 ;; esac
 [ "${#PARTS[@]}" -gt 0 ] || PARTS=(switch d)
+STUB=${E2E_STUB:-0}
+if [ "$STUB" = 1 ]; then PARTS=(switch); fi   # the stub flow never starts a real worker, so part d (real pi worker) is out
 want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 QQ=${QQ:-$REPO_ROOT/target/debug/qq}
 PI_MODEL=${E2E_PI_MODEL:-}
+[ "$STUB" = 1 ] && [ -z "$PI_MODEL" ] && PI_MODEL=stub
 PI_EFFORT=${E2E_PI_EFFORT:-medium}
 TIMEOUT=${E2E_TIMEOUT:-900}
 BUILDER=${E2E_BUILDER_KIND:-sude}
@@ -229,6 +236,36 @@ def walk(o):
 walk(json.load(sys.stdin))'; }
 
 # ---- C2 session + daemon ---------------------------------------------------------------------------------
+if [ "$STUB" = 1 ]; then
+  # Stub harnesses: one executable per harness name. herdr starts the executable named by the kind, so a stub first
+  # on PATH stands in for the real CLI. It spends nothing: it only commits a file or writes a fixed report.
+  mkdir -p "$T/stubbin"
+  cat >"$T/stubbin/stub" <<'STUBEOF'
+#!/usr/bin/env bash
+# stub harness: one prompt in, one report out. Phase and report path come from the pipeline's own prompt text.
+printf '? for shortcuts\n> '
+prompt=""
+while IFS= read -r line; do
+  prompt="$prompt$line"$'\n'
+  case "$prompt" in *"Write your report to "*) sleep 1; break ;; esac
+done
+report=$(printf '%s' "$prompt" | grep -o 'report to [^ ]*\.md' | head -1 | sed 's/^report to //')
+case "$prompt" in
+  *"Pipeline phase: BUILD"*)
+    printf 'hello\n' >HELLO.txt && git add HELLO.txt && git -c user.email=stub@example.invalid -c user.name=stub commit -qm "stub: add HELLO.txt"
+    sha=$(git rev-parse HEAD)
+    printf 'Outcome: COMPLETE\nVerified: unit-test-verified %s\n\n## Blockers\nnone\n\n## Lessons\nnone\n' "$sha" >"$report.tmp" ;;
+  *) printf '## Findings\nnone\n\nVerdict: clean\n' >"$report.tmp" ;;
+esac
+mv "$report.tmp" "$report"
+sleep 3600
+STUBEOF
+  chmod +x "$T/stubbin/stub"
+  for h in claude pi; do ln -sf stub "$T/stubbin/$h"; done
+  export PATH="$T/stubbin:$PATH"
+  # A pane shell that sources the user's rc puts the real CLIs back first on PATH; an empty ZDOTDIR keeps it as is.
+  mkdir -p "$T/zdot"; echo "# empty: no user rc" >"$T/zdot/.zshrc"; export ZDOTDIR="$T/zdot"
+fi
 herdr --session "$SESSION" server >"$T/herdr.log" 2>&1 & SERVER_PID=$!
 wait_for C2 30 H workspace list
 H workspace create --cwd "$WS" --label e2e --no-focus >/dev/null
@@ -258,6 +295,13 @@ stop_after() { [ "${E2E_STOP_AFTER:-}" = "$1" ] || return 0; echo "STOP after $1
 i=0
 until as_cos "$QQ" ping; [ "$AP_RC" = 0 ]; do i=$((i + 2)); [ "$i" -le 30 ] || fail C2 "timed out after 30s: qq ping in cos pane: $AP_OUT"; sleep 2; done
 pass C2 "herdr session=$SESSION daemon pid=$DAEMON_PID ping ok in cos pane $COS_PANE"
+if [ "$STUB" = 1 ]; then
+  # The $0 guarantee: what a pane shell resolves for each harness must be the stub, checked before any prompt.
+  for h in claude pi; do
+    as_cos "${SHELL:-sh}" -ic "command -v $h"; [ "$AP_RC" = 0 ] || fail C2s "no $h in the cos pane shell: $AP_OUT"
+    case "$(printf '%s' "$AP_OUT" | tail -1)" in "$T"/stubbin/*) pass C2s "pane shell resolves $h to the stub: $(printf '%s' "$AP_OUT" | tail -1)" ;; *) fail C2s "pane shell resolves $h to [$(printf '%s' "$AP_OUT" | tail -1)], not the stub: a real model would run" ;; esac
+  done
+fi
 stop_after C2
 
 # ---- C3 seed / C4 second harness ---------------------------------------------------------------------------
@@ -339,15 +383,12 @@ if want switch; then
   [ "$AP_RC" = 0 ] || fail S5 "pipeline --wait exit=$AP_RC (want 0): $AP_OUT"
   pass S5w "pipeline --wait exit=0 after $PAUSES approved pause(s): $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-120)"
   expect S3 "$BUILDER|$REVIEWER" "$(q "select (select kind from agent where name='$TASK-b')||'|'||(select kind from agent where name='$TASK-r1')")"
-  expect S4a "2" "$(q "select count(distinct r.harness) from run r join agent a on a.id=r.agent_id where a.name in ('$TASK-b','$TASK-r1')")"
-  expect S4 "0" "$(q "select count(*) from run r join agent a on a.id=r.agent_id join kind k on k.name=r.kind
-           where a.name in ('$TASK-b','$TASK-r1')
-           and not (r.harness=k.harness and r.model=k.model and coalesce(r.effort,'')=coalesce(k.effort,''))")"
-  SHA=$(q "select r.candidate_sha from run r join agent a on a.id=r.agent_id where a.name='$TASK-b' and r.candidate_sha is not null order by r.id desc limit 1")
-  [ -n "$SHA" ] && git -C "$PROJ" cat-file -e "$SHA^{commit}" && pass S5 "builder candidate sha=$SHA" || fail S5 "no builder candidate sha (workflow state=$(q "select state from workflow where id='$WF'"))"
-
-  RSHA=$(q "select r.candidate_sha from run r join agent a on a.id=r.agent_id where a.name='$TASK-r1' order by r.id desc limit 1")
-  expect S6 "$SHA" "$RSHA"
+  # The pipeline drives its builder and reviewer itself (no `task.start`), so no `run` rows exist for them: the roster
+  # check reads the agent rows (kind -> harness) against the kind table instead.
+  expect S4a "2" "$(q "select count(distinct k.harness) from agent a join kind k on k.name=a.kind where a.name in ('$TASK-b','$TASK-r1')")"
+  SHA=$(git -C "$PROJ" rev-parse "quaqua/$TASK-b")
+  [ -n "$SHA" ] && git -C "$PROJ" cat-file -e "$SHA^{commit}" && pass S5 "builder branch tip (candidate) sha=$SHA" || fail S5 "no builder commit (workflow state=$(q "select state from workflow where id='$WF'"))"
+  expect S6 "1" "$(q "select count(*) from workflow where id='$WF' and state like '%complete%'")"
 
   # merge '<json>': an entry whose branch tip is not the sha it carries is refused before anything merges.
   mjson() { python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"repo":a[1],"integ":a[2],"entries":[{"branch":a[3],"sha":a[4]}]}))' "$PROJ" "integ/$PROJECT" "quaqua/$TASK-b" "$1"; }
@@ -360,8 +401,7 @@ if want switch; then
   case "$WST" in *merge*|*done*|*complete*) pass S8 "workflow $WF state=$WST; merge journaled: $(q "select count(*) from events where workflow_id='$WF'") events" ;; *) fail S8 "workflow state [$WST] is not past the gate" ;; esac
   expect_ok S9 "integ/$PROJECT contains $SHA" git -C "$PROJ" merge-base --is-ancestor "$SHA" "integ/$PROJECT"
 
-  expect S10 "0" "$(q "select count(*) from run r join agent a on a.id=r.agent_id where a.name in ('$TASK-b','$TASK-r1') and not exists
-    (select 1 from kind k join harness h on h.name=k.harness where k.name=r.kind and h.name=r.harness and k.model=r.model)")"
+  expect S10 "0" "$(q "select count(*) from agent a where a.name in ('$TASK-b','$TASK-r1') and not exists (select 1 from kind k join harness h on h.name=k.harness where k.name=a.kind)")"
 fi
 
 # ---- part d ------------------------------------------------------------------------------------------------
