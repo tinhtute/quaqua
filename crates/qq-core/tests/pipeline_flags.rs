@@ -644,7 +644,10 @@ fn the_builder_gets_its_own_pane_and_worktree_not_the_callers() {
     );
     assert!(r.ok, "{:?}", r.error);
     let builder = agent_pane(&herdr, "t1-b");
-    assert_ne!(builder, cos_pane, "the builder is not started in the caller's pane");
+    assert_ne!(
+        builder, cos_pane,
+        "the builder is not started in the caller's pane"
+    );
     let wt = fx.root.join(".wt").join("t1-b");
     assert_eq!(
         herdr.split_cwds(),
@@ -661,9 +664,7 @@ fn each_reviewer_round_gets_its_own_pane_and_worktree_at_the_candidate() {
     let tip = fx.commit_on_t1("a.txt");
     let herdr = Arc::new(FakeHerdr::new());
     let home = herdr.seed_pane("work", None, &[]);
-    herdr
-        .agent_start("t1-b", "claude", &home, 1, &[])
-        .unwrap();
+    herdr.agent_start("t1-b", "claude", &home, 1, &[]).unwrap();
     let deps = Deps {
         herdr: herdr.clone(),
         runs_dir: fx.runs.clone(),
@@ -689,6 +690,10 @@ fn each_reviewer_round_gets_its_own_pane_and_worktree_at_the_candidate() {
     assert!(b != r1 && b != r2 && r1 != r2, "{b} {r1} {r2}");
     for r in ["t1-r1", "t1-r2"] {
         let wt = fx.root.join(".wt").join(r);
-        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), tip, "{r} is at the candidate");
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]),
+            tip,
+            "{r} is at the candidate"
+        );
     }
 }
