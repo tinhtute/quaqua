@@ -16,6 +16,7 @@
 //! unfenced driver.
 
 mod gate;
+pub mod push;
 mod tokenizer;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -89,6 +90,7 @@ pub enum Op {
     Merge,
     Push,
     ConfigWrite,
+    TaskCreate,
 }
 
 impl Op {
@@ -98,6 +100,7 @@ impl Op {
             Op::Merge => "merge",
             Op::Push => "push",
             Op::ConfigWrite => "config_write",
+            Op::TaskCreate => "task_create",
         }
     }
 }
@@ -489,8 +492,9 @@ pub fn check_orchestration(
 }
 
 /// Registers the `gate` command. Called from `cli::MODULES` at wave end.
-pub fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
-    registry.register(gate::command())
+pub fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
+    registry.register(gate::command())?;
+    push::install(registry, daemon)
 }
 
 /// The entry `cli::MODULES` lists.
