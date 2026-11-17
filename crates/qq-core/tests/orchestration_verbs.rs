@@ -95,6 +95,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
@@ -122,6 +123,13 @@ fn repo_with_origin(r: &Rig) -> (std::path::PathBuf, std::path::PathBuf) {
         &work,
         &["remote", "add", "origin", origin.to_str().unwrap()],
     );
+    // The caller's project (alpha) owns this repo.
+    conn(r)
+        .execute(
+            "UPDATE project SET repo_path = ?1 WHERE slug = 'alpha'",
+            [work.to_str().unwrap()],
+        )
+        .unwrap();
     (work, origin)
 }
 
@@ -321,4 +329,78 @@ fn unmapped_peer_is_still_refused_on_both_verbs() {
         .unwrap();
     assert_eq!(n, 0);
     let _ = &r.herdr;
+}
+
+fn origin_ref(origin: &Path, r: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(origin)
+        .args(["rev-parse", "--verify", "-q", r])
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).unwrap().trim().to_string())
+}
+
+#[test]
+fn push_cannot_force_delete_overwrite_or_leave_the_configured_remotes() {
+    let r = rig("g1-push-escape", false);
+    let (work, origin) = repo_with_origin(&r);
+    // origin already has a `main` the Lead must not touch.
+    git(&work, &["branch", "main"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    let main_before = origin_ref(&origin, "refs/heads/main");
+    assert!(main_before.is_some());
+    let elsewhere = r.ws.root().join("elsewhere.git");
+    git(r.ws.root(), &["init", "-q", "--bare", "elsewhere.git"]);
+
+    let cases = [
+        ("origin", "+feat:main"),
+        ("origin", ":main"),
+        ("origin", "feat:refs/heads/main"),
+        ("origin", "feat:main"),
+        ("origin", "^feat"),
+        ("origin", "refs/../x"),
+        ("https://example.invalid/x.git", "feat"),
+        (elsewhere.to_str().unwrap(), "feat"),
+        ("nosuchremote", "feat"),
+    ];
+    for (remote, branch) in cases {
+        let e = call(
+            &r,
+            "push",
+            Some("lead-f"),
+            json!({"repo": work, "remote": remote, "branch": branch}),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "refused", "{remote} {branch}");
+    }
+    assert_eq!(origin_ref(&origin, "refs/heads/main"), main_before);
+    assert!(!origin_has_feat(&origin));
+    assert!(origin_ref(&elsewhere, "refs/heads/feat").is_none());
+    let rows = authority::refusals(&conn(&r)).unwrap();
+    assert_eq!(rows.len(), cases.len(), "each refusal is journaled");
+    assert!(rows
+        .iter()
+        .all(|x| x.caller == "lead-f" && x.edge == "push"));
+
+    // The same Lead still pushes a plain branch to the configured remote.
+    call(&r, "push", Some("lead-f"), push_args(&work)).unwrap();
+    assert!(origin_has_feat(&origin));
+}
+
+#[test]
+fn push_of_a_repo_outside_the_callers_project_is_refused() {
+    let r = rig("g1-push-repo", false);
+    let (work, origin) = repo_with_origin(&r);
+    conn(&r)
+        .execute(
+            "UPDATE project SET repo_path = '/elsewhere' WHERE slug = 'alpha'",
+            [],
+        )
+        .unwrap();
+    let e = call(&r, "push", Some("lead-f"), push_args(&work)).unwrap_err();
+    assert_eq!(e.code, "refused");
+    assert!(!origin_has_feat(&origin));
 }
