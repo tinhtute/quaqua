@@ -887,17 +887,12 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
         ],
     )?;
     let prompt = |text: &str| -> R<()> {
-        let r = ctx
-            .herdr
-            .agent_prompt(&name, text, None)
-            .map_err(|e| fail(format!("herdr could not prompt {name}: {e}")))?;
-        if r.ok {
-            Ok(())
-        } else {
-            Err(fail(format!(
-                "herdr refused the prompt to {name}: {}",
-                r.error_code().unwrap_or(r.body)
-            )))
+        match crate::herdr::prompt_landed(ctx.herdr, &name, text).0 {
+            crate::herdr::Landing::Landed => Ok(()),
+            crate::herdr::Landing::Blocked => Err(fail(format!(
+                "herdr refused the prompt to {name}: agent_blocked"
+            ))),
+            crate::herdr::Landing::NotLanded(why) => Err(fail(why)),
         }
     };
     let ms = std::env::var("QQ_LEAD_READY_MS")

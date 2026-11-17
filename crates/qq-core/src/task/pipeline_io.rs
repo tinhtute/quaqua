@@ -196,12 +196,19 @@ impl Activity for Effects {
     fn execute(&self, req: &ActivityRequest) -> Result<ActivityResult, ActivityError> {
         match req {
             ActivityRequest::Herdr(HerdrRequest::Prompt { name, task }) => {
-                let sent = matches!(self.deps.herdr.agent_prompt(name, task, None), Ok(r) if r.ok);
-                Ok(ActivityResult::Herdr(if sent {
-                    HerdrResult::Prompted { name: name.clone() }
-                } else {
-                    HerdrResult::Unknown
-                }))
+                Ok(ActivityResult::Herdr(
+                    match crate::herdr::prompt_landed(self.deps.herdr.as_ref(), name, task).0 {
+                        crate::herdr::Landing::Landed => HerdrResult::Prompted { name: name.clone() },
+                        crate::herdr::Landing::Blocked => HerdrResult::PromptFailed {
+                            name: name.clone(),
+                            cause: format!("{name} is blocked on a question; the prompt did not land"),
+                        },
+                        crate::herdr::Landing::NotLanded(cause) => HerdrResult::PromptFailed {
+                            name: name.clone(),
+                            cause,
+                        },
+                    },
+                ))
             }
             ActivityRequest::Herdr(HerdrRequest::Spawn { name, kind, .. }) => {
                 Ok(ActivityResult::Herdr(if self.spawn_reviewer(name, kind) {

@@ -232,9 +232,12 @@ impl Workflow for WorkerFlow {
                     state.phase = Phase::Working;
                     Self::read_if_ready(state)
                 }
-                ("prompt", _) => StepDecision::Fail {
+                ("prompt", result) => StepDecision::Fail {
                     code: PROMPT_FAILED,
-                    reason: "herdr did not take the prompt".into(),
+                    reason: match result {
+                        ActivityResult::Herdr(HerdrResult::PromptFailed { cause, .. }) => cause,
+                        _ => "herdr did not take the prompt".into(),
+                    },
                 },
                 ("report", ActivityResult::ReportFile(ReportFileResult::Content(text))) => {
                     match judge(&text) {
@@ -273,12 +276,19 @@ impl Activity for WorkerActivities {
     fn execute(&self, req: &ActivityRequest) -> Result<ActivityResult, ActivityError> {
         match req {
             ActivityRequest::Herdr(HerdrRequest::Prompt { name, task }) => {
-                let sent = matches!(self.herdr.agent_prompt(name, task, None), Ok(r) if r.ok);
-                Ok(ActivityResult::Herdr(if sent {
-                    HerdrResult::Prompted { name: name.clone() }
-                } else {
-                    HerdrResult::Unknown
-                }))
+                Ok(ActivityResult::Herdr(
+                    match crate::herdr::prompt_landed(self.herdr.as_ref(), name, task).0 {
+                        crate::herdr::Landing::Landed => HerdrResult::Prompted { name: name.clone() },
+                        crate::herdr::Landing::Blocked => HerdrResult::PromptFailed {
+                            name: name.clone(),
+                            cause: format!("{name} is blocked on a question; the prompt did not land"),
+                        },
+                        crate::herdr::Landing::NotLanded(cause) => HerdrResult::PromptFailed {
+                            name: name.clone(),
+                            cause,
+                        },
+                    },
+                ))
             }
             ActivityRequest::ReportFile(ReportFileRequest::Read { path }) => Ok(
                 ActivityResult::ReportFile(match std::fs::read_to_string(path) {

@@ -91,15 +91,56 @@ impl std::fmt::Display for SpawnError {
 impl std::error::Error for SpawnError {}
 
 /// Accepts claude's workspace-trust dialog when `pane` shows it, then waits
-/// for the agent to be idle. `false`: no dialog, or the agent did not come up.
-fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, _ready: &Ready) -> bool {
-    let up = herdr
-        .pane_read(pane, 40)
-        .is_ok_and(|r| r.ok && r.body.contains("trust"));
-    up && herdr.agent_send_keys(name, &["down", "enter"]).is_ok_and(|r| r.ok)
-        && herdr
-            .agent_wait(name, &["idle"], u64::from(START_TIMEOUT_MS))
-            .is_ok_and(|r| r.ok)
+/// until claude is really ready: the dialog text gone from the pane's last
+/// lines, something drawn there (a blank pane is claude still booting) and
+/// herdr reporting `idle`. herdr says `idle` right after the keys while claude
+/// is still booting, and a prompt typed then is dropped.
+fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, ready: &Ready) -> Trust {
+    let mut drawn = String::new();
+    for i in 0..=ready.settle_polls {
+        match herdr.pane_read(pane, 40) {
+            Ok(r) if r.ok && !r.body.trim().is_empty() => {
+                drawn = r.body;
+                break;
+            }
+            _ => {}
+        }
+        if i < ready.settle_polls {
+            std::thread::sleep(std::time::Duration::from_millis(ready.settle_ms));
+        }
+    }
+    if !drawn.contains("trust") {
+        return Trust::NoDialog;
+    }
+    if !herdr
+        .agent_send_keys(name, &["down", "enter"])
+        .is_ok_and(|r| r.ok)
+    {
+        return Trust::NotReady;
+    }
+    for i in 0..ready.polls {
+        let gone = herdr
+            .pane_read(pane, 12)
+            .is_ok_and(|r| r.ok && !r.body.contains("trust") && !r.body.trim().is_empty());
+        if gone && herdr.agent_wait(name, &["idle"], 1_000).is_ok_and(|r| r.ok) {
+            return Trust::Ready;
+        }
+        if i + 1 < ready.polls {
+            std::thread::sleep(std::time::Duration::from_millis(ready.poll_ms));
+        }
+    }
+    Trust::NotReady
+}
+
+/// What [`accept_trust_dialog`] found.
+#[derive(PartialEq)]
+enum Trust {
+    /// The pane shows no trust dialog.
+    NoDialog,
+    /// The dialog was accepted and claude is ready.
+    Ready,
+    /// The dialog was there and claude was not ready within the bound.
+    NotReady,
 }
 
 /// How long [`spawn`] waits for claude to be really ready once its trust dialog
@@ -107,12 +148,18 @@ fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, _ready: 
 pub struct Ready {
     pub polls: u32,
     pub poll_ms: u64,
+    /// Looks (`settle_ms` apart) for claude to have drawn anything at all after
+    /// the start: herdr can return before the dialog is on screen.
+    pub settle_polls: u32,
+    pub settle_ms: u64,
 }
 
 impl Ready {
     pub const DEFAULT: Ready = Ready {
         polls: 60,
         poll_ms: 500,
+        settle_polls: 10,
+        settle_ms: 100,
     };
 }
 
@@ -183,18 +230,29 @@ pub fn spawn_with(
             &arg_refs,
         )
         .map_err(SpawnError::Io)?;
-    if !reply.ok {
-        let code = reply.error_code();
-        // A fresh worktree is a folder claude has not been trusted in: its
-        // startup dialog ("Quick safety check ... trust") holds the start back
-        // as `agent_not_ready`. Accept it the way a person would (one Down to
-        // "Yes, I trust this folder", then Enter) and wait for the agent.
-        let cleared = code.as_deref() == Some("agent_not_ready")
-            && driver.herdr_kind() == "claude"
-            && accept_trust_dialog(herdr, spec.name, spec.pane, ready);
-        if !cleared {
-            return Err(SpawnError::Herdr(code.unwrap_or(reply.body)));
-        }
+    // A fresh worktree is a folder claude has not been trusted in: its startup
+    // dialog ("Quick safety check ... trust") may hold the start back as
+    // `agent_not_ready`, or herdr may report the agent up while the dialog is
+    // still on screen. Either way accept it the way a person would (one Down
+    // to "Yes, I trust this folder", then Enter) and wait until claude is ready.
+    let code = reply.error_code();
+    if !reply.ok && code.as_deref() != Some("agent_not_ready") {
+        return Err(SpawnError::Herdr(code.unwrap_or(reply.body)));
+    }
+    let trust = if driver.herdr_kind() == "claude" {
+        accept_trust_dialog(herdr, spec.name, spec.pane, ready)
+    } else {
+        Trust::NoDialog
+    };
+    let held = if reply.ok {
+        trust == Trust::NotReady
+    } else {
+        trust != Trust::Ready
+    };
+    if held {
+        return Err(SpawnError::Herdr(
+            code.unwrap_or_else(|| "agent_not_ready".into()),
+        ));
     }
     let agent_id = match open {
         Some((id, ..)) => id,

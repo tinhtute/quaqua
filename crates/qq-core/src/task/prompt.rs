@@ -998,27 +998,19 @@ fn send_brief(
     name: &str,
     body: &str,
 ) -> Result<(), CliError> {
-    let landed = |r: &crate::herdr::Reply| r.ok;
-    let first = herdr.agent_prompt(name, body, Some((&["working", "blocked"], 10_000)));
-    if let Ok(r) = &first {
-        let _ = std::fs::write(side(runs, name, "submit.log"), &r.body);
-        if r.error_code().as_deref() == Some("agent_blocked") {
-            return Err(CliError::new(
-                5,
-                format!("WATCHDOG exit=5 blocked before the brief | name={name}"),
-            ));
-        }
-        if landed(r) {
-            return Ok(());
-        }
+    let (landing, first) = crate::herdr::prompt_landed(herdr, name, body);
+    if let Some(b) = first {
+        let _ = std::fs::write(side(runs, name, "submit.log"), b);
     }
-    eprintln!("WATCHDOG prompt-not-landed | name={name} - sent enter once");
-    let _ = herdr.agent_send_keys(name, &["enter"]);
-    match herdr.agent_wait(name, &["working", "blocked"], 10_000) {
-        Ok(r) if landed(&r) => Ok(()),
-        _ => Err(CliError::new(
+    match landing {
+        crate::herdr::Landing::Landed => Ok(()),
+        crate::herdr::Landing::Blocked => Err(CliError::new(
+            5,
+            format!("WATCHDOG exit=5 blocked before the brief | name={name}"),
+        )),
+        crate::herdr::Landing::NotLanded(why) => Err(CliError::new(
             1,
-            format!("the brief did not land | name={name}"),
+            format!("the brief did not land | name={name} | {why}"),
         )),
     }
 }

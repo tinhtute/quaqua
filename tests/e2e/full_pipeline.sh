@@ -204,6 +204,11 @@ DAEMON_PID=""; SERVER_PID=""; cleaned=0
 cleanup() {
   [ "$cleaned" -eq 0 ] || return 0
   cleaned=1; set +e
+  if [ -n "${E2E_DUMP:-}" ]; then   # debug: what each agent pane shows at exit
+    for a in $(H agent list 2>/dev/null | grep -o '"name": *"[^"]*"' | cut -d'"' -f4); do
+      echo "--- pane $a"; H agent read "$a" --source recent-unwrapped --lines 25 2>&1 | tail -25
+    done
+  fi
   "$QQ" stop >/dev/null 2>&1
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
   H server stop >/dev/null 2>&1
@@ -243,11 +248,31 @@ if [ "$STUB" = 1 ]; then
   cat >"$T/stubbin/stub" <<'STUBEOF'
 #!/usr/bin/env bash
 # stub harness: one prompt in, one report out. Phase and report path come from the pipeline's own prompt text.
+# As `claude` it boots like the real one: in a folder it has not been trusted in it shows the trust dialog until it
+# reads Down+Enter, then a short boot window drops any typed input, and only then does it take a prompt. (The pi stub
+# has no dialog and no boot window.)
+if [ "$(basename "$0")" = claude ]; then
+  trusted="${STUB_TRUST_DIR:?}/$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+  if [ ! -e "$trusted" ]; then
+    printf 'Quick safety check: Is this a project you created or one you trust?\n  1. Yes, I trust this folder\n  2. No, exit\n'
+    while IFS= read -r line; do case "$line" in *$'\e[B'*) break ;; esac; done
+    : >"$trusted"
+    printf '\033[2J\033[H'
+    now() { local t=${EPOCHREALTIME/./}; echo $((t / 1000)); }
+    end=$(( $(now) + ${STUB_BOOT_MS:-1500} ))
+    while [ "$(now)" -lt "$end" ]; do IFS= read -r -t 0.1 _ || true; done   # typed during boot: dropped
+  fi
+fi
 printf '? for shortcuts\n> '
 prompt=""
 while IFS= read -r line; do
   prompt="$prompt$line"$'\n'
-  case "$prompt" in *"Write your report to "*) sleep 1; break ;; esac
+  # herdr's claude detection reads a `✻ Working…` line in the bottom 12 lines as a live turn, so
+  # draw it after the echoed prompt, not before (a long echo would push it out of the window)
+  case "$prompt" in *"Write your report to "*)
+    # claude reads `✻ Working…`; pi reads a `Working...` line (herdr's per-harness manifests)
+    if [ "$(basename "$0")" = claude ]; then printf '\n✻ Working…\n'; else printf '\nWorking...\n'; fi
+    sleep 3; break ;; esac
 done
 report=$(printf '%s' "$prompt" | grep -o 'report to [^ ]*\.md' | head -1 | sed 's/^report to //')
 case "$prompt" in
@@ -258,11 +283,13 @@ case "$prompt" in
   *) printf '## Findings\nnone\n\nVerdict: clean\n' >"$report.tmp" ;;
 esac
 mv "$report.tmp" "$report"
+printf '\033[2J\033[H? for shortcuts\n> '   # turn over: back to the idle screen
 sleep 3600
 STUBEOF
   chmod +x "$T/stubbin/stub"
   for h in claude pi; do ln -sf stub "$T/stubbin/$h"; done
   export PATH="$T/stubbin:$PATH"
+  mkdir -p "$T/stubtrust"; export STUB_TRUST_DIR="$T/stubtrust"
   # A pane shell that sources the user's rc puts the real CLIs back first on PATH; an empty ZDOTDIR keeps it as is.
   mkdir -p "$T/zdot"; echo "# empty: no user rc" >"$T/zdot/.zshrc"; export ZDOTDIR="$T/zdot"
 fi

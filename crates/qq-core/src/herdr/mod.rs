@@ -15,6 +15,52 @@ pub const PANE_BUSY: &str = "pane_busy";
 /// different kind or pane (distinct from an occupied pane).
 pub const NAME_CLASH: &str = "agent_name_clash";
 
+/// What became of a prompt sent through [`prompt_landed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// The agent started a turn (`working`) or asked a question (`blocked`).
+    Landed,
+    /// herdr refused it: the agent was already blocked on a question.
+    Blocked,
+    /// It never reached a turn, an enter included; the cause is for a human.
+    NotLanded(String),
+}
+
+/// Sends `text` to `name` and checks it reached a turn: wait for `working` or
+/// `blocked` (10 s), then one `enter` and one more wait, then give up with the
+/// cause. A fire-and-forget prompt is lost silently while claude is still
+/// booting; this is the one place that tells. Returns the first reply's body
+/// too (what herdr said to the prompt itself).
+pub fn prompt_landed(herdr: &dyn HerdrClient, name: &str, text: &str) -> (Landing, Option<String>) {
+    let first = herdr.agent_prompt(name, text, Some((&["working", "blocked"], 10_000)));
+    let body = first.as_ref().ok().map(|r| r.body.clone());
+    let cause = match &first {
+        Ok(r) if r.ok => return (Landing::Landed, body),
+        Ok(r) if r.error_code().as_deref() == Some("agent_blocked") => {
+            return (Landing::Blocked, body)
+        }
+        Ok(r) => r.error_code().unwrap_or_else(|| r.body.clone()),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("WATCHDOG prompt-not-landed | name={name} - sent enter once");
+    let _ = herdr.agent_send_keys(name, &["enter"]);
+    match herdr.agent_wait(name, &["working", "blocked"], 10_000) {
+        Ok(r) if r.ok => (Landing::Landed, body),
+        retry => {
+            let after = match retry {
+                Ok(r) => r.error_code().unwrap_or(r.body),
+                Err(e) => e.to_string(),
+            };
+            (
+                Landing::NotLanded(format!(
+                    "the prompt to {name} did not land (no working/blocked within 10s: {cause}; after one enter: {after})"
+                )),
+                body,
+            )
+        }
+    }
+}
+
 /// The herdr verbs of [`HerdrClient`], for [`FakeHerdr`] fault/reply injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verb {

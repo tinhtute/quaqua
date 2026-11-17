@@ -614,10 +614,14 @@ impl Workflow for PipelineFlow {
                         s.prompted = true;
                         read_if_ready(s)
                     }
-                    ("prompt", _) => StepDecision::Fail {
-                        code: PROMPT_FAILED,
-                        reason: "herdr did not take the prompt".into(),
-                    },
+                    ("prompt", result) => {
+                        let why = match result {
+                            ActivityResult::Herdr(HerdrResult::PromptFailed { cause, .. }) => cause,
+                            _ => "herdr did not take the prompt".into(),
+                        };
+                        let from = s.stage;
+                        block(s, from, BlockKind::Restart, PROMPT_FAILED, why)
+                    }
                     ("spawn", ActivityResult::Herdr(HerdrResult::Spawned { .. })) => {
                         begin_review(s)
                     }
