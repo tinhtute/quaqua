@@ -515,10 +515,15 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     merge::register(daemon)?;
     cli.register(Command {
         name: "pipeline",
-        help: "pipeline '<json>' [--rounds <N>] [--wait] | --resume <task> [<repo>] [--rounds <N>] [--wait] | --cancel <task> [--wait]: build -> cross-harness review -> gate -> merge for one task; --wait blocks until the run ends (exit 0 merged or no changes, 3 cancelled, 4 held or disputed, 1 failed)",
+        help: "pipeline '<json>' [--rounds <N>] [--wait] | --resume <task> [<repo>] [--rounds <N>] [--wait] | --cancel <task> [--wait]: build -> cross-harness review -> gate -> merge for one task; --wait blocks until the run ends or pauses for approval (exit 0 merged or no changes, 3 cancelled, 4 held or disputed, 5 paused: the JSON names it in `paused`, approve with --resume and wait again, 1 failed, daemon gone or loop stopped)",
         run: |env, args| {
             let (wait, rest) = split_wait(args);
             let call = pipeline_args(&rest)?;
+            // A resume's wait must not return at the pause it approves.
+            let after = match (wait, call.get("resume").and_then(Value::as_str)) {
+                (true, Some(task)) => last_pause_seq(env, &format!("pipeline:{task}")),
+                _ => 0,
+            };
             let mut r = crate::cli::rpc_call(env, VERB, call)?;
             if wait {
                 let id = r
@@ -526,13 +531,23 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
                     .and_then(Value::as_str)
                     .ok_or_else(|| CliError::new(1, "the daemon named no workflow to wait for"))?
                     .to_string();
-                let done = wait_finished(&mut || probe(env, &id), &mut || {
+                let outcome = wait_finished(&mut || probe(env, &id, after), &mut || {
                     std::thread::sleep(POLL)
                 })?;
-                r["state"] = json!(done.state);
-                r["status"] = json!(done.status);
+                let verdict = match &outcome {
+                    Wait::Done(f) => {
+                        r["state"] = json!(f.state);
+                        r["status"] = json!(f.status);
+                        verdict(f)
+                    }
+                    Wait::Paused(why) => {
+                        r["status"] = json!("paused");
+                        r["paused"] = json!(why);
+                        Err(paused_exit(why))
+                    }
+                };
                 let out = serde_json::to_string_pretty(&r).unwrap_or_default();
-                return verdict(&done).map(|()| out.clone()).map_err(|e| {
+                return verdict.map(|()| out.clone()).map_err(|e| {
                     CliError::new(e.code, format!("{out}\n{}", e.message))
                 });
             }
@@ -581,35 +596,109 @@ fn finished_of(state: &str, events: &[crate::engine::journal::EventRecord]) -> F
     }
 }
 
-/// One look at run `id`: `None` while it is still running. Re-reading is safe
-/// at any point, so a wait started after the run ended returns at once.
-fn probe(env: &crate::cli::Env, id: &str) -> Result<Option<Finished>, CliError> {
+/// What one look at a run found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Look {
+    Running,
+    /// Unfinished and no daemon loop drives it.
+    Gone,
+    /// Waiting for an approval; carries the pause's reason.
+    Paused(String),
+    Done(Finished),
+}
+
+/// How a wait ended without an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wait {
+    Done(Finished),
+    Paused(String),
+}
+
+/// The reason of the run's open pause: the latest of its pause and resolution
+/// events decides, and only a pause journaled after `after_seq` counts (a
+/// resume's wait must not return at the pause it just approved).
+fn pause_of(events: &[crate::engine::journal::EventRecord], after_seq: u64) -> Option<String> {
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind.as_str(), "pause_for_approval" | "approval_resolved"))?;
+    if last.kind != "pause_for_approval" || last.seq <= after_seq {
+        return None;
+    }
+    serde_json::from_str::<Value>(&last.payload_json)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_string))
+}
+
+/// `--wait` returns at a pause with exit 5 so the caller can approve
+/// (`pipeline --resume`) and wait again.
+fn paused_exit(reason: &str) -> CliError {
+    CliError::new(5, format!("pipeline paused: {reason}"))
+}
+
+/// The newest pause event's seq, 0 when there is none: the baseline a resume's
+/// wait starts from.
+fn last_pause_seq(env: &crate::cli::Env, id: &str) -> u64 {
+    let db = env.runs_dir.join(crate::db::path::DB_FILE);
+    SqliteJournal::open(&db)
+        .and_then(|j| j.load_events(id, 1))
+        .map(|ev| {
+            ev.iter()
+                .filter(|e| e.kind == "pause_for_approval")
+                .map(|e| e.seq)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+/// One look at run `id`. Re-reading is safe at any point, so a wait started
+/// after the run ended returns at once.
+fn probe(env: &crate::cli::Env, id: &str, after_seq: u64) -> Result<Look, CliError> {
     let status = crate::cli::rpc_call(env, "status", Value::Null)?;
     let row = status
         .get("workflows")
         .and_then(Value::as_array)
         .and_then(|rows| rows.iter().find(|w| w["id"] == id))
         .ok_or_else(|| CliError::new(1, format!("{id}: no such workflow")))?;
-    if row["finished_ms"].is_null() {
-        return Ok(None);
-    }
-    let state = row["state"].as_str().unwrap_or("completed");
     let db = env.runs_dir.join(crate::db::path::DB_FILE);
     let events = SqliteJournal::open(&db)
         .and_then(|j| j.load_events(id, 1))
         .map_err(|e| CliError::new(1, format!("{id}: cannot read the journal: {e}")))?;
-    Ok(Some(finished_of(state, &events)))
+    if !row["finished_ms"].is_null() {
+        let state = row["state"].as_str().unwrap_or("completed");
+        return Ok(Look::Done(finished_of(state, &events)));
+    }
+    if let Some(reason) = pause_of(&events, after_seq) {
+        return Ok(Look::Paused(reason));
+    }
+    Ok(if row["loop"].as_bool() == Some(false) {
+        Look::Gone
+    } else {
+        Look::Running
+    })
 }
 
-/// Looks until the run is terminal; `sleep` runs between looks. A look that
-/// fails (the daemon is gone) ends the wait with that error.
+/// Looks until the run is terminal or paused; `sleep` runs between looks. A
+/// look that fails (the daemon is gone) ends the wait with that error, and so
+/// do two looks in a row that find the run unfinished with no loop driving it
+/// (one is the start/recover window).
 fn wait_finished(
-    probe: &mut dyn FnMut() -> Result<Option<Finished>, CliError>,
+    probe: &mut dyn FnMut() -> Result<Look, CliError>,
     sleep: &mut dyn FnMut(),
-) -> Result<Finished, CliError> {
+) -> Result<Wait, CliError> {
+    let mut gone = 0;
     loop {
-        if let Some(done) = probe()? {
-            return Ok(done);
+        match probe()? {
+            Look::Done(f) => return Ok(Wait::Done(f)),
+            Look::Paused(r) => return Ok(Wait::Paused(r)),
+            Look::Gone => {
+                gone += 1;
+                if gone >= 2 {
+                    return Err(CliError::new(1, "pipeline loop stopped"));
+                }
+            }
+            Look::Running => gone = 0,
         }
         sleep();
     }
@@ -732,10 +821,15 @@ mod tests {
 
     #[test]
     fn wait_polls_until_the_run_is_terminal_without_real_sleeps() {
-        let mut script = vec![None, None, Some(fin("completed", Some("merged")))].into_iter();
+        let mut script = vec![
+            Look::Running,
+            Look::Running,
+            Look::Done(fin("completed", Some("merged"))),
+        ]
+        .into_iter();
         let mut sleeps = 0;
         let got = wait_finished(&mut || Ok(script.next().unwrap()), &mut || sleeps += 1).unwrap();
-        assert_eq!(got.status.as_deref(), Some("merged"));
+        assert_eq!(got, Wait::Done(fin("completed", Some("merged"))));
         assert_eq!(sleeps, 2, "one sleep per poll that found it still running");
         // A probe error (daemon gone) ends the wait at once, no more polling.
         let mut sleeps = 0;
@@ -745,6 +839,59 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!((e.code, sleeps), (1, 0));
+    }
+
+    #[test]
+    fn wait_ends_when_the_loop_is_gone_on_two_polls_in_a_row() {
+        let mut script = vec![Look::Gone, Look::Gone].into_iter();
+        let mut sleeps = 0;
+        let e = wait_finished(&mut || Ok(script.next().unwrap()), &mut || sleeps += 1).unwrap_err();
+        assert_eq!(e.code, 1);
+        assert!(e.message.contains("loop stopped"), "{}", e.message);
+        assert_eq!(sleeps, 1);
+        // One gone look between running ones (the start/recover window) is not the end.
+        let mut script = vec![
+            Look::Gone,
+            Look::Running,
+            Look::Gone,
+            Look::Done(fin("completed", Some("merged"))),
+        ]
+        .into_iter();
+        let got = wait_finished(&mut || Ok(script.next().unwrap()), &mut || {}).unwrap();
+        assert_eq!(got, Wait::Done(fin("completed", Some("merged"))));
+    }
+
+    #[test]
+    fn wait_returns_at_a_pause_and_the_pause_has_its_own_exit() {
+        let mut script = vec![Look::Running, Look::Paused("plan ready".into())].into_iter();
+        let got = wait_finished(&mut || Ok(script.next().unwrap()), &mut || {}).unwrap();
+        assert_eq!(got, Wait::Paused("plan ready".into()));
+        let e = paused_exit("plan ready");
+        assert_eq!(e.code, 5);
+        assert!(e.message.contains("plan ready"));
+    }
+
+    #[test]
+    fn a_pause_is_the_latest_unresolved_pause_event_after_the_baseline() {
+        use crate::engine::journal::EventRecord;
+        let ev = |seq, k: &str, p: &str| EventRecord::new(seq, 0, k, p);
+        let pause = |seq| ev(seq, "pause_for_approval", r#"{"reason":"blocked 7: x"}"#);
+        let resolved = |seq| {
+            ev(
+                seq,
+                "approval_resolved",
+                r#"{"approved":true,"reason":null}"#,
+            )
+        };
+        assert_eq!(pause_of(&[pause(2)], 0), Some("blocked 7: x".to_string()));
+        assert_eq!(pause_of(&[pause(2), resolved(3)], 0), None);
+        assert_eq!(
+            pause_of(&[pause(2), resolved(3), pause(5)], 0),
+            Some("blocked 7: x".to_string())
+        );
+        // A pause already there before a resume was sent is not the next one.
+        assert_eq!(pause_of(&[pause(2)], 2), None);
+        assert_eq!(pause_of(&[], 0), None);
     }
 
     #[test]
