@@ -374,8 +374,12 @@ fn daemon(ws: &TestWorkspace, herdr: Arc<FakeHerdr>) -> qq_core::daemon::DaemonH
         runs_dir: ws.runs_dir(),
         herdr: herdr.clone(),
     });
-    let mut deps = Deps::new(herdr.clone(), ws.runs_dir(), Registry::native());
-    deps.watch = Arc::new(|_, _| Ok(()));
+    let deps = Deps::new(
+        herdr.clone(),
+        ws.runs_dir(),
+        Registry::native(),
+        Arc::new(|_, _| Ok(())),
+    );
     pipeline_io::register(&mut d, deps).expect("register");
     d.require_peer(Arc::new(HerdrPeers::new(herdr)));
     d.spawn().expect("daemon starts")
@@ -789,7 +793,12 @@ fn a_daemon_in_no_pane_arms_the_report_watcher_for_a_pipeline() {
         runs_dir: ws.runs_dir(),
         herdr: herdr.clone(),
     });
-    let deps = Deps::new(herdr.clone(), ws.runs_dir(), Registry::native());
+    let deps = Deps::new(
+        herdr.clone(),
+        ws.runs_dir(),
+        Registry::native(),
+        d.report_watcher(),
+    );
     pipeline_io::register(&mut d, deps).expect("register");
     d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
     let handle = d.spawn().expect("daemon starts");

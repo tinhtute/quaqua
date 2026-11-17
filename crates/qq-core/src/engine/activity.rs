@@ -212,6 +212,8 @@ pub enum ReportFileResult {
     Written,
     MtimeMs(u64),
     Exists(bool),
+    /// The report watcher could not be armed; the text says why.
+    ArmFailed(String),
 }
 
 // ----------------------------------------------------------------------------

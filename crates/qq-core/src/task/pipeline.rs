@@ -594,14 +594,20 @@ impl Workflow for PipelineFlow {
                             None => StepDecision::Continue,
                         }
                     }
-                    ("arm", _) => {
+                    ("arm", result) => {
                         let from = s.stage;
+                        let why = match result {
+                            ActivityResult::ReportFile(ReportFileResult::ArmFailed(e)) => {
+                                format!(": {e}")
+                            }
+                            _ => String::new(),
+                        };
                         block(
                             s,
                             from,
                             BlockKind::Restart,
                             BLOCK_UNFINISHED,
-                            "the report watcher could not be armed".into(),
+                            format!("the report watcher could not be armed{why}"),
                         )
                     }
                     ("prompt", ActivityResult::Herdr(HerdrResult::Prompted { .. })) => {

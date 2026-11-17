@@ -957,13 +957,14 @@ fn daemon_with(
         runs_dir: ws.runs_dir(),
         herdr: herdr.clone(),
     });
-    let mut deps = Deps::new(herdr, ws.runs_dir(), Registry::native());
-    if let Some(seen) = watch {
-        deps.watch = Arc::new(move |_, path| {
+    let watcher: qq_core::daemon::ReportWatcher = match watch {
+        Some(seen) => Arc::new(move |_, path| {
             seen.lock().unwrap().push(path.to_string());
             Ok(())
-        });
-    }
+        }),
+        None => d.report_watcher(),
+    };
+    let deps = Deps::new(herdr, ws.runs_dir(), Registry::native(), watcher);
     pipeline_io::register(&mut d, deps).expect("register pipeline");
     d.spawn().expect("daemon starts")
 }

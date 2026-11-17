@@ -30,27 +30,12 @@ use crate::engine::journal_sqlite::SqliteJournal;
 use crate::engine::{Activity, ActivityError, ActivityRequest, ActivityResult};
 use crate::herdr::{CliHerdr, HerdrClient};
 use crate::merge;
-use crate::rpc::{self, Request, RpcError};
+use crate::rpc::{self, RpcError};
 
 pub const VERB: &str = "pipeline";
 
 /// Registers a report watcher: `(workflow id, report path)`.
-pub type Watch = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
-
-/// The daemon's `watch.report` verb, over the workspace socket.
-pub fn rpc_watch(runs_dir: &Path) -> Watch {
-    let socket = rpc::socket_path(runs_dir);
-    Arc::new(move |wf, path| {
-        rpc::call(
-            &socket,
-            &Request::new("watch.report", json!({ "workflow": wf, "path": path })),
-        )
-        .map_err(|e| e.to_string())?
-        .into_result()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-    })
-}
+pub type Watch = crate::daemon::ReportWatcher;
 
 /// What the flow needs from the daemon's surroundings.
 pub struct Deps {
@@ -62,9 +47,15 @@ pub struct Deps {
 }
 
 impl Deps {
-    /// The real wiring: watchers go through the daemon socket.
-    pub fn new(herdr: Arc<dyn HerdrClient>, runs_dir: PathBuf, drivers: Drivers) -> Deps {
-        let watch = rpc_watch(&runs_dir);
+    /// The real wiring takes the daemon's in-process watcher
+    /// ([`Daemon::report_watcher`]): the daemon is in no pane, so a call to its
+    /// own socket would be refused as `unmapped_peer`.
+    pub fn new(
+        herdr: Arc<dyn HerdrClient>,
+        runs_dir: PathBuf,
+        drivers: Drivers,
+        watch: Watch,
+    ) -> Deps {
         Deps {
             herdr,
             runs_dir,
@@ -92,14 +83,17 @@ impl Effects {
 
     /// Moves a report that is already at `path` aside, then registers the
     /// watcher: the wait can only be answered by a file written after the prompt.
-    fn arm(&self, path: &str) -> bool {
+    fn arm(&self, path: &str) -> ReportFileResult {
         if Path::new(path).exists() {
             let stale = format!("{path}.stale-{}", SystemClock.now_ms());
-            if std::fs::rename(path, stale).is_err() {
-                return false;
+            if let Err(e) = std::fs::rename(path, stale) {
+                return ReportFileResult::ArmFailed(format!("stale report not moved: {e}"));
             }
         }
-        (self.deps.watch)(&self.id(), path).is_ok()
+        match (self.deps.watch)(&self.id(), path) {
+            Ok(()) => ReportFileResult::Exists(true),
+            Err(e) => ReportFileResult::ArmFailed(e),
+        }
     }
 
     fn tip(&self) -> String {
@@ -217,7 +211,7 @@ impl Activity for Effects {
                 }))
             }
             ActivityRequest::ReportFile(ReportFileRequest::Exists { path }) => Ok(
-                ActivityResult::ReportFile(ReportFileResult::Exists(self.arm(path))),
+                ActivityResult::ReportFile(self.arm(path)),
             ),
             ActivityRequest::ReportFile(ReportFileRequest::Read { path }) => Ok(
                 ActivityResult::ReportFile(match std::fs::read_to_string(path) {
@@ -570,6 +564,7 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
             Arc::new(CliHerdr::new()),
             crate::db::path::default_runs_dir(),
             Drivers::native(),
+            daemon.report_watcher(),
         ),
     )?;
     merge::register(daemon)?;

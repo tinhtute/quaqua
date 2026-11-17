@@ -32,7 +32,7 @@ use crate::engine::{
     WorkflowContext, WorkflowEvent,
 };
 use crate::herdr::{CliHerdr, HerdrClient};
-use crate::rpc::{self, Request, RpcError};
+use crate::rpc::{self, RpcError};
 
 /// The workflow kind and the verb this module registers.
 pub const KIND: &str = "worker_flow";
@@ -623,15 +623,10 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
         if ctx.supervisor.is_running(&id) {
             // Repeats are ignored by the flow once it is past `Armed`.
             let _ = ctx.supervisor.signal(&id, "task", "launched", Value::Null);
-            for (verb, args) in [
-                ("watch.agent", json!({ "workflow": id, "agent": name })),
-                ("watch.report", json!({ "workflow": id, "path": report })),
-            ] {
-                rpc::call(&ctx.socket, &Request::new(verb, args))
-                    .map_err(internal)?
-                    .into_result()
-                    .map_err(|e| internal(e.to_string()))?;
-            }
+            // In-process: the daemon is in no pane, so its own socket would
+            // refuse it as `unmapped_peer`.
+            ctx.watch_agent(&id, name)?;
+            ctx.watch_report(&id, &report)?;
         }
         Ok(json!({ "workflow": id, "agent_id": spawned.agent_id }))
     })

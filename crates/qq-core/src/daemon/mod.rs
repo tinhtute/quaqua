@@ -17,7 +17,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -198,7 +198,12 @@ pub struct Daemon {
     kinds: HashMap<String, Factory>,
     live_hooks: Vec<LiveHook>,
     peers: Option<Arc<dyn PeerResolver>>,
+    /// Filled by `run` once the `Ctx` exists; see [`Daemon::report_watcher`].
+    link: Arc<OnceLock<Weak<Ctx>>>,
 }
+
+/// Registers a report watcher in the daemon's own process: `(workflow, path)`.
+pub type ReportWatcher = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     args.get(key)
@@ -224,6 +229,7 @@ impl Daemon {
             kinds: HashMap::new(),
             live_hooks: Vec::new(),
             peers: None,
+            link: Arc::new(OnceLock::new()),
         };
         d.register_builtin();
         d
@@ -258,6 +264,22 @@ impl Daemon {
     /// would otherwise rebuild their own.
     pub fn herdr(&self) -> Arc<dyn HerdrClient> {
         Arc::clone(&self.cfg.herdr)
+    }
+
+    /// A report watcher that runs in this daemon's own process. A flow must use
+    /// it, never a call to its own socket: the daemon is not in a pane, so the
+    /// peer gate refuses it as `unmapped_peer`. Until the daemon is serving
+    /// (workflows are revived first) it answers `Err`, and callers retry.
+    pub fn report_watcher(&self) -> ReportWatcher {
+        let (link, runs_dir) = (Arc::clone(&self.link), self.cfg.runs_dir.clone());
+        Arc::new(move |workflow, path| {
+            let ctx = link
+                .get()
+                .and_then(Weak::upgrade)
+                .ok_or("daemon is not serving yet")?;
+            ctx.watch_report(workflow, &normalize(&runs_dir, path))
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// The workspace `runs/` directory the daemon serves.
@@ -371,6 +393,7 @@ impl Daemon {
             kinds,
             live_hooks,
             peers,
+            link,
         } = self;
         let socket = rpc::socket_path(&cfg.runs_dir);
         std::fs::create_dir_all(&cfg.runs_dir)?;
@@ -394,6 +417,7 @@ impl Daemon {
             stop_watchers: Arc::new(AtomicBool::new(false)),
             watchers: Mutex::new(HashMap::new()),
         });
+        let _ = link.set(Arc::downgrade(&ctx));
         ctx.rearm_watches().map_err(DaemonError::Store)?;
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
@@ -432,11 +456,18 @@ impl Daemon {
     pub fn spawn(self) -> Result<DaemonHandle, DaemonError> {
         let socket = rpc::socket_path(&self.cfg.runs_dir);
         let (tx, rx) = mpsc::channel();
+        let link = Arc::clone(&self.link);
         let thread = std::thread::spawn(move || self.run(Some(tx)));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(()) => return Ok(DaemonHandle { socket, thread }),
+                Ok(()) => {
+                    return Ok(DaemonHandle {
+                        socket,
+                        thread,
+                        link,
+                    })
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return match thread.join() {
@@ -498,12 +529,16 @@ fn normalize(runs_dir: &Path, path: &str) -> PathBuf {
 pub struct DaemonHandle {
     pub socket: PathBuf,
     thread: JoinHandle<Result<(), DaemonError>>,
+    link: Arc<OnceLock<Weak<Ctx>>>,
 }
 
 impl DaemonHandle {
-    /// Sends `stop` and waits for the daemon to wind down.
+    /// Stops the daemon in-process (no socket call: the owner of the handle
+    /// is not a pane peer) and waits for it to wind down.
     pub fn stop(self) -> Result<(), DaemonError> {
-        let _ = rpc::call(&self.socket, &Request::new("stop", Value::Null));
+        if let Some(ctx) = self.link.get().and_then(Weak::upgrade) {
+            ctx.request_shutdown();
+        }
         self.thread
             .join()
             .unwrap_or_else(|_| Err(DaemonError::Io(io::Error::other("daemon panicked"))))
