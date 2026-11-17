@@ -96,6 +96,7 @@ pub type Install = fn(&mut Registry, &mut Daemon) -> Result<(), String>;
 /// Every module's install. Each module adds exactly one line here.
 pub const MODULES: &[Install] = &[
     crate::task::worker_flow::INSTALL,
+    crate::task::create::INSTALL,
     crate::bus::INSTALL,
     crate::config::INSTALL,
     crate::authority::INSTALL,
