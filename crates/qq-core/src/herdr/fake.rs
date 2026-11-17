@@ -53,7 +53,22 @@ struct State {
     split_cwds: Vec<(String, String)>,
     /// pane id -> (shell pid, foreground pids) `pane_process_info` reports.
     pids: BTreeMap<String, (u32, Vec<u32>)>,
+    /// Agents whose prompts do not reach a turn (claude still booting).
+    lose: BTreeMap<String, Lose>,
+    /// Agents holding a lost prompt that an `enter` submits.
+    awaiting_enter: Vec<String>,
+    /// pane id -> texts `pane_read` returns one per read; the last one sticks.
+    text_script: BTreeMap<String, VecDeque<String>>,
     next_id: u32,
+}
+
+/// How a prompt is lost: [`FakeHerdr::lose_prompts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lose {
+    /// Every prompt is swallowed, an enter included.
+    Always,
+    /// The prompt is typed but not submitted: the next `enter` lands it.
+    UntilEnter,
 }
 
 #[derive(Default)]
@@ -169,6 +184,21 @@ impl FakeHerdr {
     /// What `pane_read` returns for `pane` (its whole scrollback).
     pub fn set_pane_text(&self, pane: &str, text: &str) {
         self.lock().text.insert(pane.to_string(), text.to_string());
+    }
+
+    /// Test control: prompts sent to `name` are accepted by herdr but never
+    /// start a turn (the agent stays as it was), as when claude is still booting.
+    pub fn lose_prompts(&self, name: &str, how: Lose) {
+        self.lock().lose.insert(name.to_string(), how);
+    }
+
+    /// Test control: successive `pane_read`s of `pane` return these texts in
+    /// order; the last one stays.
+    pub fn script_pane_text(&self, pane: &str, texts: &[&str]) {
+        self.lock().text_script.insert(
+            pane.to_string(),
+            texts.iter().map(|t| t.to_string()).collect(),
+        );
     }
 
     /// Test control: the next `agent_start` registers the agent `blocked` and
@@ -366,7 +396,11 @@ impl HerdrClient for FakeHerdr {
         if a.status == "blocked" {
             return Ok(Reply::err("agent_blocked"));
         }
-        a.status = "working".into();
+        match st.lose.get(name) {
+            None => a.status = "working".into(),
+            Some(Lose::UntilEnter) => st.awaiting_enter.push(name.to_string()),
+            Some(Lose::Always) => {}
+        }
         st.prompts.push((name.to_string(), text.to_string()));
         Ok(match wait {
             None => Reply::ok(r#"{"result":{"submitted":true}}"#),
@@ -381,6 +415,12 @@ impl HerdrClient for FakeHerdr {
             return Ok(Reply::err("agent_not_found"));
         }
         let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        if keys == ["enter"] && st.awaiting_enter.iter().any(|n| n == name) {
+            st.awaiting_enter.retain(|n| n != name);
+            if let Some(a) = st.agents.get_mut(name) {
+                a.status = "working".into();
+            }
+        }
         if st.idle_on.get(name) == Some(&keys) {
             if let Some(a) = st.agents.get_mut(name) {
                 a.status = "idle".into();
@@ -522,9 +562,19 @@ impl HerdrClient for FakeHerdr {
     }
 
     fn pane_read(&self, pane: &str, lines: u32) -> io::Result<Reply> {
-        let st = enter!(self, Verb::PaneRead);
+        let mut st = enter!(self, Verb::PaneRead);
         if !st.panes.contains_key(pane) && !st.text.contains_key(pane) {
             return Ok(Reply::err("pane_not_found"));
+        }
+        let scripted = st.text_script.get_mut(pane).and_then(|q| {
+            if q.len() > 1 {
+                q.pop_front()
+            } else {
+                q.front().cloned()
+            }
+        });
+        if let Some(t) = scripted {
+            st.text.insert(pane.to_string(), t);
         }
         let text = st.text.get(pane).cloned().unwrap_or_default();
         let all: Vec<&str> = text.lines().collect();

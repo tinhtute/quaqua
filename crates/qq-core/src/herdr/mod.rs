@@ -5,7 +5,7 @@
 mod fake;
 pub mod liveness;
 
-pub use fake::FakeHerdr;
+pub use fake::{FakeHerdr, Lose};
 
 /// Error code for a start on a pane that already hosts another agent. Not a
 /// herdr 0.9.5 documented code: T39's live probe may replace the value, so

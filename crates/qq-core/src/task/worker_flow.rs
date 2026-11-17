@@ -718,4 +718,49 @@ mod tests {
             );
         }
     }
+
+    fn prompt_through(herdr: Arc<crate::herdr::FakeHerdr>) -> HerdrResult {
+        let act = WorkerActivities { herdr };
+        match act
+            .execute(&ActivityRequest::Herdr(HerdrRequest::Prompt {
+                name: "w1".into(),
+                task: "do it".into(),
+            }))
+            .expect("a prompt result, never an Err that stops the loop")
+        {
+            ActivityResult::Herdr(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn fake_with_agent() -> Arc<crate::herdr::FakeHerdr> {
+        let h = Arc::new(crate::herdr::FakeHerdr::new());
+        let pane = h.seed_pane("work", None, &[]);
+        h.agent_start("w1", "claude", &pane, 1, &[]).unwrap();
+        h
+    }
+
+    #[test]
+    fn a_builder_prompt_that_never_lands_is_a_failure_with_its_cause() {
+        let h = fake_with_agent();
+        h.lose_prompts("w1", crate::herdr::Lose::Always);
+        match prompt_through(h) {
+            HerdrResult::PromptFailed { name, cause } => {
+                assert_eq!(name, "w1");
+                assert!(cause.contains("did not land"), "{cause}");
+            }
+            other => panic!("not landed must not look sent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_builder_prompt_that_lands_after_one_enter_is_prompted() {
+        let h = fake_with_agent();
+        h.lose_prompts("w1", crate::herdr::Lose::UntilEnter);
+        assert_eq!(
+            prompt_through(h.clone()),
+            HerdrResult::Prompted { name: "w1".into() }
+        );
+        assert_eq!(h.keys(), vec![("w1".to_string(), vec!["enter".to_string()])]);
+    }
 }

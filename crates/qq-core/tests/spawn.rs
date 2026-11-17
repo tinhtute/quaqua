@@ -969,3 +969,33 @@ fn claudes_trust_dialog_is_accepted_when_a_start_is_held_by_it() {
     assert_eq!(fx.herdr.keys().len(), 1, "no keys sent without the dialog");
     assert_eq!(fx.agents("sude-b"), 0);
 }
+
+#[test]
+fn spawn_returns_only_once_claude_is_really_ready_after_the_trust_dialog() {
+    use qq_core::task::spawn::{spawn_with, Ready};
+    const DIALOG: &str = "Is this a project you trust?\n  Yes, I trust this folder";
+    let quick = Ready { polls: 4, poll_ms: 0 };
+    let go = |fx: &Fx, name: &str, pane: &str| {
+        spawn_with(&fx.conn, &fx.herdr, &fx.drivers, &peer(name, "ni", pane), 1_000, &quick)
+    };
+
+    // herdr reports idle while the dialog is still on screen: claude is not
+    // ready, so the start fails with its cause instead of returning.
+    let fx = Fx::new("readystuck");
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    fx.herdr.block_next_start();
+    fx.herdr.idle_on_keys("sude-a", &["down", "enter"]);
+    fx.herdr.set_pane_text(&pane, DIALOG);
+    let err = go(&fx, "sude-a", &pane).expect_err("a dialog still up is not ready").to_string();
+    assert!(err.contains("agent_not_ready"), "{err}");
+    assert_eq!(fx.agents("sude-a"), 0, "no row for an agent that never came up");
+
+    // The dialog clears a moment after the keys: the start waits for that.
+    let fx = Fx::new("readyslow");
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    fx.herdr.block_next_start();
+    fx.herdr.idle_on_keys("sude-a", &["down", "enter"]);
+    fx.herdr.script_pane_text(&pane, &[DIALOG, DIALOG, "> ready for input"]);
+    go(&fx, "sude-a", &pane).expect("ready once the dialog is gone");
+    assert_eq!(fx.agents("sude-a"), 1);
+}

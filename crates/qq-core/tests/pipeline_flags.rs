@@ -195,11 +195,17 @@ fn hold() -> RunnerOptions {
 
 impl Run {
     fn start(fx: &Fixture, input: PipelineInput) -> Self {
+        Self::start_with(fx, input, |_| {})
+    }
+
+    /// [`Run::start`] with `setup` run on the fake herdr after the builder is up.
+    fn start_with(fx: &Fixture, input: PipelineInput, setup: impl FnOnce(&FakeHerdr)) -> Self {
         let herdr = Arc::new(FakeHerdr::new());
         let pane = herdr.seed_pane("work", None, &[]);
         herdr
             .agent_start(&input.builder(), "claude", &pane, 1, &[])
             .unwrap();
+        setup(&herdr);
         HERDR.with(|h| *h.borrow_mut() = Some(herdr.clone()));
         let armed = Arc::new(Mutex::new(Vec::new()));
         let a = armed.clone();
@@ -841,4 +847,23 @@ fn a_daemon_in_no_pane_arms_the_report_watcher_for_a_pipeline() {
         std::thread::sleep(Duration::from_millis(20));
     }
     handle.stop().unwrap_or(());
+}
+
+#[test]
+fn a_builder_prompt_that_never_lands_pauses_with_its_cause_and_waits_for_no_report() {
+    use qq_core::herdr::Lose;
+    let fx = Fixture::new("lost");
+    let r = Run::start_with(&fx, fx.input(false, 2), |h| h.lose_prompts("t1-b", Lose::Always));
+    let (code, reason) = r.blocked().expect("a prompt that did not land pauses the flow");
+    assert_eq!(code, i64::from(qq_core::task::pipeline::PROMPT_FAILED));
+    assert!(reason.contains("t1-b") && reason.contains("did not land"), "{reason}");
+}
+
+#[test]
+fn a_builder_prompt_that_needs_one_enter_still_runs_the_flow() {
+    use qq_core::herdr::Lose;
+    let fx = Fixture::new("enter");
+    let r = Run::start_with(&fx, fx.input(false, 2), |h| h.lose_prompts("t1-b", Lose::UntilEnter));
+    assert!(r.blocked().is_none(), "one enter lands it: {:?}", r.blocked());
+    assert_eq!(r.sim.builder_prompts().len(), 1);
 }

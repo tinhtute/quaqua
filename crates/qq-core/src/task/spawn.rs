@@ -92,7 +92,7 @@ impl std::error::Error for SpawnError {}
 
 /// Accepts claude's workspace-trust dialog when `pane` shows it, then waits
 /// for the agent to be idle. `false`: no dialog, or the agent did not come up.
-fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str) -> bool {
+fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, _ready: &Ready) -> bool {
     let up = herdr
         .pane_read(pane, 40)
         .is_ok_and(|r| r.ok && r.body.contains("trust"));
@@ -102,12 +102,37 @@ fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str) -> bool 
             .is_ok_and(|r| r.ok)
 }
 
+/// How long [`spawn`] waits for claude to be really ready once its trust dialog
+/// is accepted: `polls` looks, `poll_ms` apart.
+pub struct Ready {
+    pub polls: u32,
+    pub poll_ms: u64,
+}
+
+impl Ready {
+    pub const DEFAULT: Ready = Ready {
+        polls: 60,
+        poll_ms: 500,
+    };
+}
+
 pub fn spawn(
     conn: &Connection,
     herdr: &dyn HerdrClient,
     drivers: &Registry,
     spec: &SpawnSpec,
     now_ms: u64,
+) -> Result<Spawned, SpawnError> {
+    spawn_with(conn, herdr, drivers, spec, now_ms, &Ready::DEFAULT)
+}
+
+pub fn spawn_with(
+    conn: &Connection,
+    herdr: &dyn HerdrClient,
+    drivers: &Registry,
+    spec: &SpawnSpec,
+    now_ms: u64,
+    ready: &Ready,
 ) -> Result<Spawned, SpawnError> {
     let target = config::resolve_spawn(conn, spec.kind).map_err(SpawnError::Config)?;
     let driver = drivers
@@ -166,7 +191,7 @@ pub fn spawn(
         // "Yes, I trust this folder", then Enter) and wait for the agent.
         let cleared = code.as_deref() == Some("agent_not_ready")
             && driver.herdr_kind() == "claude"
-            && accept_trust_dialog(herdr, spec.name, spec.pane);
+            && accept_trust_dialog(herdr, spec.name, spec.pane, ready);
         if !cleared {
             return Err(SpawnError::Herdr(code.unwrap_or(reply.body)));
         }
