@@ -659,6 +659,42 @@ fn the_builder_gets_its_own_pane_and_worktree_not_the_callers() {
 }
 
 #[test]
+fn a_caller_mapped_to_an_unnamed_pane_gets_its_builder_split_off_that_pane() {
+    let ws = TestWorkspace::new("pflags-anchor");
+    let fx = Fixture::new("anchor");
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    ws.seal_herdr();
+    let herdr = Arc::new(FakeHerdr::new());
+    // The CoS pane: only the grid_role=cos token, no herdr agent name.
+    let cos_pane = herdr.seed_pane("cos", None, &[("grid_role", "cos")]);
+    herdr.set_pane_pids(&cos_pane, std::process::id(), &[]);
+    conn.execute(
+        "INSERT INTO agent (name, role, started_ms) VALUES ('cos', 'cos', 1)",
+        [],
+    )
+    .unwrap();
+    let d = daemon(&ws, herdr.clone());
+    let r = call(
+        &ws,
+        json!({
+            "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+            "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+            "integ": "integ", "plan": false,
+        }),
+    );
+    assert!(r.ok, "{:?}", r.error);
+    let builder = agent_pane(&herdr, "t1-b");
+    assert_ne!(builder, cos_pane);
+    assert_eq!(
+        herdr.splits().first().map(|(anchor, _)| anchor.clone()),
+        Some(cos_pane),
+        "the builder is split off the pane the daemon mapped the caller to"
+    );
+    d.stop().unwrap();
+}
+
+#[test]
 fn each_reviewer_round_gets_its_own_pane_and_worktree_at_the_candidate() {
     let fx = Fixture::new("reviewers");
     let tip = fx.commit_on_t1("a.txt");

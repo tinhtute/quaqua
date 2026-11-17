@@ -589,7 +589,9 @@ fn identify(
             format!("peer uid {} is not the daemon's uid {own_uid}", cred.uid),
         ));
     }
-    req.caller = Some(peers.resolve(*cred)?.0);
+    let (who, pane) = peers.resolve_pane(*cred)?;
+    req.caller = Some(who.0);
+    req.caller_pane = pane;
     Ok(req)
 }
 

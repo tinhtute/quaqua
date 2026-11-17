@@ -189,6 +189,7 @@ fn daemon_rpc_roundtrip() {
             verb: "whoami".into(),
             args: Value::Null,
             caller: Some("peer-a".into()),
+            caller_pane: None,
         },
     )
     .unwrap()

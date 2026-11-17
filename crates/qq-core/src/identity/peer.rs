@@ -55,6 +55,12 @@ impl CallerId {
 /// Maps a peer to the caller it speaks as.
 pub trait PeerResolver: Send + Sync {
     fn resolve(&self, cred: PeerCred) -> Result<CallerId, RpcError>;
+
+    /// As [`PeerResolver::resolve`], plus the pane the peer was mapped to.
+    /// For placement only (where to split a new pane), never authority.
+    fn resolve_pane(&self, cred: PeerCred) -> Result<(CallerId, Option<String>), RpcError> {
+        self.resolve(cred).map(|c| (c, None))
+    }
 }
 
 #[repr(C)]
@@ -226,6 +232,10 @@ fn json(r: io::Result<Reply>, what: &str) -> Result<Value, RpcError> {
 
 impl PeerResolver for HerdrPeers {
     fn resolve(&self, cred: PeerCred) -> Result<CallerId, RpcError> {
+        self.resolve_pane(cred).map(|(c, _)| c)
+    }
+
+    fn resolve_pane(&self, cred: PeerCred) -> Result<(CallerId, Option<String>), RpcError> {
         let chain = ancestry(cred.pid);
         let panes = json(self.herdr.pane_list(), "pane list")?;
         let panes = panes
@@ -270,7 +280,7 @@ impl PeerResolver for HerdrPeers {
             .ok_or_else(|| refuse(format!("pid {} is in no herdr pane", cred.pid)))?;
         if cos {
             self.ensure_cos(pane)?;
-            return Ok(CallerId("cos".into()));
+            return Ok((CallerId("cos".into()), Some(pane.to_string())));
         }
         let agents = json(self.herdr.agent_list(), "agent list")?;
         agents
@@ -280,7 +290,7 @@ impl PeerResolver for HerdrPeers {
             .flatten()
             .find(|a| a.get("pane_id").and_then(Value::as_str) == Some(pane))
             .and_then(|a| a.get("name").and_then(Value::as_str))
-            .map(|n| CallerId(n.to_string()))
+            .map(|n| (CallerId(n.to_string()), Some(pane.to_string())))
             .ok_or_else(|| refuse(format!("pane {pane} hosts no known agent")))
     }
 }
