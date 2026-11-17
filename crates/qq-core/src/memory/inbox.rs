@@ -58,11 +58,6 @@ pub fn inbox_as(env: &Env, claim: Option<String>, args: &[String]) -> Result<Str
             _ => return Err(usage()),
         }
     }
-    // `--for` moves another recipient's cursor, so only the recipient itself,
-    // the CoS, or the recipient's spawner may; anyone else reads without acking.
-    if let (Some(t), false) = (&to, peek) {
-        peek = !may_ack(env, claim.as_deref(), t);
-    }
     let mut call = json!({ "limit": if all { PAGE } else { MAX_LINES + 1 } });
     if let Some(t) = &to {
         call["to"] = json!(t);
@@ -110,27 +105,6 @@ pub fn inbox_as(env: &Env, claim: Option<String>, args: &[String]) -> Result<Str
             "hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}})
         .to_string(),
     })
-}
-
-/// May the caller (`QQ_AGENT`) advance `to`'s cursor? No caller is the CoS's own
-/// shell and hook. Any database or lookup failure says no.
-fn may_ack(env: &Env, claim: Option<&str>, to: &str) -> bool {
-    let Some(caller) = claim else {
-        return true;
-    };
-    if caller == to {
-        return true;
-    }
-    let Ok(conn) = crate::db::open(&env.runs_dir.join("qq.db")) else {
-        return false;
-    };
-    let Ok(Some(c)) = crate::authority::resolve(&conn, caller) else {
-        return false;
-    };
-    if c.role == crate::authority::Role::Cos {
-        return true;
-    }
-    matches!(crate::authority::resolve(&conn, to), Ok(Some(t)) if t.spawner_id == Some(c.id))
 }
 
 /// `#<id> <from> [<kind>] <first line of the body, 100 chars>`.

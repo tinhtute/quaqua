@@ -18,7 +18,6 @@ use crate::authority::{self, Decision};
 use crate::cli::{Install, Registry};
 use crate::daemon::store::Store;
 use crate::daemon::{Ctx, Daemon};
-use crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL;
 use crate::rpc::{self, Request, RpcError};
 
 pub mod cli;
@@ -119,7 +118,15 @@ fn owner<'a>(ctx: &Ctx, req: &'a Request, op: &str) -> Result<&'a str, RpcError>
     match req.args.get("to").and_then(Value::as_str) {
         Some(to) if !to.is_empty() && to != caller => {
             ctx.store
-                .with_conn(|c| refuse_mailbox(c, caller, op, to))
+                .with_conn(|c| {
+                    authority::refuse(
+                        c,
+                        caller,
+                        op,
+                        to,
+                        "a mailbox is read and acked by its owner only",
+                    )
+                })
                 .map_err(internal)?;
             Err(RpcError::new(
                 "refused",
@@ -128,30 +135,6 @@ fn owner<'a>(ctx: &Ctx, req: &'a Request, op: &str) -> Result<&'a str, RpcError>
         }
         _ => Ok(caller),
     }
-}
-
-/// One `refusal` row in the authority stream, same shape as the other edges.
-fn refuse_mailbox(c: &Connection, caller: &str, op: &str, to: &str) -> rusqlite::Result<()> {
-    c.execute_batch(JOURNAL_SCHEMA_SQL)?;
-    let role = authority::resolve(c, caller)
-        .ok()
-        .flatten()
-        .map(|a| a.role.as_str());
-    let payload = json!({
-        "caller": caller, "caller_role": role, "edge": op, "target": to,
-        "reason": "a mailbox is read and acked by its owner only",
-    });
-    c.execute(
-        "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) \
-         SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3, ?4 FROM events WHERE workflow_id = ?1",
-        params![
-            authority::JOURNAL_STREAM,
-            now_ms() as i64,
-            authority::REFUSAL_KIND,
-            payload.to_string()
-        ],
-    )?;
-    Ok(())
 }
 
 fn now_ms() -> u64 {

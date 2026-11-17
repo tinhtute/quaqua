@@ -209,7 +209,8 @@ fn ported_verbs_answer() {
     let env = Env {
         runs_dir: ws.runs_dir(),
     };
-    let inbox = |a: &[&str]| memory::inbox_cmd(&env, &args(a)).expect("inbox");
+    let inbox =
+        |a: &[&str]| memory::inbox_as(&env, Some("peer-a".to_string()), &args(a)).expect("inbox");
     assert_eq!(inbox(&["--for", "peer-a"]), "", "no mail, no output");
     send(&ws, "peer-a", "build T45\nsecond line");
     send(&ws, "peer-a", "and T46");
@@ -648,23 +649,29 @@ fn update_merges_memory_hooks_into_a_modified_settings() {
 }
 
 #[test]
-fn inbox_for_does_not_move_another_cursor() {
+fn inbox_for_another_mailbox_is_refused_and_moves_no_cursor() {
     let ws = TestWorkspace::new("inbox-guard");
     let env = Env {
         runs_dir: ws.runs_dir(),
     };
     let daemon = start(&ws);
     send(&ws, "peer-a", "do the thing");
-    let inbox = |caller: &str, a: &[&str]| {
-        memory::inbox_as(&env, Some(caller.to_string()), &args(a)).unwrap()
-    };
-    // `lead` is neither peer-a nor the CoS nor peer-a's spawner: reads, never acks.
-    assert!(inbox("lead", &["--for", "peer-a"]).contains("do the thing"));
-    assert!(inbox("peer-a", &["--for", "peer-a", "--peek"]).contains("do the thing"));
-    // The recipient itself acks.
-    assert!(inbox("peer-a", &["--for", "peer-a"]).contains("do the thing"));
-    assert_eq!(inbox("peer-a", &["--for", "peer-a"]), "");
+    let inbox =
+        |caller: &str, a: &[&str]| memory::inbox_as(&env, Some(caller.to_string()), &args(a));
+    // `lead` may not read peer-a's box, peeking or not.
+    for a in [&["--for", "peer-a"][..], &["--for", "peer-a", "--peek"][..]] {
+        let err = inbox("lead", a).expect_err("another mailbox is refused");
+        assert!(err.message.starts_with("refused"), "{}", err.message);
+    }
+    // peer-a's cursor did not move; it reads its own box with `--for` itself.
+    assert!(inbox("peer-a", &["--for", "peer-a", "--peek"])
+        .unwrap()
+        .contains("do the thing"));
+    assert!(inbox("peer-a", &["--for", "peer-a"])
+        .unwrap()
+        .contains("do the thing"));
+    assert_eq!(inbox("peer-a", &["--for", "peer-a"]).unwrap(), "");
     // A hook format fails open when the daemon cannot answer.
     daemon.stop().expect("daemon stops");
-    assert_eq!(inbox("peer-a", &["--format", "hook-ups"]), "");
+    assert_eq!(inbox("peer-a", &["--format", "hook-ups"]).unwrap(), "");
 }
