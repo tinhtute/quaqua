@@ -265,7 +265,10 @@ pub fn heal(panes: &dyn PaneOps, runs_dir: &Path) -> Result<Vec<String>, String>
 pub const INSTALL: Install = install;
 
 fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
-    daemon.require_peer(std::sync::Arc::new(peer::HerdrPeers::new(daemon.herdr())));
+    daemon.require_peer(std::sync::Arc::new(peer::HerdrPeers::with_cos_bootstrap(
+        daemon.herdr(),
+        daemon.runs_dir().to_path_buf(),
+    )));
     registry.register(Command {
         name: "identity",
         help: "identity heal: restore the CoS pane tokens after a herdr restart",

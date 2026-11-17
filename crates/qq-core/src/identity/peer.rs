@@ -166,11 +166,49 @@ fn ancestry(pid: i32) -> Vec<i32> {
 /// agent hosted by that pane.
 pub struct HerdrPeers {
     herdr: Arc<dyn HerdrClient>,
+    /// Workspace `runs/` whose database gets the CoS agent row on the first
+    /// call from a `grid_role=cos` pane; `None` seeds nothing.
+    cos_runs: Option<std::path::PathBuf>,
 }
 
 impl HerdrPeers {
     pub fn new(herdr: Arc<dyn HerdrClient>) -> Self {
-        HerdrPeers { herdr }
+        HerdrPeers {
+            herdr,
+            cos_runs: None,
+        }
+    }
+
+    /// As [`HerdrPeers::new`], and a call that maps to a cos-tagged pane makes
+    /// sure the database holds one active `cos` agent row (a fresh workspace
+    /// has none). The row is only ever made on that mapping, so an unmapped
+    /// peer is still refused before this runs.
+    pub fn with_cos_bootstrap(herdr: Arc<dyn HerdrClient>, runs_dir: std::path::PathBuf) -> Self {
+        HerdrPeers {
+            herdr,
+            cos_runs: Some(runs_dir),
+        }
+    }
+
+    fn ensure_cos(&self, pane: &str) -> Result<(), RpcError> {
+        let Some(runs) = &self.cos_runs else {
+            return Ok(());
+        };
+        let conn = crate::db::open(&runs.join(crate::db::path::DB_FILE))
+            .map_err(|e| refuse(format!("cos bootstrap: {e}")))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // One statement: two first calls cannot both insert.
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms, pane_id) \
+             SELECT 'cos', 'cos', ?1, ?2 \
+             WHERE NOT EXISTS (SELECT 1 FROM agent WHERE name = 'cos' AND role = 'cos' AND ended_ms IS NULL)",
+            rusqlite::params![now, pane],
+        )
+        .map_err(|e| refuse(format!("cos bootstrap: {e}")))?;
+        Ok(())
     }
 }
 
@@ -231,6 +269,7 @@ impl PeerResolver for HerdrPeers {
             })
             .ok_or_else(|| refuse(format!("pid {} is in no herdr pane", cred.pid)))?;
         if cos {
+            self.ensure_cos(pane)?;
             return Ok(CallerId("cos".into()));
         }
         let agents = json(self.herdr.agent_list(), "agent list")?;

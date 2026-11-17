@@ -18,6 +18,10 @@ struct Rig {
 }
 
 fn rig(tag: &str) -> Rig {
+    rig_with(tag, false)
+}
+
+fn rig_with(tag: &str, bootstrap: bool) -> Rig {
     let ws = TestWorkspace::new(tag);
     ws.seal_herdr();
     let herdr = Arc::new(FakeHerdr::new());
@@ -42,7 +46,14 @@ fn rig(tag: &str) -> Rig {
         d.register_verb(v, Box::new(|_, _| Ok(json!({ "ran": true }))))
             .unwrap();
     }
-    d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
+    if bootstrap {
+        d.require_peer(Arc::new(HerdrPeers::with_cos_bootstrap(
+            herdr.clone(),
+            ws.runs_dir(),
+        )));
+    } else {
+        d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
+    }
     let daemon = d.spawn().unwrap();
     Rig {
         _ws: ws,
@@ -210,5 +221,49 @@ fn unmapped_same_uid_is_refused_on_worker_spawn_and_on_lookalike_verbs() {
     r.herdr.agent_start("w-2", "claude", &pane, 0, &[]).unwrap();
     r.herdr.set_pane_pids(&pane, me(), &[]);
     assert_eq!(call(&r, "task.start", None).unwrap()["ran"], true);
+    stop(r);
+}
+
+fn cos_rows(r: &Rig) -> i64 {
+    let conn = qq_core::db::open(&r._ws.runs_dir().join(qq_core::db::path::DB_FILE)).unwrap();
+    conn.query_row(
+        "SELECT count(*) FROM agent WHERE name = 'cos' AND role = 'cos' AND ended_ms IS NULL",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn first_call_from_the_cos_pane_makes_one_active_cos_agent() {
+    let r = rig_with("cos-boot", true);
+    let pane = r
+        .herdr
+        .seed_pane("c", Some("claude"), &[("grid_role", "cos")]);
+    let parent = parent_pid(me() as i32).expect("test process has a parent");
+    r.herdr.set_pane_pids(&pane, parent as u32, &[]);
+    assert_eq!(cos_rows(&r), 0, "a fresh workspace has no cos row");
+    for _ in 0..2 {
+        assert_eq!(whoami(&r, None).unwrap()["caller"], "cos");
+        assert_eq!(cos_rows(&r), 1, "one row, repeat calls add none");
+    }
+    stop(r);
+}
+
+#[test]
+fn bootstrap_makes_no_cos_row_for_a_worker_pane_or_an_unmapped_peer() {
+    let r = rig_with("cos-boot-none", true);
+    let pane = r.herdr.seed_pane("w", None, &[]);
+    r.herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
+    r.herdr.set_pane_pids(&pane, me(), &[]);
+    assert_eq!(whoami(&r, Some("cos")).unwrap()["caller"], "w-1");
+    assert_eq!(
+        cos_rows(&r),
+        0,
+        "a claim of 'cos' from a worker pane seeds nothing"
+    );
+    r.herdr.set_pane_pids(&pane, 1, &[]);
+    assert_eq!(whoami(&r, Some("cos")).unwrap_err().code, "unmapped_peer");
+    assert_eq!(cos_rows(&r), 0, "an unmapped peer seeds nothing");
     stop(r);
 }
