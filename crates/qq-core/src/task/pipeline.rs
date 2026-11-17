@@ -65,7 +65,7 @@ pub struct PipelineInput {
     pub integ: String,
     /// Absolute directory the workers publish their reports into.
     pub runs_dir: String,
-    /// The herdr pane the reviewer is spawned into.
+    /// Optional anchor pane the flow's agents are split off (empty: the caller's pane).
     #[serde(default)]
     pub pane: String,
     #[serde(default)]

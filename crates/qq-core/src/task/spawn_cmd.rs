@@ -279,7 +279,7 @@ fn pane_of(reply_body: &str) -> Option<String> {
 }
 
 /// The pane herdr already holds for agent `name`, if any.
-fn existing_pane(herdr: &dyn HerdrClient, name: &str) -> Option<String> {
+pub fn existing_pane(herdr: &dyn HerdrClient, name: &str) -> Option<String> {
     let r = herdr.agent_get(name).ok().filter(|r| r.ok)?;
     serde_json::from_str::<Value>(&r.body)
         .ok()?
@@ -478,25 +478,66 @@ pub fn run_worker(ctx: &Ctx, args: &[String]) -> R<WorkerSpawned> {
         }
     }
 
-    let wt = worktree_of(&repo, name);
     let branch = format!("quaqua/{name}");
-    ensure_worktree(&repo, &wt, &branch, a.base.as_deref().unwrap_or("HEAD"))?;
-    block_push(&repo, &wt);
+    spawn_placed(
+        ctx,
+        &Placed {
+            name,
+            kind: &kind,
+            repo: &repo,
+            branch: &branch,
+            base: a.base.as_deref().unwrap_or("HEAD"),
+            record_base: a.base.as_deref(),
+            review: a.review,
+            project_id,
+            spawner_id: caller.as_ref().map(|c| c.id),
+            owner: &owner,
+            slug: &slug,
+        },
+    )
+}
+
+/// What [`spawn_placed`] needs: one agent, its own worktree and its own pane.
+pub struct Placed<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub repo: &'a Path,
+    /// The branch the worktree is on (made from `base` when it does not exist).
+    pub branch: &'a str,
+    pub base: &'a str,
+    /// The `--base` the caller gave, recorded beside the run files.
+    pub record_base: Option<&'a str>,
+    pub review: bool,
+    pub project_id: Option<i64>,
+    pub spawner_id: Option<i64>,
+    pub owner: &'a str,
+    pub slug: &'a str,
+}
+
+/// The tail every placed agent shares (`worker spawn`, the pipeline's builder
+/// and reviewers): a worktree beside the repo, a pane split from the anchor
+/// with the worktree as its cwd, the spawn, the pane tokens. An agent herdr
+/// already knows keeps its pane, so a repeat places nothing new.
+pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
+    let (name, repo) = (p.name, p.repo);
+    let wt = worktree_of(repo, name);
+    ensure_worktree(repo, &wt, p.branch, p.base)?;
+    block_push(repo, &wt);
     std::fs::create_dir_all(&ctx.runs_dir).map_err(|e| fail(e.to_string()))?;
     let side = |ext: &str, body: String| {
         std::fs::write(ctx.runs_dir.join(format!("{name}.{ext}")), body)
             .map_err(|e| fail(format!("cannot record {name}.{ext}: {e}")))
     };
     side("repo", format!("{}\n", repo.display()))?;
-    if let Some(b) = &a.base {
+    if let Some(b) = p.record_base {
         side("base", format!("{b}\n"))?;
     }
-    if a.review {
+    if p.review {
         side("review", "1\n".into())?;
     }
 
     let pane = match existing_pane(ctx.herdr, name) {
-        Some(p) => p,
+        Some(x) => x,
         None => new_pane(ctx, &wt)?,
     };
     spawn(
@@ -505,34 +546,34 @@ pub fn run_worker(ctx: &Ctx, args: &[String]) -> R<WorkerSpawned> {
         ctx.drivers,
         &SpawnSpec {
             name,
-            kind: &kind,
+            kind: p.kind,
             role: Role::Peer,
             pane: &pane,
-            project_id,
-            spawner_id: caller.as_ref().map(|c| c.id),
+            project_id: p.project_id,
+            spawner_id: p.spawner_id,
         },
         ctx.now_ms,
     )
     .map_err(|e| fail(e.to_string()))?;
-    let group = base_name(&repo);
-    let tab = format!("{slug}-workers");
+    let group = base_name(repo);
+    let tab = format!("{}-workers", p.slug);
     report_tokens(
         ctx,
         &pane,
         &[
             ("grid_role", "worker"),
             ("grid_group", &group),
-            ("grid_owner", &owner),
+            ("grid_owner", p.owner),
             ("grid_tab", &tab),
             ("grid_ready", "1"),
         ],
     )?;
     Ok(WorkerSpawned {
-        name: name.clone(),
-        kind,
+        name: name.to_string(),
+        kind: p.kind.to_string(),
         pane,
         worktree: wt.to_string_lossy().into_owned(),
-        branch,
+        branch: p.branch.to_string(),
     })
 }
 

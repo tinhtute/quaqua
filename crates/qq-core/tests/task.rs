@@ -126,7 +126,6 @@ impl Fixture {
             "branch": "t1",
             "integ": "integ",
             "runs_dir": self.runs.to_string_lossy(),
-            "pane": "p1",
         }))
         .unwrap()
     }
@@ -175,8 +174,9 @@ impl Sim {
     fn new(fx: &Fixture, input: PipelineInput) -> Self {
         let herdr = Arc::new(FakeHerdr::new());
         // the builder is already running when the flow starts (spawn.rs owns that)
+        let pane = herdr.seed_pane("work", None, &[]);
         herdr
-            .agent_start(&input.builder(), "claude", "%1", 1, &[])
+            .agent_start(&input.builder(), "claude", &pane, 1, &[])
             .unwrap();
         let armed = Arc::new(Mutex::new(Vec::new()));
         let watch_ok = Arc::new(AtomicBool::new(true));
@@ -976,11 +976,11 @@ fn verb_call(ws: &TestWorkspace, args: Value) -> rpc::Response {
     .expect("rpc transport")
 }
 
-fn verb_args(fx: &Fixture, builder: &str, reviewer: &str, brief: &str) -> Value {
+fn verb_args(fx: &Fixture, builder: &str, reviewer: &str, brief: &str, pane: &str) -> Value {
     json!({
         "task": "t1", "builder_kind": builder, "reviewer_kind": reviewer,
         "brief": brief, "repo": fx.repo.to_string_lossy(), "branch": "t1",
-        "integ": "integ", "pane": "p1", "project_id": 1, "plan": false,
+        "integ": "integ", "project_id": 1, "plan": false, "pane": pane,
     })
 }
 
@@ -1009,8 +1009,9 @@ fn pipeline_verb_enforces_cross_harness_review_and_converges() {
     conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", [])
         .unwrap();
     let herdr = Arc::new(FakeHerdr::new());
+    let anchor = herdr.seed_pane("work", None, &[]);
     let daemon = daemon_with(&ws, herdr.clone(), None);
-    let args = |b: &str, r: &str, brief: &str| verb_args(&fx, b, r, brief);
+    let args = |b: &str, r: &str, brief: &str| verb_args(&fx, b, r, brief, &anchor);
 
     // ni and suhuynh both run on claude; tieude cannot review.
     assert_eq!(
@@ -1043,14 +1044,16 @@ fn pipeline_verb_enforces_cross_harness_review_and_converges() {
         "conflict"
     );
     for (key, val) in [
-        ("pane", "p2"),
+        ("pane", "elsewhere"),
         ("integ", "other"),
         ("check", "true"),
         ("repo", "/elsewhere"),
     ] {
         let mut a = args("ni", "sude", "Goal: x\n");
         a[key] = json!(val);
-        assert_eq!(refused(verb_call(&ws, a)), "conflict", "{key}");
+        let r = verb_call(&ws, a);
+        assert!(!r.ok, "{key} must conflict: {:?}", r.result);
+        assert_eq!(refused(r), "conflict", "{key}");
     }
     assert_eq!(herdr.prompts().len(), 1);
 
@@ -1088,8 +1091,9 @@ fn revived_flow_rearms_its_report_watcher() {
 
     let seen1 = Arc::new(Mutex::new(Vec::new()));
     let herdr = Arc::new(FakeHerdr::new());
+    let anchor = herdr.seed_pane("work", None, &[]);
     let daemon = daemon_with(&ws, herdr.clone(), Some(seen1.clone()));
-    let r = verb_call(&ws, verb_args(&fx, "ni", "sude", "Goal: x\n"));
+    let r = verb_call(&ws, verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor));
     assert!(r.ok, "{:?}", r.error);
     wait_for("first watcher", || !seen1.lock().unwrap().is_empty());
     wait_for("build prompt", || !herdr.prompts().is_empty());

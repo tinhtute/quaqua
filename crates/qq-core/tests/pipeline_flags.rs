@@ -116,7 +116,7 @@ impl Fixture {
             "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
             "brief": "Goal: x\n", "repo": self.repo.to_string_lossy(),
             "branch": "t1", "integ": "integ",
-            "runs_dir": self.runs.to_string_lossy(), "pane": "p1",
+            "runs_dir": self.runs.to_string_lossy(),
             "plan": plan, "max_rounds": max_rounds,
         }))
         .unwrap()
@@ -196,8 +196,9 @@ fn hold() -> RunnerOptions {
 impl Run {
     fn start(fx: &Fixture, input: PipelineInput) -> Self {
         let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("work", None, &[]);
         herdr
-            .agent_start(&input.builder(), "claude", "%1", 1, &[])
+            .agent_start(&input.builder(), "claude", &pane, 1, &[])
             .unwrap();
         HERDR.with(|h| *h.borrow_mut() = Some(herdr.clone()));
         let armed = Arc::new(Mutex::new(Vec::new()));
@@ -448,7 +449,7 @@ fn first_builder_prompt(tag: &str, plan: Option<bool>) -> String {
     let mut start = json!({
         "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
         "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
-        "integ": "integ", "pane": "p1",
+        "integ": "integ",
     });
     if let Some(p) = plan {
         start["plan"] = json!(p);
@@ -492,7 +493,7 @@ fn resume_verb_signals_a_live_flow_and_refuses_the_rest() {
     let start = json!({
         "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
         "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
-        "integ": "integ", "pane": "p1", "project_id": 1, "plan": true,
+        "integ": "integ", "project_id": 1, "plan": true,
     });
     assert!(call(&ws, start).ok);
     let t0 = Instant::now();
@@ -566,7 +567,7 @@ fn wait_blocks_until_the_run_ends_and_exits_by_how_it_ended() {
     let start = json!({
         "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
         "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
-        "integ": "integ", "pane": "p1", "project_id": 1, "plan": true,
+        "integ": "integ", "project_id": 1, "plan": true,
     });
     assert!(call(&ws, start).ok);
     let mut reg = CliRegistry::new();
@@ -605,10 +606,89 @@ fn wait_blocks_until_the_run_ends_and_exits_by_how_it_ended() {
     let again = serde_json::to_string(&json!({
         "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
         "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
-        "integ": "integ", "pane": "p1", "project_id": 1, "plan": true,
+        "integ": "integ", "project_id": 1, "plan": true,
     }))
     .unwrap();
     assert_eq!(run(&["pipeline", &again]), 0);
     assert_eq!(run(&["pipeline", &again, "--wait"]), 3);
     d.stop().unwrap();
+}
+
+fn agent_pane(herdr: &FakeHerdr, name: &str) -> String {
+    let body = herdr.agent_get(name).unwrap().body;
+    serde_json::from_str::<Value>(&body).unwrap()["result"]["agent"]["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name} has no pane: {body}"))
+        .to_string()
+}
+
+#[test]
+fn the_builder_gets_its_own_pane_and_worktree_not_the_callers() {
+    let ws = TestWorkspace::new("pflags-place");
+    let fx = Fixture::new("place");
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    ws.seal_herdr();
+    let herdr = Arc::new(FakeHerdr::new());
+    let who = Agents::seed(&conn, &herdr);
+    who.become_agent("cos");
+    let cos_pane = agent_pane(&herdr, "cos");
+    let d = daemon(&ws, herdr.clone());
+    let r = call(
+        &ws,
+        json!({
+            "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+            "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+            "integ": "integ", "plan": false,
+        }),
+    );
+    assert!(r.ok, "{:?}", r.error);
+    let builder = agent_pane(&herdr, "t1-b");
+    assert_ne!(builder, cos_pane, "the builder is not started in the caller's pane");
+    let wt = fx.root.join(".wt").join("t1-b");
+    assert_eq!(
+        herdr.split_cwds(),
+        vec![(builder, wt.to_string_lossy().into_owned())],
+        "its pane starts in its worktree"
+    );
+    assert_eq!(git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]), "t1");
+    d.stop().unwrap();
+}
+
+#[test]
+fn each_reviewer_round_gets_its_own_pane_and_worktree_at_the_candidate() {
+    let fx = Fixture::new("reviewers");
+    let tip = fx.commit_on_t1("a.txt");
+    let herdr = Arc::new(FakeHerdr::new());
+    let home = herdr.seed_pane("work", None, &[]);
+    herdr
+        .agent_start("t1-b", "claude", &home, 1, &[])
+        .unwrap();
+    let deps = Deps {
+        herdr: herdr.clone(),
+        runs_dir: fx.runs.clone(),
+        drivers: drivers(),
+        watch: Arc::new(|_, _| Ok(())),
+    };
+    let input = fx.input(false, 2);
+    let eff = Effects::new(Arc::new(deps), input);
+    for round in 1..=2 {
+        eff.execute(&ActivityRequest::Herdr(HerdrRequest::Spawn {
+            name: format!("t1-r{round}"),
+            kind: "sude".into(),
+            repo: fx.repo.to_string_lossy().into_owned(),
+            approve_kinds: Vec::new(),
+        }))
+        .unwrap();
+    }
+    let (b, r1, r2) = (
+        agent_pane(&herdr, "t1-b"),
+        agent_pane(&herdr, "t1-r1"),
+        agent_pane(&herdr, "t1-r2"),
+    );
+    assert!(b != r1 && b != r2 && r1 != r2, "{b} {r1} {r2}");
+    for r in ["t1-r1", "t1-r2"] {
+        let wt = fx.root.join(".wt").join(r);
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), tip, "{r} is at the candidate");
+    }
 }

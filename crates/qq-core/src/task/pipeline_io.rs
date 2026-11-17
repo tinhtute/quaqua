@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::pipeline::{self, PipelineFlow, PipelineInput, PipelineState};
-use super::spawn::{spawn, Role, SpawnError, SpawnSpec};
+use super::worker_flow::spawn_cmd::{existing_pane, spawn_placed, Ctx, Placed, WorkerSpawned};
 use crate::authority::{self, Role as AuthRole};
 use crate::cli::{CliError, Command, Install, Registry as CliRegistry};
 use crate::config;
@@ -135,22 +135,67 @@ impl Effects {
         if open.as_deref() == Some(kind) {
             return true;
         }
-        spawn(
+        // Its own pane, split off the builder's, and its own worktree on a
+        // branch started at the candidate (git holds a branch in one worktree).
+        let herdr = self.deps.herdr.as_ref();
+        let Some(anchor) = existing_pane(herdr, &self.input.builder())
+            .or_else(|| Some(self.input.pane.clone()).filter(|p| !p.is_empty()))
+        else {
+            return false;
+        };
+        let candidate = Some(self.tip()).filter(|t| !t.is_empty());
+        let branch = format!("quaqua/{name}");
+        let repo = Path::new(&self.input.repo);
+        placed(
             &conn,
-            self.deps.herdr.as_ref(),
-            &self.deps.drivers,
-            &SpawnSpec {
+            &self.deps,
+            &anchor,
+            &Placed {
                 name,
                 kind,
-                role: Role::Peer,
-                pane: &self.input.pane,
+                repo,
+                branch: &branch,
+                base: candidate.as_deref().unwrap_or(&self.input.branch),
+                record_base: candidate.as_deref(),
+                review: true,
                 project_id: self.input.project_id,
                 spawner_id: None,
+                owner: "cos",
+                slug: &slug_of(&conn, self.input.project_id),
             },
-            SystemClock.now_ms(),
         )
         .is_ok()
     }
+}
+
+fn slug_of(conn: &rusqlite::Connection, project_id: Option<i64>) -> String {
+    project_id
+        .and_then(|id| {
+            conn.query_row("SELECT slug FROM project WHERE id = ?1", [id], |r| r.get(0))
+                .ok()
+        })
+        .unwrap_or_else(|| "pipeline".to_string())
+}
+
+/// [`spawn_placed`] against the flow's herdr, drivers and runs dir.
+fn placed(
+    conn: &rusqlite::Connection,
+    deps: &Deps,
+    anchor: &str,
+    p: &Placed,
+) -> Result<WorkerSpawned, crate::cli::CliError> {
+    spawn_placed(
+        &Ctx {
+            conn,
+            herdr: deps.herdr.as_ref(),
+            drivers: &deps.drivers,
+            runs_dir: deps.runs_dir.clone(),
+            caller: None,
+            anchor: Some(anchor),
+            now_ms: SystemClock.now_ms(),
+        },
+        p,
+    )
 }
 
 impl Activity for Effects {
@@ -346,7 +391,7 @@ fn input_of(a: &Value, runs_dir: &Path) -> Result<PipelineInput, RpcError> {
         "repo": text(a, "repo")?,
         "branch": text(a, "branch")?,
         "integ": text(a, "integ")?,
-        "pane": text(a, "pane")?,
+        "pane": a.get("pane").and_then(Value::as_str).unwrap_or(""),
         "runs_dir": runs_dir,
     });
     // A new start plans first (the serde default stays false so a journaled
@@ -464,24 +509,33 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 return Ok(json!({ "workflow": id, "running": true }));
             }
         }
-        spawn(
+        // The builder's own pane (split off the anchor: `pane`, else the
+        // caller's) and its own worktree on the task branch.
+        let herdr = deps.herdr.as_ref();
+        let anchor = Some(input.pane.clone())
+            .filter(|p| !p.is_empty())
+            .or_else(|| req.caller.as_deref().and_then(|c| existing_pane(herdr, c)))
+            .ok_or_else(|| bad("no anchor pane: pass 'pane' or call from an agent's pane"))?;
+        let name = input.builder();
+        placed(
             &conn,
-            deps.herdr.as_ref(),
-            &deps.drivers,
-            &SpawnSpec {
-                name: &input.builder(),
+            &deps,
+            &anchor,
+            &Placed {
+                name: &name,
                 kind: &input.builder_kind,
-                role: Role::Peer,
-                pane: &input.pane,
+                repo: Path::new(&input.repo),
+                branch: &input.branch,
+                base: &input.integ,
+                record_base: Some(&input.integ),
+                review: false,
                 project_id: input.project_id,
                 spawner_id: None,
+                owner: req.caller.as_deref().unwrap_or("cos"),
+                slug: &slug_of(&conn, input.project_id),
             },
-            SystemClock.now_ms(),
         )
-        .map_err(|e| match e {
-            SpawnError::Conflict(m) => RpcError::new("conflict", m),
-            e => RpcError::new("spawn_failed", e.to_string()),
-        })?;
+        .map_err(|e| RpcError::new("spawn_failed", e.message))?;
         ctx.supervisor
             .start(pipeline::KIND, &id, &json!(input))
             .map_err(|e| RpcError::new("workflow_start_refused", e))?;
