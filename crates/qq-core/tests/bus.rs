@@ -505,7 +505,12 @@ fn a_mailbox_is_read_and_acked_by_its_owner_only() {
         ids(&ok(&ws, "peer-b", "mail.inbox", json!({"to": "peer-b"}))),
         vec![b]
     );
-    ok(&ws, "peer-b", "mail.ack", json!({"to": "peer-b", "upto": b}));
+    ok(
+        &ws,
+        "peer-b",
+        "mail.ack",
+        json!({"to": "peer-b", "upto": b}),
+    );
     assert!(ids(&ok(&ws, "peer-b", "mail.inbox", Value::Null)).is_empty());
 
     // No caller: still refused, as before.
