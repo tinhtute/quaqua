@@ -321,7 +321,7 @@ fn mail_send_refused_off_edge() {
         refusals(&ws),
         vec![("peer-a".into(), "mail".into(), "peer-b".into())]
     );
-    let inbox = ok(&ws, None, "mail.inbox", json!({"to": "peer-b"}));
+    let inbox = ok(&ws, Some("peer-b"), "mail.inbox", Value::Null);
     assert_eq!(inbox["mail"].as_array().unwrap().len(), 0, "nothing stored");
     // An unknown sender is refused too, and journaled.
     let code = refusal(

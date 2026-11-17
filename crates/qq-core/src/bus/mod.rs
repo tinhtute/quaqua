@@ -107,14 +107,33 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     }
 }
 
-/// The mailbox owner: the `to` argument, else the caller.
-fn owner(req: &Request) -> Result<&str, RpcError> {
+/// The mailbox owner: always the caller. `to` may name the caller (the CLI
+/// passes it for `--for`); naming anyone else is refused and journaled as an
+/// authority refusal on the edge `op`, target = that mailbox.
+fn owner<'a>(ctx: &Ctx, req: &'a Request, op: &str) -> Result<&'a str, RpcError> {
+    let caller = req
+        .caller
+        .as_deref()
+        .ok_or_else(|| bad("no mailbox: a caller is needed"))?;
     match req.args.get("to").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => Ok(s),
-        _ => req
-            .caller
-            .as_deref()
-            .ok_or_else(|| bad("no mailbox: pass 'to' or a caller")),
+        Some(to) if !to.is_empty() && to != caller => {
+            ctx.store
+                .with_conn(|c| {
+                    authority::refuse(
+                        c,
+                        caller,
+                        op,
+                        to,
+                        "a mailbox is read and acked by its owner only",
+                    )
+                })
+                .map_err(internal)?;
+            Err(RpcError::new(
+                "refused",
+                format!("{caller} -> {to}: {op} reaches only the caller's own mailbox"),
+            ))
+        }
+        _ => Ok(caller),
     }
 }
 
@@ -300,7 +319,7 @@ fn pending(store: &Store, who: &str) -> rusqlite::Result<Option<Value>> {
 }
 
 fn inbox(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
-    let who = owner(req)?;
+    let who = owner(ctx, req, "mail.inbox")?;
     let advance_cursor = req
         .args
         .get("advance")
@@ -340,7 +359,7 @@ fn inbox(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
 }
 
 fn ack(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
-    let who = owner(req)?;
+    let who = owner(ctx, req, "mail.ack")?;
     let upto = req
         .args
         .get("upto")
