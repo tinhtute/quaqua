@@ -536,6 +536,12 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             },
         )
         .map_err(|e| RpcError::new("spawn_failed", e.message))?;
+        // `place_only` (default off; read from the call, not journaled): the
+        // builder is placed (pane, worktree, agent row) and nothing more: no
+        // workflow, no prompt. For a $0 smoke of placement.
+        if req.args.get("place_only").and_then(Value::as_bool) == Some(true) {
+            return Ok(json!({ "placed": name, "workflow": null }));
+        }
         ctx.supervisor
             .start(pipeline::KIND, &id, &json!(input))
             .map_err(|e| RpcError::new("workflow_start_refused", e))?;

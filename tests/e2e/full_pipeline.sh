@@ -19,7 +19,9 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
 env: QQ (binary, default target/debug/qq)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
-     E2E_STOP_AFTER (C2 | C3 | C4 | S2b: end cleanly after that common step; starts no agent, spends no tokens)
+     E2E_STOP_AFTER (C2 | C3 | C4 | S2b: end cleanly after that step; starts no agent, spends no tokens.
+                     S2d: the pipeline places the builder (pane, worktree, agent row; starts ONE real builder-kind
+                     agent, sends it NO prompt, starts no flow), asserts that, and ends; needs E2E_PI_MODEL)
 USAGE
 }
 
@@ -35,7 +37,7 @@ for a in "$@"; do
     *) usage >&2; exit 2 ;;
   esac
 done
-case "${E2E_STOP_AFTER:-}" in "" | C2 | C3 | C4 | S2b) ;; *) echo "unknown E2E_STOP_AFTER '${E2E_STOP_AFTER}' (C2 | C3 | C4 | S2b)" >&2; exit 2 ;; esac
+case "${E2E_STOP_AFTER:-}" in "" | C2 | C3 | C4 | S2b | S2d) ;; *) echo "unknown E2E_STOP_AFTER '${E2E_STOP_AFTER}' (C2 | C3 | C4 | S2b | S2d)" >&2; exit 2 ;; esac
 [ "${#PARTS[@]}" -gt 0 ] || PARTS=(switch d)
 want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
 
@@ -81,6 +83,8 @@ part switch
                     kind, state open); the same call again returns that row (created=false)
   S2c authority     SQLite holds the active cos agent row (made by the daemon on the first call from the cos pane)
                     and the cos -> peer spawn edge
+  S2d placement     (E2E_STOP_AFTER=S2d) \`pipeline '<json>'\` with place_only=true from the cos pane (no 'pane' given): the
+                    builder has an agent row, its own pane (not the cos pane) and worktree; no flow, no prompt sent
   S3 placement      the pipeline gave its builder and reviewer their own agent rows and panes (nothing is pre-spawned)
   S4 sqlite spawn   after the pipeline: its run rows name two harnesses, each equal to its kind row (config read from SQLite)
   S5 build          \`pipeline '<json>' --wait\` (plan=false) returns exit 0 (merged); exit 5 = paused for approval ->
@@ -248,7 +252,7 @@ as_pane() {
 }
 as_cos() { as_pane "$COS_PANE" "$@"; }
 # stop_after STEP: E2E_STOP_AFTER=STEP ends the run cleanly after that step (before any agent or token spend).
-stop_after() { [ "${E2E_STOP_AFTER:-}" = "$1" ] || return 0; echo "STOP after $1 (E2E_STOP_AFTER): $N assertions passed, nothing spent"; exit 0; }
+stop_after() { [ "${E2E_STOP_AFTER:-}" = "$1" ] || return 0; echo "STOP after $1 (E2E_STOP_AFTER): $N assertions passed, no prompt sent"; exit 0; }
 
 # The daemon refuses an unmapped peer for every verb (ping included), so readiness is a ping run inside the cos pane.
 i=0
@@ -311,6 +315,18 @@ if want switch; then
   # pipeline '<json>': async (returns the workflow id); plan=false skips the plan-ready pause.
   PJSON=$(python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"task":a[1],"builder_kind":a[2],"reviewer_kind":a[3],"brief":open(a[4]).read(),"repo":a[5],"branch":"quaqua/"+a[1]+"-b","integ":"integ/"+a[6],"project_id":int(a[8]),"plan":False,"max_rounds":2,"timeout_ms":int(a[7])*1000}))' \
     "$TASK" "$BUILDER" "$REVIEWER" "$BRIEF" "$PROJ" "$PROJECT" "$TIMEOUT" "$PROJECT_ID")
+
+  # S2d (E2E_STOP_AFTER=S2d): place_only makes the verb place the builder and return before the flow starts, so no
+  # prompt is ever sent. It starts one real builder-kind agent (an idle harness at its input prompt).
+  if [ "${E2E_STOP_AFTER:-}" = S2d ]; then
+    PO=$(printf '%s' "$PJSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["place_only"]=True; print(json.dumps(d))')
+    as_cos "$QQ" pipeline "$PO"; [ "$AP_RC" = 0 ] || fail S2d "pipeline place_only rc=$AP_RC: $AP_OUT"
+    BPANE=$(q "select pane_id from agent where name='$TASK-b' and ended_ms is null")
+    [ -n "$BPANE" ] && [ "$BPANE" != "$COS_PANE" ] && pass S2d "builder $TASK-b has pane $BPANE (cos pane $COS_PANE)" || fail S2d "builder pane [$BPANE] vs cos pane [$COS_PANE]"
+    expect S2d_wt "quaqua/$TASK-b" "$(git -C "$PROJ" worktree list --porcelain | awk '$1=="branch" && $2 ~ /-b$/ {sub("refs/heads/","",$2); print $2}')"
+    expect S2d_noflow "0" "$(q "select count(*) from workflow where id='$WF'")"
+    stop_after S2d
+  fi
   # --wait exits 0 merged|no_changes, 3 cancelled, 4 held|disputed, 1 failed|loop stopped, 5 paused for approval
   # (the JSON names the pause): approve with --resume and wait again.
   PAUSES=0

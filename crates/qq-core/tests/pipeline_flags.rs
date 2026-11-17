@@ -695,6 +695,40 @@ fn a_caller_mapped_to_an_unnamed_pane_gets_its_builder_split_off_that_pane() {
 }
 
 #[test]
+fn place_only_places_the_builder_and_sends_no_prompt_and_starts_no_flow() {
+    let ws = TestWorkspace::new("pflags-placeonly");
+    let fx = Fixture::new("placeonly");
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    ws.seal_herdr();
+    let herdr = Arc::new(FakeHerdr::new());
+    let who = Agents::seed(&conn, &herdr);
+    who.become_agent("cos");
+    let d = daemon(&ws, herdr.clone());
+    let r = call(
+        &ws,
+        json!({
+            "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+            "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+            "integ": "integ", "plan": false, "place_only": true,
+        }),
+    );
+    assert!(r.ok, "{:?}", r.error);
+    let _ = agent_pane(&herdr, "t1-b");
+    assert!(fx.root.join(".wt").join("t1-b").exists(), "worktree placed");
+    assert!(herdr.prompts().is_empty(), "no prompt was sent");
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM workflow WHERE id = 'pipeline:t1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(n, 0, "no flow started");
+    d.stop().unwrap();
+}
+
+#[test]
 fn each_reviewer_round_gets_its_own_pane_and_worktree_at_the_candidate() {
     let fx = Fixture::new("reviewers");
     let tip = fx.commit_on_t1("a.txt");
