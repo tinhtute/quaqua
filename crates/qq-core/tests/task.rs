@@ -803,6 +803,54 @@ fn a_claim_equal_to_the_base_tip_is_no_changes() {
 }
 
 #[test]
+fn every_brief_that_asks_for_a_verified_line_names_the_passing_levels() {
+    let levels = ["unit-test-verified", "type-check-only", "review-clean"];
+    let fx = Fixture::new("levels");
+    let first = fx.commit_on_t1("a.txt");
+    let mut r = Run::start(&fx);
+    r.signal("pipeline", "start");
+    let build = r.sim.prompt_text("t1-b", 0);
+    r.answer(&build_report(&first));
+    r.answer("## Findings\n- [major] x\nVerdict: 1 findings\n");
+    let fix = r.sim.prompt_text("t1-b", 1);
+    for (phase, text) in [("build", build), ("fix", fix)] {
+        for l in levels {
+            assert!(text.contains(l), "{phase} brief does not name {l}: {text}");
+        }
+    }
+}
+
+#[test]
+fn no_changes_after_an_earlier_commit_keeps_that_candidate_for_review() {
+    let fx = Fixture::new("adopt");
+    let mut r = Run::start(&fx);
+    r.signal("pipeline", "start");
+    // attempt 1 commits but its Verified level is not a passing one: paused
+    let first = fx.commit_on_t1("a.txt");
+    let out = r.answer(&format!("Outcome: COMPLETE\nVerified: tested {first}\n"));
+    blocked_out(&out);
+    // resumed: the builder finds the work already committed and says so
+    r.approve();
+    assert_eq!(r.sim.saw("prompt t1-b"), 2);
+    r.answer("Outcome: NO_CHANGES\n");
+    assert_eq!(r.sim.saw("spawn t1-r1 sude"), 1, "the committed tip is reviewed");
+    assert!(r.sim.prompt_text("t1-r1", 0).contains(&first));
+    let done = merged(r.answer(clean()));
+    assert_eq!(done.status, "merged");
+    assert_eq!(done.candidate_sha.as_deref(), Some(first.as_str()));
+}
+
+#[test]
+fn no_changes_with_nothing_ahead_of_the_base_still_ends_the_flow() {
+    let fx = Fixture::new("noop");
+    let mut r = Run::start(&fx);
+    r.signal("pipeline", "start");
+    let done = merged(r.answer("Outcome: NO_CHANGES\n"));
+    assert_eq!(done.status, "no_changes");
+    assert_eq!(r.sim.saw("spawn"), 0);
+}
+
+#[test]
 fn production_effects_encode_git_facts_refusals_and_watchers() {
     let fx = Fixture::new("effects");
     let sim = Sim::new(&fx, fx.input());
