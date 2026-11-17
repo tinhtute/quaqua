@@ -767,3 +767,69 @@ fn each_reviewer_round_gets_its_own_pane_and_worktree_at_the_candidate() {
         );
     }
 }
+
+/// The daemon runs outside every pane (the script shell starts it), so its own
+/// pid maps to no pane and the peer gate refuses it. A pipeline start from a
+/// real pane must still arm its report watcher and prompt the builder.
+#[test]
+fn a_daemon_in_no_pane_arms_the_report_watcher_for_a_pipeline() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let tag = "dn-nopane";
+    let ws = TestWorkspace::new(tag);
+    let fx = Fixture::new(tag);
+    ws.seal_herdr();
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    let herdr = Arc::new(FakeHerdr::new());
+    let agents = Agents::seed(&conn, &herdr);
+    // The real wiring: no test watch closure. The test process (the daemon)
+    // is mapped to no pane; only the client child below is, as the CoS.
+    let mut d = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: herdr.clone(),
+    });
+    let deps = Deps::new(herdr.clone(), ws.runs_dir(), Registry::native());
+    pipeline_io::register(&mut d, deps).expect("register");
+    d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
+    let handle = d.spawn().expect("daemon starts");
+
+    let input = json!({
+        "task": "t1", "builder_kind": "ni", "reviewer_kind": "sude",
+        "brief": "Goal: x\n", "repo": fx.repo.to_string_lossy(), "branch": "t1",
+        "integ": "integ",
+    })
+    .to_string();
+    let mut client = Command::new("sh")
+        .args(["-c", "read _; exec \"$0\" pipeline \"$1\""])
+        .arg(env!("CARGO_BIN_EXE_qq"))
+        .arg(&input)
+        .env("QUAQUA_RUNS_DIR", ws.runs_dir())
+        .env("QUAQUA_TEST", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn client");
+    for (name, pane) in &agents.panes {
+        let pid = if *name == "cos" { client.id() } else { 0 };
+        herdr.set_pane_pids(pane, pid, &[]);
+    }
+    client.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let out = client.wait_with_output().expect("client ends");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t0 = Instant::now();
+    while herdr.prompts().is_empty() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "no builder prompt: the report watcher was never armed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.stop().unwrap_or(());
+}
