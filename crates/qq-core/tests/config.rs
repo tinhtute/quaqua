@@ -1,9 +1,13 @@
 //! T35: config seed from the template team.toml, readers from SQLite only.
 
+use qq_core::cli::{Env, Registry};
 use qq_core::config::{self, ConfigError, Driver, Seeded};
+use qq_core::daemon::{Config, Daemon, DaemonHandle};
 use qq_core::db;
+use qq_core::herdr::FakeHerdr;
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
+use std::sync::Arc;
 
 fn template() -> String {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -72,6 +76,159 @@ fn unknown_harness_rejected() {
         config::seed(&mut conn, &template_without_omp()).unwrap(),
         Seeded::Fresh
     );
+
+    // The daily verbs refuse the same names and change nothing.
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (_registry, daemon) = start(&ws);
+    let before = config::roster(&conn).unwrap();
+    for h in ["omp", "nope"] {
+        let file = ws.root().join(format!("{h}.toml"));
+        std::fs::write(
+            &file,
+            template().replace("harness = \"omp\"", &format!("harness = \"{h}\"")),
+        )
+        .unwrap();
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for cmd in [
+            args(&["import", file.to_str().unwrap()]),
+            args(&["validate", file.to_str().unwrap()]),
+            args(&["set", "kind.ni.harness", h]),
+            args(&[
+                "set",
+                "kind.fresh",
+                &format!("{{\"harness\":\"{h}\",\"model\":\"m\"}}"),
+            ]),
+        ] {
+            let e = config::config_cmd(&env, &cmd).expect_err("refused");
+            assert_eq!(e.code, 1, "{cmd:?}");
+            assert!(e.message.contains("unknown harness"), "{}", e.message);
+        }
+    }
+    assert_eq!(config::roster(&conn).unwrap(), before);
+    assert!(config::kind(&conn, "fresh").unwrap().is_none());
+    daemon.stop().unwrap();
+}
+
+/// A daemon with the config verbs installed on a fresh registry; the CLI
+/// commands in that registry are its clients.
+fn start(ws: &TestWorkspace) -> (Registry, DaemonHandle) {
+    let mut registry = Registry::new();
+    let mut daemon = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: Arc::new(FakeHerdr::new()),
+    });
+    config::INSTALL(&mut registry, &mut daemon).expect("config installs");
+    (registry, daemon.spawn().expect("daemon starts"))
+}
+
+fn strs(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn config_set_import_roster() {
+    let ws = TestWorkspace::new("cfg-verbs");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+
+    // import: the toml goes in through the verb; a repeat converges.
+    std::fs::write(ws.team_toml(), template_without_omp()).unwrap();
+    let toml = ws.team_toml();
+    let toml = toml.to_str().unwrap();
+    assert_eq!(run(&["config", "import", toml]), 0);
+    let conn = open(&ws);
+    let snapshot = |c: &Connection| -> Vec<i64> { TABLES.iter().map(|t| count(c, t)).collect() };
+    let once = snapshot(&conn);
+    assert_eq!(
+        config::resolve_spawn(&conn, "ni").unwrap().model,
+        "opus-5.5"
+    );
+    assert_eq!(run(&["config", "import", toml]), 0);
+    assert_eq!(snapshot(&conn), once);
+    assert_eq!(run(&["config", "validate"]), 0);
+
+    // set: a kind added here is the one the next spawn reads.
+    let scout = r#"{"harness":"claude","model":"haiku-5.5","effort":"low","fallback":"ni","use_for":"quick scans","avoid":"edits"}"#;
+    assert_eq!(run(&["config", "set", "kind.scout", scout]), 0);
+    assert_eq!(run(&["config", "set", "kind.scout", scout]), 0);
+    let conn = open(&ws);
+    let t = config::resolve_spawn(&conn, "scout").unwrap();
+    assert_eq!(
+        (
+            t.harness.name.as_str(),
+            t.model.as_str(),
+            t.effort.as_deref(),
+            t.fallback.as_deref()
+        ),
+        ("claude", "haiku-5.5", Some("low"), Some("ni"))
+    );
+    assert_eq!(count(&conn, "kind"), 6, "a repeat adds no row");
+
+    // a field edit changes only that field; get reads it back.
+    assert_eq!(run(&["config", "set", "kind.scout.model", "haiku-6"]), 0);
+    let k = config::kind(&open(&ws), "scout").unwrap().unwrap();
+    assert_eq!(
+        (k.model.as_str(), k.use_for.as_deref()),
+        ("haiku-6", Some("quick scans"))
+    );
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "kind.scout.model"])).unwrap(),
+        "haiku-6"
+    );
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "purpose.build"])).unwrap(),
+        "sude"
+    );
+    assert_eq!(run(&["config", "set", "limits.depth", "3"]), 0);
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "limits.depth"])).unwrap(),
+        "3"
+    );
+    assert_eq!(run(&["config", "set", "purpose.scan", "scout"]), 0);
+    assert_eq!(
+        config::purpose_kind(&open(&ws), "scan").unwrap().as_deref(),
+        Some("scout")
+    );
+
+    // roster lists every kind with use_for and avoid.
+    let out = config::roster_cmd(&env, &[]).unwrap();
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("scout"))
+        .expect("scout listed");
+    assert!(
+        line.contains("haiku-6")
+            && line.contains("use: quick scans")
+            && line.contains("avoid: edits"),
+        "{line}"
+    );
+    assert_eq!(out.lines().count(), 6);
+
+    // bad edits are refused and leave the row alone.
+    assert_eq!(run(&["config", "set", "kind.scout.fallback", "ghost"]), 1);
+    assert_eq!(run(&["config", "set", "kind.ghost.model", "m"]), 1);
+    assert_eq!(run(&["config", "set", "kind.half", r#"{"model":"m"}"#]), 1);
+    // the toml's own spellings are not keys: refused, nothing stored.
+    let settings = count(&open(&ws), "setting");
+    assert_eq!(run(&["config", "set", "kinds.scout.model", "m"]), 1);
+    assert_eq!(run(&["config", "set", "purposes.build", "scout"]), 1);
+    assert_eq!(run(&["config", "set", "roles.cos.can_spawn", "[]"]), 1);
+    assert_eq!(count(&open(&ws), "setting"), settings);
+    assert_eq!(run(&["config", "set", "purpose.x", "ghost"]), 1);
+    assert_eq!(run(&["config", "get", "kind.ghost"]), 1);
+    let k = config::kind(&open(&ws), "scout").unwrap().unwrap();
+    assert_eq!(k.fallback.as_deref(), Some("ni"));
+
+    // a later import keeps the kind added by set (it never deletes) and
+    // does not undo it: the file's own kinds win, the rest stays.
+    assert_eq!(run(&["config", "import", toml]), 0);
+    assert!(config::kind(&open(&ws), "scout").unwrap().is_some());
+    daemon.stop().unwrap();
 }
 
 #[test]
@@ -243,4 +400,131 @@ fn config_boundary_rejects_unmapped() {
         config::seed(&mut conn, "this is not toml [[[").unwrap(),
         Seeded::AlreadySeeded
     );
+}
+
+/// Child half of `config_import_relative_path`: a no-op unless the parent set
+/// the env, in which case it is a CLI client running in another cwd.
+#[test]
+fn relative_path_child() {
+    let Some(runs) = std::env::var_os("QQ_T40_RUNS") else {
+        return;
+    };
+    let env = Env {
+        runs_dir: runs.into(),
+    };
+    for verb in ["validate", "import"] {
+        config::config_cmd(&env, &strs(&[verb, "rel.toml"])).expect("relative path resolves");
+    }
+}
+
+#[test]
+fn config_import_relative_path() {
+    let ws = TestWorkspace::new("cfg-relpath");
+    let (_registry, daemon) = start(&ws);
+    std::fs::write(ws.root().join("rel.toml"), template_without_omp()).unwrap();
+    // The daemon runs in this process's cwd; the client runs in the workspace.
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .current_dir(ws.root())
+        .env("QQ_T40_RUNS", ws.runs_dir())
+        .args(["--exact", "relative_path_child", "--nocapture"])
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    assert_eq!(config::roster(&open(&ws)).unwrap().len(), 5);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn config_set_typed_and_usage() {
+    let ws = TestWorkspace::new("cfg-typed");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    std::fs::write(ws.team_toml(), template_without_omp()).unwrap();
+    assert_eq!(
+        run(&["config", "import", ws.team_toml().to_str().unwrap()]),
+        0
+    );
+
+    // reports_to with a role is an edge (as import does), not a setting row.
+    assert_eq!(
+        run(&["config", "set", "roles.lead.reports_to", "supervisor"]),
+        0
+    );
+    let conn = open(&ws);
+    let edges: Vec<_> = config::topology(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.from == "lead" && e.edge == "report")
+        .map(|e| e.to)
+        .collect();
+    assert_eq!(edges, ["supervisor"], "the old report edge is replaced");
+    assert!(config::setting(&conn, "roles.lead.reports_to")
+        .unwrap()
+        .is_none());
+    assert_eq!(run(&["config", "set", "roles.lead.reports_to", "owner"]), 0);
+    let conn = open(&ws);
+    assert!(config::topology(&conn)
+        .unwrap()
+        .iter()
+        .all(|e| !(e.from == "lead" && e.edge == "report")));
+    assert_eq!(
+        config::setting(&conn, "roles.lead.reports_to").unwrap(),
+        Some(serde_json::json!("owner"))
+    );
+    assert_eq!(
+        run(&["config", "set", "roles.lead.reports_to", "nobody"]),
+        1
+    );
+
+    // role settings are typed like import: bad values refused, good stored.
+    let before = config::setting(&conn, "roles.lead.max_peers").unwrap();
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "abc"]), 1);
+    assert_eq!(
+        run(&["config", "set", "roles.lead.can_prompt", r#"["wizard"]"#]),
+        1
+    );
+    assert_eq!(run(&["config", "set", "roles.lead.can_prompt", "[3]"]), 1);
+    assert_eq!(
+        config::setting(&open(&ws), "roles.lead.max_peers").unwrap(),
+        before
+    );
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "6"]), 0);
+    assert_eq!(
+        run(&["config", "set", "roles.lead.can_prompt", r#"["peer"]"#]),
+        0
+    );
+    let conn = open(&ws);
+    assert_eq!(
+        config::setting(&conn, "roles.lead.max_peers").unwrap(),
+        Some(serde_json::json!(6))
+    );
+    assert_eq!(
+        config::setting(&conn, "roles.lead.can_prompt").unwrap(),
+        Some(serde_json::json!(["peer"]))
+    );
+
+    // import holds kind names to the lowercase rule of set; nothing written.
+    let upper = ws.root().join("upper.toml");
+    std::fs::write(
+        &upper,
+        format!(
+            "{}\n[kinds.Scout]\nharness = \"claude\"\nmodel = \"m\"\n",
+            template_without_omp()
+        ),
+    )
+    .unwrap();
+    assert_eq!(run(&["config", "import", upper.to_str().unwrap()]), 1);
+    assert_eq!(count(&open(&ws), "kind"), 5);
+
+    // usage errors exit 2.
+    assert_eq!(run(&["config"]), 2);
+    assert_eq!(run(&["config", "bogus"]), 2);
+    assert_eq!(run(&["config", "set", "limits.depth"]), 2);
+    assert_eq!(run(&["config", "import"]), 2);
+    daemon.stop().unwrap();
 }

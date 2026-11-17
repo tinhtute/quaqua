@@ -1,0 +1,85 @@
+# Runtime v2 config; layout is synthesized from these role limits.
+schema_version = 2
+
+[limits]
+depth = 2
+max_workers_per_orchestrator = 8
+weights = { default = 1, pipeline = 2 }
+
+[timers]
+budget_default = "45m"
+hard_cap = "120m"
+stall = "10m"
+idle = "2m"
+nudge_at = 0.8
+grace = 0.25
+pilot_budget = "30m"
+cost_buffer = 0.2
+mail_ack = "30m"
+
+[roles.cos]
+can_spawn = ["lead", "peer"]
+can_prompt = ["lead", "peer"]
+
+[roles.lead]
+can_spawn = ["peer"]
+can_prompt = ["lead", "peer"]
+reports_to = "cos"
+max_peers = 4
+
+[roles.peer]
+can_spawn = []
+can_prompt = []
+reports_to = "owner"
+
+[strategy]
+default_kind = "sude"
+lead_kind = "ni"
+default_reviewer = ["suhuynh"]
+# Kinds whose live workers hold a build slot in the Lead gate (`quaqua worker spawn`).
+build_kinds = ["sude", "ni"]
+builder_reviewer_differ = "kind"
+
+[purposes]
+build = "sude"
+review = "suhuynh"
+research = "sude"
+quick = "ni"
+design = "truonglao"
+
+[opencode_models]
+"deepseek-v4.1-flash" = ["low", "high", "max"]
+
+# Set harness, model, and effort for every kind; fallback is one hop on agent-start failure only.
+[kinds.sude]
+harness = "claude"
+model = "sonnet-5.5"
+effort = "medium"
+fallback = "suhuynh"
+can_review = true
+
+[kinds.ni]
+harness = "claude"
+model = "opus-5.5"
+effort = "low"
+can_review = true
+
+[kinds.suhuynh]
+harness = "claude"
+model = "opus-5.5"
+effort = "medium"
+can_review = true
+
+[kinds.truonglao]
+harness = "claude"
+model = "opus-5.5"
+effort = "high"
+can_review = true
+spawn = "auto" # "approve" requires Principal approval.
+
+[merge]
+integ_branch = "quaqua/{slug}-integ"
+
+[grid]
+workers_tab = "workers"
+deferred_statuses = ["working"]

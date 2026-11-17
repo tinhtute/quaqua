@@ -16,6 +16,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[path = "spawn_cmd.rs"]
+pub mod spawn_cmd;
+
 use super::spawn::{spawn, Role, SpawnError, SpawnSpec};
 use crate::cli::{Install, Registry as CliRegistry};
 use crate::daemon::supervisor::{Factory, Machine, Progress, WorkflowDriver};
@@ -29,7 +32,7 @@ use crate::engine::{
     WorkflowContext, WorkflowEvent,
 };
 use crate::herdr::{CliHerdr, HerdrClient};
-use crate::rpc::{self, Request, RpcError};
+use crate::rpc::{self, RpcError};
 
 /// The workflow kind and the verb this module registers.
 pub const KIND: &str = "worker_flow";
@@ -114,7 +117,15 @@ fn field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
 
 /// Levels of a `Verified: <level> <sha>` line that count as a pass. Any other
 /// level (verifier-failed, verifier-blocked, inconclusive, unknown) does not.
-const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
+pub(crate) const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
+
+/// The `Verified:` line a brief asks for, with the levels that pass spelled out.
+pub(crate) fn verified_line_ask() -> String {
+    format!(
+        "`Verified: <level> <full 40-hex sha of your last commit>` where <level> is exactly one of {}",
+        PASSING_LEVELS.join(" | ")
+    )
+}
 
 /// `verified` = `Outcome: COMPLETE` plus a `Verified:` line with a passing
 /// level and a sha: the worker reported a passing level, nothing more. The sha
@@ -229,9 +240,12 @@ impl Workflow for WorkerFlow {
                     state.phase = Phase::Working;
                     Self::read_if_ready(state)
                 }
-                ("prompt", _) => StepDecision::Fail {
+                ("prompt", result) => StepDecision::Fail {
                     code: PROMPT_FAILED,
-                    reason: "herdr did not take the prompt".into(),
+                    reason: match result {
+                        ActivityResult::Herdr(HerdrResult::PromptFailed { cause, .. }) => cause,
+                        _ => "herdr did not take the prompt".into(),
+                    },
                 },
                 ("report", ActivityResult::ReportFile(ReportFileResult::Content(text))) => {
                     match judge(&text) {
@@ -270,12 +284,19 @@ impl Activity for WorkerActivities {
     fn execute(&self, req: &ActivityRequest) -> Result<ActivityResult, ActivityError> {
         match req {
             ActivityRequest::Herdr(HerdrRequest::Prompt { name, task }) => {
-                let sent = matches!(self.herdr.agent_prompt(name, task, None), Ok(r) if r.ok);
-                Ok(ActivityResult::Herdr(if sent {
-                    HerdrResult::Prompted { name: name.clone() }
-                } else {
-                    HerdrResult::Unknown
-                }))
+                Ok(ActivityResult::Herdr(
+                    match crate::herdr::prompt_landed(self.herdr.as_ref(), name, task).0 {
+                        crate::herdr::Landing::Landed => HerdrResult::Prompted { name: name.clone() },
+                        crate::herdr::Landing::Blocked => HerdrResult::PromptFailed {
+                            name: name.clone(),
+                            cause: format!("{name} is blocked on a question; the prompt did not land"),
+                        },
+                        crate::herdr::Landing::NotLanded(cause) => HerdrResult::PromptFailed {
+                            name: name.clone(),
+                            cause,
+                        },
+                    },
+                ))
             }
             ActivityRequest::ReportFile(ReportFileRequest::Read { path }) => Ok(
                 ActivityResult::ReportFile(match std::fs::read_to_string(path) {
@@ -387,6 +408,47 @@ fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .ok_or_else(|| bad(format!("missing string argument '{key}'")))
 }
 
+/// The pane for a spawn that named none. A worker herdr already knows keeps
+/// its pane (a retry places nothing new); otherwise grid placement picks one
+/// by the project's repo, four agents to a tab.
+pub fn place_pane(
+    conn: &rusqlite::Connection,
+    herdr: &dyn HerdrClient,
+    name: &str,
+    project_id: Option<i64>,
+) -> Result<String, RpcError> {
+    if let Ok(r) = herdr.agent_get(name) {
+        if let Some(p) = serde_json::from_str::<Value>(&r.body).ok().and_then(|v| {
+            v.pointer("/result/agent/pane_id")?
+                .as_str()
+                .map(String::from)
+        }) {
+            return Ok(p);
+        }
+    }
+    let id = project_id.ok_or_else(|| bad("a spawn needs 'pane' or a 'project_id' to place it"))?;
+    let repo: String = conn
+        .query_row("SELECT repo_path FROM project WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .map_err(|_| bad(format!("no project {id} to place '{name}'")))?;
+    let repo = std::path::Path::new(&repo)
+        .file_name()
+        .map_or_else(|| repo.clone(), |f| f.to_string_lossy().into_owned());
+    let runs = conn
+        .path()
+        .and_then(|p| Path::new(p).parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| bad("no runs dir to place '".to_string() + name + "' in"))?;
+    crate::grid::acquire(
+        &crate::grid::HerdrPanes(herdr),
+        &repo,
+        &crate::grid::Scope::from_runs_dir(&runs),
+        &runs,
+    )
+    .map_err(|e| RpcError::new("place_failed", e.to_string()))
+}
+
 /// The input `task.start` journaled for `id`, read from the replay base.
 fn journaled_input(
     store: &crate::daemon::store::Store,
@@ -441,7 +503,7 @@ fn settle_run(
     record_end(journal, db_path, id)
 }
 
-/// `task.start {name, kind, role, pane, prompt, report, [timeout_ms, base,
+/// `task.start {name, kind, role, [pane: else grid-placed from project_id], prompt, report, [timeout_ms, base,
 /// project_id, task_id]}`: runs one task on one agent. The workflow id is
 /// `worker:<name>`. A repeat with the same input converges; a different input
 /// for an existing id is a `conflict`; a new task whose report path already
@@ -506,6 +568,44 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             None => {}
         }
 
+        // Gate and attribute the spawn. The gate is skipped only for the open
+        // agent's own spawner retrying (it converges and spawns nothing new);
+        // any other caller goes through it. A request with no caller is not
+        // gated (identity is client-asserted).
+        let caller = req.caller.as_deref();
+        let open = crate::authority::resolve(&conn, name).map_err(internal)?;
+        let own_retry = match (&open, caller) {
+            (Some(o), Some(c)) => {
+                let who = crate::authority::resolve(&conn, c).map_err(internal)?;
+                o.spawner_id.is_some() && who.map(|w| w.id) == o.spawner_id
+            }
+            _ => false,
+        };
+        if let (Some(caller), false) = (caller, own_retry) {
+            let target = match role {
+                Role::Lead => crate::authority::Role::Lead,
+                Role::Peer => crate::authority::Role::Peer,
+            };
+            if let crate::authority::Decision::Refused(r) =
+                crate::authority::check_spawn(&conn, caller, target, project_id)
+                    .map_err(internal)?
+            {
+                return Err(RpcError::new(
+                    "refused",
+                    format!("{} -> {}: {}", r.caller, r.target, r.reason),
+                ));
+            }
+        }
+        let spawner_id = match caller {
+            Some(c) => crate::authority::resolve(&conn, c)
+                .map_err(internal)?
+                .map(|a| a.id),
+            None => None,
+        };
+        let pane = match a.get("pane").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => place_pane(&conn, deps.herdr.as_ref(), name, project_id)?,
+        };
         let spawned = spawn(
             &conn,
             deps.herdr.as_ref(),
@@ -514,9 +614,9 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 name,
                 kind,
                 role,
-                pane: text(a, "pane")?,
+                pane: &pane,
                 project_id,
-                spawner_id: None,
+                spawner_id,
             },
             now_ms(),
         )
@@ -541,15 +641,10 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
         if ctx.supervisor.is_running(&id) {
             // Repeats are ignored by the flow once it is past `Armed`.
             let _ = ctx.supervisor.signal(&id, "task", "launched", Value::Null);
-            for (verb, args) in [
-                ("watch.agent", json!({ "workflow": id, "agent": name })),
-                ("watch.report", json!({ "workflow": id, "path": report })),
-            ] {
-                rpc::call(&ctx.socket, &Request::new(verb, args))
-                    .map_err(internal)?
-                    .into_result()
-                    .map_err(|e| internal(e.to_string()))?;
-            }
+            // In-process: the daemon is in no pane, so its own socket would
+            // refuse it as `unmapped_peer`.
+            ctx.watch_agent(&id, name)?;
+            ctx.watch_report(&id, &report)?;
         }
         Ok(json!({ "workflow": id, "agent_id": spawned.agent_id }))
     })
@@ -640,5 +735,50 @@ mod tests {
                 "{report}"
             );
         }
+    }
+
+    fn prompt_through(herdr: Arc<crate::herdr::FakeHerdr>) -> HerdrResult {
+        let act = WorkerActivities { herdr };
+        match act
+            .execute(&ActivityRequest::Herdr(HerdrRequest::Prompt {
+                name: "w1".into(),
+                task: "do it".into(),
+            }))
+            .expect("a prompt result, never an Err that stops the loop")
+        {
+            ActivityResult::Herdr(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn fake_with_agent() -> Arc<crate::herdr::FakeHerdr> {
+        let h = Arc::new(crate::herdr::FakeHerdr::new());
+        let pane = h.seed_pane("work", None, &[]);
+        h.agent_start("w1", "claude", &pane, 1, &[]).unwrap();
+        h
+    }
+
+    #[test]
+    fn a_builder_prompt_that_never_lands_is_a_failure_with_its_cause() {
+        let h = fake_with_agent();
+        h.lose_prompts("w1", crate::herdr::Lose::Always);
+        match prompt_through(h) {
+            HerdrResult::PromptFailed { name, cause } => {
+                assert_eq!(name, "w1");
+                assert!(cause.contains("did not land"), "{cause}");
+            }
+            other => panic!("not landed must not look sent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_builder_prompt_that_lands_after_one_enter_is_prompted() {
+        let h = fake_with_agent();
+        h.lose_prompts("w1", crate::herdr::Lose::UntilEnter);
+        assert_eq!(
+            prompt_through(h.clone()),
+            HerdrResult::Prompted { name: "w1".into() }
+        );
+        assert_eq!(h.keys(), vec![("w1".to_string(), vec!["enter".to_string()])]);
     }
 }

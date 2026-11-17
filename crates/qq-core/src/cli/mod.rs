@@ -96,7 +96,19 @@ pub type Install = fn(&mut Registry, &mut Daemon) -> Result<(), String>;
 /// Every module's install. Each module adds exactly one line here.
 pub const MODULES: &[Install] = &[
     crate::task::worker_flow::INSTALL,
+    crate::task::create::INSTALL,
     crate::bus::INSTALL,
+    crate::config::INSTALL,
+    crate::authority::INSTALL,
+    crate::task::pipeline_io::INSTALL,
+    crate::task::prompt::INSTALL,
+    crate::grid::INSTALL,
+    crate::status::INSTALL,
+    crate::playbook::INSTALL,
+    crate::memory::INSTALL,
+    crate::transcripts::INSTALL,
+    crate::identity::INSTALL,
+    crate::init::INSTALL,
 ];
 
 /// The CLI registry and the daemon, both filled from the core and [`MODULES`].
@@ -130,10 +142,29 @@ pub fn run() -> i32 {
     }
 }
 
+/// The `QQ_AGENT` claim of this process, `None` when unset or empty. The one
+/// place the env is read; a command reads it once and passes the value down.
+pub fn caller_claim() -> Option<String> {
+    std::env::var("QQ_AGENT").ok().filter(|n| !n.is_empty())
+}
+
 /// Sends one verb to the daemon: a refusal or a missing daemon is an error at once.
 pub fn rpc_call(env: &Env, verb: &str, args: Value) -> Result<Value, CliError> {
+    rpc_call_as(env, caller_claim(), verb, args)
+}
+
+/// [`rpc_call`] with the caller's claim already read: the daemon still names
+/// the caller from the socket peer, so the claim is a hint, never authority.
+pub fn rpc_call_as(
+    env: &Env,
+    claim: Option<String>,
+    verb: &str,
+    args: Value,
+) -> Result<Value, CliError> {
     let socket = rpc::socket_path(&env.runs_dir);
-    match rpc::call(&socket, &Request::new(verb, args)) {
+    let mut req = Request::new(verb, args);
+    req.caller = claim;
+    match rpc::call(&socket, &req) {
         Ok(resp) => resp
             .into_result()
             .map_err(|e| CliError::new(1, e.to_string())),
@@ -181,11 +212,6 @@ fn core_commands() -> Vec<Command> {
             name: "ping",
             help: "check that the daemon answers",
             run: |env, _| rpc_call(env, "ping", Value::Null).map(|v| pretty(&v)),
-        },
-        Command {
-            name: "status",
-            help: "list workflows from the daemon's database",
-            run: |env, _| rpc_call(env, "status", Value::Null).map(|v| pretty(&v)),
         },
         Command {
             name: "stop",

@@ -17,16 +17,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::herdr::HerdrClient;
+use crate::identity::peer::{self, PeerResolver};
 use crate::rpc::{self, Request, Response, RpcError};
 use store::Store;
-use supervisor::{Factory, Supervisor};
+use supervisor::{Factory, LiveHook, Supervisor};
 
 /// A live watcher: kept so a repeat of its key is a no-op while it runs.
 struct WatcherSlot {
@@ -52,7 +53,7 @@ impl Ctx {
     /// calls never journal one change twice. `restart_finished` marks an agent
     /// watcher, which a later call replaces once it ends; a report watcher
     /// stays until its workflow ends, since its one Signal is already out.
-    fn add_watcher(
+    pub fn add_watcher(
         &self,
         key: &str,
         workflow: &str,
@@ -88,6 +89,63 @@ impl Ctx {
                 handle,
             },
         );
+        Ok(())
+    }
+
+    /// Watches `agent` in herdr for `workflow` and remembers the watch, so a
+    /// restarted daemon re-arms it. A repeat changes nothing.
+    pub fn watch_agent(&self, workflow: &str, agent: &str) -> Result<(), RpcError> {
+        self.add_watcher(
+            &format!("agent:{workflow}:{agent}"),
+            workflow,
+            true,
+            |sup, stop| {
+                watch::watch_agent(
+                    Arc::clone(&self.herdr),
+                    agent.to_string(),
+                    workflow.to_string(),
+                    sup,
+                    stop,
+                )
+            },
+        )?;
+        self.store
+            .remember_agent_watch(workflow, agent, now_ms())
+            .map_err(internal)
+    }
+
+    /// Watches the report file `path` (already normalized) for `workflow` and
+    /// remembers the watch, so a restarted daemon re-arms it. A report that
+    /// already exists is seen at once; the flow treats `report/appeared` as
+    /// idempotent. A repeat changes nothing.
+    pub fn watch_report(&self, workflow: &str, path: &Path) -> Result<(), RpcError> {
+        self.add_watcher(
+            &format!("report:{workflow}:{}", path.display()),
+            workflow,
+            false,
+            |sup, stop| watch::watch_report(path.to_path_buf(), workflow.to_string(), sup, stop),
+        )?;
+        self.store
+            .remember_report_watch(workflow, path, now_ms())
+            .map_err(internal)
+    }
+
+    /// Re-arms the remembered agent and report watches of every workflow whose
+    /// loop runs. A watch whose workflow is finished or gone is skipped.
+    ///
+    /// Delivery is at-least-once: a re-armed agent watcher reports the current
+    /// status first, changed or not, so a restart can repeat the last status.
+    fn rearm_watches(&self) -> Result<(), String> {
+        for (workflow, agent) in self.store.agent_watches()? {
+            if self.supervisor.is_running(&workflow) {
+                let _ = self.watch_agent(&workflow, &agent);
+            }
+        }
+        for (workflow, path) in self.store.report_watches()? {
+            if self.supervisor.is_running(&workflow) {
+                let _ = self.watch_report(&workflow, &path);
+            }
+        }
         Ok(())
     }
 
@@ -138,7 +196,14 @@ pub struct Daemon {
     cfg: Config,
     verbs: BTreeMap<String, Handler>,
     kinds: HashMap<String, Factory>,
+    live_hooks: Vec<LiveHook>,
+    peers: Option<Arc<dyn PeerResolver>>,
+    /// Filled by `run` once the `Ctx` exists; see [`Daemon::report_watcher`].
+    link: Arc<OnceLock<Weak<Ctx>>>,
 }
+
+/// Registers a report watcher in the daemon's own process: `(workflow, path)`.
+pub type ReportWatcher = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     args.get(key)
@@ -150,12 +215,21 @@ fn internal(e: String) -> RpcError {
     RpcError::new("internal", e)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 impl Daemon {
     pub fn new(cfg: Config) -> Self {
         let mut d = Daemon {
             cfg,
             verbs: BTreeMap::new(),
             kinds: HashMap::new(),
+            live_hooks: Vec::new(),
+            peers: None,
+            link: Arc::new(OnceLock::new()),
         };
         d.register_builtin();
         d
@@ -177,6 +251,46 @@ impl Daemon {
         }
         self.kinds.insert(kind.to_string(), factory);
         Ok(())
+    }
+
+    /// Names every caller from the socket peer: a request's own `caller` is
+    /// replaced by the resolved agent, and a peer that maps to none is refused
+    /// before any verb runs. Without it the claimed `caller` stands.
+    pub fn require_peer(&mut self, peers: Arc<dyn PeerResolver>) {
+        self.peers = Some(peers);
+    }
+
+    /// The herdr handle the daemon was configured with, for installs that
+    /// would otherwise rebuild their own.
+    pub fn herdr(&self) -> Arc<dyn HerdrClient> {
+        Arc::clone(&self.cfg.herdr)
+    }
+
+    /// A report watcher that runs in this daemon's own process. A flow must use
+    /// it, never a call to its own socket: the daemon is not in a pane, so the
+    /// peer gate refuses it as `unmapped_peer`. Until the daemon is serving
+    /// (workflows are revived first) it answers `Err`, and callers retry.
+    pub fn report_watcher(&self) -> ReportWatcher {
+        let (link, runs_dir) = (Arc::clone(&self.link), self.cfg.runs_dir.clone());
+        Arc::new(move |workflow, path| {
+            let ctx = link
+                .get()
+                .and_then(Weak::upgrade)
+                .ok_or("daemon is not serving yet")?;
+            ctx.watch_report(workflow, &normalize(&runs_dir, path))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// The workspace `runs/` directory the daemon serves.
+    pub fn runs_dir(&self) -> &Path {
+        &self.cfg.runs_dir
+    }
+
+    /// Adds a hook run for each workflow whose loop goes live, on a new start
+    /// and on each recovery at daemon start.
+    pub fn on_workflow_live(&mut self, hook: LiveHook) {
+        self.live_hooks.push(hook);
     }
 
     fn register_builtin(&mut self) {
@@ -248,15 +362,7 @@ impl Daemon {
                 let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let agent = str_arg(args, "agent")?;
-                ctx.add_watcher(&format!("agent:{wf}:{agent}"), wf, true, |sup, stop| {
-                    watch::watch_agent(
-                        Arc::clone(&ctx.herdr),
-                        agent.to_string(),
-                        wf.to_string(),
-                        sup,
-                        stop,
-                    )
-                })?;
+                ctx.watch_agent(wf, agent)?;
                 Ok(json!({ "watching": agent }))
             }),
         );
@@ -267,10 +373,7 @@ impl Daemon {
                 let args = &req.args;
                 let wf = str_arg(args, "workflow")?;
                 let path = normalize(&ctx.runs_dir, str_arg(args, "path")?);
-                let key = format!("report:{wf}:{}", path.display());
-                ctx.add_watcher(&key, wf, false, |sup, stop| {
-                    watch::watch_report(path.clone(), wf.to_string(), sup, stop)
-                })?;
+                ctx.watch_report(wf, &path)?;
                 Ok(json!({ "watching": path }))
             }),
         );
@@ -284,7 +387,14 @@ impl Daemon {
 
     /// `ready` is told once the socket is bound and the workflows revived.
     fn run(self, ready: Option<mpsc::Sender<()>>) -> Result<(), DaemonError> {
-        let Daemon { cfg, verbs, kinds } = self;
+        let Daemon {
+            cfg,
+            verbs,
+            kinds,
+            live_hooks,
+            peers,
+            link,
+        } = self;
         let socket = rpc::socket_path(&cfg.runs_dir);
         std::fs::create_dir_all(&cfg.runs_dir)?;
         let db_path = cfg.runs_dir.join(crate::db::path::DB_FILE);
@@ -293,6 +403,9 @@ impl Daemon {
         let store = Arc::new(Store::open(&db_path).map_err(DaemonError::Store)?);
         let listener = bind_socket(&socket)?;
         let supervisor = Supervisor::new(Arc::clone(&store), kinds);
+        for h in live_hooks {
+            supervisor.on_live(h);
+        }
         supervisor.recover().map_err(DaemonError::Store)?;
         let ctx = Arc::new(Ctx {
             runs_dir: cfg.runs_dir,
@@ -304,6 +417,8 @@ impl Daemon {
             stop_watchers: Arc::new(AtomicBool::new(false)),
             watchers: Mutex::new(HashMap::new()),
         });
+        let _ = link.set(Arc::downgrade(&ctx));
+        ctx.rearm_watches().map_err(DaemonError::Store)?;
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());
@@ -313,8 +428,8 @@ impl Daemon {
                 break;
             }
             let Ok(stream) = conn else { continue };
-            let (ctx, verbs) = (Arc::clone(&ctx), Arc::clone(&verbs));
-            std::thread::spawn(move || serve_conn(stream, &ctx, &verbs));
+            let (ctx, verbs, peers) = (Arc::clone(&ctx), Arc::clone(&verbs), peers.clone());
+            std::thread::spawn(move || serve_conn(stream, &ctx, &verbs, peers.as_deref()));
         }
         // Stopping: close the door first, so a new daemon is not kept out by
         // a watcher blocked in `agent wait` (herdr cannot cancel it).
@@ -341,11 +456,18 @@ impl Daemon {
     pub fn spawn(self) -> Result<DaemonHandle, DaemonError> {
         let socket = rpc::socket_path(&self.cfg.runs_dir);
         let (tx, rx) = mpsc::channel();
+        let link = Arc::clone(&self.link);
         let thread = std::thread::spawn(move || self.run(Some(tx)));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(()) => return Ok(DaemonHandle { socket, thread }),
+                Ok(()) => {
+                    return Ok(DaemonHandle {
+                        socket,
+                        thread,
+                        link,
+                    })
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return match thread.join() {
@@ -361,9 +483,20 @@ impl Daemon {
     }
 }
 
+/// The held lock. Dropping unlocks, not just closes: a child forked mid-run
+/// shares the open file until it execs, and a plain close would leave the flock
+/// with it. Every exit path of `run` goes through this drop.
+struct WorkspaceLock(File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// An exclusive advisory lock on the database file itself, so the one-daemon
 /// rule needs no sidecar file. The OS drops it when the process dies.
-fn lock_workspace(db: &Path, socket: &Path) -> Result<File, DaemonError> {
+fn lock_workspace(db: &Path, socket: &Path) -> Result<WorkspaceLock, DaemonError> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -371,7 +504,7 @@ fn lock_workspace(db: &Path, socket: &Path) -> Result<File, DaemonError> {
         .truncate(false)
         .open(db)?;
     match f.try_lock() {
-        Ok(()) => Ok(f),
+        Ok(()) => Ok(WorkspaceLock(f)),
         Err(TryLockError::WouldBlock) => Err(DaemonError::AlreadyRunning(socket.to_path_buf())),
         Err(TryLockError::Error(e)) => Err(e.into()),
     }
@@ -396,12 +529,16 @@ fn normalize(runs_dir: &Path, path: &str) -> PathBuf {
 pub struct DaemonHandle {
     pub socket: PathBuf,
     thread: JoinHandle<Result<(), DaemonError>>,
+    link: Arc<OnceLock<Weak<Ctx>>>,
 }
 
 impl DaemonHandle {
-    /// Sends `stop` and waits for the daemon to wind down.
+    /// Stops the daemon in-process (no socket call: the owner of the handle
+    /// is not a pane peer) and waits for it to wind down.
     pub fn stop(self) -> Result<(), DaemonError> {
-        let _ = rpc::call(&self.socket, &Request::new("stop", Value::Null));
+        if let Some(ctx) = self.link.get().and_then(Weak::upgrade) {
+            ctx.request_shutdown();
+        }
         self.thread
             .join()
             .unwrap_or_else(|_| Err(DaemonError::Io(io::Error::other("daemon panicked"))))
@@ -424,10 +561,18 @@ fn bind_socket(path: &Path) -> Result<UnixListener, DaemonError> {
     }
 }
 
-fn serve_conn(stream: UnixStream, ctx: &Ctx, verbs: &BTreeMap<String, Handler>) {
+fn serve_conn(
+    stream: UnixStream,
+    ctx: &Ctx,
+    verbs: &BTreeMap<String, Handler>,
+    peers: Option<&dyn PeerResolver>,
+) {
     let Ok(mut out) = stream.try_clone() else {
         return;
     };
+    // Read once: the peer of a connected socket never changes.
+    let cred = peers.map(|_| peer::peer_cred(&stream));
+    let own_uid = peer::own_uid();
     let mut reader = BufReader::new(stream);
     while let Ok(Some(line)) = rpc::read_line(&mut reader) {
         if line.trim().is_empty() {
@@ -435,19 +580,90 @@ fn serve_conn(stream: UnixStream, ctx: &Ctx, verbs: &BTreeMap<String, Handler>) 
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             Err(e) => Response::err(RpcError::new(rpc::BAD_REQUEST, e.to_string())),
-            Ok(req) => match verbs.get(&req.verb) {
-                None => Response::err(RpcError::new(
-                    rpc::UNKNOWN_VERB,
-                    format!("no verb '{}'", req.verb),
-                )),
-                Some(h) => match h(ctx, &req) {
-                    Ok(v) => Response::ok(v),
-                    Err(e) => Response::err(e),
+            Ok(req) => match identify(req, peers, cred.as_ref(), own_uid) {
+                Err(e) => Response::err(e),
+                Ok(req) => match verbs.get(&req.verb) {
+                    None => Response::err(RpcError::new(
+                        rpc::UNKNOWN_VERB,
+                        format!("no verb '{}'", req.verb),
+                    )),
+                    Some(h) => match h(ctx, &req) {
+                        Ok(v) => Response::ok(v),
+                        Err(e) => Response::err(e),
+                    },
                 },
             },
         };
         if rpc::write_line(&mut out, &resp).is_err() {
             return;
+        }
+    }
+}
+
+/// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
+/// client's claim is dropped). A peer of another uid is refused outright, and
+/// so is an unmapped peer of the daemon's uid, whatever the verb.
+fn identify(
+    mut req: Request,
+    peers: Option<&dyn PeerResolver>,
+    cred: Option<&io::Result<peer::PeerCred>>,
+    own_uid: u32,
+) -> Result<Request, RpcError> {
+    let (Some(peers), Some(cred)) = (peers, cred) else {
+        return Ok(req);
+    };
+    let cred = cred.as_ref().map_err(|e| {
+        RpcError::new(
+            peer::UNMAPPED_PEER,
+            format!("caller not identified: socket peer unreadable: {e}"),
+        )
+    })?;
+    if cred.uid != own_uid {
+        return Err(RpcError::new(
+            peer::FOREIGN_UID,
+            format!("peer uid {} is not the daemon's uid {own_uid}", cred.uid),
+        ));
+    }
+    let (who, pane) = peers.resolve_pane(*cred)?;
+    req.caller = Some(who.0);
+    req.caller_pane = pane;
+    Ok(req)
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+    use crate::identity::peer::{CallerId, PeerCred};
+
+    struct Fixed(Result<&'static str, ()>);
+    impl PeerResolver for Fixed {
+        fn resolve(&self, _: peer::PeerCred) -> Result<CallerId, RpcError> {
+            self.0
+                .map(|n| CallerId(n.into()))
+                .map_err(|()| RpcError::new(peer::UNMAPPED_PEER, "no pane"))
+        }
+    }
+
+    fn run(verb: &str, who: Result<&'static str, ()>, uid: u32) -> Result<Request, RpcError> {
+        let mut req = Request::new(verb, Value::Null);
+        req.caller = Some("spoof".into());
+        let cred = Ok(PeerCred { pid: 1, uid });
+        identify(req, Some(&Fixed(who)), Some(&cred), 1000)
+    }
+
+    #[test]
+    fn other_uid_is_refused_for_every_verb_even_when_mapped() {
+        for v in ["ping", "stop", "mail.send"] {
+            let e = run(v, Ok("w-1"), 0).unwrap_err();
+            assert_eq!(e.code, peer::FOREIGN_UID, "{v}");
+        }
+    }
+
+    #[test]
+    fn unmapped_same_uid_is_refused_for_every_verb() {
+        for v in ["ping", "stop", "status", "mail.send"] {
+            let e = run(v, Err(()), 1000).unwrap_err();
+            assert_eq!(e.code, peer::UNMAPPED_PEER, "{v}");
         }
     }
 }

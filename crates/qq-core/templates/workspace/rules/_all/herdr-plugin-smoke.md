@@ -1,0 +1,1 @@
+- Smoke-test herdr plugins in isolation: set HOME + XDG_CONFIG_HOME to a temp dir AND unset HERDR_SOCKET_PATH, else the live daemon/registry is touched — 2026-10-14, runs/tieude-pubfix.md

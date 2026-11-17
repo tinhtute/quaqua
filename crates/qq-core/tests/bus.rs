@@ -69,7 +69,52 @@ fn listener_factory() -> Factory {
     })
 }
 
+/// The senders and addressees the cases use, as active agents of one project
+/// (two leads, two peers), plus a lead -> peer mail edge.
+/// Idempotent, so a restart in a test can call `start` again.
+fn seed_agents(ws: &TestWorkspace) {
+    let conn = qq_core::db::open(&ws.db_path()).expect("open qq db");
+    let seeded: i64 = conn
+        .query_row("SELECT count(*) FROM agent", [], |r| r.get(0))
+        .unwrap();
+    if seeded > 0 {
+        return;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO topology_edge (from_role, to_role, edge) VALUES ('lead', 'peer', 'mail')",
+        [],
+    )
+    .unwrap();
+    for slug in ["p1", "p2"] {
+        conn.execute(
+            "INSERT INTO project (slug, created_ms) VALUES (?1, 0)",
+            [slug],
+        )
+        .unwrap();
+    }
+    // One active Lead per project: `lead` owns project 1 (and so both peers),
+    // `lead2` is in project 2 and is peer-a's spawner.
+    for (name, role, project) in [
+        ("lead", "lead", 1),
+        ("lead2", "lead", 2),
+        ("peer-a", "peer", 1),
+        ("peer-b", "peer", 1),
+    ] {
+        conn.execute(
+            "INSERT INTO agent (name, role, project_id, started_ms) VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![name, role, project],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE agent SET spawner_id = (SELECT id FROM agent WHERE name = 'lead2') WHERE name = 'peer-a'",
+        [],
+    )
+    .unwrap();
+}
+
 fn start(ws: &TestWorkspace) -> DaemonHandle {
+    seed_agents(ws);
     let mut d = Daemon::new(Config {
         runs_dir: ws.runs_dir(),
         herdr: Arc::new(FakeHerdr::new()),

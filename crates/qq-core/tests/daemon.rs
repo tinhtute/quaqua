@@ -189,6 +189,7 @@ fn daemon_rpc_roundtrip() {
             verb: "whoami".into(),
             args: Value::Null,
             caller: Some("peer-a".into()),
+            caller_pane: None,
         },
     )
     .unwrap()
@@ -716,4 +717,34 @@ fn lock_refuses_a_second_daemon_when_the_socket_file_is_gone() {
     assert!(matches!(second, Err(DaemonError::AlreadyRunning(_))));
     std::fs::rename(&aside, &sock).unwrap();
     daemon.stop().unwrap();
+}
+
+/// A child forked by another thread holds a copy of the daemon's lock until it
+/// execs; the lock must still be released when the daemon stops, so the next
+/// daemon starts at once (under load this made restarts fail at random).
+#[test]
+fn a_forked_child_does_not_keep_the_stopped_daemons_lock() {
+    use std::os::unix::process::CommandExt;
+    let ws = TestWorkspace::new("daemon-lock-fork");
+    let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).expect("first daemon");
+    // Forked while the daemon holds the lock; sleeps in the child before exec.
+    let child = std::thread::spawn(|| {
+        let mut cmd = Command::new("true");
+        unsafe {
+            cmd.pre_exec(|| {
+                std::thread::sleep(Duration::from_millis(2500));
+                Ok(())
+            });
+        }
+        cmd.status().expect("child runs")
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    daemon.stop().expect("clean stop");
+    let next = start_daemon(&ws, Arc::new(FakeHerdr::new()));
+    let refused = matches!(next, Err(DaemonError::AlreadyRunning(_)));
+    if let Ok(d) = next {
+        d.stop().expect("clean stop");
+    }
+    child.join().unwrap();
+    assert!(!refused, "the stopped daemon's lock outlived it");
 }

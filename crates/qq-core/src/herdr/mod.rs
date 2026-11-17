@@ -5,7 +5,7 @@
 mod fake;
 pub mod liveness;
 
-pub use fake::FakeHerdr;
+pub use fake::{FakeHerdr, Lose};
 
 /// Error code for a start on a pane that already hosts another agent. Not a
 /// herdr 0.9.5 documented code: T39's live probe may replace the value, so
@@ -15,6 +15,52 @@ pub const PANE_BUSY: &str = "pane_busy";
 /// different kind or pane (distinct from an occupied pane).
 pub const NAME_CLASH: &str = "agent_name_clash";
 
+/// What became of a prompt sent through [`prompt_landed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// The agent started a turn (`working`) or asked a question (`blocked`).
+    Landed,
+    /// herdr refused it: the agent was already blocked on a question.
+    Blocked,
+    /// It never reached a turn, an enter included; the cause is for a human.
+    NotLanded(String),
+}
+
+/// Sends `text` to `name` and checks it reached a turn: wait for `working` or
+/// `blocked` (10 s), then one `enter` and one more wait, then give up with the
+/// cause. A fire-and-forget prompt is lost silently while claude is still
+/// booting; this is the one place that tells. Returns the first reply's body
+/// too (what herdr said to the prompt itself).
+pub fn prompt_landed(herdr: &dyn HerdrClient, name: &str, text: &str) -> (Landing, Option<String>) {
+    let first = herdr.agent_prompt(name, text, Some((&["working", "blocked"], 10_000)));
+    let body = first.as_ref().ok().map(|r| r.body.clone());
+    let cause = match &first {
+        Ok(r) if r.ok => return (Landing::Landed, body),
+        Ok(r) if r.error_code().as_deref() == Some("agent_blocked") => {
+            return (Landing::Blocked, body)
+        }
+        Ok(r) => r.error_code().unwrap_or_else(|| r.body.clone()),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("WATCHDOG prompt-not-landed | name={name} - sent enter once");
+    let _ = herdr.agent_send_keys(name, &["enter"]);
+    match herdr.agent_wait(name, &["working", "blocked"], 10_000) {
+        Ok(r) if r.ok => (Landing::Landed, body),
+        retry => {
+            let after = match retry {
+                Ok(r) => r.error_code().unwrap_or(r.body),
+                Err(e) => e.to_string(),
+            };
+            (
+                Landing::NotLanded(format!(
+                    "the prompt to {name} did not land (no working/blocked within 10s: {cause}; after one enter: {after})"
+                )),
+                body,
+            )
+        }
+    }
+}
+
 /// The herdr verbs of [`HerdrClient`], for [`FakeHerdr`] fault/reply injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verb {
@@ -23,6 +69,17 @@ pub enum Verb {
     List,
     Wait,
     Prompt,
+    SendKeys,
+    PaneSplit,
+    PaneClose,
+    PaneList,
+    TabCreate,
+    TabClose,
+    TabList,
+    PaneGet,
+    PaneReportMetadata,
+    PaneRead,
+    PaneProcessInfo,
 }
 
 use std::io;
@@ -83,6 +140,88 @@ pub trait HerdrClient: Send + Sync {
         text: &str,
         wait: Option<(&[&str], u64)>,
     ) -> io::Result<Reply>;
+    /// `herdr agent send-keys NAME KEY...` (`esc` is the canonical Escape).
+    /// A client that cannot send keys reports `Unsupported`, so existing
+    /// implementors keep compiling.
+    fn agent_send_keys(&self, _name: &str, _keys: &[&str]) -> io::Result<Reply> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "agent send-keys not supported by this client",
+        ))
+    }
+    /// `herdr notification show TITLE --body BODY [--sound SOUND]`: a desktop
+    /// notification. Default `Unsupported`, like `agent_send_keys`.
+    fn notification_show(
+        &self,
+        _title: &str,
+        _body: &str,
+        _sound: Option<&str>,
+    ) -> io::Result<Reply> {
+        Err(unsupported("notification show"))
+    }
+    /// `herdr pane split TARGET --direction right|down --no-focus`.
+    /// Default `Unsupported`, like `agent_send_keys`.
+    fn pane_split(&self, _target: &str, _dir: &str) -> io::Result<Reply> {
+        Err(unsupported("pane split"))
+    }
+    /// `herdr pane split TARGET --direction right|down --cwd CWD --no-focus`: the new
+    /// pane's shell starts in `cwd`. Default `Unsupported`.
+    fn pane_split_in(&self, _target: &str, _dir: &str, _cwd: &str) -> io::Result<Reply> {
+        Err(unsupported("pane split --cwd"))
+    }
+    /// `herdr pane close PANE`.
+    fn pane_close(&self, _pane: &str) -> io::Result<Reply> {
+        Err(unsupported("pane close"))
+    }
+    /// `herdr pane list`.
+    fn pane_list(&self) -> io::Result<Reply> {
+        Err(unsupported("pane list"))
+    }
+    /// `herdr tab create --label NAME --no-focus`.
+    fn tab_create(&self, _name: &str) -> io::Result<Reply> {
+        Err(unsupported("tab create"))
+    }
+    /// `herdr tab close TAB`.
+    fn tab_close(&self, _tab: &str) -> io::Result<Reply> {
+        Err(unsupported("tab close"))
+    }
+    /// `herdr tab list`: `{"result":{"tabs":[{tab_id,label,...}]}}`.
+    fn tab_list(&self) -> io::Result<Reply> {
+        Err(unsupported("tab list"))
+    }
+    /// `herdr pane get PANE`.
+    fn pane_get(&self, _pane: &str) -> io::Result<Reply> {
+        Err(unsupported("pane get"))
+    }
+    /// `herdr pane report-metadata PANE --source SOURCE [--token K=V]...
+    /// [--display-agent TEXT]`. herdr merges tokens, so a repeat converges.
+    fn pane_report_metadata(
+        &self,
+        _pane: &str,
+        _source: &str,
+        _tokens: &[(&str, &str)],
+        _display: Option<&str>,
+    ) -> io::Result<Reply> {
+        Err(unsupported("pane report-metadata"))
+    }
+    /// `herdr pane read PANE --source recent-unwrapped --lines N`: the pane's
+    /// recent text. The reply body is the text itself, not JSON.
+    fn pane_read(&self, _pane: &str, _lines: u32) -> io::Result<Reply> {
+        Err(unsupported("pane read"))
+    }
+    /// `herdr pane process-info --pane PANE`:
+    /// `{"result":{"process_info":{"shell_pid":N,"foreground_processes":[{"pid":N,..}]}}}`.
+    /// Default `Unsupported`.
+    fn pane_process_info(&self, _pane: &str) -> io::Result<Reply> {
+        Err(unsupported("pane process-info"))
+    }
+}
+
+fn unsupported(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{what} not supported by this client"),
+    )
 }
 
 /// The real binary: `HERDR_BIN_PATH` when set and non-empty, else `herdr`.
@@ -190,6 +329,104 @@ impl HerdrClient for CliHerdr {
         if let Some((until, timeout_ms)) = wait {
             args.push("--wait".into());
             wait_args(&mut args, until, timeout_ms);
+        }
+        self.run(&args)
+    }
+
+    fn agent_send_keys(&self, name: &str, keys: &[&str]) -> io::Result<Reply> {
+        let mut args = argv(&["agent", "send-keys", name]);
+        args.extend(keys.iter().map(|k| k.to_string()));
+        self.run(&args)
+    }
+
+    fn notification_show(&self, title: &str, body: &str, sound: Option<&str>) -> io::Result<Reply> {
+        let mut args = argv(&["notification", "show", title, "--body", body]);
+        if let Some(s) = sound {
+            args.push("--sound".into());
+            args.push(s.into());
+        }
+        self.run(&args)
+    }
+
+    fn pane_split(&self, target: &str, dir: &str) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "split",
+            target,
+            "--direction",
+            dir,
+            "--no-focus",
+        ]))
+    }
+
+    fn pane_split_in(&self, target: &str, dir: &str, cwd: &str) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "split",
+            target,
+            "--direction",
+            dir,
+            "--cwd",
+            cwd,
+            "--no-focus",
+        ]))
+    }
+
+    fn pane_close(&self, pane: &str) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "close", pane]))
+    }
+
+    fn pane_list(&self) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "list"]))
+    }
+
+    fn tab_create(&self, name: &str) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "create", "--label", name, "--no-focus"]))
+    }
+
+    fn tab_close(&self, tab: &str) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "close", tab]))
+    }
+
+    fn tab_list(&self) -> io::Result<Reply> {
+        self.run(&argv(&["tab", "list"]))
+    }
+
+    fn pane_get(&self, pane: &str) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "get", pane]))
+    }
+
+    fn pane_process_info(&self, pane: &str) -> io::Result<Reply> {
+        self.run(&argv(&["pane", "process-info", "--pane", pane]))
+    }
+
+    fn pane_read(&self, pane: &str, lines: u32) -> io::Result<Reply> {
+        self.run(&argv(&[
+            "pane",
+            "read",
+            pane,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            &lines.to_string(),
+        ]))
+    }
+
+    fn pane_report_metadata(
+        &self,
+        pane: &str,
+        source: &str,
+        tokens: &[(&str, &str)],
+        display: Option<&str>,
+    ) -> io::Result<Reply> {
+        let mut args = argv(&["pane", "report-metadata", pane, "--source", source]);
+        for (k, v) in tokens {
+            args.push("--token".into());
+            args.push(format!("{k}={v}"));
+        }
+        if let Some(d) = display {
+            args.push("--display-agent".into());
+            args.push(d.into());
         }
         self.run(&args)
     }

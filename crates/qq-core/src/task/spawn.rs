@@ -4,7 +4,8 @@
 //! Steps, each safe to repeat: resolve the kind from SQLite, find the driver
 //! of its harness, `herdr agent start` (herdr converges on the same name,
 //! kind and pane), then record the agent unless an open one with that name
-//! exists. A pane is an input: herdr 0.9.5's client has no pane split.
+//! exists. The pane is an input; `task.start` fills a missing one from grid
+//! placement (`worker_flow::place_pane`) before it gets here.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -69,6 +70,8 @@ pub enum SpawnError {
     Db(rusqlite::Error),
     /// An open agent of that name exists with a different role, kind or project.
     Conflict(String),
+    /// The target pane already hosts another open agent: herdr is not asked to start there.
+    PaneBusy(String),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -80,11 +83,85 @@ impl std::fmt::Display for SpawnError {
             SpawnError::Io(e) => write!(f, "herdr could not be run: {e}"),
             SpawnError::Db(e) => write!(f, "database: {e}"),
             SpawnError::Conflict(m) => write!(f, "{m}"),
+            SpawnError::PaneBusy(m) => write!(f, "{m}"),
         }
     }
 }
 
 impl std::error::Error for SpawnError {}
+
+/// Accepts claude's workspace-trust dialog when `pane` shows it, then waits
+/// until claude is really ready: the dialog text gone from the pane's last
+/// lines, something drawn there (a blank pane is claude still booting) and
+/// herdr reporting `idle`. herdr says `idle` right after the keys while claude
+/// is still booting, and a prompt typed then is dropped.
+fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, ready: &Ready) -> Trust {
+    let mut drawn = String::new();
+    for i in 0..=ready.settle_polls {
+        match herdr.pane_read(pane, 40) {
+            Ok(r) if r.ok && !r.body.trim().is_empty() => {
+                drawn = r.body;
+                break;
+            }
+            _ => {}
+        }
+        if i < ready.settle_polls {
+            std::thread::sleep(std::time::Duration::from_millis(ready.settle_ms));
+        }
+    }
+    if !drawn.contains("trust") {
+        return Trust::NoDialog;
+    }
+    if !herdr
+        .agent_send_keys(name, &["down", "enter"])
+        .is_ok_and(|r| r.ok)
+    {
+        return Trust::NotReady;
+    }
+    for i in 0..ready.polls {
+        let gone = herdr
+            .pane_read(pane, 12)
+            .is_ok_and(|r| r.ok && !r.body.contains("trust") && !r.body.trim().is_empty());
+        if gone && herdr.agent_wait(name, &["idle"], 1_000).is_ok_and(|r| r.ok) {
+            return Trust::Ready;
+        }
+        if i + 1 < ready.polls {
+            std::thread::sleep(std::time::Duration::from_millis(ready.poll_ms));
+        }
+    }
+    Trust::NotReady
+}
+
+/// What [`accept_trust_dialog`] found.
+#[derive(PartialEq)]
+enum Trust {
+    /// The pane shows no trust dialog.
+    NoDialog,
+    /// The dialog was accepted and claude is ready.
+    Ready,
+    /// The dialog was there and claude was not ready within the bound.
+    NotReady,
+}
+
+/// How long [`spawn`] waits for claude to be really ready once its trust dialog
+/// is accepted: `polls` looks, `poll_ms` apart.
+pub struct Ready {
+    pub polls: u32,
+    pub poll_ms: u64,
+    /// Looks (`settle_ms` apart) for claude to have drawn anything at all after
+    /// the start: herdr can return before the dialog is on screen.
+    pub settle_polls: u32,
+    pub settle_ms: u64,
+}
+
+impl Ready {
+    pub const DEFAULT: Ready = Ready {
+        polls: 60,
+        poll_ms: 500,
+        settle_polls: 10,
+        settle_ms: 100,
+    };
+}
 
 pub fn spawn(
     conn: &Connection,
@@ -92,6 +169,17 @@ pub fn spawn(
     drivers: &Registry,
     spec: &SpawnSpec,
     now_ms: u64,
+) -> Result<Spawned, SpawnError> {
+    spawn_with(conn, herdr, drivers, spec, now_ms, &Ready::DEFAULT)
+}
+
+pub fn spawn_with(
+    conn: &Connection,
+    herdr: &dyn HerdrClient,
+    drivers: &Registry,
+    spec: &SpawnSpec,
+    now_ms: u64,
+    ready: &Ready,
 ) -> Result<Spawned, SpawnError> {
     let target = config::resolve_spawn(conn, spec.kind).map_err(SpawnError::Config)?;
     let driver = drivers
@@ -117,6 +205,20 @@ pub fn spawn(
             )));
         }
     }
+    let host: Option<String> = conn
+        .query_row(
+            "SELECT name FROM agent WHERE pane_id = ?1 AND name <> ?2 AND ended_ms IS NULL",
+            params![spec.pane, spec.name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(SpawnError::Db)?;
+    if let Some(host) = host {
+        return Err(SpawnError::PaneBusy(format!(
+            "pane {} already hosts open agent '{host}'; '{}' needs its own pane",
+            spec.pane, spec.name
+        )));
+    }
     let args = driver.launch_args(&target.model, target.effort.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let reply = herdr
@@ -128,22 +230,44 @@ pub fn spawn(
             &arg_refs,
         )
         .map_err(SpawnError::Io)?;
-    if !reply.ok {
-        return Err(SpawnError::Herdr(reply.error_code().unwrap_or(reply.body)));
+    // A fresh worktree is a folder claude has not been trusted in: its startup
+    // dialog ("Quick safety check ... trust") may hold the start back as
+    // `agent_not_ready`, or herdr may report the agent up while the dialog is
+    // still on screen. Either way accept it the way a person would (one Down
+    // to "Yes, I trust this folder", then Enter) and wait until claude is ready.
+    let code = reply.error_code();
+    if !reply.ok && code.as_deref() != Some("agent_not_ready") {
+        return Err(SpawnError::Herdr(code.unwrap_or(reply.body)));
+    }
+    let trust = if driver.herdr_kind() == "claude" {
+        accept_trust_dialog(herdr, spec.name, spec.pane, ready)
+    } else {
+        Trust::NoDialog
+    };
+    let held = if reply.ok {
+        trust == Trust::NotReady
+    } else {
+        trust != Trust::Ready
+    };
+    if held {
+        return Err(SpawnError::Herdr(
+            code.unwrap_or_else(|| "agent_not_ready".into()),
+        ));
     }
     let agent_id = match open {
         Some((id, ..)) => id,
         None => {
             conn.execute(
-                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms, pane_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     spec.name,
                     spec.role.as_str(),
                     spec.kind,
                     spec.project_id,
                     spec.spawner_id,
-                    now_ms as i64
+                    now_ms as i64,
+                    spec.pane
                 ],
             )
             .map_err(SpawnError::Db)?;

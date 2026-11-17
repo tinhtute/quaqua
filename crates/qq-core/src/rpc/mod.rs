@@ -31,6 +31,10 @@ pub struct Request {
     pub args: Value,
     #[serde(default)]
     pub caller: Option<String>,
+    /// The pane the daemon mapped the peer to. Set only by the daemon, never
+    /// read off the wire; used for placement, never as authority.
+    #[serde(skip)]
+    pub caller_pane: Option<String>,
 }
 
 impl Request {
@@ -39,6 +43,7 @@ impl Request {
             verb: verb.to_string(),
             args,
             caller: None,
+            caller_pane: None,
         }
     }
 }

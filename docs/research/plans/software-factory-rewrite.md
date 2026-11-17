@@ -241,6 +241,15 @@ lane: high-risk
   - phase check: `cargo test --locked -p qq-core && cargo clippy --locked --all-targets -- -D warnings && test -d crates/qq-core/templates/workspace && test -z "$(git grep -n -i -E 'taskforce|telemetry_otel|mod (gui|legacy)|bus_migrate|layout_migrate' -- crates/qq-core | grep -v -E '^crates/qq-core/src/config/mod\.rs:[0-9]+:const NOT_PORTED: &str = "taskforce";$')" && test -z "$(git grep -n -i -w -E 'omp|taskforce' -- crates/qq-core/templates/workspace)"`, plus the T66 output in `## Validation`
 
 ## Log
+- 2026-11-16: switch-ready wave-end: cli::MODULES wired for T40–T45; PaneOps wired to CliHerdr; template SessionStart runs `qq memory hook session-start`.
+- 2026-11-16: Lead: agent.pane_id (db migration 0005) is the pane-ownership record; reconcile/cleanup close only recorded panes (CoS #3827).
+- 2026-11-16: Lead: T40 config import merges (no converge mode); T42 gate reductions accepted after its fix round.
+- 2026-11-16: Lead: config emits no mail/question edges; authority treats spawn/report edges as mail carriers (revisit with the config owner).
+- 2026-11-16: anh iu: daemon caller identity = peer-cred (SO_PEERCRED/LOCAL_PEERPID → pid → herdr pane → agent name); unmapped is refused; never fall back to Request.caller; own task T42c.
+- 2026-11-16: anh iu rejected the same-uid relaxation (CoS #3873): the daemon refuses every peer that maps to no herdr pane, same uid included, for every verb (ping, stop, status, mail.inbox, roster too); descendants of a pane process still map (T42c, sude-pcrevert).
+- 2026-11-16 CoS ruling: HerdrClient += pane_split, pane_close, pane_list, tab_create, tab_close, tab_list, pane_get, pane_report_metadata, pane_read (additive, defaults Unsupported)
+- 2026-11-16 CoS: HerdrClient += agent_send_keys (additive)
+- 2026-11-16: switch-ready: Lead added the nine phase module declarations to lib.rs in one scaffold commit before wave 1 (seam file, additive), so wave Peers share no file; each Peer exposes `pub const INSTALL` and the Lead's wave-end commit adds the `cli::MODULES` lines.
 - 2026-11-16: `synchronous=NORMAL` accepted by anh iu (closes the pending note on the CI journal lock line below): an app crash loses nothing; a power loss may lose the last journal events.
 - 2026-11-16: R15 exemption (anh iu): `NOT_PORTED` in `config/mod.rs` is the literal string and the R15 grep gets one narrow `grep -v` for that line (see `constraints`), replacing the `concat!("task","force")` trick; every encoded R15 grep (R15 acceptance and the three phase checks) carries it.
 - 2026-11-16: command registry shape confirmed by anh iu as built (`cli::Registry`, `Command{name,help,run}`, `Daemon::register_verb` / `register_kind`, static `cli::MODULES` of `Install`, one line per module); it freezes at the end of `walking-skeleton`.

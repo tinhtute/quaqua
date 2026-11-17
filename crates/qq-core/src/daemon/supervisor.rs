@@ -158,8 +158,13 @@ struct Slot {
     handle: JoinHandle<()>,
 }
 
+/// Called once for each workflow whose loop is newly live: created by `start`
+/// or revived by `recover`. Runs with no supervisor lock held.
+pub type LiveHook = Arc<dyn Fn(&Supervisor, &Store, &str) + Send + Sync>;
+
 pub struct Supervisor {
     store: Arc<Store>,
+    live_hooks: Mutex<Vec<LiveHook>>,
     kinds: HashMap<String, Factory>,
     loops: Mutex<HashMap<String, Slot>>,
     /// Set by `shutdown` under the `loops` lock: no loop starts after it.
@@ -174,6 +179,7 @@ impl Supervisor {
     pub fn new(store: Arc<Store>, kinds: HashMap<String, Factory>) -> Arc<Self> {
         Arc::new(Supervisor {
             store,
+            live_hooks: Mutex::new(Vec::new()),
             kinds,
             loops: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
@@ -182,6 +188,25 @@ impl Supervisor {
 
     fn loops(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
         self.loops.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Adds a hook run for every workflow that goes live from now on.
+    pub fn on_live(&self, hook: LiveHook) {
+        self.live_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(hook);
+    }
+
+    fn fire_live(&self, id: &str) {
+        let hooks = self
+            .live_hooks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for h in hooks {
+            h(self, &self.store, id);
+        }
     }
 
     /// Starts a workflow loop. A repeat of a live or finished id changes
@@ -209,6 +234,7 @@ impl Supervisor {
         // so `recover` never meets a row that has no base to resume from.
         let progress = driver.advance(&mut self.store.journal(), Vec::new())?;
         self.store.register_workflow(id, kind, now_ms())?;
+        let live = progress == Progress::Running;
         match progress {
             Progress::Running => self.spawn_loop(&mut loops, id, driver),
             Progress::Completed => self.store.finish_workflow(id, "completed", now_ms())?,
@@ -216,6 +242,10 @@ impl Supervisor {
                 eprintln!("qq daemon: workflow {id} failed: {reason}");
                 self.store.finish_workflow(id, "failed", now_ms())?;
             }
+        }
+        drop(loops);
+        if live {
+            self.fire_live(id);
         }
         Ok(true)
     }
@@ -235,6 +265,8 @@ impl Supervisor {
             match factory(&row.id, None) {
                 Ok(driver) => {
                     self.spawn_loop(&mut loops, &row.id, driver);
+                    drop(loops);
+                    self.fire_live(&row.id);
                     revived.push(row.id);
                 }
                 Err(e) => eprintln!("qq daemon: cannot recover {}: {e}", row.id),
