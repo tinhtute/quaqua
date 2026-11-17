@@ -70,6 +70,8 @@ pub enum SpawnError {
     Db(rusqlite::Error),
     /// An open agent of that name exists with a different role, kind or project.
     Conflict(String),
+    /// The target pane already hosts another open agent: herdr is not asked to start there.
+    PaneBusy(String),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -81,11 +83,24 @@ impl std::fmt::Display for SpawnError {
             SpawnError::Io(e) => write!(f, "herdr could not be run: {e}"),
             SpawnError::Db(e) => write!(f, "database: {e}"),
             SpawnError::Conflict(m) => write!(f, "{m}"),
+            SpawnError::PaneBusy(m) => write!(f, "{m}"),
         }
     }
 }
 
 impl std::error::Error for SpawnError {}
+
+/// Accepts claude's workspace-trust dialog when `pane` shows it, then waits
+/// for the agent to be idle. `false`: no dialog, or the agent did not come up.
+fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str) -> bool {
+    let up = herdr
+        .pane_read(pane, 40)
+        .is_ok_and(|r| r.ok && r.body.contains("trust"));
+    up && herdr.agent_send_keys(name, &["down", "enter"]).is_ok_and(|r| r.ok)
+        && herdr
+            .agent_wait(name, &["idle"], u64::from(START_TIMEOUT_MS))
+            .is_ok_and(|r| r.ok)
+}
 
 pub fn spawn(
     conn: &Connection,
@@ -118,6 +133,20 @@ pub fn spawn(
             )));
         }
     }
+    let host: Option<String> = conn
+        .query_row(
+            "SELECT name FROM agent WHERE pane_id = ?1 AND name <> ?2 AND ended_ms IS NULL",
+            params![spec.pane, spec.name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(SpawnError::Db)?;
+    if let Some(host) = host {
+        return Err(SpawnError::PaneBusy(format!(
+            "pane {} already hosts open agent '{host}'; '{}' needs its own pane",
+            spec.pane, spec.name
+        )));
+    }
     let args = driver.launch_args(&target.model, target.effort.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let reply = herdr
@@ -130,7 +159,17 @@ pub fn spawn(
         )
         .map_err(SpawnError::Io)?;
     if !reply.ok {
-        return Err(SpawnError::Herdr(reply.error_code().unwrap_or(reply.body)));
+        let code = reply.error_code();
+        // A fresh worktree is a folder claude has not been trusted in: its
+        // startup dialog ("Quick safety check ... trust") holds the start back
+        // as `agent_not_ready`. Accept it the way a person would (one Down to
+        // "Yes, I trust this folder", then Enter) and wait for the agent.
+        let cleared = code.as_deref() == Some("agent_not_ready")
+            && driver.herdr_kind() == "claude"
+            && accept_trust_dialog(herdr, spec.name, spec.pane);
+        if !cleared {
+            return Err(SpawnError::Herdr(code.unwrap_or(reply.body)));
+        }
     }
     let agent_id = match open {
         Some((id, ..)) => id,

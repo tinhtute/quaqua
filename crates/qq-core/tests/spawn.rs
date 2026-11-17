@@ -647,7 +647,11 @@ fn a_spawn_from_the_cos_pane_is_cos_owned_and_from_a_lead_pane_lead_owned() {
         .unwrap();
     assert_eq!(spawner, None);
 
-    // Now the same process sits in a Lead's pane.
+    // Now the same process sits in a Lead's pane, in a second herdr whose pane
+    // ids start over: the first world's agent is gone.
+    fx.conn
+        .execute("UPDATE agent SET ended_ms = 2 WHERE name = 'tieude-a'", [])
+        .unwrap();
     fx.conn
         .execute(
             "INSERT INTO agent (name, role, project_id, started_ms) \
@@ -893,4 +897,75 @@ fn a_claim_never_names_an_unmapped_process() {
     let e = spawn_claiming(&fx, &h, Some("alpha-lead"), "tieude-a").unwrap_err();
     assert!(e.contains("caller not identified"), "{e}");
     assert_eq!(fx.agents("tieude-a"), 0);
+}
+
+// ---- the one spawn path: a pane hosts one agent; claude's trust dialog ------------
+
+use qq_core::task::spawn::{spawn, Role, SpawnSpec};
+
+fn peer<'a>(name: &'a str, kind: &'a str, pane: &'a str) -> SpawnSpec<'a> {
+    SpawnSpec {
+        name,
+        kind,
+        role: Role::Peer,
+        pane,
+        project_id: None,
+        spawner_id: None,
+    }
+}
+
+#[test]
+fn spawn_never_starts_into_a_pane_that_hosts_another_open_agent() {
+    let fx = Fx::new("panebusy");
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    let go = |name: &str, pane: &str| {
+        spawn(
+            &fx.conn,
+            &fx.herdr,
+            &fx.drivers,
+            &peer(name, "sude", pane),
+            1_000,
+        )
+    };
+    go("sude-a", &pane).expect("a free pane takes its agent");
+    // herdr may forget the agent while its row is open; the row is the claim.
+    fx.herdr.remove("sude-a");
+    let err = go("sude-b", &pane).expect_err("the pane is taken").to_string();
+    assert!(err.contains("sude-a"), "names the host: {err}");
+    assert_eq!(fx.agents("sude-b"), 0, "no row for the refused agent");
+    assert!(fx.herdr.agent_get("sude-b").unwrap().body.contains("not_found"));
+    // The same agent again on its own pane converges; another pane is free.
+    go("sude-a", &pane).expect("a repeat on its own pane converges");
+    let other = fx.herdr.seed_pane("work", None, &[]);
+    go("sude-b", &other).expect("its own pane is free");
+}
+
+#[test]
+fn claudes_trust_dialog_is_accepted_when_a_start_is_held_by_it() {
+    let fx = Fx::new("trustdlg");
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    fx.herdr.block_next_start();
+    fx.herdr.idle_on_keys("sude-a", &["down", "enter"]);
+    fx.herdr.set_pane_text(
+        &pane,
+        "Quick safety check: Is this a project you created or one you trust?\n  Yes, I trust this folder",
+    );
+    spawn(&fx.conn, &fx.herdr, &fx.drivers, &peer("sude-a", "ni", &pane), 1_000)
+        .expect("the dialog is accepted and the agent comes up");
+    assert_eq!(
+        fx.herdr.keys(),
+        vec![("sude-a".to_string(), vec!["down".to_string(), "enter".to_string()])]
+    );
+    assert_eq!(fx.agents("sude-a"), 1);
+
+    // Not-ready for another reason: nothing is typed into the pane.
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    fx.herdr.block_next_start();
+    fx.herdr.set_pane_text(&pane, "starting up");
+    let err = spawn(&fx.conn, &fx.herdr, &fx.drivers, &peer("sude-b", "ni", &pane), 1_000)
+        .expect_err("not ready stays an error")
+        .to_string();
+    assert!(err.contains("agent_not_ready"), "{err}");
+    assert_eq!(fx.herdr.keys().len(), 1, "no keys sent without the dialog");
+    assert_eq!(fx.agents("sude-b"), 0);
 }

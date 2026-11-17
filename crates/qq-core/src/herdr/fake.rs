@@ -29,6 +29,9 @@ struct State {
     notifications: Vec<(String, String, Option<String>)>,
     /// Per agent: the key sequence that idles it (anything else changes nothing).
     idle_on: BTreeMap<String, Vec<String>>,
+    /// The next start leaves the agent `blocked` and answers `agent_not_ready`
+    /// (a startup dialog holds it).
+    block_next_start: bool,
     /// When set, the next call (any verb) fails with this transport error kind.
     fail_next: Option<io::ErrorKind>,
     /// Sticky per-verb transport errors, until [`FakeHerdr::clear`].
@@ -168,6 +171,12 @@ impl FakeHerdr {
         self.lock().text.insert(pane.to_string(), text.to_string());
     }
 
+    /// Test control: the next `agent_start` registers the agent `blocked` and
+    /// answers `agent_not_ready`, as herdr does while a startup dialog is up.
+    pub fn block_next_start(&self) {
+        self.lock().block_next_start = true;
+    }
+
     /// Test control: force an agent's status (`idle`, `working`, `blocked`, `done`).
     pub fn set_status(&self, name: &str, status: &str) {
         if let Some(a) = self.lock().agents.get_mut(name) {
@@ -300,14 +309,19 @@ impl HerdrClient for FakeHerdr {
         if st.agents.values().any(|a| a.pane == pane) {
             return Ok(Reply::err(PANE_BUSY));
         }
+        let blocked = std::mem::take(&mut st.block_next_start);
         let a = Agent {
             kind: kind.into(),
             pane: pane.into(),
-            status: "idle".into(),
+            status: if blocked { "blocked" } else { "idle" }.into(),
             start_args: agent_args.iter().map(|s| s.to_string()).collect(),
             script: VecDeque::new(),
         };
-        let reply = agent_reply(name, &a);
+        let reply = if blocked {
+            Reply::err("agent_not_ready")
+        } else {
+            agent_reply(name, &a)
+        };
         st.agents.insert(name.to_string(), a);
         Ok(reply)
     }
