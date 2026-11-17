@@ -250,6 +250,17 @@ fn review_needs_a_kind_that_can_review() {
 // ---- spawn identity: worktree, owner, grid, repo ---------------------------------------
 
 #[test]
+fn a_pi_worker_starts_with_its_fence_extension_on_disk() {
+    // pi is launched with `-e .qq/pi-gate.ts`; a missing file makes pi exit at start.
+    let fx = Fx::new("pigate");
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    assert!(
+        fx.wt("tieude-a").join(".qq/pi-gate.ts").is_file(),
+        "the spawn wrote no fence extension into the worktree"
+    );
+}
+
+#[test]
 fn a_spawn_leaves_a_worktree_a_row_and_pane_tokens() {
     let fx = Fx::new("meta");
     fx.spawn(&[], "tieude-a", "tieude").unwrap();

@@ -81,6 +81,11 @@ pub enum HerdrResult {
     Prompted {
         name: String,
     },
+    /// The spawn did not produce an agent; `cause` says why.
+    SpawnFailed {
+        name: String,
+        cause: String,
+    },
     /// The prompt did not reach a turn (landing check failed); `cause` says why.
     PromptFailed {
         name: String,
@@ -376,6 +381,11 @@ struct PromptedResultPayload {
     name: String,
 }
 #[derive(Deserialize)]
+struct SpawnFailedResultPayload {
+    name: String,
+    cause: String,
+}
+#[derive(Deserialize)]
 struct PromptFailedResultPayload {
     name: String,
     cause: String,
@@ -426,6 +436,13 @@ impl<'de> Deserialize<'de> for HerdrResult {
             },
             "Prompted" => match serde_json::from_value::<PromptedResultPayload>(inner) {
                 Ok(p) => HerdrResult::Prompted { name: p.name },
+                Err(_) => HerdrResult::Unknown,
+            },
+            "SpawnFailed" => match serde_json::from_value::<SpawnFailedResultPayload>(inner) {
+                Ok(p) => HerdrResult::SpawnFailed {
+                    name: p.name,
+                    cause: p.cause,
+                },
                 Err(_) => HerdrResult::Unknown,
             },
             "PromptFailed" => match serde_json::from_value::<PromptFailedResultPayload>(inner) {

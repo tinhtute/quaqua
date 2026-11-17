@@ -639,13 +639,15 @@ impl Workflow for PipelineFlow {
                     ("spawn", ActivityResult::Herdr(HerdrResult::Spawned { .. })) => {
                         begin_review(s)
                     }
-                    ("spawn", _) => block(
-                        s,
-                        Stage::SpawnReview,
-                        BlockKind::Restart,
-                        BLOCK_UNFINISHED,
-                        "the reviewer could not be spawned".into(),
-                    ),
+                    ("spawn", result) => {
+                        let why = match result {
+                            ActivityResult::Herdr(HerdrResult::SpawnFailed { cause, .. }) => {
+                                format!("the reviewer could not be spawned: {cause}")
+                            }
+                            _ => "the reviewer could not be spawned".into(),
+                        };
+                        block(s, Stage::SpawnReview, BlockKind::Restart, BLOCK_UNFINISHED, why)
+                    }
                     ("read", ActivityResult::ReportFile(ReportFileResult::Content(text))) => {
                         self.on_report(s, &text)
                     }

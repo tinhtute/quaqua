@@ -209,6 +209,13 @@ cleanup() {
       echo "--- pane $a"; H agent read "$a" --source recent-unwrapped --lines 25 2>&1 | tail -25
     done
   fi
+  # E2E_KEEP=<dir>: copy the run records (events db, reports, daemon/herdr logs) out before the temp dir is trashed.
+  if [ -n "${E2E_KEEP:-}" ]; then
+    mkdir -p "$E2E_KEEP" && cp -r "$WS/runs" "$E2E_KEEP/" 2>/dev/null; cp "$T"/*.log "$T"/cfg/herdr/sessions/*/herdr-server.log "$E2E_KEEP/" 2>/dev/null
+    for p in $(H pane list 2>/dev/null | grep -o '"pane_id": *"[^"]*"' | cut -d'"' -f4); do
+      { echo "--- pane $p"; H pane read "$p" --source visible --lines 40 2>&1 | tail -40; } >>"$E2E_KEEP/panes.txt"
+    done
+  fi
   "$QQ" stop >/dev/null 2>&1
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
   H server stop >/dev/null 2>&1

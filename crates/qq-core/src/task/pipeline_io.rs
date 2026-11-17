@@ -112,11 +112,9 @@ impl Effects {
         .unwrap_or_default()
     }
 
-    fn spawn_reviewer(&self, name: &str, kind: &str) -> bool {
+    fn spawn_reviewer(&self, name: &str, kind: &str) -> Result<(), String> {
         let db = self.deps.runs_dir.join(crate::db::path::DB_FILE);
-        let Ok(conn) = crate::db::open(&db) else {
-            return false;
-        };
+        let conn = crate::db::open(&db).map_err(|e| format!("cannot open the run database: {e}"))?;
         // A restart re-enters this step: an agent already open under this name
         // and kind is reused, herdr is not asked to start it again.
         let open: Option<String> = conn
@@ -127,7 +125,7 @@ impl Effects {
             )
             .ok();
         if open.as_deref() == Some(kind) {
-            return true;
+            return Ok(());
         }
         // Its own pane, split off the builder's, and its own worktree on a
         // branch started at the candidate (git holds a branch in one worktree).
@@ -135,7 +133,7 @@ impl Effects {
         let Some(anchor) = existing_pane(herdr, &self.input.builder())
             .or_else(|| Some(self.input.pane.clone()).filter(|p| !p.is_empty()))
         else {
-            return false;
+            return Err("no pane to split the reviewer from".into());
         };
         let candidate = Some(self.tip()).filter(|t| !t.is_empty());
         let branch = format!("quaqua/{name}");
@@ -158,7 +156,8 @@ impl Effects {
                 slug: &slug_of(&conn, self.input.project_id),
             },
         )
-        .is_ok()
+        .map(|_| ())
+        .map_err(|e| e.message)
     }
 }
 
@@ -211,10 +210,12 @@ impl Activity for Effects {
                 ))
             }
             ActivityRequest::Herdr(HerdrRequest::Spawn { name, kind, .. }) => {
-                Ok(ActivityResult::Herdr(if self.spawn_reviewer(name, kind) {
-                    HerdrResult::Spawned { name: name.clone() }
-                } else {
-                    HerdrResult::Unknown
+                Ok(ActivityResult::Herdr(match self.spawn_reviewer(name, kind) {
+                    Ok(()) => HerdrResult::Spawned { name: name.clone() },
+                    Err(cause) => HerdrResult::SpawnFailed {
+                        name: name.clone(),
+                        cause,
+                    },
                 }))
             }
             ActivityRequest::ReportFile(ReportFileRequest::Exists { path }) => {
