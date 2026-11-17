@@ -523,6 +523,15 @@ pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
     let wt = worktree_of(repo, name);
     ensure_worktree(repo, &wt, p.branch, p.base)?;
     block_push(repo, &wt);
+    // The harness's fence hook (pi loads `-e .qq/pi-gate.ts` at launch and exits
+    // when the file is missing), gating through this binary's `gate` verb.
+    let target = crate::config::resolve_spawn(ctx.conn, p.kind).map_err(|e| fail(e.to_string()))?;
+    if let Some(driver) = ctx.drivers.get(&target.harness.name) {
+        let gate = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
+        driver
+            .install_hook(&wt, &gate)
+            .map_err(|e| fail(format!("cannot install the fence hook: {e}")))?;
+    }
     std::fs::create_dir_all(&ctx.runs_dir).map_err(|e| fail(e.to_string()))?;
     let side = |ext: &str, body: String| {
         std::fs::write(ctx.runs_dir.join(format!("{name}.{ext}")), body)
