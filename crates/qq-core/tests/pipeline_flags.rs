@@ -45,7 +45,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn seed(conn: &mut rusqlite::Connection) {
     let template =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
     let team = std::fs::read_to_string(template)
         .unwrap()
         .replace("harness = \"omp\"", "harness = \"opencode\"");
@@ -817,7 +817,7 @@ fn a_daemon_in_no_pane_arms_the_report_watcher_for_a_pipeline() {
     .to_string();
     let mut client = Command::new("sh")
         .args(["-c", "read _; exec \"$0\" pipeline \"$1\""])
-        .arg(env!("CARGO_BIN_EXE_qq"))
+        .arg(env!("CARGO_BIN_EXE_quaqua"))
         .arg(&input)
         .env("QUAQUA_RUNS_DIR", ws.runs_dir())
         .env("QUAQUA_TEST", "1")

@@ -1,4 +1,4 @@
-//! `qq inbox`: the mail digest of one recipient, read through the bus verbs
+//! `quaqua inbox`: the mail digest of one recipient, read through the bus verbs
 //! `mail.inbox` and `mail.ack`. Silent when nothing waits, so a hook that runs
 //! on every prompt injects nothing. At most [`MAX_LINES`] lines unless `--all`;
 //! the cursor moves to the last mail shown (never past), so an overflow is
@@ -23,7 +23,7 @@ enum Format {
 fn usage() -> CliError {
     CliError::new(
         2,
-        "usage: qq inbox [--for NAME] [--peek] [--all] [--format plain|hook-ups|hook-stop]",
+        "usage: quaqua inbox [--for NAME] [--peek] [--all] [--format plain|hook-ups|hook-stop]",
     )
 }
 
@@ -80,7 +80,7 @@ pub fn inbox_as(env: &Env, claim: Option<String>, args: &[String]) -> Result<Str
     };
     let mut lines: Vec<String> = mail[..shown].iter().map(line).collect();
     if shown < mail.len() {
-        lines.push("… more waiting: qq inbox --all".to_string());
+        lines.push("… more waiting: quaqua inbox --all".to_string());
     }
     if !peek {
         let upto = mail[shown - 1]["id"].as_i64().unwrap_or(0);

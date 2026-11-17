@@ -1,1 +1,0 @@
-- opencode workers: never run tests in background and end the turn waiting for a notification — it never comes; run foreground — 2026-10-15, runs/tieude-slowtests.md

@@ -136,7 +136,7 @@ fn now_ms() -> i64 {
 }
 
 const USAGE: &str =
-    "usage: qq task create <project> <title> [--kind K] [--disposition D] [--repo PATH]";
+    "usage: quaqua task create <project> <title> [--kind K] [--disposition D] [--repo PATH]";
 
 fn create_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
     let usage = || CliError::new(2, USAGE);
@@ -162,7 +162,7 @@ fn create_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
         .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
-/// The seam `cli::MODULES` lists: the verb on the default workspace plus `qq task create`.
+/// The seam `cli::MODULES` lists: the verb on the default workspace plus `quaqua task create`.
 pub const INSTALL: crate::cli::Install = install;
 
 fn install(cli: &mut crate::cli::Registry, daemon: &mut Daemon) -> Result<(), String> {

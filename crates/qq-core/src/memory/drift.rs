@@ -133,10 +133,10 @@ pub fn drift(root: &Path, session_id: &str) -> Vec<String> {
     changed
 }
 
-/// True when any segment runs `quaqua|qq worker …` or `quaqua|qq lead …`.
+/// True when any segment runs `quaqua|quaqua worker …` or `quaqua|quaqua lead …`.
 pub fn is_dispatch(segs: &[Vec<String>]) -> bool {
     let bin =
-        |w: &str| matches!(w, "quaqua" | "qq") || w.ends_with("/quaqua") || w.ends_with("/qq");
+        |w: &str| matches!(w, "quaqua") || w.ends_with("/quaqua");
     segs.iter().any(|seg| {
         seg.iter()
             .position(|w| bin(w))

@@ -491,7 +491,7 @@ fn init_seeds_hooks_and_cos_identity() {
         "/elsewhere"
     );
 
-    // heal works on a workspace `qq init` made: the session re-tag records the
+    // heal works on a workspace `quaqua init` made: the session re-tag records the
     // identity, and a later heal restores tokens a herdr restart dropped.
     let live = FakePane::new(Some("sess-1"), &[]);
     let r = identity::session_retag(&live, Some("p1"), root, root).expect("eligible");

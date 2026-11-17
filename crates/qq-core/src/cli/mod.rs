@@ -62,7 +62,7 @@ impl Registry {
     }
 
     fn usage(&self) -> String {
-        let mut s = String::from("usage: qq <command> [args]\n");
+        let mut s = String::from("usage: quaqua <command> [args]\n");
         for c in self.commands.values() {
             s.push_str(&format!("  {:<8} {}\n", c.name, c.help));
         }
@@ -83,7 +83,7 @@ impl Registry {
                 0
             }
             Err(e) => {
-                eprintln!("qq: {}", e.message);
+                eprintln!("quaqua: {}", e.message);
                 e.code
             }
         }
@@ -127,7 +127,7 @@ pub fn assemble(env: &Env) -> Result<(Registry, Daemon), String> {
     Ok((registry, daemon))
 }
 
-/// Entry point of the `qq` binary.
+/// Entry point of the `quaqua` binary.
 pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let env = Env {
@@ -136,7 +136,7 @@ pub fn run() -> i32 {
     match assemble(&env) {
         Ok((registry, _)) => registry.dispatch(&env, &args),
         Err(e) => {
-            eprintln!("qq: {e}");
+            eprintln!("quaqua: {e}");
             1
         }
     }
@@ -225,7 +225,7 @@ fn core_commands() -> Vec<Command> {
                 let (Some(wf), Some(name)) = (a.first(), a.get(1)) else {
                     return Err(CliError::new(
                         2,
-                        "usage: qq signal <workflow> <name> [json]",
+                        "usage: quaqua signal <workflow> <name> [json]",
                     ));
                 };
                 let args = serde_json::json!({
@@ -240,7 +240,7 @@ fn core_commands() -> Vec<Command> {
             help: "call <verb> [json-args]: send any daemon verb",
             run: |env, a| {
                 let Some(verb) = a.first() else {
-                    return Err(CliError::new(2, "usage: qq call <verb> [json]"));
+                    return Err(CliError::new(2, "usage: quaqua call <verb> [json]"));
                 };
                 rpc_call(env, verb, json_arg(a.get(1))?).map(|v| pretty(&v))
             },

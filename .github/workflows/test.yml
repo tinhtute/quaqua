@@ -56,9 +56,9 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # The suite must be hermetic with respect to the live workspace database:
-      # no test may open <passwd home>/quaqua/runs/quaqua.db* (the file the
-      # owner's real workspace runs on). tests/test_hermetic_db.sh traces every
-      # open(2) of that path across the whole suite and fails listing each hit,
+      # no test may open <passwd home>/quaqua/runs/qq.db* or runs/quaqua.db*
+      # (the files the owner's real workspace runs on). tests/hermetic.sh traces
+      # every open(2) of those paths across the whole suite and fails listing each hit,
       # and plants a decoy there for the traced run: an existence-gated open of
       # a path that does not exist calls no open(2) at all, which the runner's
       # missing workspace directory would otherwise hide.
@@ -87,7 +87,7 @@ jobs:
         if: success() || failure()
         env:
           HERMETIC_REQUIRE_STRACE: '1'
-        run: bash tests/test_hermetic_db.sh
+        run: bash tests/hermetic.sh
 
   # The engine ships darwin release assets, and cfg(target_os = "macos") code
   # is not compiled by the Linux jobs above. This type-checks the whole

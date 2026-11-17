@@ -1,14 +1,14 @@
-//! `qq memory` — the CoS memory caps and secret gate.
+//! `quaqua memory` — the CoS memory caps and secret gate.
 //!
 //! AGENTS.md '## Memory' caps two files: `memory/rules.md` (durable rules) and
 //! `USER.md` (what the Principal wants). The caps were convention only; this
 //! module makes the engine enforce them.
 //!
-//! - `qq memory hook pre` is the `PreToolUse` (`Write|Edit|MultiEdit`) hook
+//! - `quaqua memory hook pre` is the `PreToolUse` (`Write|Edit|MultiEdit`) hook
 //!   the workspace template installs: it simulates the post-edit content and denies the
 //!   call (`hookSpecificOutput.permissionDecision = "deny"`) when the result
 //!   would break a cap or carry a secret.
-//! - `qq memory hook batch` is the `PostToolBatch` hook: it re-runs the
+//! - `quaqua memory hook batch` is the `PostToolBatch` hook: it re-runs the
 //!   check after a batch that could have written, so a `Bash`/`sed` write the
 //!   file tools never saw is flagged in the same turn via `additionalContext`.
 //!

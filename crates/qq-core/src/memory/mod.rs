@@ -64,7 +64,7 @@ pub fn memory_cmd_with(
         _ => {
             return Err(CliError::new(
                 2,
-                "usage: qq memory hook pre|batch|session-start",
+                "usage: quaqua memory hook pre|batch|session-start",
             ))
         }
     };
@@ -84,7 +84,7 @@ pub fn memory_cmd_with(
         _ => {
             return Err(CliError::new(
                 2,
-                "usage: qq memory hook pre|batch|session-start",
+                "usage: quaqua memory hook pre|batch|session-start",
             ))
         }
     };
@@ -114,7 +114,7 @@ pub fn session_start(
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     if let Some(Err(e)) = identity::session_retag(panes, pane, &cwd, ws_root) {
-        eprintln!("qq: CoS pane re-tag failed: {e}");
+        eprintln!("quaqua: CoS pane re-tag failed: {e}");
     }
     text
 }

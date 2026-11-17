@@ -6,7 +6,7 @@
 //! its pane, a registered worktree and an existing branch are reused, nothing
 //! is created twice.
 //!
-//! Legacy contract (`crates/quaqua`): `worker/spawn.rs` (grammar, name rule,
+//! Legacy contract (the removed engine): `worker/spawn.rs` (grammar, name rule,
 //! `--base`, `--review`), `cap.rs` (owner cap), `worker/leadgate.rs` (two
 //! signals block, one warns, `--solo` records), `lead/spawn.rs`.
 

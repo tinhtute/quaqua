@@ -1,4 +1,4 @@
-//! `qq init [DIR] [--update] [--dry-run]`: writes the managed workspace template
+//! `quaqua init [DIR] [--update] [--dry-run]`: writes the managed workspace template
 //! (embedded in the binary, see `table.rs`) into a workspace.
 //!
 //! - plain `init` creates the private dirs and the files that are missing, and
@@ -36,7 +36,7 @@ use crate::daemon::Daemon;
 
 /// gitignored personal-state dirs of a workspace.
 const PRIVATE_DIRS: &[&str] = &["memory", "projects", "raw", "runs", "reports"];
-const ENGINE: &str = "qq";
+const ENGINE: &str = "quaqua";
 
 /// The entry `cli::MODULES` lists.
 pub const INSTALL: Install = install;
@@ -50,7 +50,7 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     })
 }
 
-const USAGE: &str = "usage: qq init [DIR] [--update] [--dry-run] | qq init --git-hooks <repo>";
+const USAGE: &str = "usage: quaqua init [DIR] [--update] [--dry-run] | quaqua init --git-hooks <repo>";
 
 pub fn init_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     let (mut dir, mut update, mut dry, mut git_hooks) = (None, false, false, false);
@@ -256,7 +256,7 @@ fn differing_lines(path: &Path, new: &[u8]) -> usize {
 }
 
 const SETTINGS_REL: &str = ".claude/settings.json";
-/// Trailing shell comment that marks a handler `qq init --update` added.
+/// Trailing shell comment that marks a handler `quaqua init --update` added.
 const MARKER: &str = "# qq-managed";
 
 /// `(event, matcher, needle, command)`: a handler whose command holds `needle`
@@ -267,13 +267,13 @@ fn memory_hooks() -> [(&'static str, Option<&'static str>, &'static str, String)
             "PreToolUse",
             Some("Write|Edit|MultiEdit"),
             "memory hook pre",
-            format!("qq memory hook pre {MARKER}"),
+            format!("quaqua memory hook pre {MARKER}"),
         ),
         (
             "PostToolBatch",
             None,
             "memory hook batch",
-            format!("qq memory hook batch {MARKER}"),
+            format!("quaqua memory hook batch {MARKER}"),
         ),
     ]
 }

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Hermetic-workspace guard: the full test suite must never open the live
-# workspace database at <passwd home>/quaqua/runs/quaqua.db*.
+# workspace databases at <passwd home>/quaqua/runs/qq.db* (the current file) or
+# <passwd home>/quaqua/runs/quaqua.db* (the legacy name qq-core also refuses).
 #
 # The path is resolved the way the binary resolves it, not from $HOME alone:
-# crates/quaqua/src/workspace.rs::system_user_home() reads the passwd entry for
-# the current uid (getpwuid(getuid())->pw_dir) and uses $HOME only as a
-# fallback. A tracker that trusted $HOME would report a false clean on any run
+# qq_core::db::path::system_user_home() reads the passwd entry for the current
+# uid (getpwuid(getuid())->pw_dir) and uses $HOME only as a fallback. A tracker that trusted $HOME would report a false clean on any run
 # with HOME overridden (CI isolation, a fixture, a sandbox).
 #
 # A decoy file is planted at the live DB path for the duration of the traced
@@ -17,8 +17,8 @@
 # created for it are removed on exit, so a repeat run finds nothing left to do.
 #
 # Usage:
-#   tests/test_hermetic_db.sh                 trace `cargo test --locked`
-#   tests/test_hermetic_db.sh --scan-only LOG replay a saved trace through the
+#   tests/hermetic.sh                 trace `cargo test --locked`
+#   tests/hermetic.sh --scan-only LOG replay a saved trace through the
 #                                             same detector, no cargo run
 #
 # Exit: 0 - the suite never opened the live DB; on a host without strace the
@@ -33,22 +33,22 @@
 #
 # Reproducing a detection (planted-test procedure, run in CI or any Linux box
 # with strace):
-#   1. cat >> crates/quaqua/tests/zz_planted_live_db.rs <<'RS'
+#   1. cat >> crates/qq-core/tests/zz_planted_live_db.rs <<'RS'
 #      use std::fs::OpenOptions;
 #      #[test]
 #      fn planted_open_of_live_workspace_db() {
-#          let p = quaqua::workspace::live_workspace_db().expect("system user home");
+#          let p = qq_core::db::path::live_db_files().remove(0);
 #          OpenOptions::new().create(true).append(true).open(&p).expect("planted open");
 #      }
 #      RS
-#   2. bash tests/test_hermetic_db.sh    # -> exit 1, lists the planted openat
-#   3. rm crates/quaqua/tests/zz_planted_live_db.rs
+#   2. bash tests/hermetic.sh    # -> exit 1, lists the planted openat
+#   3. delete crates/qq-core/tests/zz_planted_live_db.rs
 #
 # The detector can also be exercised without running the suite, by replaying a
 # hand-built trace:
-#   printf '%s\n' "1234  openat(AT_FDCWD, \"$HOME/quaqua/runs/quaqua.db\", O_RDWR) = 7" > trace.log
+#   printf '%s\n' "1234  openat(AT_FDCWD, \"$HOME/quaqua/runs/qq.db\", O_RDWR) = 7" > trace.log
 #   printf '%s\n' "1235  openat(AT_FDCWD, \"/tmp/other.db\", O_RDWR) = 8" >> trace.log
-#   bash tests/test_hermetic_db.sh --scan-only trace.log   # -> exit 1, lists the first
+#   bash tests/hermetic.sh --scan-only trace.log   # -> exit 1, lists the first
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -78,21 +78,21 @@ passwd_home() {
 }
 
 # Prints every open of the live DB found in $1 as "<count>x <call>", and returns
-# 1 when there is at least one. Over-matching is deliberate: `quaqua.db-journal`,
+# 1 when there is at least one. Over-matching is deliberate: `qq.db-journal`,
 # `-wal` and `-shm` all sit under the same prefix, and a failed open (ENOENT,
 # EACCES) is still an attempt to touch the live workspace.
 scan_log() {
   local log=$1 total
-  total=$(grep -cF -- "$live_db" "$log" 2>/dev/null) || total=0
+  total=$(grep -cF -e "$live_db" -e "$legacy_db" -- "$log" 2>/dev/null) || total=0
   if [[ $total -eq 0 ]]; then
     return 0
   fi
   printf 'FAIL: %s open(s) of the live workspace database:\n' "$total"
-  grep -F -- "$live_db" "$log" \
+  grep -F -e "$live_db" -e "$legacy_db" -- "$log" \
     | sed -E 's/^ *[0-9]+ +//; s/ = .*$//' \
     | sort | uniq -c | sort -rn \
     | sed -E 's/^ *([0-9]+) /\1x /'
-  printf 'the suite must run against a temp workspace; see is_live_workspace_db in crates/quaqua/src/workspace.rs\n'
+  printf 'the suite must run against a temp workspace; see is_live_db in crates/qq-core/src/db/path.rs\n'
   return 1
 }
 
@@ -247,7 +247,8 @@ if [[ -z $live_home ]]; then
   printf 'error: cannot resolve the system user home (passwd and HOME both empty)\n' >&2
   exit 1
 fi
-live_db="$live_home/quaqua/runs/quaqua.db"
+live_db="$live_home/quaqua/runs/qq.db"
+legacy_db="$live_home/quaqua/runs/quaqua.db"
 workdir=''
 trace_log=''
 decoy=''

@@ -1,9 +1,0 @@
-[Unit]
-Description=quaqua Auditor, twice a day (reports/audit-*.md)
-
-[Timer]
-OnCalendar=*-*-* 07,19:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target

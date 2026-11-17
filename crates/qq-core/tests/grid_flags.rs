@@ -39,7 +39,7 @@ impl World {
         ];
         let mut conn = db::open(&ws.db_path()).expect("open qq db");
         let team = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
         )
         .unwrap()
         .replace("harness = \"omp\"", "harness = \"opencode\"");

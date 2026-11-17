@@ -54,7 +54,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// opencode here). `ni` builds on claude, `sude` reviews on opencode.
 fn seed(conn: &mut rusqlite::Connection) {
     let template =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
     let team = std::fs::read_to_string(template)
         .unwrap()
         .replace("harness = \"omp\"", "harness = \"opencode\"");

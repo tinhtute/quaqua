@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 
 fn template() -> String {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../templates/workspace/team.toml");
+        .join("tests/fixtures/team.toml");
     std::fs::read_to_string(p)
         .expect("read template team.toml")
         .replace("harness = \"omp\"", "harness = \"claude\"")
@@ -414,7 +414,7 @@ fn gate_fails_closed() {
         assert_eq!(
             authority::gate_evaluate(json),
             authority::GateVerdict::Block(
-                "blocked: spawn/move panes and workspaces only through the qq daemon (qq call task.spawn / grid verbs)"
+                "blocked: spawn/move panes and workspaces only through the quaqua daemon (quaqua call task.spawn / grid verbs)"
             ),
             "must block: {json:?}"
         );

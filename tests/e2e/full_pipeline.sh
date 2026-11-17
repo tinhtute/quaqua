@@ -11,12 +11,12 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
   switch  one real task on the new binary: brief -> fanout to 2 harnesses -> cross-harness
           review bound to a candidate sha -> gate -> merge into the project integration branch;
           every kind/harness/model/effort is checked against qq.db.
-  d       a non-claude worker's `git push`, an out-of-band spawn and a Peer's `qq push` are all refused.
+  d       a non-claude worker's `git push`, an out-of-band spawn and a Peer's `quaqua push` are all refused.
   --dry-run   print the planned steps; start no herdr, no daemon, no agent, spend nothing.
-  --check     resolve every qq verb and flag this script calls against the binary (usage probes in a
+  --check     resolve every quaqua verb and flag this script calls against the binary (usage probes in a
               temp workspace); start no herdr, no daemon, no agent, spend nothing. Exit 1 on a miss.
 
-env: QQ (binary, default target/debug/qq)  E2E_PI_MODEL (model of the pi kind added with `config set`,
+env: QQ (binary, default target/debug/quaqua)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
      E2E_STUB=1 (default off, test-only: runs the whole `switch` flow arm -> prompt -> report -> review -> gate ->
@@ -48,7 +48,7 @@ if [ "$STUB" = 1 ]; then PARTS=(switch); fi   # the stub flow never starts a rea
 want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-QQ=${QQ:-$REPO_ROOT/target/debug/qq}
+QQ=${QQ:-$REPO_ROOT/target/debug/quaqua}
 PI_MODEL=${E2E_PI_MODEL:-}
 [ "$STUB" = 1 ] && [ -z "$PI_MODEL" ] && PI_MODEL=stub
 PI_EFFORT=${E2E_PI_EFFORT:-medium}
@@ -56,7 +56,7 @@ TIMEOUT=${E2E_TIMEOUT:-900}
 BUILDER=${E2E_BUILDER_KIND:-sude}
 REVIEWER=${E2E_REVIEWER_KIND:-pie}
 PROJECT=e2e
-TASK=${E2E_TASK:-$BUILDER-e2e1}   # `worker spawn` names are <kind>-<task>, and the pipeline names its builder <task>-b, so the task id starts with the builder kind; the pipeline's task id (a string); its task row is made with `qq task create` in S2b
+TASK=${E2E_TASK:-$BUILDER-e2e1}   # `worker spawn` names are <kind>-<task>, and the pipeline names its builder <task>-b, so the task id starts with the builder kind; the pipeline's task id (a string); its task row is made with `quaqua task create` in S2b
 N=0
 
 # ---- assertion helpers: one assertion per step, evidence on every pass, first failure exits --------
@@ -79,14 +79,14 @@ plan() {
   cat <<PLAN
 common
   C1 isolate        temp workspace seeded from a COPY of ~/quaqua; refuse a path inside ~/quaqua
-  C2 session        private herdr session (own XDG_CONFIG_HOME), \`qq daemon\` on the copy, \`qq ping\`;
+  C2 session        private herdr session (own XDG_CONFIG_HOME), \`quaqua daemon\` on the copy, \`quaqua ping\`;
                     a pane tagged grid_role=cos is the only door for CoS calls (identity = herdr pane)
-  C3 seed           \`qq config import team.toml\`; roster has the claude builder kind
-  C4 second harness \`qq config set kind.$REVIEWER '{harness:pi,model:\$E2E_PI_MODEL,...}'\` (live roster is claude-only)
+  C3 seed           \`quaqua config import team.toml\`; roster has the claude builder kind
+  C4 second harness \`quaqua config set kind.$REVIEWER '{harness:pi,model:\$E2E_PI_MODEL,...}'\` (live roster is claude-only)
 part switch
   S1 sqlite roster  kind rows for $BUILDER and $REVIEWER in qq.db name two different harnesses
   S2 fixture        git repo + local bare origin + integration branch integ/$PROJECT, brief file
-  S2b task row      \`qq task create $PROJECT '<title>' --kind $BUILDER --repo <repo>\` writes a task row (project, title,
+  S2b task row      \`quaqua task create $PROJECT '<title>' --kind $BUILDER --repo <repo>\` writes a task row (project, title,
                     kind, state open); the same call again returns that row (created=false)
   S2c authority     SQLite holds the active cos agent row (made by the daemon on the first call from the cos pane)
                     and the cos -> peer spawn edge
@@ -103,10 +103,10 @@ part switch
   S10 sqlite config no run of the task names a kind/harness/model/effort absent from qq.db
 part d
   D1 spawn fence    \`worker spawn\` from a pane with no agent identity is refused
-  D2 push fence     \`qq gate\` blocks \`git push\` (PreToolUse hook, exit 2)
+  D2 push fence     \`quaqua gate\` blocks \`git push\` (PreToolUse hook, exit 2)
   D3 worker push    a pi worker told to run \`git push\` leaves the bare origin without the ref
   D4 journal        qq.db journal holds a refusal event (authority:refusals) after D1
-  D5 qq push fence  \`qq push\` from a pane with no agent identity is refused; the same \`qq push\` run by the pi
+  D5 quaqua push fence  \`quaqua push\` from a pane with no agent identity is refused; the same \`quaqua push\` run by the pi
                     worker (a Peer) leaves the bare origin without the ref and journals a refusal on edge
                     push/orchestration naming that worker
 cleanup (trap)      stop daemon, stop the herdr session, trash the temp dir
@@ -139,7 +139,7 @@ check_cmds() {
   for spec in "${specs[@]}"; do
     IFS='|' read -r verb probe tok <<<"$spec"
     line=$(printf '%s\n' "$list" | grep -E "^  $verb( |$)" || true)
-    if [ -z "$line" ]; then printf 'MISSING verb %-9s not in qq usage list\n' "$verb"; miss=1; continue; fi
+    if [ -z "$line" ]; then printf 'MISSING verb %-9s not in quaqua usage list\n' "$verb"; miss=1; continue; fi
     local out=""
     if [ "$probe" != "-" ] && [ "$verb" != "daemon" ]; then
       # shellcheck disable=SC2086  # probe words are split on purpose
@@ -158,7 +158,7 @@ check_cmds() {
     set -- $spec
     verb=$1; shift
     line=$(printf '%s\n' "$list" | grep -E "^  $verb( |$)" || true)
-    [ -n "$line" ] || { printf 'MISSING verb %-9s not in qq usage list\n' "$verb"; miss=1; continue; }
+    [ -n "$line" ] || { printf 'MISSING verb %-9s not in quaqua usage list\n' "$verb"; miss=1; continue; }
     local bad=""
     for t in "$@"; do printf '%s' "$line" | grep -qF -- "$t" || bad="$bad $t"; done
     [ -z "$bad" ] && printf 'FOUND   %-9s tokens ok: %s\n' "$verb" "$*" || { printf 'MISSING %-9s token(s) not in usage:%s\n' "$verb" "$bad"; miss=1; }
@@ -185,7 +185,7 @@ for need in herdr git sqlite3 python3; do
 done
 [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; exit 1; }
 [ -n "$PI_MODEL" ] || { echo "set E2E_PI_MODEL (model for the pi kind)" >&2; exit 1; }
-check_cmds >/dev/null || { echo "qq lacks a verb or flag this script calls; run with --check" >&2; exit 1; }
+check_cmds >/dev/null || { echo "quaqua lacks a verb or flag this script calls; run with --check" >&2; exit 1; }
 
 # ---- C1 isolate -----------------------------------------------------------------------------------------
 LIVE=$(cd ~/quaqua && pwd -P)
@@ -193,7 +193,7 @@ T=$(mktemp -d /tmp/qqe2e.XXXXXX)      # /tmp: unix socket paths are short
 WS=$(cd "$T" && pwd -P)/ws
 case "$WS/" in "$LIVE"/*) echo "refusing: workspace $WS is inside $LIVE" >&2; exit 1 ;; esac
 SESSION="qqe2e-$$-$RANDOM"
-export HERDR_SESSION="$SESSION"   # herdr server, daemon (its pane lookup) and every qq call share this session
+export HERDR_SESSION="$SESSION"   # herdr server, daemon (its pane lookup) and every quaqua call share this session
 export XDG_CONFIG_HOME="$T/cfg"
 mkdir -p "$XDG_CONFIG_HOME" "$WS" "$T/calls"
 unset HERDR_SOCKET_PATH HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_AGENT QQ_AGENT
@@ -327,7 +327,7 @@ stop_after() { [ "${E2E_STOP_AFTER:-}" = "$1" ] || return 0; echo "STOP after $1
 
 # The daemon refuses an unmapped peer for every verb (ping included), so readiness is a ping run inside the cos pane.
 i=0
-until as_cos "$QQ" ping; [ "$AP_RC" = 0 ]; do i=$((i + 2)); [ "$i" -le 30 ] || fail C2 "timed out after 30s: qq ping in cos pane: $AP_OUT"; sleep 2; done
+until as_cos "$QQ" ping; [ "$AP_RC" = 0 ]; do i=$((i + 2)); [ "$i" -le 30 ] || fail C2 "timed out after 30s: quaqua ping in cos pane: $AP_OUT"; sleep 2; done
 pass C2 "herdr session=$SESSION daemon pid=$DAEMON_PID ping ok in cos pane $COS_PANE"
 if [ "$STUB" = 1 ]; then
   # The $0 guarantee: what a pane shell resolves for each harness must be the stub, checked before any prompt.
@@ -449,7 +449,7 @@ if want d; then
   [ -n "$ROGUE_PANE" ] || fail D1 "could not open a plain pane"
   as_pane "$ROGUE_PANE" "$QQ" worker spawn e2e-rogue "$REVIEWER" "$PROJ"
   [ "$AP_RC" -ne 0 ] && pass D1 "exit=$AP_RC $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" || fail D1 "out-of-band spawn was allowed"
-  # D2: the PreToolUse gate blocks `git push` (exit 2) for any agent; `qq push` (D5) is the daemon's one door.
+  # D2: the PreToolUse gate blocks `git push` (exit 2) for any agent; `quaqua push` (D5) is the daemon's one door.
   GRC=0; GOUT=$(printf '%s' '{"tool_input":{"command":"git push origin main"}}' | "$QQ" gate 2>&1) || GRC=$?
   [ "$GRC" = 2 ] && pass D2 "gate exit=$GRC $(printf '%s' "$GOUT" | tr '\n' ' ' | cut -c1-120)" || fail D2 "gate exit=$GRC for git push (want 2)"
   # D3: a real non-claude worker told to push; asserted from the remote, whatever blocks it.
@@ -457,7 +457,7 @@ if want d; then
   H agent prompt "$PUSHY" "run: git push origin HEAD:refs/heads/pwned" --wait --until working >"$T/pushy.out" 2>&1 || fail D3 "$(cat "$T/pushy.out")"
   H agent wait "$PUSHY" --until idle --until 'done' --until blocked --timeout $((TIMEOUT * 1000)) >>"$T/pushy.out" 2>&1 || fail D3 "pushy never settled: $(tail -3 "$T/pushy.out")"
   expect D3 "" "$(git -C "$ORIGIN" for-each-ref refs/heads/pwned)"
-  # D5: `qq push` is refused for a caller with no identity and for the Peer (the pi worker), by the daemon.
+  # D5: `quaqua push` is refused for a caller with no identity and for the Peer (the pi worker), by the daemon.
   as_pane "$ROGUE_PANE" "$QQ" push "$PROJ" origin e2e-pwn2
   [ "$AP_RC" -ne 0 ] && pass D5a "no-identity push exit=$AP_RC $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" || fail D5a "push from an unidentified pane was allowed"
   PEDGE="select count(*) from events where workflow_id='authority:refusals' and kind='refusal' and json_extract(payload_json,'\$.caller')='$PUSHY' and json_extract(payload_json,'\$.edge') in ('push','orchestration')"

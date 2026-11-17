@@ -1,4 +1,4 @@
-//! T42b: `qq mail send` as a CLI verb on the bus: body from stdin, a file or a
+//! T42b: `quaqua mail send` as a CLI verb on the bus: body from stdin, a file or a
 //! flag; sender is the calling agent; a Lead's mail to the CoS is also written
 //! to its inbox markdown, once per mail.
 
@@ -86,7 +86,7 @@ fn start(ws: &TestWorkspace) -> Rig {
     }
 }
 
-/// Runs `qq mail <args>` as agent `who` with `stdin`.
+/// Runs `quaqua mail <args>` as agent `who` with `stdin`.
 fn run(rig: &Rig, who: &str, args: &[&str], stdin: &str) -> Result<String, (i32, String)> {
     rig.become_agent(who);
     let env = Env {

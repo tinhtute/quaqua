@@ -239,7 +239,7 @@ impl Supervisor {
             Progress::Running => self.spawn_loop(&mut loops, id, driver),
             Progress::Completed => self.store.finish_workflow(id, "completed", now_ms())?,
             Progress::Failed(reason) => {
-                eprintln!("qq daemon: workflow {id} failed: {reason}");
+                eprintln!("quaqua daemon: workflow {id} failed: {reason}");
                 self.store.finish_workflow(id, "failed", now_ms())?;
             }
         }
@@ -259,7 +259,7 @@ impl Supervisor {
                 continue;
             }
             let Some(factory) = self.kinds.get(&row.kind) else {
-                eprintln!("qq daemon: no kind '{}' for workflow {}", row.kind, row.id);
+                eprintln!("quaqua daemon: no kind '{}' for workflow {}", row.kind, row.id);
                 continue;
             };
             match factory(&row.id, None) {
@@ -269,7 +269,7 @@ impl Supervisor {
                     self.fire_live(&row.id);
                     revived.push(row.id);
                 }
-                Err(e) => eprintln!("qq daemon: cannot recover {}: {e}", row.id),
+                Err(e) => eprintln!("quaqua daemon: cannot recover {}: {e}", row.id),
             }
         }
         Ok(revived)
@@ -344,13 +344,13 @@ fn run_loop(
                 return;
             }
             Ok(Progress::Failed(reason)) => {
-                eprintln!("qq daemon: workflow {id} failed: {reason}");
+                eprintln!("quaqua daemon: workflow {id} failed: {reason}");
                 let _ = store.finish_workflow(id, "failed", now_ms());
                 return;
             }
             // Left unfinished in the database: the next daemon start resumes it.
             Err(e) => {
-                eprintln!("qq daemon: workflow {id} stopped: {e}");
+                eprintln!("quaqua daemon: workflow {id} stopped: {e}");
                 return;
             }
         }

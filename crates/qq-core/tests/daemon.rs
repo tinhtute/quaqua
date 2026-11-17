@@ -1,4 +1,4 @@
-//! Daemon core, through its two doors: the Unix-socket RPC and the `qq` CLI.
+//! Daemon core, through its two doors: the Unix-socket RPC and the `quaqua` CLI.
 //! Workflows are driven only by pushed Signals and real deadlines.
 
 use std::collections::BTreeSet;
@@ -151,7 +151,7 @@ fn count(rows: &[(String, Value)], kind: &str) -> usize {
 }
 
 fn qq(runs: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_qq"))
+    Command::new(env!("CARGO_BIN_EXE_quaqua"))
         .args(args)
         .env("QUAQUA_RUNS_DIR", runs)
         .env("QUAQUA_TEST", "1")

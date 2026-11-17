@@ -1,5 +1,5 @@
 //! Git hooks of a workspace repo: the portable-paths pre-commit gate and
-//! `qq init --git-hooks <repo>`. The hook lives in `<git-dir>/quaqua-hooks` and
+//! `quaqua init --git-hooks <repo>`. The hook lives in `<git-dir>/quaqua-hooks` and
 //! `core.hooksPath` points at it; a repo that sets `core.hooksPath` elsewhere
 //! is refused untouched. The worker pre-push guard is installed by the spawn
 //! path, not here.
@@ -33,7 +33,7 @@ pub(super) const PRE_COMMIT_TEMPLATE: &str = r#"#!/usr/bin/env bash
 # `--no-prefix` + `core.quotePath=false` make the "+++" line the literal path
 # (a trailing TAB is added when the name contains a space, hence the strip).
 #
-# Installed by `qq init` via `core.hooksPath`.
+# Installed by `quaqua init` via `core.hooksPath`.
 # Exit 1 with each offending file:line on stderr; 0 when clean.
 set -uo pipefail
 
@@ -154,7 +154,7 @@ pub(super) fn wire(root: &Path) -> Result<Option<String>, String> {
     Ok(Some(String::new()))
 }
 
-/// `qq init --git-hooks <repo>`: the pre-commit gate only — no template, no lock.
+/// `quaqua init --git-hooks <repo>`: the pre-commit gate only — no template, no lock.
 pub fn run_git_hooks(repo: &Path) -> Result<String, String> {
     let repo = std::fs::canonicalize(repo)
         .map_err(|e| format!("init --git-hooks: cannot resolve {}: {e}", repo.display()))?;
