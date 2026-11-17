@@ -509,13 +509,13 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 return Ok(json!({ "workflow": id, "running": true }));
             }
         }
-        // The builder's own pane (split off the anchor: `pane`, else the
-        // caller's) and its own worktree on the task branch.
-        let herdr = deps.herdr.as_ref();
+        // The builder's own pane (split off the anchor: `pane`, else the pane
+        // the daemon mapped the caller to) and its own worktree on the task
+        // branch. The mapped pane is placement only, never authority.
         let anchor = Some(input.pane.clone())
             .filter(|p| !p.is_empty())
-            .or_else(|| req.caller.as_deref().and_then(|c| existing_pane(herdr, c)))
-            .ok_or_else(|| bad("no anchor pane: pass 'pane' or call from an agent's pane"))?;
+            .or_else(|| req.caller_pane.clone())
+            .ok_or_else(|| bad("no anchor pane: pass 'pane' or call from a herdr pane"))?;
         let name = input.builder();
         placed(
             &conn,
