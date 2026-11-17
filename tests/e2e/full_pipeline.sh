@@ -19,6 +19,7 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
 env: QQ (binary, default target/debug/qq)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
+     E2E_STOP_AFTER (C2 | C3 | C4: end cleanly after that common step; starts no agent, spends no tokens)
 USAGE
 }
 
@@ -178,6 +179,7 @@ T=$(mktemp -d /tmp/qqe2e.XXXXXX)      # /tmp: unix socket paths are short
 WS=$(cd "$T" && pwd -P)/ws
 case "$WS/" in "$LIVE"/*) echo "refusing: workspace $WS is inside $LIVE" >&2; exit 1 ;; esac
 SESSION="qqe2e-$$-$RANDOM"
+export HERDR_SESSION="$SESSION"   # herdr server, daemon (its pane lookup) and every qq call share this session
 export XDG_CONFIG_HOME="$T/cfg"
 mkdir -p "$XDG_CONFIG_HOME" "$WS" "$T/calls"
 unset HERDR_SOCKET_PATH HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_AGENT QQ_AGENT
@@ -205,7 +207,6 @@ pass C1 "workspace=$WS is a copy of $LIVE, outside it"
 
 DB="$WS/runs/qq.db"
 q() { sqlite3 -readonly "$DB" "$1"; }
-QQ_() { "$QQ" "$@"; }
 wait_for() { # wait_for STEP SECONDS CMD...
   local s=$1 t=$2 i=0; shift 2
   until "$@" >/dev/null 2>&1; do i=$((i + 2)); [ "$i" -le "$t" ] || fail "$s" "timed out after ${t}s: $*"; sleep 2; done
@@ -224,9 +225,7 @@ walk(json.load(sys.stdin))'; }
 herdr --session "$SESSION" server >"$T/herdr.log" 2>&1 & SERVER_PID=$!
 wait_for C2 30 H workspace list
 H workspace create --cwd "$WS" --label e2e --no-focus >/dev/null
-( cd "$WS" && "$QQ" daemon >"$T/daemon.log" 2>&1 ) & DAEMON_PID=$!
-wait_for C2 30 "$QQ" ping
-pass C2 "herdr session=$SESSION daemon pid=$DAEMON_PID ping ok"
+( cd "$WS" && exec "$QQ" daemon >"$T/daemon.log" 2>&1 ) & DAEMON_PID=$!   # exec: $! is the daemon itself, so cleanup kills it
 
 # Caller identity is the herdr pane the process runs in (a pane tagged grid_role=cos is the CoS; a process in
 # no pane, or in a pane with no agent, is refused). So every orchestration call runs inside a pane:
@@ -245,13 +244,22 @@ as_pane() {
   AP_RC=$(cat "$base.rc"); AP_OUT=$(cat "$base.out")
 }
 as_cos() { as_pane "$COS_PANE" "$@"; }
+# stop_after STEP: E2E_STOP_AFTER=STEP ends the run cleanly after that step (before any agent or token spend).
+stop_after() { [ "${E2E_STOP_AFTER:-}" = "$1" ] || return 0; echo "STOP after $1 (E2E_STOP_AFTER): $N assertions passed, nothing spent"; exit 0; }
+
+# The daemon refuses an unmapped peer for every verb (ping included), so readiness is a ping run inside the cos pane.
+i=0
+until as_cos "$QQ" ping; [ "$AP_RC" = 0 ]; do i=$((i + 2)); [ "$i" -le 30 ] || fail C2 "timed out after 30s: qq ping in cos pane: $AP_OUT"; sleep 2; done
+pass C2 "herdr session=$SESSION daemon pid=$DAEMON_PID ping ok in cos pane $COS_PANE"
+stop_after C2
 
 # ---- C3 seed / C4 second harness ---------------------------------------------------------------------------
-QQ_ config import "$WS/team.toml" >"$T/import.out" 2>&1 || fail C3 "$(cat "$T/import.out")"
+as_cos "$QQ" config import "$WS/team.toml"; [ "$AP_RC" = 0 ] || fail C3 "config import rc=$AP_RC: $AP_OUT"
 expect C3 "1" "$(q "select count(*) from kind where name='$BUILDER' and harness='claude'")"
-QQ_ config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}" >"$T/set.out" 2>&1 \
-  || fail C4 "$(cat "$T/set.out")"
+stop_after C3
+as_cos "$QQ" config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail C4 "config set rc=$AP_RC: $AP_OUT"
 expect C4 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$REVIEWER'")"
+stop_after C4
 
 # ---- project fixture (git repo with integration branch and a local bare origin) --------------------------
 PROJ="$T/proj"; ORIGIN="$T/origin.git"
