@@ -203,13 +203,7 @@ pub struct Observed {
     pub provider_error: bool,
 }
 
-/// A report is well-formed when it ends with the machine-read tail: a
-/// `## Lessons` heading (builder) or one `Verdict:` line (reviewer).
-pub fn report_well_formed(text: &str) -> bool {
-    text.lines()
-        .any(|l| l.trim_end() == "## Lessons" || l.starts_with("## ") && l.contains("Lessons"))
-        || text.lines().any(|l| l.starts_with("Verdict: "))
-}
+pub use super::report_contract::well_formed as report_well_formed;
 
 /// The exit to take now, or `None` to keep waiting. A report beats every
 /// other signal; the hard cap beats the rest.

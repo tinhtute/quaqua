@@ -22,20 +22,26 @@ fn reviewer_verdict_after_blockers_is_accepted() {
 // 4. reviewer: no Blockers/Lessons at all, Verdict last (g4rev)
 #[test]
 fn reviewer_with_only_findings_and_verdict_is_accepted() {
-    assert!(report_well_formed("Outcome: COMPLETE\n\n## Findings\n- [minor] y\n\nVerdict: 2 findings\n"));
+    assert!(report_well_formed(
+        "Outcome: COMPLETE\n\n## Findings\n- [minor] y\n\nVerdict: 2 findings\n"
+    ));
 }
 
 // 5. builder: Blockers then Lessons, no Verified/Playbook (t48anchor)
 #[test]
 fn builder_without_playbook_is_accepted() {
-    assert!(report_well_formed("Outcome: COMPLETE\n\n## Blockers\nnone\n\n## Lessons\nnone\n"));
+    assert!(report_well_formed(
+        "Outcome: COMPLETE\n\n## Blockers\nnone\n\n## Lessons\nnone\n"
+    ));
 }
 
 // Drift: the BUILD brief asks only for Outcome + a Verified line, so a report
 // that does exactly that must be machine-readable, not "malformed".
 #[test]
 fn builder_report_as_the_brief_asks_is_accepted() {
-    assert!(report_well_formed(&format!("Outcome: COMPLETE\nVerified: unit-test-verified {SHA}\n")));
+    assert!(report_well_formed(&format!(
+        "Outcome: COMPLETE\nVerified: unit-test-verified {SHA}\n"
+    )));
 }
 
 // Drift: parse_verdict takes an indented / lower-case verdict line, so the

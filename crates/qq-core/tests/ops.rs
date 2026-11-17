@@ -153,7 +153,7 @@ fn prompt_check_brief_and_resume() {
     );
     assert_eq!(
         code(Observed {
-            report: Some("Outcome: COMPLETE\n".into()),
+            report: Some("done, all green\n".into()),
             ..base.clone()
         }),
         Some(6)
