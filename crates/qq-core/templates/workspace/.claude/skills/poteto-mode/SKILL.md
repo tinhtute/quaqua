@@ -31,7 +31,7 @@ The Principles section below grounds every trigger. In your reply, name each pri
 
 Active triggers:
 
-- About to ask a question on a "which approach", "how should I", or "what should this do" fork: classify it before asking. If the answer is an observable fact (behavior, timing, layout, output, perf), it is not the human's to answer. Settle it by running an experiment, reproduction, or prototype (routes to `prototype`) and let the result decide. If the task is a read-only investigation whose deliverable is a cited answer (how does X work, why was Y built this way, or "are we sure?"), answer from evidence (routes to `investigation`; maps pstack `how`). Reserve questions for genuine product or preference calls no experiment can settle. Under a full-autonomy grant, decide calls covered by the grant, act, and report. Irreversible writes in Autonomy always pause.
+- About to ask a question on a "which approach", "how should I", or "what should this do" fork: classify it before asking. If the answer is an observable fact (behavior, timing, layout, output, perf), it is not the human's to answer. Settle it by running an experiment, reproduction, or prototype (routes to `prototype`) and let the result decide. If the task is a read-only investigation whose deliverable is a cited answer (how does X work, why was Y built this way, or "are we sure?"), answer from evidence (routes to `investigation`; maps pstack `how`). Reserve questions for genuine product or preference calls no experiment can settle. Under a full-autonomy grant, decide calls covered by the grant, act, and report. Actions on the `AGENTS.md` approval list always pause.
 - Any code: name the data shape first and choose its organizing structure per **principle-model-the-domain**; routes to `feature`.
 - Behavior-preserving change to structure or shape (rename, extract, inline, dedupe, move): routes to `refactoring`.
 - Running a benchmark, measuring perf, or reporting measured numbers: routes to `perf-issue` and follow **Explain the Number** (`principle-explain-the-number`). For sustained, scientific improvement of one metric against a target across multiple hypotheses, routes to `hillclimb`.
@@ -47,13 +47,6 @@ Active triggers:
 - Diagnosing a captured profiling artifact (cpuprofile, trace, spindump, heap snapshot): routes to `trace-forensics`.
 - Pixel-exact UI equivalence or migrating a styling system: routes to `visual-parity`, running headless only per `rules/_all/no-gui-driving.md`.
 - Testing how a skill, structure, or prompt change affects agent behavior before promoting it, evaluating playbook spread and telemetry across runs, or running bakeoffs / competitive designs with N workers of different kinds + judge: routes to `eval` (maps pstack `arena`).
-
-Deferred routes with quaqua mappings (P2):
-
-- Parallel fan-out (P2): routes to worker fan-out per `models.md` kinds and grid layout (maps pstack `swarm`).
-- Contested design (P2): routes to cross-harness reviewer on a different model (maps pstack `interrogate`).
-- Docs, RFCs, readmes, PR descriptions, or commit messages (P2): deferred to P2 documentation skill (maps pstack `technical-writing`).
-- Running a benchmark or reporting measured numbers (P2): follow **Explain the Number** (`principle-explain-the-number`); deferred to P2 benchmark checklist (maps pstack `benchmark-checklist`).
 
 ## Principles
 
@@ -99,18 +92,6 @@ Read the full `principles/<name>.md` leaf before citing it.
 - **Encode Lessons in Structure.** You catch yourself writing the same instruction a second time. Encode it as a lint, metadata flag, runtime check, or script instead of more text.
 
 ## Autonomy
-
-**Just do it.** Reversible work and external queries proceed without asking. Never block on the human for reversible calls; proceed, present the result, and let the human course-correct (`AGENTS.md`).
-
-**Always pause for irreversible actions.** Never approve on anh iu's behalf without explicit approval (`AGENTS.md`):
-- Deleting data
-- Push or force-push
-- Branch delete or merge to main
-- Deploy
-- Spending money
-- Sending or publishing anything outward
-
-**Session overrides.** "Don't stop", "run until done", or "be fully autonomous" mean keep going on reversible work, but never bypass anh iu's approval for the irreversible actions above.
 
 **No is an acceptable answer.** Asked whether to do something, invited to add scope, or shown an approach, reply with your real judgment. Decline, push back, or say "this doesn't earn its place" when true. A recommendation is a judgment, not a validation. Candor over sycophancy.
 

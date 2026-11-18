@@ -341,6 +341,16 @@ fn session_start_rereads_and_retags() {
     // After a compaction: the re-read list, a baseline, and the CoS tokens.
     let out = memory::session_start(root, &input("s1", "compact", root), &pane, Some("p1"))
         .expect("re-read list");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("hook JSON");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let out = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext")
+        .to_string();
+    assert!(
+        out.contains("## rules — memory/rules.md"),
+        "compact carries the block too:\n{out}"
+    );
     for want in [
         "AGENTS.md",
         "memory/rules.md",
@@ -366,10 +376,15 @@ fn session_start_rereads_and_retags() {
     memory::session_start(root, &input("s1", "compact", root), &pane, Some("p1"));
     assert_eq!(*pane.writes.borrow(), 1);
 
-    // A fresh start prints nothing; a resume keeps the baseline it had.
-    assert!(
-        memory::session_start(root, &input("s1", "startup", root), &pane, Some("p1")).is_none()
-    );
+    // A fresh start prints the standing block, no re-read hint; a resume whose
+    // transcript is unknown prints it too (see the shipped-template test) and
+    // keeps the baseline it had.
+    let start = memory::session_start(root, &input("s1", "startup", root), &pane, Some("p1"))
+        .expect("standing block");
+    assert!(start.contains("## projects — projects/INDEX.md") && !start.contains("Re-read"));
+    assert!(memory::session_start(root, &input("s1", "resume", root), &pane, Some("p1")).is_some());
+    let clear = memory::session_start(root, &input("s1", "clear", root), &pane, Some("p1"));
+    assert!(clear.is_some_and(|c| c.contains("memory/rules.md")));
     write(&root.join("AGENTS.md"), "rules v2\n");
     let before = std::fs::read_to_string(&baseline).unwrap();
     memory::session_start(root, &input("s1", "resume", root), &pane, Some("p1"));
@@ -397,6 +412,112 @@ fn session_start_rereads_and_retags() {
 
     // Hooks fail open: garbage in, nothing out.
     assert!(memory::session_start(root, "not json", &elsewhere, None).is_none());
+}
+
+/// The `additionalContext` of a SessionStart hook answer, parsed as JSON.
+fn hook_context(out: Option<String>) -> String {
+    let v: Value = serde_json::from_str(&out.expect("hook output")).expect("hook JSON");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext")
+        .to_string()
+}
+
+#[test]
+fn standing_block_of_the_shipped_template() {
+    let ws = TestWorkspace::new("standing-shipped");
+    let root = ws.root();
+    init::run(root, false, false).expect("init");
+    let pane = FakePane::new(None, &[]);
+    let input = |source: &str, extra: Value| {
+        let mut v = json!({"session_id": "b1", "source": source, "cwd": root});
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v.to_string()
+    };
+    let start = hook_context(memory::session_start(
+        root,
+        &input("startup", json!({})),
+        &pane,
+        None,
+    ));
+    assert!(
+        start.contains(r#"prefix 🍑 (not 👾), self "em" (not tui), user "anh iu" (not ní)"#),
+        "{start}"
+    );
+    assert!(
+        start.contains("## persona — SOUL.md") && start.contains("## projects — projects/INDEX.md")
+    );
+    assert!(!start.contains("USER.md"), "the seed USER.md is skipped");
+    let clear = hook_context(memory::session_start(
+        root,
+        &input("clear", json!({})),
+        &pane,
+        None,
+    ));
+    assert!(clear.contains("prefix 🍑"));
+
+    // With the block, the compact hint names only what the block lacks.
+    let compact = hook_context(memory::session_start(
+        root,
+        &input("compact", json!({})),
+        &pane,
+        None,
+    ));
+    let hint = &compact[compact.find("Context was compacted").expect("hint")..];
+    assert!(
+        hint.contains("AGENTS.md")
+            && !hint.contains("memory/rules.md")
+            && !hint.contains("INDEX.md")
+    );
+
+    // An empty or missing source prints nothing.
+    assert!(memory::session_start(
+        root,
+        &json!({"session_id": "b1", "cwd": root}).to_string(),
+        &pane,
+        None
+    )
+    .is_none());
+    assert!(memory::session_start(root, &input("", json!({})), &pane, None).is_none());
+
+    // A resume gets the block only when its transcript has none.
+    let t = root.join("t.jsonl");
+    write(
+        &t,
+        &format!("{{\"text\": \"{}\"}}\n", memory::STANDING_HEADER),
+    );
+    let with = input("resume", json!({"transcript_path": t}));
+    assert!(memory::session_start(root, &with, &pane, None).is_none());
+    write(&t, "{\"text\": \"old engine session\"}\n");
+    let got = hook_context(memory::session_start(root, &with, &pane, None));
+    assert!(got.contains("prefix 🍑"));
+    let gone = input(
+        "resume",
+        json!({"transcript_path": root.join("missing.jsonl")}),
+    );
+    assert!(hook_context(memory::session_start(root, &gone, &pane, None)).contains("prefix 🍑"));
+    assert!(hook_context(memory::session_start(
+        root,
+        &input("resume", json!({})),
+        &pane,
+        None
+    ))
+    .contains("prefix 🍑"));
+}
+
+#[test]
+fn standing_block_skips_a_worker_worktree_cwd() {
+    let ws = TestWorkspace::new("standing-wt");
+    let root = ws.root();
+    init::run(root, false, false).expect("init");
+    let pane = FakePane::new(None, &[]);
+    let wt = root.join(".wt/w1");
+    std::fs::create_dir_all(&wt).unwrap();
+    let input = json!({"session_id": "w1", "source": "startup", "cwd": wt}).to_string();
+    assert!(memory::session_start(root, &input, &pane, None).is_none());
 }
 
 /// Runs a workspace's git with a fixed identity, failing the test on error.
