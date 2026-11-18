@@ -7,6 +7,11 @@
 //!   missing → write; equal → record; untouched since the lock → overwrite;
 //!   changed locally, or no lock entry → keep it, save the new template to
 //!   `.quaqua/pending/<path>`, and exit 3.
+//! - `--update --accept <path>` (repeatable) settles a conflict the operator
+//!   resolved by hand: the lock base moves to the current template and the
+//!   resolved local file's md5 is remembered (`accepted`), `.quaqua/pending/<path>`
+//!   goes away. Later: same template + same file → quiet; the template moves or
+//!   the file changes again → a conflict, never an overwrite.
 //! - seed files (`memory/rules.md`, `projects/INDEX.md`, `projects/_template.md`,
 //!   `USER.md`) are written only when absent, never overwritten.
 //! - plain `init` in a git repo installs the portable-paths pre-commit gate
@@ -44,18 +49,20 @@ pub const INSTALL: Install = install;
 fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     registry.register(Command {
         name: "init",
-        help:
-            "init [DIR] [--update] [--dry-run]  write the workspace template (exit 3 on conflict)",
+        help: "init [DIR] [--update [--accept PATH]...] [--dry-run]  write the workspace template (exit 3 on conflict)",
         run: init_cmd,
     })
 }
 
-const USAGE: &str = "usage: quaqua init [DIR] [--update] [--dry-run] | quaqua init --git-hooks <repo>";
+const USAGE: &str = "usage: quaqua init [DIR] [--update [--accept PATH]...] [--dry-run] | quaqua init --git-hooks <repo>";
 
 pub fn init_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     let (mut dir, mut update, mut dry, mut git_hooks) = (None, false, false, false);
-    for a in args {
+    let mut accept: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
+            "--accept" => accept.push(it.next().ok_or_else(|| CliError::new(2, USAGE))?.clone()),
             "--update" => update = true,
             "--dry-run" => dry = true,
             "--git-hooks" => git_hooks = true,
@@ -67,9 +74,13 @@ pub fn init_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
         let repo = dir.ok_or_else(|| CliError::new(2, USAGE))?;
         return run_git_hooks(&repo).map_err(|e| CliError::new(1, e));
     }
+    if !accept.is_empty() && !update {
+        return Err(CliError::new(2, USAGE));
+    }
     let target = dir.or_else(|| env.runs_dir.parent().map(Path::to_path_buf));
     let target = target.ok_or_else(|| CliError::new(2, "init: no target directory"))?;
-    let (mut report, conflicts) = run(&target, update, dry).map_err(|e| CliError::new(1, e))?;
+    let (mut report, conflicts) =
+        run_with(&target, update, dry, &accept).map_err(|e| CliError::new(1, e))?;
     if !update && !dry {
         // The CoS pane of this workspace gets its tokens and identity record.
         let panes = crate::identity::cli_panes();
@@ -97,6 +108,9 @@ struct Lock {
 struct LockEntry {
     md5: String,
     mode: u32,
+    /// md5 of a hand-resolved local file the operator accepted against `md5`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<String>,
 }
 
 fn lock_path(root: &Path) -> PathBuf {
@@ -126,16 +140,61 @@ impl Lock {
     }
 
     fn record(&mut self, rel: &str, md5: String, mode: u32) {
-        self.files.insert(rel.to_string(), LockEntry { md5, mode });
+        self.files.insert(
+            rel.to_string(),
+            LockEntry {
+                md5,
+                mode,
+                accepted: None,
+            },
+        );
     }
 }
 
 /// Runs init or update on `root`. Returns the report text and the number of
 /// `--update` conflicts.
 pub fn run(root: &Path, update: bool, dry: bool) -> Result<(String, usize), String> {
+    run_with(root, update, dry, &[])
+}
+
+/// `run` plus `accept`: managed paths whose hand-resolved local file the
+/// operator accepts (`--update --accept <path>`).
+pub fn run_with(
+    root: &Path,
+    update: bool,
+    dry: bool,
+    accept: &[String],
+) -> Result<(String, usize), String> {
     let mut log: Vec<String> = Vec::new();
     let mut lock = Lock::load(root)?;
     let mut conflicts = 0usize;
+
+    for rel in accept {
+        let (_, mode, bytes) = table::TABLE
+            .iter()
+            .find(|(r, ..)| r == rel)
+            .ok_or_else(|| format!("init: --accept {rel}: not a managed template file"))?;
+        let have = md5_file(&root.join(rel))?
+            .ok_or_else(|| format!("init: --accept {rel}: no local file to accept"))?;
+        let want = md5_hex(bytes);
+        lock.record(rel, want.clone(), *mode);
+        if have != want {
+            if let Some(e) = lock.files.get_mut(rel.as_str()) {
+                e.accepted = Some(have);
+            }
+        }
+        log.push(format!(
+            "{} {rel}",
+            if dry { "would accept" } else { "accept" }
+        ));
+        if !dry {
+            let pending = root.join(".quaqua/pending").join(rel);
+            if pending.is_file() {
+                std::fs::remove_file(&pending)
+                    .map_err(|e| format!("init: cannot remove {}: {e}", pending.display()))?;
+            }
+        }
+    }
 
     if !update {
         for d in PRIVATE_DIRS {
@@ -158,6 +217,11 @@ pub fn run(root: &Path, update: bool, dry: bool) -> Result<(String, usize), Stri
         let want = md5_hex(bytes);
         let have = md5_file(&dst)?;
         let locked = lock.files.get(*rel).map(|e| e.md5.clone());
+        // Accepted: same template as at accept time, same file the operator resolved.
+        let resolved = update
+            && locked.as_deref() == Some(want.as_str())
+            && have.is_some()
+            && lock.files.get(*rel).and_then(|e| e.accepted.as_ref()) == have.as_ref();
         // Missing → write; equal → record; untouched since the lock → overwrite
         // (update only); otherwise keep the file.
         let write = match &have {
@@ -181,6 +245,8 @@ pub fn run(root: &Path, update: bool, dry: bool) -> Result<(String, usize), Stri
                 set_mode(&dst, *mode)?;
                 lock.record(rel, want, *mode);
             }
+        } else if resolved {
+            // Settled by `--accept`; nothing to report.
         } else if update {
             conflicts += 1;
             let pending = format!(".quaqua/pending/{rel}");
@@ -370,8 +436,12 @@ fn merge_memory_hooks(root: &Path, dry: bool, lock: &mut Lock) -> Result<Option<
     // file keeps its old lock entry, so the next `--update` still reports it
     // and never overwrites it.
     if let Some(e) = lock.files.get_mut(SETTINGS_REL) {
-        if e.md5 == md5_hex(body.as_bytes()) {
+        let old = md5_hex(body.as_bytes());
+        if e.md5 == old {
             e.md5 = md5_hex(out.as_bytes());
+        }
+        if e.accepted.as_deref() == Some(old.as_str()) {
+            e.accepted = Some(md5_hex(out.as_bytes()));
         }
     }
     Ok(Some(format!("merged memory hooks into {SETTINGS_REL}")))
@@ -446,5 +516,99 @@ mod tests {
                 assert_eq!(disk & 0o111 != 0, mode & 0o111 != 0, "{rel}: exec bit");
             }
         }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qq-init-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn set_lock_md5(root: &Path, rel: &str, md5: &str) {
+        let p = lock_path(root);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["files"][rel]["md5"] = serde_json::json!(md5);
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+
+    /// A conflict the operator resolved by hand stays resolved; a later template
+    /// change or a later local edit is a conflict again.
+    #[test]
+    fn init_accept_resolves_a_conflict_until_the_template_or_file_moves() {
+        let root = scratch("accept");
+        let acc = ["AGENTS.md".to_string()];
+        run(&root, false, false).unwrap();
+        let agents = root.join("AGENTS.md");
+        // The template moved on since the lock, and the operator edited the file.
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        std::fs::write(&agents, "upstream + my block\n").unwrap();
+        let (r, c) = run(&root, true, false).unwrap();
+        assert_eq!(c, 1, "{r}");
+        assert!(root.join(".quaqua/pending/AGENTS.md").is_file());
+
+        // Without accept it is flagged forever.
+        assert_eq!(run(&root, true, false).unwrap().1, 1);
+
+        // Accept: this update reports 0 conflicts, drops the pending copy, keeps the file.
+        let (r, c) = run_with(&root, true, false, &acc).unwrap();
+        assert_eq!(c, 0, "{r}");
+        assert!(!root.join(".quaqua/pending/AGENTS.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "upstream + my block\n"
+        );
+        // And it stays quiet.
+        let (r, c) = run(&root, true, false).unwrap();
+        assert_eq!((c, r.as_str()), (0, "workspace up to date"));
+
+        // A later template change (lock base differs from the template) is a conflict again.
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        assert_eq!(run(&root, true, false).unwrap().1, 1);
+        run_with(&root, true, false, &acc).unwrap();
+
+        // A later local edit is a conflict again, and is never overwritten.
+        std::fs::write(&agents, "edited again\n").unwrap();
+        assert_eq!(run(&root, true, false).unwrap().1, 1);
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "edited again\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--dry-run --accept` writes nothing; `--accept` needs `--update` and a managed path.
+    #[test]
+    fn init_accept_dry_run_and_usage() {
+        let root = scratch("accept-dry");
+        run(&root, false, false).unwrap();
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        std::fs::write(root.join("AGENTS.md"), "mine\n").unwrap();
+        run(&root, true, false).unwrap();
+        let before = std::fs::read(lock_path(&root)).unwrap();
+        let acc = ["AGENTS.md".to_string()];
+        let (r, c) = run_with(&root, true, true, &acc).unwrap();
+        assert_eq!(c, 0, "{r}");
+        assert!(r.contains("would accept AGENTS.md"), "{r}");
+        assert_eq!(std::fs::read(lock_path(&root)).unwrap(), before);
+        assert!(root.join(".quaqua/pending/AGENTS.md").is_file());
+        assert!(run_with(&root, true, false, &["nope.md".to_string()]).is_err());
+        let env = Env {
+            runs_dir: root.join("runs"),
+        };
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let d = root.to_str().unwrap();
+        assert_eq!(
+            init_cmd(&env, &a(&[d, "--accept", "AGENTS.md"]))
+                .unwrap_err()
+                .code,
+            2
+        );
+        assert_eq!(
+            init_cmd(&env, &a(&[d, "--update", "--accept"]))
+                .unwrap_err()
+                .code,
+            2
+        );
+        assert!(init_cmd(&env, &a(&[d, "--update", "--accept", "AGENTS.md"])).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
