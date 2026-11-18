@@ -133,6 +133,18 @@ impl Lock {
 /// Runs init or update on `root`. Returns the report text and the number of
 /// `--update` conflicts.
 pub fn run(root: &Path, update: bool, dry: bool) -> Result<(String, usize), String> {
+    run_with(root, update, dry, &[])
+}
+
+/// `run` plus `accept`: managed paths whose hand-resolved local file the
+/// operator accepts (`--update --accept <path>`).
+pub fn run_with(
+    root: &Path,
+    update: bool,
+    dry: bool,
+    accept: &[String],
+) -> Result<(String, usize), String> {
+    let _ = accept;
     let mut log: Vec<String> = Vec::new();
     let mut lock = Lock::load(root)?;
     let mut conflicts = 0usize;
@@ -446,5 +458,84 @@ mod tests {
                 assert_eq!(disk & 0o111 != 0, mode & 0o111 != 0, "{rel}: exec bit");
             }
         }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qq-init-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn set_lock_md5(root: &Path, rel: &str, md5: &str) {
+        let p = lock_path(root);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["files"][rel]["md5"] = serde_json::json!(md5);
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+
+    /// A conflict the operator resolved by hand stays resolved; a later template
+    /// change or a later local edit is a conflict again.
+    #[test]
+    fn init_accept_resolves_a_conflict_until_the_template_or_file_moves() {
+        let root = scratch("accept");
+        let acc = ["AGENTS.md".to_string()];
+        run(&root, false, false).unwrap();
+        let agents = root.join("AGENTS.md");
+        // The template moved on since the lock, and the operator edited the file.
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        std::fs::write(&agents, "upstream + my block\n").unwrap();
+        let (r, c) = run(&root, true, false).unwrap();
+        assert_eq!(c, 1, "{r}");
+        assert!(root.join(".quaqua/pending/AGENTS.md").is_file());
+
+        // Without accept it is flagged forever.
+        assert_eq!(run(&root, true, false).unwrap().1, 1);
+
+        // Accept: this update reports 0 conflicts, drops the pending copy, keeps the file.
+        let (r, c) = run_with(&root, true, false, &acc).unwrap();
+        assert_eq!(c, 0, "{r}");
+        assert!(!root.join(".quaqua/pending/AGENTS.md").exists());
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "upstream + my block\n");
+        // And it stays quiet.
+        let (r, c) = run(&root, true, false).unwrap();
+        assert_eq!((c, r.as_str()), (0, "workspace up to date"));
+
+        // A later template change (lock base differs from the template) is a conflict again.
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        assert_eq!(run(&root, true, false).unwrap().1, 1);
+        run_with(&root, true, false, &acc).unwrap();
+
+        // A later local edit is a conflict again, and is never overwritten.
+        std::fs::write(&agents, "edited again\n").unwrap();
+        assert_eq!(run(&root, true, false).unwrap().1, 1);
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "edited again\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--dry-run --accept` writes nothing; `--accept` needs `--update` and a managed path.
+    #[test]
+    fn init_accept_dry_run_and_usage() {
+        let root = scratch("accept-dry");
+        run(&root, false, false).unwrap();
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        std::fs::write(root.join("AGENTS.md"), "mine\n").unwrap();
+        run(&root, true, false).unwrap();
+        let before = std::fs::read(lock_path(&root)).unwrap();
+        let acc = ["AGENTS.md".to_string()];
+        let (r, c) = run_with(&root, true, true, &acc).unwrap();
+        assert_eq!(c, 0, "{r}");
+        assert!(r.contains("would accept AGENTS.md"), "{r}");
+        assert_eq!(std::fs::read(lock_path(&root)).unwrap(), before);
+        assert!(root.join(".quaqua/pending/AGENTS.md").is_file());
+        assert!(run_with(&root, true, false, &["nope.md".to_string()]).is_err());
+        let env = Env { runs_dir: root.join("runs") };
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let d = root.to_str().unwrap();
+        assert_eq!(init_cmd(&env, &a(&[d, "--accept", "AGENTS.md"])).unwrap_err().code, 2);
+        assert_eq!(init_cmd(&env, &a(&[d, "--update", "--accept"])).unwrap_err().code, 2);
+        assert!(init_cmd(&env, &a(&[d, "--update", "--accept", "AGENTS.md"])).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
