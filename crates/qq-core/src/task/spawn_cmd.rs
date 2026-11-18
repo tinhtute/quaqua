@@ -347,10 +347,16 @@ fn place_pane(ctx: &Ctx, pane: &str, fresh: bool) -> R<String> {
         &deferred,
     )
     .map_err(|e| fail(format!("herdr could not place the pane: {e}")))?;
-    Ok(placed
+    let now = placed
         .moved
         .last()
-        .map_or_else(|| pane.to_string(), |(_, now)| now.clone()))
+        .map_or_else(|| pane.to_string(), |(_, now)| now.clone());
+    if placed.unplaced.contains(&now) {
+        return Err(fail(format!(
+            "herdr could not place pane {now} in its grid tab (the move changed nothing)"
+        )));
+    }
+    Ok(now)
 }
 
 fn open_agent(conn: &Connection, name: &str) -> R<Option<i64>> {

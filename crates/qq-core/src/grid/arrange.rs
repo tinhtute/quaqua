@@ -29,6 +29,8 @@ pub struct Arranged {
     pub moved: Vec<(String, String)>,
     /// Panes that are misplaced but deferred by their status.
     pub deferred: Vec<String>,
+    /// Panes still misplaced that nothing deferred: herdr would not move them.
+    pub unplaced: Vec<String>,
 }
 
 /// Label of overflow tab `i` of `base`: `base`, `base-2`, `base-3`...
@@ -157,7 +159,8 @@ impl Pass<'_> {
                 .collect();
             if members.is_empty() {
                 return MoveTo::NewTab {
-                    workspace: Some(ws_id),
+                    // The pane's own workspace is herdr's default.
+                    workspace: (ws_id != p.workspace_id).then_some(ws_id),
                     label,
                 };
             }
@@ -201,10 +204,13 @@ pub fn arrange(
         };
         let mut waiting = Vec::new();
         let Step::Move(id, to) = pass.next(&panes, &skip, &mut waiting) else {
-            out.deferred = waiting;
+            finish(farm, &only, deferred, &panes, &mut out);
             return Ok(out);
         };
-        let now = ops.move_pane(&id, &to)?;
+        let Some(now) = ops.move_pane(&id, &to)? else {
+            skip.insert(id);
+            continue;
+        };
         if let Some(ids) = only.panes.as_mut() {
             for i in ids.iter_mut().filter(|i| **i == id) {
                 *i = now.clone();
@@ -218,15 +224,34 @@ pub fn arrange(
         out.moved.push((id, now));
         panes = ops.panes()?;
     }
-    let mut waiting = Vec::new();
+    finish(farm, &only, deferred, &panes, &mut out);
+    Ok(out)
+}
+
+/// Fills `deferred` and `unplaced` from what is still misplaced.
+fn finish(
+    farm: Option<&str>,
+    only: &Only,
+    deferred: &[String],
+    panes: &[Pane],
+    out: &mut Arranged,
+) {
     let pass = Pass {
         farm,
-        only: &only,
+        only,
         deferred,
     };
-    let _ = pass.next(&panes, &skip, &mut waiting);
-    out.deferred = waiting;
-    Ok(out)
+    out.deferred.clear();
+    for p in panes
+        .iter()
+        .filter(|p| pass.selected(p) && pass.misplaced(p, panes))
+    {
+        if pass.is_deferred(p) {
+            out.deferred.push(p.id.clone());
+        } else {
+            out.unplaced.push(p.id.clone());
+        }
+    }
 }
 
 /// `[grid] deferred_statuses` from the workspace settings, `working` by default.

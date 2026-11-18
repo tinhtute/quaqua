@@ -70,6 +70,8 @@ struct State {
     seeded_status: BTreeMap<String, String>,
     /// Every `pane_move`, in order.
     moves: Vec<(String, MoveTo)>,
+    /// A pane that crosses workspaces gets a new id, as herdr may give it.
+    renumber: bool,
 }
 
 impl State {
@@ -105,6 +107,26 @@ impl State {
         self.tabs.insert(tab.clone(), label.to_string());
         self.tab_ws.insert(tab.clone(), ws.to_string());
         tab
+    }
+
+    /// Re-keys every per-pane map from `old` to `new`.
+    fn renumber_pane(&mut self, old: &str, new: &str) {
+        fn rekey<V>(m: &mut BTreeMap<String, V>, old: &str, new: &str) {
+            if let Some(v) = m.remove(old) {
+                m.insert(new.to_string(), v);
+            }
+        }
+        rekey(&mut self.panes, old, new);
+        rekey(&mut self.text, old, new);
+        rekey(&mut self.agents, old, new);
+        rekey(&mut self.foreign, old, new);
+        rekey(&mut self.meta, old, new);
+        rekey(&mut self.pids, old, new);
+        rekey(&mut self.seeded_status, old, new);
+        rekey(&mut self.text_script, old, new);
+        for p in self.order.iter_mut().filter(|p| *p == old) {
+            *p = new.to_string();
+        }
     }
 
     /// herdr closes a tab whose last pane left.
@@ -247,6 +269,12 @@ impl FakeHerdr {
             .collect();
         out.sort();
         out
+    }
+
+    /// Test control: a pane that moves to another workspace gets a new id,
+    /// tokens and status carried over (herdr may do this).
+    pub fn renumber_cross_workspace(&self, on: bool) {
+        self.lock().renumber = on;
     }
 
     /// Every `pane_move` the fake served: `(pane, destination)`.
@@ -757,12 +785,19 @@ impl HerdrClient for FakeHerdr {
                 r#"{"result":{"move_result":{"changed":false,"reason":"same_tab"}}}"#,
             ));
         }
+        let crossed = st.ws_of(&from) != st.ws_of(&dest);
         st.panes.insert(pane.to_string(), dest.clone());
         st.order.retain(|p| p != pane);
         st.order.push(pane.to_string());
+        let mut now = pane.to_string();
+        if st.renumber && crossed {
+            st.next_id += 1;
+            now = format!("p{}", st.next_id);
+            st.renumber_pane(pane, &now);
+        }
         st.drop_if_empty(&from);
         Ok(Reply::ok(format!(
-            r#"{{"result":{{"move_result":{{"changed":true,"previous_pane_id":"{pane}","pane":{{"pane_id":"{pane}","tab_id":"{dest}"}}}}}}}}"#
+            r#"{{"result":{{"move_result":{{"changed":true,"previous_pane_id":"{pane}","pane":{{"pane_id":"{now}","tab_id":"{dest}"}}}}}}}}"#
         )))
     }
 

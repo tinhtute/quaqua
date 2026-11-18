@@ -154,7 +154,11 @@ pub trait PaneOps {
     fn claim(&self, pane: &str, scope: &Scope) -> std::io::Result<()>;
     /// Moves `pane` and returns its id afterwards (herdr may change it across
     /// workspaces). Default `Unsupported`, like the herdr client's.
-    fn move_pane(&self, _pane: &str, _to: &crate::herdr::MoveTo) -> std::io::Result<String> {
+    fn move_pane(
+        &self,
+        _pane: &str,
+        _to: &crate::herdr::MoveTo,
+    ) -> std::io::Result<Option<String>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "pane move not supported by this client",
@@ -353,13 +357,23 @@ pub fn arrange_filtered(
         panes,
         tab: filter.tab.clone(),
     };
-    arrange::arrange(
+    let done = arrange::arrange(
         ops,
         scope.farm.as_deref(),
         &only,
         &arrange::deferred_statuses(conn),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // herdr may give a pane a new id when it crosses workspaces: keep the
+    // recorded id live, or reconcile and cleanup could no longer close it.
+    for (old, new) in done.moved.iter().filter(|(o, n)| o != n) {
+        conn.execute(
+            "UPDATE agent SET pane_id = ?2 WHERE pane_id = ?1 AND ended_ms IS NULL",
+            [old, new],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(done)
 }
 
 /// [`PaneOps`] over any [`HerdrClient`]: the one adapter from herdr replies.
@@ -517,18 +531,18 @@ impl PaneOps for HerdrPanes<'_> {
         reply_json(self.0.pane_close(id)?).map(|_| ())
     }
 
-    fn move_pane(&self, pane: &str, to: &crate::herdr::MoveTo) -> std::io::Result<String> {
+    fn move_pane(&self, pane: &str, to: &crate::herdr::MoveTo) -> std::io::Result<Option<String>> {
         let v = reply_json(self.0.pane_move(pane, to)?)?;
         let res = v.pointer("/result/move_result");
-        let flag = |k: &str| res.and_then(|r| r.get(k));
-        if flag("changed").and_then(|c| c.as_bool()) == Some(false) {
-            return Ok(pane.to_string());
+        if res.and_then(|r| r.get("changed")).and_then(|c| c.as_bool()) == Some(false) {
+            return Ok(None);
         }
-        Ok(res
-            .and_then(|r| r.pointer("/pane/pane_id"))
-            .and_then(|x| x.as_str())
-            .unwrap_or(pane)
-            .to_string())
+        Ok(Some(
+            res.and_then(|r| r.pointer("/pane/pane_id"))
+                .and_then(|x| x.as_str())
+                .unwrap_or(pane)
+                .to_string(),
+        ))
     }
 
     fn claim(&self, pane: &str, scope: &Scope) -> std::io::Result<()> {
@@ -644,6 +658,7 @@ fn register_reconcile(d: &mut crate::daemon::Daemon) -> Result<(), String> {
                 "panes": closed,
                 "moved": moved,
                 "deferred": arranged.deferred,
+                "unplaced": arranged.unplaced,
             }))
         }),
     )
