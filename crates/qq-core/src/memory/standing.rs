@@ -16,6 +16,8 @@ const SECTIONS: &[(&str, &str)] = &[
     ("rules", "memory/rules.md"),
     ("projects", INDEX),
 ];
+/// The block's first words; a transcript holding them already has a block.
+pub const HEADER: &str = "# Standing context";
 const INDEX: &str = "projects/INDEX.md";
 
 struct Section {
@@ -55,9 +57,9 @@ pub fn render_standing(root: &Path) -> String {
         return String::new();
     }
     let size = |s: &str| s.chars().count();
-    let head = "# Standing context (rendered at session start from the files named in each header; these outrank the global persona)\n\n";
+    let head = format!("{HEADER} (rendered at session start from the files named in each header; these outrank the global persona)\n\n");
     let mut parts: Vec<String> = sections.iter().map(Section::render).collect();
-    if size(head) + parts.iter().map(|p| size(p) + 1).sum::<usize>() > BUDGET {
+    if size(&head) + parts.iter().map(|p| size(p) + 1).sum::<usize>() > BUDGET {
         if let Some(i) = sections.iter().position(|s| s.path == INDEX) {
             parts[i] = format!("## {} — {INDEX}\nread {INDEX}\n", sections[i].title);
         }

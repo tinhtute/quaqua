@@ -44,7 +44,7 @@ Rules:
 | File | Role |
 |---|---|
 | `templates/workspace/AGENTS.md` | Workspace entrypoint: SLP roles, memory policy, worker protocol (the root `AGENTS.md` is an engine contributor stub) |
-| `templates/workspace/AGENTS.md` `## Identity` | CoS persona and voice |
+| `templates/workspace/{identity.md,SOUL.md}` | CoS persona and voice (injected at session start) |
 | `templates/workspace/PEER.md` | Worker contract: boundaries, contract-before-test, git commit gates, handback |
 | `templates/workspace/rules/_all/` | Worker rules injected as the system prompt (brief shape, fanout grid, timebox) |
 | `templates/workspace/models.md` | Worker roster: nickname → kind / model / effort |

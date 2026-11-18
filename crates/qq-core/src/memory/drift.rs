@@ -77,12 +77,15 @@ pub fn session_start(root: &Path, session_id: &str, source: &str) -> Option<Stri
     if !(source == "resume" && path.is_file()) {
         write_baseline(&path, &snapshot(root));
     }
-    (source == "compact").then(|| reread_list(root))
+    (source == "compact").then(|| compact_hint(root, false))
 }
 
-fn reread_list(root: &Path) -> String {
+/// The post-compaction re-read list. With `block` the standing block is
+/// emitted too, so the list leaves out the files it carries.
+pub fn compact_hint(root: &Path, block: bool) -> String {
     let mut files: Vec<String> = REREAD
         .iter()
+        .filter(|f| !block || **f == "AGENTS.md")
         .filter(|f| root.join(f).is_file())
         .map(|f| f.to_string())
         .collect();
