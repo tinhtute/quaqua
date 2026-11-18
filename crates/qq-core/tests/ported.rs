@@ -341,6 +341,16 @@ fn session_start_rereads_and_retags() {
     // After a compaction: the re-read list, a baseline, and the CoS tokens.
     let out = memory::session_start(root, &input("s1", "compact", root), &pane, Some("p1"))
         .expect("re-read list");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("hook JSON");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let out = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext")
+        .to_string();
+    assert!(
+        out.contains("## rules — memory/rules.md"),
+        "compact carries the block too:\n{out}"
+    );
     for want in [
         "AGENTS.md",
         "memory/rules.md",
@@ -366,10 +376,16 @@ fn session_start_rereads_and_retags() {
     memory::session_start(root, &input("s1", "compact", root), &pane, Some("p1"));
     assert_eq!(*pane.writes.borrow(), 1);
 
-    // A fresh start prints nothing; a resume keeps the baseline it had.
+    // A fresh start prints the standing block, no re-read hint; a resume
+    // prints nothing and keeps the baseline it had.
+    let start = memory::session_start(root, &input("s1", "startup", root), &pane, Some("p1"))
+        .expect("standing block");
+    assert!(start.contains("## projects — projects/INDEX.md") && !start.contains("Re-read"));
     assert!(
-        memory::session_start(root, &input("s1", "startup", root), &pane, Some("p1")).is_none()
+        memory::session_start(root, &input("s1", "resume", root), &pane, Some("p1")).is_none()
     );
+    let clear = memory::session_start(root, &input("s1", "clear", root), &pane, Some("p1"));
+    assert!(clear.is_some_and(|c| c.contains("memory/rules.md")));
     write(&root.join("AGENTS.md"), "rules v2\n");
     let before = std::fs::read_to_string(&baseline).unwrap();
     memory::session_start(root, &input("s1", "resume", root), &pane, Some("p1"));

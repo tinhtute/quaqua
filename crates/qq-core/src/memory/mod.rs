@@ -5,17 +5,19 @@
 mod caps;
 mod drift;
 mod inbox;
+mod standing;
 
 pub use caps::*;
 pub use drift::{
     drift, drift_message, is_dispatch, session_start as record_session, snapshot, tracked,
 };
 pub use inbox::{inbox_as, inbox_cmd};
+pub use standing::{render_standing, BUDGET as STANDING_BUDGET};
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::cli::{CliError, Command, Env, Install, Registry};
 use crate::daemon::Daemon;
@@ -92,8 +94,26 @@ pub fn memory_cmd_with(
     Ok(out.unwrap_or_default())
 }
 
+/// The hook's JSON: the standing block, then the re-read hint after a
+/// compaction, as SessionStart `additionalContext`. `None` when both are empty.
+fn standing_output(ws_root: &Path, hint: Option<String>) -> Option<String> {
+    let mut text = render_standing(ws_root);
+    if let Some(h) = hint {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&h);
+    }
+    (!text.is_empty()).then(|| {
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart", "additionalContext": text}})
+        .to_string()
+    })
+}
+
 /// The SessionStart hook. Records the session's rule baseline (a `resume`
-/// keeps the old one), prints the re-read list after a compaction, and re-tags
+/// keeps the old one and gets no block), emits the standing block (plus the re-read list after a
+/// compaction) as `additionalContext`, and re-tags
 /// the CoS pane when the session runs in the workspace itself. Idempotent: a
 /// repeat rewrites the same baseline and finds the pane already tagged.
 pub fn session_start(
@@ -105,7 +125,15 @@ pub fn session_start(
     let v: Value = serde_json::from_str(input).unwrap_or_default();
     let sid = v.get("session_id").and_then(Value::as_str).unwrap_or("");
     let source = v.get("source").and_then(Value::as_str).unwrap_or("");
-    let text = record_session(ws_root, sid, source);
+    let hint = record_session(ws_root, sid, source);
+    // A `resume` keeps the block its transcript already holds: Claude Code
+    // drops an identical re-emit, but an edited block would stack a second
+    // copy next to the stale one (probe, 2026-11-18).
+    let text = if source == "resume" || source.is_empty() {
+        None
+    } else {
+        standing_output(ws_root, hint)
+    };
     let cwd = v
         .get("cwd")
         .and_then(Value::as_str)

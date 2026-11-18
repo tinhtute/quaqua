@@ -55,9 +55,19 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/PEER.md"),
     ),
     (
+        "SOUL.md",
+        0o644,
+        include_bytes!("../../templates/workspace/SOUL.md"),
+    ),
+    (
         "herdr/sidebar-chip.toml",
         0o644,
         include_bytes!("../../templates/workspace/herdr/sidebar-chip.toml"),
+    ),
+    (
+        "identity.md",
+        0o644,
+        include_bytes!("../../templates/workspace/identity.md"),
     ),
     (
         "models.md",
