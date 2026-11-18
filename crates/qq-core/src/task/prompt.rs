@@ -259,26 +259,8 @@ pub fn parse_extend(v: &str) -> Result<u64, String> {
 
 // ---- provider-error classifier (ported from the old worker/prompt/retry.rs) ----
 
-/// Which harness's pane text shape to read (`harness.name` in config).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shape {
-    Claude,
-    Pi,
-    Agy,
-    Opencode,
-}
-
-impl Shape {
-    pub fn parse(name: &str) -> Option<Shape> {
-        match name {
-            "claude" => Some(Shape::Claude),
-            "pi" => Some(Shape::Pi),
-            "agy" => Some(Shape::Agy),
-            "opencode" => Some(Shape::Opencode),
-            _ => None,
-        }
-    }
-}
+/// Which harness's pane text shape to read: the driver's `error_shape`.
+pub use crate::driver::ErrorShape as Shape;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
@@ -1029,7 +1011,9 @@ fn lookup(runs: &Path, name: &str) -> (Option<PathBuf>, Option<Shape>) {
             |r| r.get::<_, String>(0),
         )
         .ok()
-        .and_then(|h| Shape::parse(&h));
+        .and_then(|h| crate::config::harness(&c, &h).ok().flatten())
+        .and_then(|h| crate::driver::Registry::new().resolve(&h))
+        .and_then(|d| d.error_shape());
     (wt, shape)
 }
 

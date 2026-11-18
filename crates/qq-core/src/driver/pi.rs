@@ -43,6 +43,10 @@ impl HarnessDriver for Pi {
         "pi"
     }
 
+    fn error_shape(&self) -> Option<super::ErrorShape> {
+        Some(super::ErrorShape::Pi)
+    }
+
     fn launch_args(&self, model: &str, effort: Option<&str>) -> Vec<String> {
         let mut out = vec!["--model".to_string(), model.to_string()];
         if let Some(e) = effort {

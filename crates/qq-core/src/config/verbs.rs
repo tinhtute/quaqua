@@ -7,7 +7,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Map, Value};
 
-use super::{parse, setting, validate, ConfigError, Kind, Parsed, RawKind, HARNESSES};
+use super::{parse, setting, validate, ConfigError, Kind, Parsed, RawKind};
 use crate::cli::{rpc_call, CliError, Command, Env, Install, Registry};
 use crate::daemon::{Ctx, Daemon};
 use crate::db::path::DB_FILE;
@@ -275,13 +275,7 @@ fn loose(v: &str) -> Value {
 }
 
 fn ensure_harnesses(tx: &Transaction<'_>) -> Result<(), ConfigError> {
-    for (name, driver) in HARNESSES {
-        tx.execute(
-            "INSERT OR IGNORE INTO harness (name, driver) VALUES (?1, ?2)",
-            params![name, driver.as_str()],
-        )?;
-    }
-    Ok(())
+    super::write_harnesses(tx, std::iter::empty())
 }
 
 fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
@@ -531,6 +525,7 @@ fn upsert_kind(
         avoid: s("avoid")?,
     };
     let mut p = Parsed {
+        harnesses: super::stored_harnesses(tx).map_err(fail)?,
         kinds: Default::default(),
         purposes: vec![],
         reviewers: vec![],
@@ -601,6 +596,7 @@ fn write_kind(tx: &Transaction<'_>, name: &str, k: &RawKind) -> Result<(), Confi
 fn parse_checked(conn: &Connection, text: &str) -> Result<Parsed, ConfigError> {
     let mut p = parse(text)?;
     let mut stored = Parsed {
+        harnesses: Default::default(),
         kinds: Default::default(),
         purposes: vec![],
         reviewers: vec![],
@@ -612,7 +608,11 @@ fn parse_checked(conn: &Connection, text: &str) -> Result<Parsed, ConfigError> {
             stored.kinds.insert(k.name.clone(), stand_in(&k));
         }
     }
-    // Validate the file's kinds with the stored ones visible.
+    // Validate the file's kinds with the stored ones visible; the file's own
+    // declarations win over stored harnesses of the same name.
+    let file_harnesses = std::mem::take(&mut p.harnesses);
+    p.harnesses = super::stored_harnesses(conn)?;
+    p.harnesses.extend(file_harnesses);
     let file_kinds = std::mem::take(&mut p.kinds);
     p.kinds = stored.kinds;
     p.kinds.extend(file_kinds);
@@ -630,9 +630,15 @@ fn check_text(conn: &Connection, text: &str) -> Result<(), ConfigError> {
 fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = parse_checked(&tx, text)?;
-    ensure_harnesses(&tx)?;
-    // Only the file's own kinds are written; the stored stand-ins are skipped.
+    // Only the file's own kinds and harnesses are written; the stored
+    // stand-ins are skipped.
     let doc: toml::Table = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let declared: Vec<String> = doc
+        .get("harnesses")
+        .and_then(|v| v.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    super::write_harnesses(&tx, p.harnesses.iter().filter(|(n, _)| declared.contains(n)))?;
     let named: Vec<String> = doc
         .get("kinds")
         .and_then(|v| v.as_table())
@@ -689,6 +695,7 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
 /// The stored config must satisfy the checks an import applies.
 fn check_db(conn: &Connection) -> Result<(), ConfigError> {
     let mut p = Parsed {
+        harnesses: super::stored_harnesses(conn)?,
         kinds: Default::default(),
         purposes: vec![],
         reviewers: super::reviewers(conn)?,

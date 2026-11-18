@@ -221,16 +221,6 @@ fn open_agent(conn: &Connection, name: &str) -> Result<(i64, Option<String>), Op
     .ok_or_else(|| OpsError::NoAgent(name.to_string()))
 }
 
-/// The verified stop key sequence of a harness (the old `Harness::stop_keys`):
-/// none for a harness without one (claude, pi). Never ctrl+c.
-pub fn stop_keys(harness: &str) -> Option<&'static [&'static str]> {
-    match harness {
-        "opencode" => Some(&["esc", "esc"]),
-        "agy" => Some(&["esc"]),
-        _ => None,
-    }
-}
-
 /// Interrupts a working agent with its harness's verified keys and waits for
 /// idle. The worker stays alive: no pane is closed and the agent is not
 /// ended (`cleanup` does that). A harness without a verified sequence is
@@ -239,9 +229,15 @@ pub fn stop_worker(conn: &Connection, herdr: &dyn HerdrClient, name: &str) -> Re
     let (_, kind) = open_agent(conn, name)?;
     let kind = kind.ok_or_else(|| OpsError::Other(format!("'{name}' has no kind")))?;
     let target = crate::config::resolve_spawn(conn, &kind).map_err(|e| other(format!("{e:?}")))?;
-    let harness = target.harness.name;
-    let keys = stop_keys(&harness).ok_or(OpsError::Unverified(harness))?;
+    let harness = target.harness.name.clone();
+    let keys = crate::driver::Registry::native()
+        .resolve(&target.harness)
+        .map(|d| d.stop_keys())
+        .filter(|k| !k.is_empty())
+        .ok_or(OpsError::Unverified(harness))?;
     debug_assert!(keys.iter().all(|k| !k.contains("ctrl+c")));
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let keys = keys.as_slice();
     let idle = |r: &crate::herdr::Reply| {
         serde_json::from_str::<serde_json::Value>(&r.body)
             .ok()

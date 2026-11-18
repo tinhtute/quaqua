@@ -28,6 +28,15 @@ impl HarnessDriver for Claude {
         "claude"
     }
 
+    fn error_shape(&self) -> Option<super::ErrorShape> {
+        Some(super::ErrorShape::Claude)
+    }
+
+    /// A fresh worktree is a folder claude has not been trusted in.
+    fn trusts_folder_dialog(&self) -> bool {
+        true
+    }
+
     fn launch_args(&self, model: &str, effort: Option<&str>) -> Vec<String> {
         let mut out = vec!["--model".to_string(), model_id(model)];
         if let Some(e) = effort {

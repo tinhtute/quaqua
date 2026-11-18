@@ -11,19 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 mod verbs;
 pub use verbs::{config_cmd, roster_cmd, INSTALL};
-
-/// The closed harness registry: name and driver. Anything else is rejected.
-/// `opencode` has no native driver and goes through the generic one.
-pub const HARNESSES: &[(&str, Driver)] = &[
-    ("claude", Driver::Native),
-    ("pi", Driver::Native),
-    ("agy", Driver::Native),
-    ("opencode", Driver::Generic),
-];
 
 /// The four roles a topology edge can join.
 const ROLES: &[&str] = &["cos", "supervisor", "lead", "peer"];
@@ -31,7 +22,7 @@ const ROLES: &[&str] = &["cos", "supervisor", "lead", "peer"];
 /// Top-level sections that map to rows (kinds, purposes, roles) or to
 /// `setting` keys. Every other top-level key is an error, except the one in
 /// [`NOT_PORTED`].
-const MAPPED_TOP: &[&str] = &["schema_version", "kinds", "purposes", "roles"];
+const MAPPED_TOP: &[&str] = &["schema_version", "harnesses", "kinds", "purposes", "roles"];
 
 /// R15: the removed feature is not ported. Its top-level section and its
 /// `can_spawn` / `can_prompt` target are accepted in a team.toml and skipped
@@ -60,13 +51,6 @@ pub enum Driver {
 }
 
 impl Driver {
-    fn as_str(self) -> &'static str {
-        match self {
-            Driver::Native => "native",
-            Driver::Generic => "generic",
-        }
-    }
-
     fn parse(s: &str) -> Option<Driver> {
         match s {
             "native" => Some(Driver::Native),
@@ -159,10 +143,42 @@ pub enum Seeded {
 
 // ---- typed rows (the data shape) -------------------------------------------
 
+/// A harness a team.toml declares: everything the generic driver needs.
+/// Stored in the `harness` row: `herdr_agent_kind` holds `herdr_kind`, and
+/// `args_template` holds the rest as one JSON object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessSpec {
+    /// The herdr agent kind `herdr agent start --kind` is given.
+    pub herdr_kind: String,
+    /// Launch args after herdr's `--`; one element each, `{model}` required,
+    /// `{effort}` optional.
+    pub args: Vec<String>,
+    /// Efforts a kind may name; empty: not checked.
+    pub efforts: Vec<String>,
+    /// The verified interrupt key sequence (never ctrl+c); empty: none.
+    pub stop_keys: Vec<String>,
+    /// Pane error-line shape (`claude`, `pi`, `agy`, `opencode`); none: try all.
+    pub error_shape: Option<String>,
+}
+
+/// The JSON kept in `harness.args_template`.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredSpec {
+    args: Vec<String>,
+    #[serde(default)]
+    efforts: Vec<String>,
+    #[serde(default)]
+    stop_keys: Vec<String>,
+    error_shape: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Harness {
     pub name: String,
     pub driver: Driver,
+    /// `Some` for a harness declared in config; natives and rows stored
+    /// before declarations existed carry none.
+    pub spec: Option<HarnessSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +228,21 @@ struct RawKind {
     avoid: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHarness {
+    herdr_kind: String,
+    args: Vec<String>,
+    #[serde(default)]
+    efforts: Vec<String>,
+    #[serde(default)]
+    stop_keys: Vec<String>,
+    error_shape: Option<String>,
+}
+
 struct Parsed {
+    /// Declared harnesses by name; `None` is a stored row with no spec.
+    harnesses: BTreeMap<String, Option<HarnessSpec>>,
     kinds: BTreeMap<String, RawKind>,
     purposes: Vec<(String, String)>,
     reviewers: Vec<String>,
@@ -228,6 +258,29 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
         let k = key.as_str();
         if !(MAPPED_TOP.contains(&k) || SETTING_SECTIONS.contains(&k) || k == NOT_PORTED) {
             return Err(ConfigError::UnknownKey { path: key.clone() });
+        }
+    }
+
+    let mut harnesses = BTreeMap::new();
+    if let Some(v) = doc.get("harnesses") {
+        let t = v
+            .as_table()
+            .ok_or_else(|| bad("[harnesses] is not a table".into()))?;
+        for (name, row) in t {
+            let raw: RawHarness = row
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| bad(format!("harnesses.{name}: {e}")))?;
+            harnesses.insert(
+                name.clone(),
+                Some(HarnessSpec {
+                    herdr_kind: raw.herdr_kind,
+                    args: raw.args,
+                    efforts: raw.efforts,
+                    stop_keys: raw.stop_keys,
+                    error_shape: raw.error_shape,
+                }),
+            );
         }
     }
 
@@ -347,6 +400,7 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
     }
 
     Ok(Parsed {
+        harnesses,
         kinds,
         purposes,
         reviewers,
@@ -386,13 +440,83 @@ fn json(v: &toml::Value) -> Result<serde_json::Value, ConfigError> {
     serde_json::to_value(v).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
+/// The placeholders an args template may carry. `{rules_file}` and `{prompt}`
+/// (plan Q11, Q43) need the one-shot run, which is deferred (NG13).
+fn check_template(name: &str, args: &[String]) -> Result<(), ConfigError> {
+    let bad = |m: String| ConfigError::Invalid(format!("harnesses.{name}: {m}"));
+    for t in args {
+        let mut rest = t.as_str();
+        while let Some(i) = rest.find('{') {
+            let tail = &rest[i + 1..];
+            let Some(j) = tail.find('}') else {
+                return Err(bad(format!("unclosed '{{' in arg '{t}'")));
+            };
+            match &tail[..j] {
+                "model" | "effort" => {}
+                p @ ("rules_file" | "prompt") => {
+                    return Err(bad(format!("placeholder {{{p}}} is not wired yet")))
+                }
+                p => return Err(bad(format!("unknown placeholder {{{p}}} in arg '{t}'"))),
+            }
+            rest = &tail[j + 1..];
+        }
+    }
+    if !args.iter().any(|t| t.contains("{model}")) {
+        return Err(bad("args must contain {model}".into()));
+    }
+    Ok(())
+}
+
+fn check_harness(name: &str, spec: &HarnessSpec) -> Result<(), ConfigError> {
+    let bad = |m: &str| ConfigError::Invalid(format!("harnesses.{name}: {m}"));
+    if name != name.to_lowercase() || name.trim().is_empty() {
+        return Err(bad("name must be lowercase"));
+    }
+    if name == "omp" {
+        return Err(ConfigError::UnknownHarness {
+            kind: format!("harnesses.{name}"),
+            harness: name.to_string(),
+        });
+    }
+    if crate::driver::Registry::native().get(name).is_some() {
+        return Err(bad("a native harness cannot be redeclared"));
+    }
+    if spec.herdr_kind.trim().is_empty() {
+        return Err(bad("empty herdr_kind"));
+    }
+    check_template(name, &spec.args)?;
+    if spec.stop_keys.iter().any(|k| k.contains("ctrl+c")) {
+        return Err(bad("stop_keys must never send ctrl+c"));
+    }
+    if let Some(s) = &spec.error_shape {
+        if crate::driver::ErrorShape::parse(s).is_none() {
+            return Err(bad(&format!("unknown error_shape '{s}'")));
+        }
+    }
+    Ok(())
+}
+
 fn validate(p: &Parsed) -> Result<(), ConfigError> {
+    for (name, spec) in &p.harnesses {
+        if let Some(spec) = spec {
+            check_harness(name, spec)?;
+        }
+    }
+    let natives = crate::driver::Registry::native();
     for (name, k) in &p.kinds {
-        if !HARNESSES.iter().any(|(h, _)| *h == k.harness) {
+        if natives.get(&k.harness).is_none() && !p.harnesses.contains_key(&k.harness) {
             return Err(ConfigError::UnknownHarness {
                 kind: name.clone(),
                 harness: k.harness.clone(),
             });
+        }
+        if let (Some(e), Some(Some(spec))) = (&k.effort, p.harnesses.get(&k.harness)) {
+            if !spec.efforts.is_empty() && !spec.efforts.contains(e) {
+                return Err(ConfigError::Invalid(format!(
+                    "kind '{name}': effort '{e}' is not one of harnesses.{}.efforts {:?}",
+                    k.harness, spec.efforts
+                )));
+            }
         }
         if k.model.trim().is_empty() {
             return Err(ConfigError::Invalid(format!("kind '{name}': empty model")));
@@ -455,12 +579,7 @@ pub fn seed(conn: &mut Connection, team_toml_text: &str) -> Result<Seeded, Confi
     let parsed = parse(team_toml_text)?;
     validate(&parsed)?;
 
-    for (name, driver) in HARNESSES {
-        tx.execute(
-            "INSERT OR IGNORE INTO harness (name, driver) VALUES (?1, ?2)",
-            params![name, driver.as_str()],
-        )?;
-    }
+    write_harnesses(&tx, parsed.harnesses.iter())?;
     for (name, k) in &parsed.kinds {
         tx.execute(
             "INSERT INTO kind (name, harness, model, effort, can_review, spawn, on_cost_cap, use_for, avoid)
@@ -515,6 +634,55 @@ pub fn seed(conn: &mut Connection, team_toml_text: &str) -> Result<Seeded, Confi
     Ok(Seeded::Fresh)
 }
 
+/// Writes the native harness rows (kinds reference them) and every declared
+/// harness, replacing a declaration of the same name.
+fn write_harnesses<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    declared: impl Iterator<Item = (&'a String, &'a Option<HarnessSpec>)>,
+) -> Result<(), ConfigError> {
+    for name in crate::driver::Registry::native().names() {
+        tx.execute(
+            "INSERT OR IGNORE INTO harness (name, driver) VALUES (?1, 'native')",
+            [name],
+        )?;
+    }
+    for (name, spec) in declared {
+        let Some(spec) = spec else { continue };
+        let stored = serde_json::to_string(&StoredSpec {
+            args: spec.args.clone(),
+            efforts: spec.efforts.clone(),
+            stop_keys: spec.stop_keys.clone(),
+            error_shape: spec.error_shape.clone(),
+        })
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO harness (name, driver, args_template, herdr_agent_kind)
+             VALUES (?1, 'generic', ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET driver = 'generic',
+               args_template = excluded.args_template,
+               herdr_agent_kind = excluded.herdr_agent_kind",
+            params![name, stored, spec.herdr_kind],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every stored generic harness: the names a kind may still use.
+fn stored_harnesses(
+    conn: &Connection,
+) -> Result<BTreeMap<String, Option<HarnessSpec>>, ConfigError> {
+    let mut st = conn.prepare("SELECT name FROM harness WHERE driver = 'generic'")?;
+    let names = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = BTreeMap::new();
+    for n in names {
+        let spec = harness(conn, &n)?.and_then(|h| h.spec);
+        out.insert(n, spec);
+    }
+    Ok(out)
+}
+
 // ---- readers: SQLite only -----------------------------------------------------
 
 fn row_kind(r: &rusqlite::Row<'_>) -> rusqlite::Result<Kind> {
@@ -551,17 +719,32 @@ pub fn kind(conn: &Connection, name: &str) -> Result<Option<Kind>, ConfigError> 
 }
 
 pub fn harness(conn: &Connection, name: &str) -> Result<Option<Harness>, ConfigError> {
-    let row: Option<(String, String)> = conn
+    type Row = (String, String, Option<String>, Option<String>);
+    let row: Option<Row> = conn
         .query_row(
-            "SELECT name, driver FROM harness WHERE name = ?1",
+            "SELECT name, driver, args_template, herdr_agent_kind FROM harness WHERE name = ?1",
             [name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    row.map(|(name, d)| {
-        Driver::parse(&d)
-            .map(|driver| Harness { name, driver })
-            .ok_or_else(|| ConfigError::Invalid(format!("harness driver '{d}'")))
+    row.map(|(name, d, template, kind)| {
+        let driver = Driver::parse(&d)
+            .ok_or_else(|| ConfigError::Invalid(format!("harness driver '{d}'")))?;
+        let spec = match (template, kind) {
+            (Some(t), Some(herdr_kind)) => {
+                let s: StoredSpec = serde_json::from_str(&t)
+                    .map_err(|e| ConfigError::Invalid(format!("harness '{name}': {e}")))?;
+                Some(HarnessSpec {
+                    herdr_kind,
+                    args: s.args,
+                    efforts: s.efforts,
+                    stop_keys: s.stop_keys,
+                    error_shape: s.error_shape,
+                })
+            }
+            _ => None,
+        };
+        Ok(Harness { name, driver, spec })
     })
     .transpose()
 }
