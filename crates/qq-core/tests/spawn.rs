@@ -52,6 +52,11 @@ struct Fx {
 
 impl Fx {
     fn new(tag: &str) -> Self {
+        Self::with_team(tag, "")
+    }
+
+    /// The fixture team.toml plus `extra` toml appended.
+    fn with_team(tag: &str, extra: &str) -> Self {
         let ws = TestWorkspace::new(tag);
         // The repo's parent is not the workspace root: worktrees go beside the repo.
         let repo = ws.root().join("code").join("repo");
@@ -66,7 +71,7 @@ impl Fx {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
         )
         .unwrap();
-        config::seed(&mut conn, &team).expect("seed");
+        config::seed(&mut conn, &format!("{team}\n{extra}")).expect("seed");
         let herdr = FakeHerdr::new();
         let anchor = herdr.seed_pane("home", None, &[]);
         let harnesses: Vec<_> = config::roster(&conn)
@@ -80,7 +85,13 @@ impl Fx {
             conn,
             herdr,
             anchor,
-            drivers: Registry::from_config(&harnesses),
+            drivers: if extra.is_empty() {
+                Registry::from_config(&harnesses)
+            } else {
+                // Nothing pre-registered: a declared harness must resolve from
+                // its stored row alone.
+                Registry::new()
+            },
         }
     }
 
@@ -1056,4 +1067,47 @@ fn spawn_returns_only_once_claude_is_really_ready_after_the_trust_dialog() {
         go(&fx, "sude-a", &pane).expect("ready once the dialog is gone");
         assert_eq!(fx.agents("sude-a"), 1);
     }
+}
+
+/// R6 / T41c: a harness declared only in team.toml spawns with its templated
+/// args and its own herdr kind, through the production resolve path.
+#[test]
+fn harness_from_toml_alone() {
+    let fx = Fx::with_team(
+        "harness-toml",
+        r#"
+[harnesses.moonshot]
+herdr_kind = "kimi"
+efforts = ["low", "high"]
+args = ["--model", "{model}", "--effort", "{effort}", "--yolo"]
+stop_keys = ["esc"]
+error_shape = "pi"
+
+[kinds.kimik]
+harness = "moonshot"
+model = "k2"
+effort = "high"
+"#,
+    );
+    assert_eq!(fx.spawn(&[], "kimik-one", "kimik").as_deref(), Ok("kimik-one"));
+    assert_eq!(
+        fx.herdr.start_args("kimik-one"),
+        ["--model", "k2", "--effort", "high", "--yolo"]
+    );
+    let list = fx.herdr.agent_list().unwrap().body;
+    assert!(list.contains(r#""kimi""#) && !list.contains("moonshot"), "{list}");
+
+    // the stored row carries everything; stop keys and error shape read from it
+    let h = config::harness(&fx.conn, "moonshot").unwrap().unwrap();
+    let d = Registry::new().resolve(&h).unwrap();
+    assert_eq!(d.stop_keys(), ["esc"]);
+    assert_eq!(d.error_shape(), Some(qq_core::driver::ErrorShape::Pi));
+    assert!(!d.trusts_folder_dialog());
+
+    // a kind with no effort drops the effort element and its flag
+    fx.conn
+        .execute("INSERT INTO kind (name, harness, model) VALUES ('kimin', 'moonshot', 'k3')", [])
+        .unwrap();
+    fx.spawn(&[], "kimin-two", "kimin").unwrap();
+    assert_eq!(fx.herdr.start_args("kimin-two"), ["--model", "k3", "--yolo"]);
 }

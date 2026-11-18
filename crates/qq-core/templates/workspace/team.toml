@@ -50,6 +50,17 @@ design = "truonglao"
 [opencode_models]
 "deepseek-v4.1-flash" = ["low", "high", "max"]
 
+# A harness declared here runs through the generic driver (degraded: cost unknown,
+# no hook, cannot review). `args` is one element per CLI arg: {model} required,
+# {effort} optional (its element and a flag just before it drop when a kind has no
+# effort). stop_keys is the verified interrupt (never ctrl+c); error_shape picks the
+# pane error-line parser (claude, pi, agy, opencode). claude and pi are native.
+[harnesses.opencode]
+herdr_kind = "opencode"
+args = ["--model", "{model}"]
+stop_keys = ["esc", "esc"]
+error_shape = "opencode"
+
 # Set harness, model, and effort for every kind; fallback is one hop on agent-start failure only.
 [kinds.sude]
 harness = "claude"

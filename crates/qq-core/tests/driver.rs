@@ -10,6 +10,7 @@ fn harness(name: &str, driver: Driver) -> Harness {
     Harness {
         name: name.into(),
         driver,
+        spec: None,
     }
 }
 

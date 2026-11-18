@@ -518,3 +518,59 @@ fn config_set_typed_and_usage() {
     assert_eq!(run(&["config", "import"]), 2);
     daemon.stop().unwrap();
 }
+
+#[test]
+fn harness_declared_in_toml_imports_and_validates() {
+    let ws = TestWorkspace::new("cfg-harness");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let file = |name: &str, body: &str| {
+        let p = ws.root().join(name);
+        std::fs::write(&p, body).unwrap();
+        p.to_str().unwrap().to_string()
+    };
+    let decl = |h: &str| {
+        format!(
+            "[harnesses.{h}]\nherdr_kind = \"kimi\"\nefforts = [\"low\"]\nargs = [\"-m\", \"{{model}}\"]\n\
+             [kinds.k]\nharness = \"{h}\"\nmodel = \"m\"\neffort = \"low\"\n"
+        )
+    };
+    let ok = file("ok.toml", &decl("kimi"));
+    assert_eq!(run(&["config", "validate", &ok]), 0);
+    assert_eq!(run(&["config", "import", &ok]), 0);
+    let conn = open(&ws);
+    let t = config::resolve_spawn(&conn, "k").unwrap();
+    assert_eq!(t.harness.driver, Driver::Generic);
+    let spec = t.harness.spec.expect("stored spec");
+    assert_eq!((spec.herdr_kind.as_str(), spec.args.len()), ("kimi", 2));
+    // a stored harness stays usable by later sets and a bare validate
+    assert_eq!(run(&["config", "set", "kind.k2", r#"{"harness":"kimi","model":"m2"}"#]), 0);
+    assert_eq!(run(&["config", "validate"]), 0);
+    assert_eq!(run(&["config", "set", "kind.k2.effort", "high"]), 1, "not in efforts");
+
+    // refused before anything is written
+    let refused = |name: &str, body: String| {
+        let before = count(&open(&ws), "harness");
+        let f = file(name, &body);
+        assert_eq!(run(&["config", "import", &f]), 1, "{name}");
+        assert_eq!(count(&open(&ws), "harness"), before, "{name}");
+    };
+    refused("omp.toml", decl("omp"));
+    refused("native.toml", decl("claude"));
+    refused("upper.toml", decl("Kimi"));
+    refused("nomodel.toml", decl("x").replace("{model}", "m"));
+    refused("badph.toml", decl("x").replace("{model}", "{model}{nope}"));
+    refused("prompt.toml", decl("x").replace("{model}", "{model}{prompt}"));
+    refused(
+        "ctrlc.toml",
+        decl("x").replace("args =", "stop_keys = [\"ctrl+c\"]\nargs ="),
+    );
+    refused("shape.toml", decl("x").replace("args =", "error_shape = \"zzz\"\nargs ="));
+    // neither native nor declared: unknown
+    let ghost = file("ghost.toml", "[kinds.g]\nharness = \"nope\"\nmodel = \"m\"\n");
+    assert_eq!(run(&["config", "validate", &ghost]), 1);
+    daemon.stop().unwrap();
+}

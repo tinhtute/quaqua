@@ -8,8 +8,10 @@
 //! order), its native fence hook, and where a run's cost is read from.
 //!
 //! Degraded mode: the generic driver is built from config alone (a harness
-//! row with driver `generic`). It has no hook (so it is [`Fence::Unfenced`]),
-//! no cost source, no launch args, and stops only through `herdr agent stop`.
+//! row with driver `generic`, declared as `[harnesses.<name>]` in team.toml).
+//! It renders the declared args template for its launch args, keeps the
+//! declared stop keys and error-line shape, and has no hook (so it is
+//! [`Fence::Unfenced`]), no cost source and no folder-trust dialog handling.
 
 mod claude;
 mod generic;
@@ -22,6 +24,28 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Which harness's pane text shape the error classifier reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorShape {
+    Claude,
+    Pi,
+    Agy,
+    Opencode,
+}
+
+impl ErrorShape {
+    /// The spelling `error_shape = "..."` takes in a harness declaration.
+    pub fn parse(name: &str) -> Option<ErrorShape> {
+        match name {
+            "claude" => Some(ErrorShape::Claude),
+            "pi" => Some(ErrorShape::Pi),
+            "agy" => Some(ErrorShape::Agy),
+            "opencode" => Some(ErrorShape::Opencode),
+            _ => None,
+        }
+    }
+}
 
 /// Token and cost totals of one run, read from a harness's own session file.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -70,6 +94,27 @@ pub trait HarnessDriver: Send + Sync {
     /// Whether a native hook fences this driver (R11), per [`fence_for`].
     fn fence(&self) -> Fence {
         fence_for(self.driver())
+    }
+
+    /// The one verified interrupt sequence (never ctrl+c), the first of
+    /// [`Self::stop_sequences`] that avoids ctrl+c. Empty: no verified keys.
+    fn stop_keys(&self) -> Vec<String> {
+        self.stop_sequences()
+            .into_iter()
+            .find(|seq| seq.iter().all(|k| !k.contains("ctrl+c")))
+            .unwrap_or_default()
+    }
+
+    /// Which provider-error line shape this harness's pane prints. `None`:
+    /// unknown, the classifier tries every shape.
+    fn error_shape(&self) -> Option<ErrorShape> {
+        None
+    }
+
+    /// Whether the harness shows a "trust this folder" dialog at its first
+    /// start in a fresh worktree, which the spawn must accept.
+    fn trusts_folder_dialog(&self) -> bool {
+        false
     }
 
     /// Key sequences that stop a working agent, tried in order until it
@@ -231,7 +276,7 @@ impl Registry {
     }
 
     /// The native drivers that exist today: claude and pi (agy is not yet
-    /// measured, T39).
+    /// measured, T39). The only list of native harness names.
     pub fn native() -> Self {
         let mut r = Self::new();
         r.register(claude::Claude);
@@ -245,10 +290,23 @@ impl Registry {
         let mut r = Self::native();
         for h in harnesses {
             if h.driver == Driver::Generic && r.get(&h.name).is_none() {
-                r.register(generic::Generic::new(&h.name));
+                r.register(generic::Generic::new(&h.name, h.spec.clone()));
             }
         }
         r
+    }
+
+    /// The driver of one config row: a native by name, else a generic one
+    /// built from the row's declared spec. Reads the row, not a startup list,
+    /// so a harness declared after the daemon started still resolves.
+    pub fn resolve(&self, h: &Harness) -> Option<Arc<dyn HarnessDriver>> {
+        self.get(&h.name)
+            .or_else(|| Self::from_config(std::slice::from_ref(h)).get(&h.name))
+    }
+
+    /// Names of the registered drivers.
+    pub fn names(&self) -> Vec<String> {
+        self.by_harness.keys().cloned().collect()
     }
 
     /// Adds a driver; the harness name is the key, a repeat replaces.

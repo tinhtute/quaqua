@@ -183,7 +183,7 @@ pub fn spawn_with(
 ) -> Result<Spawned, SpawnError> {
     let target = config::resolve_spawn(conn, spec.kind).map_err(SpawnError::Config)?;
     let driver = drivers
-        .get(&target.harness.name)
+        .resolve(&target.harness)
         .ok_or_else(|| SpawnError::NoDriver(target.harness.name.clone()))?;
     type Open = (i64, String, Option<String>, Option<i64>);
     let open: Option<Open> = conn
@@ -239,7 +239,7 @@ pub fn spawn_with(
     if !reply.ok && code.as_deref() != Some("agent_not_ready") {
         return Err(SpawnError::Herdr(code.unwrap_or(reply.body)));
     }
-    let trust = if driver.herdr_kind() == "claude" {
+    let trust = if driver.trusts_folder_dialog() {
         accept_trust_dialog(herdr, spec.name, spec.pane, ready)
     } else {
         Trust::NoDialog

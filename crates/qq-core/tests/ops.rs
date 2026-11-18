@@ -466,9 +466,9 @@ fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     let (_dir, conn) = seeded("stop");
     let herdr = FakeHerdr::new();
     let f = foreign(&herdr);
-    // claude and pi have no verified stop sequence: refused before anything
-    // is sent, working or idle
-    for (name, kind, harness) in [("c1", "ni", "claude"), ("p1", "tieude", "pi")] {
+    // claude has no verified stop sequence: refused before anything is sent,
+    // working or idle (pi's `esc` is the driver's; see below)
+    for (name, kind, harness) in [("c1", "ni", "claude")] {
         add_agent(&conn, name, "peer", kind, None);
         let pane = herdr.seed_pane("r-workers", None, &[]);
         set_pane(&conn, name, &pane);
@@ -488,6 +488,19 @@ fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
         "nothing is sent for an unverified harness"
     );
 
+    // pi stops on esc, the one source being its driver
+    add_agent(&conn, "p1", "peer", "tieude", None);
+    let pane = herdr.seed_pane("r-workers", None, &[]);
+    set_pane(&conn, "p1", &pane);
+    herdr.agent_start("p1", "pi", &pane, 1, &[]).unwrap();
+    herdr.set_status("p1", "working");
+    herdr.idle_on_keys("p1", &["esc"]);
+    cleanup::stop_worker(&conn, &herdr, "p1").unwrap();
+    assert_eq!(
+        herdr.keys(),
+        vec![("p1".to_string(), vec!["esc".to_string()])]
+    );
+
     // opencode stops on esc esc; the worker, its pane and its record stay
     conn.execute(
         "INSERT INTO kind(name, harness, model) VALUES ('oc', 'opencode', 'm')",
@@ -502,8 +515,8 @@ fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     herdr.idle_on_keys("o1", &["esc", "esc"]);
     cleanup::stop_worker(&conn, &herdr, "o1").unwrap();
     assert_eq!(
-        herdr.keys(),
-        vec![("o1".to_string(), vec!["esc".to_string(), "esc".to_string()])]
+        herdr.keys().last(),
+        Some(&("o1".to_string(), vec!["esc".to_string(), "esc".to_string()]))
     );
     assert!(herdr
         .keys()
