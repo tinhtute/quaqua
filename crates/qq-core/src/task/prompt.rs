@@ -958,7 +958,8 @@ impl Tuning {
 /// The brief plus the report instruction, as the old binary composed it.
 pub fn compose_prompt_body(name: &str, task: &str) -> String {
     format!(
-        "{task}. When done, write summary (changes, test cmd+result, risks) to a temp file and rename it to ~/quaqua/runs/{name}.md (publish it atomically, never a partial file); reply only the path."
+        "{task}. {}",
+        super::report_contract::report_ask(name)
     )
 }
 
