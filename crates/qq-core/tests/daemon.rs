@@ -748,3 +748,66 @@ fn a_forked_child_does_not_keep_the_stopped_daemons_lock() {
     child.join().unwrap();
     assert!(!refused, "the stopped daemon's lock outlived it");
 }
+
+/// `quaqua daemon` in a fresh workspace answers on its socket, the database
+/// stays open to other connections while it runs, and a second `quaqua daemon`
+/// is refused. On macOS a flock on `qq.db` itself blocked SQLite's own locks,
+/// so the first daemon died with "database is locked".
+#[test]
+fn cli_daemon_starts_answers_and_refuses_a_second() {
+    /// Kills the daemon on every exit path, so a failed assert leaves no orphan
+    /// and no socket file.
+    struct Kill(std::process::Child, std::path::PathBuf);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_file(&self.1);
+        }
+    }
+    let ws = TestWorkspace::new("cli-daemon");
+    let runs = ws.runs_dir();
+    let sock = rpc::socket_path(&runs);
+    let mut first = Kill(
+        Command::new(env!("CARGO_BIN_EXE_quaqua"))
+            .arg("daemon")
+            .env("QUAQUA_RUNS_DIR", &runs)
+            .env("QUAQUA_TEST", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn daemon"),
+        sock.clone(),
+    );
+    // Any response is an answer: outside a herdr pane the peer gate refuses
+    // the caller, which only a serving daemon can do.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answer = loop {
+        if let Ok(r) = rpc::call(&sock, &Request::new("ping", Value::Null)) {
+            break r;
+        }
+        if let Some(status) = first.0.try_wait().unwrap() {
+            let mut err = String::new();
+            io::Read::read_to_string(&mut first.0.stderr.take().unwrap(), &mut err).unwrap();
+            panic!("daemon exited {status}: {err}");
+        }
+        assert!(Instant::now() < deadline, "daemon never answered ping");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let code = answer.error.as_ref().map(|e| e.code.as_str());
+    assert!(answer.ok || code == Some("unmapped_peer"), "{answer:?}");
+
+    // Another connection reads the database while the daemon runs.
+    Store::open(&ws.db_path()).expect("database opens beside the daemon");
+
+    let second = qq(&runs, &["daemon"]);
+    assert_eq!(second.status.code(), Some(1), "{second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already running"),
+        "{second:?}"
+    );
+    assert!(
+        first.0.try_wait().unwrap().is_none(),
+        "first daemon still runs"
+    );
+}
