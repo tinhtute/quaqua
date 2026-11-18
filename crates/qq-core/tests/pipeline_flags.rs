@@ -47,8 +47,7 @@ fn seed(conn: &mut rusqlite::Connection) {
     let template =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
     let team = std::fs::read_to_string(template)
-        .unwrap()
-        .replace("harness = \"omp\"", "harness = \"opencode\"");
+        .unwrap();
     config::seed(conn, &team).expect("seed");
 }
 

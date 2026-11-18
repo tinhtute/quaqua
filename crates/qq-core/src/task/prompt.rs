@@ -263,7 +263,6 @@ pub fn parse_extend(v: &str) -> Result<u64, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     Claude,
-    Omp,
     Pi,
     Agy,
     Opencode,
@@ -273,7 +272,6 @@ impl Shape {
     pub fn parse(name: &str) -> Option<Shape> {
         match name {
             "claude" => Some(Shape::Claude),
-            "omp" => Some(Shape::Omp),
             "pi" => Some(Shape::Pi),
             "agy" => Some(Shape::Agy),
             "opencode" => Some(Shape::Opencode),
@@ -377,7 +375,7 @@ fn status_error(status: u16, text: &str) -> ProviderError {
     }
 }
 
-/// Words a bare `NNN …` line must carry to be a provider error. omp's bare
+/// Words a bare `NNN …` line must carry to be a provider error. opencode's bare
 /// status line has no `Error:` prefix, so the status alone would also match a
 /// test line like `429 tests run, 0 failed` (rev177 F1).
 const BARE_MARKERS: &[&str] = &[
@@ -439,10 +437,10 @@ fn lead_status(l: &str) -> Option<(u16, &str)> {
     Some((digits.parse().ok()?, &l[3..]))
 }
 
-/// omp (and opencode, which prints the same provider lines):
+/// opencode:
 /// `[Error: ][Retry budget exhausted after N retries: ]NNN …`, plus its
 /// `Error: Couldn't connect to … (connection refused).` line.
-fn omp_line(l: &str) -> Option<Decision> {
+fn opencode_line(l: &str) -> Option<Decision> {
     let (rest, exhausted, prefixed) = strip_lead(l);
     if rest.starts_with("couldn't connect") && rest.contains("connection refused") {
         return Some(Decision {
@@ -565,7 +563,7 @@ fn claude_line(l: &str) -> Option<ProviderError> {
 }
 
 /// One pane line → its classification for harness `h`. The Claude tables stay
-/// Claude's (#196): omp and pi print none of those shapes, and their own
+/// Claude's (#196): opencode and pi print none of those shapes, and their own
 /// shapes are status-first.
 fn classify_line(h: Option<Shape>, line: &str) -> Option<Decision> {
     let l = line
@@ -579,13 +577,12 @@ fn classify_line(h: Option<Shape>, line: &str) -> Option<Decision> {
     };
     match h {
         Some(Shape::Claude) => claude(),
-        Some(Shape::Omp) => omp_line(&l),
         Some(Shape::Pi) => pi_line(&l),
         Some(Shape::Agy) => agy_line(&l),
         // No kind in team.toml, and opencode (no fixture of its own yet, and it
         // had the Claude tables before #196): try each shape rather than drop
         // the error or lose a classification it used to get.
-        None | Some(Shape::Opencode) => omp_line(&l).or_else(|| pi_line(&l)).or_else(claude),
+        None | Some(Shape::Opencode) => opencode_line(&l).or_else(|| pi_line(&l)).or_else(claude),
     }
 }
 

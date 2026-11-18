@@ -32,8 +32,7 @@ fn seeded(tag: &str) -> (std::path::PathBuf, Connection) {
     let team = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
     )
-    .unwrap()
-    .replace("harness = \"omp\"", "harness = \"opencode\"");
+    .unwrap();
     let mut c = conn;
     config::seed(&mut c, &team).unwrap();
     (dir, c)
@@ -490,7 +489,12 @@ fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     );
 
     // opencode stops on esc esc; the worker, its pane and its record stay
-    add_agent(&conn, "o1", "peer", "sude", None);
+    conn.execute(
+        "INSERT INTO kind(name, harness, model) VALUES ('oc', 'opencode', 'm')",
+        [],
+    )
+    .unwrap();
+    add_agent(&conn, "o1", "peer", "oc", None);
     let pane = herdr.seed_pane("r-workers", None, &[]);
     set_pane(&conn, "o1", &pane);
     herdr.agent_start("o1", "opencode", &pane, 1, &[]).unwrap();
@@ -862,15 +866,15 @@ fn prompt_wait_retries_a_provider_error_then_escalates() {
 fn provider_error_classifier_table() {
     use prompt::classify;
     let r = |h, pane| classify(h, pane).map(|d| (d.error, d.exhausted));
-    let (omp, pi, claude) = (Some(Shape::Omp), Some(Shape::Pi), Some(Shape::Claude));
+    let (opencode, pi, claude) = (Some(Shape::Opencode), Some(Shape::Pi), Some(Shape::Claude));
     let retry = |s| Some((ProviderError::Retryable(s), false));
     let fatal = |s| Some((ProviderError::Fatal(s), false));
     assert_eq!(
-        r(omp, "Error: 429 rate limit exceeded"),
+        r(opencode, "Error: 429 rate limit exceeded"),
         retry("rate-limit")
     );
-    assert_eq!(r(omp, "Error: 401 invalid api key"), fatal("signed-out"));
-    assert_eq!(r(omp, "Error: 402 payment required"), fatal("billing"));
+    assert_eq!(r(opencode, "Error: 401 invalid api key"), fatal("signed-out"));
+    assert_eq!(r(opencode, "Error: 402 payment required"), fatal("billing"));
     assert_eq!(r(pi, "Error: 503: service unavailable"), retry("5xx"));
     assert_eq!(
         r(claude, "⎿ API Error: 529 overloaded_error"),
@@ -883,21 +887,21 @@ fn provider_error_classifier_table() {
     // a spent harness ladder is flagged
     assert_eq!(
         r(
-            omp,
+            opencode,
             "Error: Retry budget exhausted after 10 retries: 529 overloaded"
         ),
         Some((ProviderError::Retryable("overloaded"), true))
     );
     // worker output that only mentions provider words never classifies
-    assert_eq!(r(omp, "429 tests run, 0 failed"), None);
+    assert_eq!(r(opencode, "429 tests run, 0 failed"), None);
     assert_eq!(r(claude, "I fixed the API error handling"), None);
     // fatal beats an earlier retryable one; only the last 15 lines count
     assert_eq!(
-        r(omp, "Error: 529 overloaded\nError: 401 invalid api key"),
+        r(opencode, "Error: 529 overloaded\nError: 401 invalid api key"),
         fatal("signed-out")
     );
     let old = format!("Error: 529 overloaded\n{}", "ok\n".repeat(15));
-    assert_eq!(r(omp, &old), None);
+    assert_eq!(r(opencode, &old), None);
     // structured record: fail closed, stale-free parse
     assert_eq!(
         prompt::parse_error_record("retryable 429 3").map(|d| (d.error, d.exhausted)),
@@ -929,7 +933,7 @@ fn prompt_wait_classifies_the_pane_tail() {
         }),
     };
     let mut cfg = wait_cfg(&runs, &journal, 7200);
-    cfg.harness = Some(Shape::Omp);
+    cfg.harness = Some(Shape::Opencode);
     // idle 120s -> the pane reads retryable -> one provider_retry and one
     // "continue"; the old error sits above the echo, so it never counts twice
     // and the wait ends as a plain stall (exit 3).

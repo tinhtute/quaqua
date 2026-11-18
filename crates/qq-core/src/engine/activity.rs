@@ -579,7 +579,7 @@ mod roundtrip_tests {
             seq: 1,
             session_kind: "path".to_string(),
             session_value: "/tmp/sess".to_string(),
-            harness: "omp".to_string(),
+            harness: "pi".to_string(),
             cwd: "/tmp".to_string(),
             err: String::new(),
             lead_waiting: false,

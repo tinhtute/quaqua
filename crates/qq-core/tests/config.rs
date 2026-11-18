@@ -15,14 +15,6 @@ fn template() -> String {
     std::fs::read_to_string(p).expect("read template team.toml")
 }
 
-/// The shipped template still puts `sude` on `omp`; the one edit the fixture
-/// makes is that harness value.
-fn template_without_omp() -> String {
-    let t = template().replace("harness = \"omp\"", "harness = \"claude\"");
-    assert!(!t.contains("harness = \"omp\""));
-    t
-}
-
 fn open(ws: &TestWorkspace) -> Connection {
     db::open(&ws.db_path()).expect("open qq db")
 }
@@ -47,12 +39,10 @@ fn unknown_harness_rejected() {
     let ws = TestWorkspace::new("cfg-unknown");
     let mut conn = open(&ws);
 
-    // omp is refused whatever the shipped template says: typed, nothing written.
-    let omp = template_without_omp().replace("harness = \"pi\"", "harness = \"omp\"");
+    // omp is an unknown harness like any other name: typed, nothing written.
+    let omp = template().replace("harness = \"pi\"", "harness = \"omp\"");
     match config::seed(&mut conn, &omp) {
-        Err(ConfigError::UnknownHarness { kind, harness }) => {
-            assert_eq!((kind.as_str(), harness.as_str()), ("tieude", "omp"));
-        }
+        Err(ConfigError::UnknownHarness { harness, .. }) => assert_eq!(harness, "omp"),
         other => panic!("expected UnknownHarness, got {other:?}"),
     }
     for t in TABLES {
@@ -64,7 +54,7 @@ fn unknown_harness_rejected() {
     }
 
     // Any other name outside the registry is refused the same way.
-    let bad = template_without_omp().replace("harness = \"pi\"", "harness = \"nope\"");
+    let bad = template().replace("harness = \"pi\"", "harness = \"nope\"");
     assert!(matches!(
         config::seed(&mut conn, &bad),
         Err(ConfigError::UnknownHarness { harness, .. }) if harness == "nope"
@@ -73,7 +63,7 @@ fn unknown_harness_rejected() {
 
     // A valid harness is accepted by the same call.
     assert_eq!(
-        config::seed(&mut conn, &template_without_omp()).unwrap(),
+        config::seed(&mut conn, &template()).unwrap(),
         Seeded::Fresh
     );
 
@@ -87,7 +77,7 @@ fn unknown_harness_rejected() {
         let file = ws.root().join(format!("{h}.toml"));
         std::fs::write(
             &file,
-            template().replace("harness = \"omp\"", &format!("harness = \"{h}\"")),
+            template().replace("harness = \"pi\"", &format!("harness = \"{h}\"")),
         )
         .unwrap();
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -137,7 +127,7 @@ fn config_set_import_roster() {
     let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
 
     // import: the toml goes in through the verb; a repeat converges.
-    std::fs::write(ws.team_toml(), template_without_omp()).unwrap();
+    std::fs::write(ws.team_toml(), template()).unwrap();
     let toml = ws.team_toml();
     let toml = toml.to_str().unwrap();
     assert_eq!(run(&["config", "import", toml]), 0);
@@ -234,7 +224,7 @@ fn config_set_import_roster() {
 #[test]
 fn config_seed_reads_template() {
     let ws = TestWorkspace::new("cfg-seed");
-    std::fs::write(ws.team_toml(), template_without_omp()).unwrap();
+    std::fs::write(ws.team_toml(), template()).unwrap();
     let mut conn = open(&ws);
     assert_eq!(
         config::init(&mut conn, &ws.team_toml()).unwrap(),
@@ -312,7 +302,7 @@ fn config_seed_reads_template() {
         .unwrap();
     let before: Vec<i64> = TABLES.iter().map(|t| count(&conn, t)).collect();
     assert_eq!(
-        config::seed(&mut conn, &template_without_omp()).unwrap(),
+        config::seed(&mut conn, &template()).unwrap(),
         Seeded::AlreadySeeded
     );
     let after: Vec<i64> = TABLES.iter().map(|t| count(&conn, t)).collect();
@@ -329,7 +319,7 @@ fn removed() -> String {
 fn config_boundary_rejects_unmapped() {
     let ws = TestWorkspace::new("cfg-boundary");
     let mut conn = open(&ws);
-    let base = template_without_omp();
+    let base = template();
 
     // Unknown top-level key, unknown role, non-table [roles], non-string
     // entry, unknown role key, bad reports_to: each a typed error, no rows.
@@ -421,7 +411,7 @@ fn relative_path_child() {
 fn config_import_relative_path() {
     let ws = TestWorkspace::new("cfg-relpath");
     let (_registry, daemon) = start(&ws);
-    std::fs::write(ws.root().join("rel.toml"), template_without_omp()).unwrap();
+    std::fs::write(ws.root().join("rel.toml"), template()).unwrap();
     // The daemon runs in this process's cwd; the client runs in the workspace.
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .current_dir(ws.root())
@@ -444,7 +434,7 @@ fn config_set_typed_and_usage() {
     };
     let (registry, daemon) = start(&ws);
     let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
-    std::fs::write(ws.team_toml(), template_without_omp()).unwrap();
+    std::fs::write(ws.team_toml(), template()).unwrap();
     assert_eq!(
         run(&["config", "import", ws.team_toml().to_str().unwrap()]),
         0
@@ -514,7 +504,7 @@ fn config_set_typed_and_usage() {
         &upper,
         format!(
             "{}\n[kinds.Scout]\nharness = \"claude\"\nmodel = \"m\"\n",
-            template_without_omp()
+            template()
         ),
     )
     .unwrap();

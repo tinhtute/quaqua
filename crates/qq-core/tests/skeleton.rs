@@ -24,7 +24,6 @@ fn template() -> String {
         .join("tests/fixtures/team.toml");
     std::fs::read_to_string(p)
         .expect("read template team.toml")
-        .replace("harness = \"omp\"", "harness = \"claude\"")
 }
 
 /// A seeded workspace with one project and one task.

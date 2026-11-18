@@ -20,7 +20,6 @@ fn template() -> String {
         .join("tests/fixtures/team.toml");
     std::fs::read_to_string(p)
         .expect("read template team.toml")
-        .replace("harness = \"omp\"", "harness = \"claude\"")
 }
 
 /// A database seeded from the shipped team.toml, with projects 1 and 2.
