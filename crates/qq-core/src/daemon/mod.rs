@@ -11,7 +11,7 @@ pub mod supervisor;
 pub mod watch;
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io::{self, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
@@ -399,7 +399,7 @@ impl Daemon {
         std::fs::create_dir_all(&cfg.runs_dir)?;
         let db_path = cfg.runs_dir.join(crate::db::path::DB_FILE);
         // Held to the end of the run: a second daemon on this workspace fails here.
-        let lock = lock_workspace(&db_path, &socket)?;
+        let lock = lock_workspace(&cfg.runs_dir, &socket)?;
         let store = Arc::new(Store::open(&db_path).map_err(DaemonError::Store)?);
         let listener = bind_socket(&socket)?;
         let supervisor = Supervisor::new(Arc::clone(&store), kinds);
@@ -494,15 +494,12 @@ impl Drop for WorkspaceLock {
     }
 }
 
-/// An exclusive advisory lock on the database file itself, so the one-daemon
-/// rule needs no sidecar file. The OS drops it when the process dies.
-fn lock_workspace(db: &Path, socket: &Path) -> Result<WorkspaceLock, DaemonError> {
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(db)?;
+/// An exclusive advisory lock on the runs directory, so the one-daemon rule
+/// needs no sidecar file. Not on `qq.db`: on macOS a flock and SQLite's fcntl
+/// locks on one file conflict, and the daemon could not open its own database.
+/// The OS drops it when the process dies.
+fn lock_workspace(runs_dir: &Path, socket: &Path) -> Result<WorkspaceLock, DaemonError> {
+    let f = File::open(runs_dir)?;
     match f.try_lock() {
         Ok(()) => Ok(WorkspaceLock(f)),
         Err(TryLockError::WouldBlock) => Err(DaemonError::AlreadyRunning(socket.to_path_buf())),
