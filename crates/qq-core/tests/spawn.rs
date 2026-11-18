@@ -1089,13 +1089,19 @@ model = "k2"
 effort = "high"
 "#,
     );
-    assert_eq!(fx.spawn(&[], "kimik-one", "kimik").as_deref(), Ok("kimik-one"));
+    assert_eq!(
+        fx.spawn(&[], "kimik-one", "kimik").as_deref(),
+        Ok("kimik-one")
+    );
     assert_eq!(
         fx.herdr.start_args("kimik-one"),
         ["--model", "k2", "--effort", "high", "--yolo"]
     );
     let list = fx.herdr.agent_list().unwrap().body;
-    assert!(list.contains(r#""kimi""#) && !list.contains("moonshot"), "{list}");
+    assert!(
+        list.contains(r#""kimi""#) && !list.contains("moonshot"),
+        "{list}"
+    );
 
     // the stored row carries everything; stop keys and error shape read from it
     let h = config::harness(&fx.conn, "moonshot").unwrap().unwrap();
@@ -1106,8 +1112,61 @@ effort = "high"
 
     // a kind with no effort drops the effort element and its flag
     fx.conn
-        .execute("INSERT INTO kind (name, harness, model) VALUES ('kimin', 'moonshot', 'k3')", [])
+        .execute(
+            "INSERT INTO kind (name, harness, model) VALUES ('kimin', 'moonshot', 'k3')",
+            [],
+        )
         .unwrap();
     fx.spawn(&[], "kimin-two", "kimin").unwrap();
-    assert_eq!(fx.herdr.start_args("kimin-two"), ["--model", "k3", "--yolo"]);
+    assert_eq!(
+        fx.herdr.start_args("kimin-two"),
+        ["--model", "k3", "--yolo"]
+    );
+}
+
+// ---- grid placement -------------------------------------------------------------------
+
+fn pane_of(fx: &Fx, name: &str) -> String {
+    fx.conn
+        .query_row("SELECT pane_id FROM agent WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_cos_worker_spawn_lands_in_the_workers_tab_not_the_cos_tab() {
+    let fx = Fx::new("placecos");
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    fx.spawn(&[], "tieude-b", "tieude").unwrap();
+    let (a, b) = (pane_of(&fx, "tieude-a"), pane_of(&fx, "tieude-b"));
+    assert_eq!(
+        fx.herdr.layout(),
+        vec![
+            ("main".into(), "home".into(), vec![fx.anchor.clone()]),
+            ("main".into(), "repo-workers".into(), vec![a, b]),
+        ]
+    );
+}
+
+#[test]
+fn a_lead_gets_its_own_workspace_and_its_peers_follow() {
+    let fx = Fx::new("placelead");
+    fx.project("alpha");
+    let s = lead(&fx, &["alpha"]).unwrap();
+    let repo = fx.repo.to_string_lossy().to_string();
+    fx.worker(Some("alpha-lead"), &["tieude-a", "tieude", &repo])
+        .unwrap();
+    assert_eq!(
+        fx.herdr.layout(),
+        vec![
+            ("alpha".into(), "alpha-lead".into(), vec![s.pane.clone()]),
+            (
+                "alpha".into(),
+                "alpha-workers".into(),
+                vec![pane_of(&fx, "tieude-a")]
+            ),
+            ("main".into(), "home".into(), vec![fx.anchor.clone()]),
+        ]
+    );
 }

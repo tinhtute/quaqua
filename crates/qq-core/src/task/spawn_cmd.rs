@@ -326,6 +326,33 @@ fn report_tokens(ctx: &Ctx, pane: &str, tokens: &[(&str, &str)]) -> R<()> {
     }
 }
 
+/// Moves a fresh `pane` into the layout its tokens ask for and returns its id
+/// afterwards. The tokens must already be on the pane. A fresh pane has no
+/// agent to disturb, so `fresh` ignores the deferred statuses.
+fn place_pane(ctx: &Ctx, pane: &str, fresh: bool) -> R<String> {
+    let deferred = if fresh {
+        Vec::new()
+    } else {
+        crate::grid::arrange::deferred_statuses(ctx.conn)
+    };
+    let only = crate::grid::arrange::Only {
+        panes: Some(vec![pane.to_string()]),
+        tab: None,
+    };
+    let farm = crate::grid::farm_id(&ctx.runs_dir);
+    let placed = crate::grid::arrange::arrange(
+        &crate::grid::HerdrPanes(ctx.herdr),
+        farm.as_deref(),
+        &only,
+        &deferred,
+    )
+    .map_err(|e| fail(format!("herdr could not place the pane: {e}")))?;
+    Ok(placed
+        .moved
+        .last()
+        .map_or_else(|| pane.to_string(), |(_, now)| now.clone()))
+}
+
 fn open_agent(conn: &Connection, name: &str) -> R<Option<i64>> {
     conn.query_row(
         "SELECT id FROM agent WHERE name = ?1 AND ended_ms IS NULL",
@@ -545,10 +572,27 @@ pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
         side("review", "1\n".into())?;
     }
 
-    let pane = match existing_pane(ctx.herdr, name) {
-        Some(x) => x,
-        None => new_pane(ctx, &wt)?,
+    let (pane, fresh) = match existing_pane(ctx.herdr, name) {
+        Some(x) => (x, false),
+        None => (new_pane(ctx, &wt)?, true),
     };
+    // Tokens first, then the move, then the agent: nothing runs in the pane
+    // while it changes tab or workspace, and the id the agent starts on is the
+    // one herdr holds afterwards.
+    let group = base_name(repo);
+    let tab = format!("{}-workers", p.slug);
+    report_tokens(
+        ctx,
+        &pane,
+        &[
+            ("grid_role", "worker"),
+            ("grid_group", &group),
+            ("grid_owner", p.owner),
+            ("grid_tab", &tab),
+            ("grid_ready", "1"),
+        ],
+    )?;
+    let pane = place_pane(ctx, &pane, fresh)?;
     spawn(
         ctx.conn,
         ctx.herdr,
@@ -564,19 +608,6 @@ pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
         ctx.now_ms,
     )
     .map_err(|e| fail(e.to_string()))?;
-    let group = base_name(repo);
-    let tab = format!("{}-workers", p.slug);
-    report_tokens(
-        ctx,
-        &pane,
-        &[
-            ("grid_role", "worker"),
-            ("grid_group", &group),
-            ("grid_owner", p.owner),
-            ("grid_tab", &tab),
-            ("grid_ready", "1"),
-        ],
-    )?;
     Ok(WorkerSpawned {
         name: name.to_string(),
         kind: p.kind.to_string(),
@@ -628,9 +659,11 @@ fn project_for(
             format!("{base}-{n}")
         };
         let taken: Option<Option<String>> = conn
-            .query_row("SELECT repo_path FROM project WHERE slug = ?1", [&slug], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT repo_path FROM project WHERE slug = ?1",
+                [&slug],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db)?;
         match taken {
@@ -865,10 +898,23 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
             params![integ, pid],
         )
         .map_err(db)?;
-    let pane = match existing_pane(ctx.herdr, &name) {
-        Some(p) => p,
-        None => new_pane(ctx, &wt)?,
+    let (pane, fresh) = match existing_pane(ctx.herdr, &name) {
+        Some(p) => (p, false),
+        None => (new_pane(ctx, &wt)?, true),
     };
+    // The Lead gets its own workspace `<slug>` (its grid_group) before it starts.
+    report_tokens(
+        ctx,
+        &pane,
+        &[
+            ("grid_role", "lead"),
+            ("grid_group", slug),
+            ("grid_owner", "cos"),
+            ("grid_tab", &format!("{slug}-lead")),
+            ("grid_ready", "1"),
+        ],
+    )?;
+    let pane = place_pane(ctx, &pane, fresh)?;
     spawn(
         ctx.conn,
         ctx.herdr,
@@ -884,17 +930,6 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
         ctx.now_ms,
     )
     .map_err(|e| fail(e.to_string()))?;
-    report_tokens(
-        ctx,
-        &pane,
-        &[
-            ("grid_role", "lead"),
-            ("grid_group", slug),
-            ("grid_owner", "cos"),
-            ("grid_tab", &format!("{slug}-lead")),
-            ("grid_ready", "1"),
-        ],
-    )?;
     let prompt = |text: &str| -> R<()> {
         match crate::herdr::prompt_landed(ctx.herdr, &name, text).0 {
             crate::herdr::Landing::Landed => Ok(()),
@@ -993,11 +1028,7 @@ fn live_with<T>(
 /// in a pane with no agent, is refused: never taken for the CoS. A `QQ_AGENT`
 /// claim must match that pane's agent (`cos` for the CoS); it never names a
 /// process the pane does not, so a mismatch is refused.
-fn caller_of(
-    herdr: &Arc<dyn HerdrClient>,
-    pid: i32,
-    claim: Option<&str>,
-) -> R<Option<String>> {
+fn caller_of(herdr: &Arc<dyn HerdrClient>, pid: i32, claim: Option<&str>) -> R<Option<String>> {
     use crate::identity::peer::{HerdrPeers, PeerCred, PeerResolver};
     // The resolver keys on the pid; the uid is not part of the decision.
     let who = HerdrPeers::new(Arc::clone(herdr))

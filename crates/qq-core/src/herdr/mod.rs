@@ -80,6 +80,8 @@ pub enum Verb {
     PaneReportMetadata,
     PaneRead,
     PaneProcessInfo,
+    PaneMove,
+    WorkspaceList,
 }
 
 use std::io;
@@ -193,6 +195,14 @@ pub trait HerdrClient: Send + Sync {
     fn pane_get(&self, _pane: &str) -> io::Result<Reply> {
         Err(unsupported("pane get"))
     }
+    /// `herdr pane move PANE <target> --no-focus`. Default `Unsupported`.
+    fn pane_move(&self, _pane: &str, _to: &MoveTo) -> io::Result<Reply> {
+        Err(unsupported("pane move"))
+    }
+    /// `herdr workspace list`: `{"result":{"workspaces":[{workspace_id,label,...}]}}`.
+    fn workspace_list(&self) -> io::Result<Reply> {
+        Err(unsupported("workspace list"))
+    }
     /// `herdr pane report-metadata PANE --source SOURCE [--token K=V]...
     /// [--display-agent TEXT]`. herdr merges tokens, so a repeat converges.
     fn pane_report_metadata(
@@ -215,6 +225,24 @@ pub trait HerdrClient: Send + Sync {
     fn pane_process_info(&self, _pane: &str) -> io::Result<Reply> {
         Err(unsupported("pane process-info"))
     }
+}
+
+/// Where `pane move` puts a pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveTo {
+    /// A new tab labelled `label`, in `workspace` (the pane's own when `None`).
+    NewTab {
+        workspace: Option<String>,
+        label: String,
+    },
+    /// A new workspace `label` whose first tab is `tab_label`.
+    NewWorkspace { label: String, tab_label: String },
+    /// Beside `anchor` in the existing tab `tab`.
+    Split {
+        tab: String,
+        anchor: String,
+        dir: String,
+    },
 }
 
 fn unsupported(what: &str) -> io::Error {
@@ -410,6 +438,37 @@ impl HerdrClient for CliHerdr {
             "--lines",
             &lines.to_string(),
         ]))
+    }
+
+    fn pane_move(&self, pane: &str, to: &MoveTo) -> io::Result<Reply> {
+        let mut args = argv(&["pane", "move", pane]);
+        let mut add = |parts: &[&str]| args.extend(parts.iter().map(|p| p.to_string()));
+        match to {
+            MoveTo::NewTab { workspace, label } => {
+                if let Some(w) = workspace {
+                    add(&["--workspace", w]);
+                }
+                add(&["--new-tab", "--label", label]);
+            }
+            MoveTo::NewWorkspace { label, tab_label } => {
+                add(&[
+                    "--new-workspace",
+                    "--label",
+                    label,
+                    "--tab-label",
+                    tab_label,
+                ]);
+            }
+            MoveTo::Split { tab, anchor, dir } => {
+                add(&["--tab", tab, "--split", dir, "--target-pane", anchor]);
+            }
+        }
+        args.push("--no-focus".into());
+        self.run(&args)
+    }
+
+    fn workspace_list(&self) -> io::Result<Reply> {
+        self.run(&argv(&["workspace", "list"]))
     }
 
     fn pane_report_metadata(
