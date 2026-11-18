@@ -3,7 +3,7 @@
 //! [`FakeHerdr::script_status`], per-verb [`FakeHerdr::set_reply`] /
 //! [`FakeHerdr::set_fault`], and read effects back with [`FakeHerdr::prompts`].
 
-use super::{HerdrClient, Reply, Verb, NAME_CLASH, PANE_BUSY};
+use super::{HerdrClient, MoveTo, Reply, Verb, NAME_CLASH, PANE_BUSY};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::{Mutex, MutexGuard};
@@ -60,6 +60,82 @@ struct State {
     /// pane id -> texts `pane_read` returns one per read; the last one sticks.
     text_script: BTreeMap<String, VecDeque<String>>,
     next_id: u32,
+    /// workspace id -> label (`w1` = `main` exists implicitly).
+    workspaces: BTreeMap<String, String>,
+    /// tab id -> workspace id (absent = `w1`).
+    tab_ws: BTreeMap<String, String>,
+    /// Pane ids in the order they arrived in the fake: `pane list` order.
+    order: Vec<String>,
+    /// pane id -> status `pane list` shows for a seeded pane.
+    seeded_status: BTreeMap<String, String>,
+    /// Every `pane_move`, in order.
+    moves: Vec<(String, MoveTo)>,
+    /// A pane that crosses workspaces gets a new id, as herdr may give it.
+    renumber: bool,
+}
+
+impl State {
+    fn ws_of(&self, tab: &str) -> String {
+        self.tab_ws.get(tab).cloned().unwrap_or_else(|| "w1".into())
+    }
+
+    fn ws_label(&self, id: &str) -> String {
+        match self.workspaces.get(id) {
+            Some(l) => l.clone(),
+            None if id == "w1" => "main".into(),
+            None => id.to_string(),
+        }
+    }
+
+    /// The id of the workspace labelled `label`, created when missing.
+    fn workspace_named(&mut self, label: &str) -> String {
+        if label == "main" && !self.workspaces.values().any(|l| l == "main") {
+            self.workspaces.insert("w1".into(), "main".into());
+        }
+        if let Some((id, _)) = self.workspaces.iter().find(|(_, l)| l.as_str() == label) {
+            return id.clone();
+        }
+        self.next_id += 1;
+        let id = format!("w{}", self.next_id);
+        self.workspaces.insert(id.clone(), label.to_string());
+        id
+    }
+
+    fn new_tab(&mut self, ws: &str, label: &str) -> String {
+        self.next_id += 1;
+        let tab = format!("t{}", self.next_id);
+        self.tabs.insert(tab.clone(), label.to_string());
+        self.tab_ws.insert(tab.clone(), ws.to_string());
+        tab
+    }
+
+    /// Re-keys every per-pane map from `old` to `new`.
+    fn renumber_pane(&mut self, old: &str, new: &str) {
+        fn rekey<V>(m: &mut BTreeMap<String, V>, old: &str, new: &str) {
+            if let Some(v) = m.remove(old) {
+                m.insert(new.to_string(), v);
+            }
+        }
+        rekey(&mut self.panes, old, new);
+        rekey(&mut self.text, old, new);
+        rekey(&mut self.agents, old, new);
+        rekey(&mut self.foreign, old, new);
+        rekey(&mut self.meta, old, new);
+        rekey(&mut self.pids, old, new);
+        rekey(&mut self.seeded_status, old, new);
+        rekey(&mut self.text_script, old, new);
+        for p in self.order.iter_mut().filter(|p| *p == old) {
+            *p = new.to_string();
+        }
+    }
+
+    /// herdr closes a tab whose last pane left.
+    fn drop_if_empty(&mut self, tab: &str) {
+        if !self.panes.values().any(|t| t == tab) {
+            self.tabs.remove(tab);
+            self.tab_ws.remove(tab);
+        }
+    }
 }
 
 /// How a prompt is lost: [`FakeHerdr::lose_prompts`].
@@ -126,19 +202,38 @@ impl FakeHerdr {
         harness: Option<&str>,
         tokens: &[(&str, &str)],
     ) -> String {
+        self.seed_pane_in("main", tab_label, harness, tokens)
+    }
+
+    /// [`FakeHerdr::seed_pane`] in the workspace labelled `ws_label` (created
+    /// when missing; `main` is the default workspace `w1`).
+    pub fn seed_pane_in(
+        &self,
+        ws_label: &str,
+        tab_label: &str,
+        harness: Option<&str>,
+        tokens: &[(&str, &str)],
+    ) -> String {
         let mut st = self.lock();
-        let tab = match st.tabs.iter().find(|(_, l)| l.as_str() == tab_label) {
+        let ws = st.workspace_named(ws_label);
+        let tab = match st
+            .tabs
+            .iter()
+            .find(|(t, l)| l.as_str() == tab_label && st.ws_of(t) == ws)
+        {
             Some((t, _)) => t.clone(),
             None => {
                 st.next_id += 1;
                 let t = format!("t{}", st.next_id);
                 st.tabs.insert(t.clone(), tab_label.to_string());
+                st.tab_ws.insert(t.clone(), ws);
                 t
             }
         };
         st.next_id += 1;
         let id = format!("p{}", st.next_id);
         st.panes.insert(id.clone(), tab);
+        st.order.push(id.clone());
         if let Some(h) = harness {
             st.foreign.insert(id.clone(), h.to_string());
         }
@@ -147,6 +242,44 @@ impl FakeHerdr {
             m.0.insert((*k).into(), (*v).into());
         }
         id
+    }
+
+    /// Test control: the status `pane list` shows for a seeded pane.
+    pub fn seed_status(&self, pane: &str, status: &str) {
+        self.lock()
+            .seeded_status
+            .insert(pane.to_string(), status.to_string());
+    }
+
+    /// The layout as `(workspace label, tab label, pane ids in order)`, sorted by label.
+    pub fn layout(&self) -> Vec<(String, String, Vec<String>)> {
+        let st = self.lock();
+        let mut out: Vec<(String, String, Vec<String>)> = st
+            .tabs
+            .iter()
+            .map(|(t, label)| {
+                let panes = st
+                    .order
+                    .iter()
+                    .filter(|p| st.panes.get(*p) == Some(t))
+                    .cloned()
+                    .collect();
+                (st.ws_label(&st.ws_of(t)), label.clone(), panes)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Test control: a pane that moves to another workspace gets a new id,
+    /// tokens and status carried over (herdr may do this).
+    pub fn renumber_cross_workspace(&self, on: bool) {
+        self.lock().renumber = on;
+    }
+
+    /// Every `pane_move` the fake served: `(pane, destination)`.
+    pub fn moves(&self) -> Vec<(String, MoveTo)> {
+        self.lock().moves.clone()
     }
 
     /// The tokens `pane list` shows for `pane`.
@@ -448,6 +581,7 @@ impl HerdrClient for FakeHerdr {
         st.next_id += 1;
         let id = format!("p{}", st.next_id);
         st.panes.insert(id.clone(), tab.clone());
+        st.order.push(id.clone());
         Ok(Reply::ok(format!(
             r#"{{"result":{{"pane":{{"pane_id":"{id}","tab_id":"{tab}"}}}}}}"#
         )))
@@ -483,19 +617,23 @@ impl HerdrClient for FakeHerdr {
     fn pane_list(&self) -> io::Result<Reply> {
         let st = enter!(self, Verb::PaneList);
         let items: Vec<serde_json::Value> = st
-            .panes
+            .order
             .iter()
+            .filter_map(|id| Some((id, st.panes.get(id)?)))
             .map(|(id, tab)| {
                 let own = st.agents.values().find(|a| &a.pane == id);
                 let harness = own
                     .map(|a| a.kind.clone())
                     .or_else(|| st.foreign.get(id).cloned());
-                let status = own.map_or("unknown", |a| a.status.as_str());
+                let status = own.map_or_else(
+                    || st.seeded_status.get(id).map_or("unknown", String::as_str),
+                    |a| a.status.as_str(),
+                );
                 let (tokens, display) = st.meta.get(id).cloned().unwrap_or_default();
                 serde_json::json!({
                     "pane_id": id,
                     "tab_id": tab,
-                    "workspace_id": "w1",
+                    "workspace_id": st.ws_of(tab),
                     "cwd": "/work",
                     "agent": harness,
                     "agent_status": status,
@@ -522,7 +660,7 @@ impl HerdrClient for FakeHerdr {
                     "label": label,
                     "number": i + 1,
                     "pane_count": st.panes.values().filter(|t| *t == id).count(),
-                    "workspace_id": "w1",
+                    "workspace_id": st.ws_of(id),
                     "agent_status": "unknown",
                     "focused": false,
                 })
@@ -541,6 +679,7 @@ impl HerdrClient for FakeHerdr {
         let pane = format!("p{}", st.next_id);
         st.tabs.insert(tab.clone(), name.to_string());
         st.panes.insert(pane.clone(), tab.clone());
+        st.order.push(pane.clone());
         Ok(Reply::ok(format!(
             r#"{{"result":{{"tab":{{"tab_id":"{tab}","label":{}}},"root_pane":{{"pane_id":"{pane}","tab_id":"{tab}"}}}}}}"#,
             serde_json::json!(name)
@@ -614,6 +753,66 @@ impl HerdrClient for FakeHerdr {
                 "pane_id": pane, "tab_id": tab, "tokens": tokens, "display_agent": display,
             }}})
             .to_string(),
+        ))
+    }
+
+    fn pane_move(&self, pane: &str, to: &MoveTo) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::PaneMove);
+        let Some(from) = st.panes.get(pane).cloned() else {
+            return Ok(Reply::err("pane_not_found"));
+        };
+        st.moves.push((pane.to_string(), to.clone()));
+        let dest = match to {
+            MoveTo::NewTab { workspace, label } => {
+                let ws = workspace.clone().unwrap_or_else(|| st.ws_of(&from));
+                st.new_tab(&ws, label)
+            }
+            MoveTo::NewWorkspace { label, tab_label } => {
+                st.next_id += 1;
+                let ws = format!("w{}", st.next_id);
+                st.workspaces.insert(ws.clone(), label.clone());
+                st.new_tab(&ws, tab_label)
+            }
+            MoveTo::Split { tab, anchor, .. } => {
+                if st.panes.get(anchor) != Some(tab) {
+                    return Ok(Reply::err("pane_not_found"));
+                }
+                tab.clone()
+            }
+        };
+        if dest == from {
+            return Ok(Reply::ok(
+                r#"{"result":{"move_result":{"changed":false,"reason":"same_tab"}}}"#,
+            ));
+        }
+        let crossed = st.ws_of(&from) != st.ws_of(&dest);
+        st.panes.insert(pane.to_string(), dest.clone());
+        st.order.retain(|p| p != pane);
+        st.order.push(pane.to_string());
+        let mut now = pane.to_string();
+        if st.renumber && crossed {
+            st.next_id += 1;
+            now = format!("p{}", st.next_id);
+            st.renumber_pane(pane, &now);
+        }
+        st.drop_if_empty(&from);
+        Ok(Reply::ok(format!(
+            r#"{{"result":{{"move_result":{{"changed":true,"previous_pane_id":"{pane}","pane":{{"pane_id":"{now}","tab_id":"{dest}"}}}}}}}}"#
+        )))
+    }
+
+    fn workspace_list(&self) -> io::Result<Reply> {
+        let mut st = enter!(self, Verb::WorkspaceList);
+        st.workspaces
+            .entry("w1".into())
+            .or_insert_with(|| "main".into());
+        let items: Vec<serde_json::Value> = st
+            .workspaces
+            .iter()
+            .map(|(id, label)| serde_json::json!({"workspace_id": id, "label": label}))
+            .collect();
+        Ok(Reply::ok(
+            serde_json::json!({"result": {"workspaces": items}}).to_string(),
         ))
     }
 

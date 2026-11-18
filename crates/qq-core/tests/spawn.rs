@@ -1089,13 +1089,19 @@ model = "k2"
 effort = "high"
 "#,
     );
-    assert_eq!(fx.spawn(&[], "kimik-one", "kimik").as_deref(), Ok("kimik-one"));
+    assert_eq!(
+        fx.spawn(&[], "kimik-one", "kimik").as_deref(),
+        Ok("kimik-one")
+    );
     assert_eq!(
         fx.herdr.start_args("kimik-one"),
         ["--model", "k2", "--effort", "high", "--yolo"]
     );
     let list = fx.herdr.agent_list().unwrap().body;
-    assert!(list.contains(r#""kimi""#) && !list.contains("moonshot"), "{list}");
+    assert!(
+        list.contains(r#""kimi""#) && !list.contains("moonshot"),
+        "{list}"
+    );
 
     // the stored row carries everything; stop keys and error shape read from it
     let h = config::harness(&fx.conn, "moonshot").unwrap().unwrap();
@@ -1106,8 +1112,158 @@ effort = "high"
 
     // a kind with no effort drops the effort element and its flag
     fx.conn
-        .execute("INSERT INTO kind (name, harness, model) VALUES ('kimin', 'moonshot', 'k3')", [])
+        .execute(
+            "INSERT INTO kind (name, harness, model) VALUES ('kimin', 'moonshot', 'k3')",
+            [],
+        )
         .unwrap();
     fx.spawn(&[], "kimin-two", "kimin").unwrap();
-    assert_eq!(fx.herdr.start_args("kimin-two"), ["--model", "k3", "--yolo"]);
+    assert_eq!(
+        fx.herdr.start_args("kimin-two"),
+        ["--model", "k3", "--yolo"]
+    );
+}
+
+// ---- grid placement -------------------------------------------------------------------
+
+fn pane_of(fx: &Fx, name: &str) -> String {
+    fx.conn
+        .query_row("SELECT pane_id FROM agent WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_cos_worker_spawn_lands_in_the_workers_tab_not_the_cos_tab() {
+    let fx = Fx::new("placecos");
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    fx.spawn(&[], "tieude-b", "tieude").unwrap();
+    let (a, b) = (pane_of(&fx, "tieude-a"), pane_of(&fx, "tieude-b"));
+    assert_eq!(
+        fx.herdr.layout(),
+        vec![
+            ("main".into(), "home".into(), vec![fx.anchor.clone()]),
+            ("main".into(), "repo-workers".into(), vec![a, b]),
+        ]
+    );
+}
+
+#[test]
+fn a_lead_gets_its_own_workspace_and_its_peers_follow() {
+    let fx = Fx::new("placelead");
+    fx.project("alpha");
+    let s = lead(&fx, &["alpha"]).unwrap();
+    let repo = fx.repo.to_string_lossy().to_string();
+    fx.worker(Some("alpha-lead"), &["tieude-a", "tieude", &repo])
+        .unwrap();
+    assert_eq!(
+        fx.herdr.layout(),
+        vec![
+            ("alpha".into(), "alpha-lead".into(), vec![s.pane.clone()]),
+            (
+                "alpha".into(),
+                "alpha-workers".into(),
+                vec![pane_of(&fx, "tieude-a")]
+            ),
+            ("main".into(), "home".into(), vec![fx.anchor.clone()]),
+        ]
+    );
+}
+
+/// Every open agent's recorded pane is a pane herdr lists.
+fn recorded_panes_are_live(fx: &Fx) {
+    let live: Vec<String> = fx
+        .herdr
+        .layout()
+        .into_iter()
+        .flat_map(|(_, _, p)| p)
+        .collect();
+    let mut st = fx
+        .conn
+        .prepare("SELECT name, pane_id FROM agent WHERE ended_ms IS NULL AND pane_id != ''")
+        .unwrap();
+    let rows: Vec<(String, String)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(!rows.is_empty());
+    for (name, pane) in rows {
+        assert!(
+            live.contains(&pane),
+            "{name} records dead pane {pane}: {live:?}"
+        );
+    }
+}
+
+#[test]
+fn spawn_records_the_new_pane_id_when_herdr_renumbers_a_cross_workspace_move() {
+    let fx = Fx::new("renumber");
+    fx.herdr.renumber_cross_workspace(true);
+    fx.project("alpha");
+    let s = lead(&fx, &["alpha"]).unwrap();
+    assert_eq!(s.pane, pane_of(&fx, "alpha-lead"));
+    let repo = fx.repo.to_string_lossy().to_string();
+    fx.worker(Some("alpha-lead"), &["tieude-a", "tieude", &repo])
+        .unwrap();
+    recorded_panes_are_live(&fx);
+}
+
+#[test]
+fn reconcile_keeps_recorded_pane_ids_live_after_a_renumbering_move() {
+    use qq_core::grid::{arrange_filtered, Filter, HerdrPanes, Scope};
+    let fx = Fx::new("renumber-reconcile");
+    fx.project("alpha");
+    lead(&fx, &["alpha"]).unwrap();
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    let before = pane_of(&fx, "tieude-a");
+    // the worker now belongs to the Lead: reconcile moves it across workspaces
+    fx.herdr
+        .pane_report_metadata(&before, "quaqua", &[("grid_owner", "alpha-lead")], None)
+        .unwrap();
+    fx.herdr.renumber_cross_workspace(true);
+    let done = arrange_filtered(
+        &HerdrPanes(&fx.herdr),
+        &fx.conn,
+        &Scope::default(),
+        &Filter::default(),
+    )
+    .unwrap();
+    assert!(done.unplaced.is_empty(), "{done:?}");
+    let after = pane_of(&fx, "tieude-a");
+    assert_ne!(before, after, "{done:?}");
+    recorded_panes_are_live(&fx);
+}
+
+#[test]
+fn a_move_that_changes_nothing_fails_the_spawn_instead_of_leaving_the_pane() {
+    let fx = Fx::new("noop-move");
+    fx.herdr.set_reply(
+        Verb::PaneMove,
+        Reply::ok(r#"{"result":{"move_result":{"changed":false,"reason":"same_tab"}}}"#),
+    );
+    let err = fx.spawn(&[], "tieude-a", "tieude").unwrap_err();
+    assert!(err.contains("could not place"), "{err}");
+}
+
+#[test]
+fn a_same_workspace_move_names_no_workspace() {
+    use qq_core::herdr::MoveTo;
+    let fx = Fx::new("same-ws-argv");
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    let moves = fx.herdr.moves();
+    assert!(
+        matches!(
+            &moves[..],
+            [(
+                _,
+                MoveTo::NewTab {
+                    workspace: None,
+                    ..
+                }
+            )]
+        ),
+        "{moves:?}"
+    );
 }

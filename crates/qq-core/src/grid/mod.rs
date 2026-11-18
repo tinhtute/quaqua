@@ -5,6 +5,7 @@
 //! and a claim is a `grid_role=worker` token, so two placements never share a
 //! pane. Reconcile and cleanup close only a pane recorded in `agent.pane_id`.
 
+pub mod arrange;
 pub mod lock;
 
 /// Workers a tab holds before the next one opens a new tab.
@@ -56,6 +57,16 @@ pub struct Pane {
     pub role: Option<String>,
     pub owner: Option<String>,
     pub farm: Option<String>,
+    pub tab_id: String,
+    /// Label of the pane's workspace, from `workspace list` (its id when unlisted).
+    pub workspace: String,
+    pub workspace_id: String,
+    /// herdr's `agent_status` (`working`, `idle`...).
+    pub status: Option<String>,
+    /// Token `grid_tab`: the tab the pane belongs in.
+    pub grid_tab: Option<String>,
+    /// Token `grid_group`: the project slug (the Lead's workspace label).
+    pub group: Option<String>,
 }
 
 impl Pane {
@@ -141,6 +152,18 @@ pub trait PaneOps {
     fn close_pane(&self, id: &str) -> std::io::Result<()>;
     /// Marks `pane` as a worker pane of `scope`.
     fn claim(&self, pane: &str, scope: &Scope) -> std::io::Result<()>;
+    /// Moves `pane` and returns its id afterwards (herdr may change it across
+    /// workspaces). Default `Unsupported`, like the herdr client's.
+    fn move_pane(
+        &self,
+        _pane: &str,
+        _to: &crate::herdr::MoveTo,
+    ) -> std::io::Result<Option<String>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pane move not supported by this client",
+        ))
+    }
 }
 
 /// Occupancy of `repo`'s worker tabs, from the live panes.
@@ -156,12 +179,13 @@ pub fn occupancy(repo: &str, panes: &[Pane]) -> Vec<usize> {
 }
 
 /// Where the n-th pane (0-based) of a tab is cut, as `(anchor index, dir)`:
-/// the 2x2 layout: right of the first, below the first, below the second.
+/// 2 = right of the first, 3 = below the second (`A | B/C`), 4 = below the
+/// first (`A B / D C`).
 pub fn cut(n: usize) -> (usize, Dir) {
     match n {
         1 => (0, Dir::Right),
-        2 => (0, Dir::Down),
-        _ => (1, Dir::Down),
+        2 => (1, Dir::Down),
+        _ => (0, Dir::Down),
     }
 }
 
@@ -309,6 +333,49 @@ pub fn reconcile_filtered(
     Ok(plan)
 }
 
+/// The move step of `grid reconcile`: [`arrange::arrange`] over the farm's
+/// panes, narrowed by `filter` (`--only` names resolve through the database).
+pub fn arrange_filtered(
+    ops: &dyn PaneOps,
+    conn: &rusqlite::Connection,
+    scope: &Scope,
+    filter: &Filter,
+) -> Result<arrange::Arranged, String> {
+    let panes = if filter.only.is_empty() {
+        None
+    } else {
+        Some(
+            recorded_panes(conn)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|r| filter.only.contains(&r.name))
+                .map(|r| r.pane)
+                .collect(),
+        )
+    };
+    let only = arrange::Only {
+        panes,
+        tab: filter.tab.clone(),
+    };
+    let done = arrange::arrange(
+        ops,
+        scope.farm.as_deref(),
+        &only,
+        &arrange::deferred_statuses(conn),
+    )
+    .map_err(|e| e.to_string())?;
+    // herdr may give a pane a new id when it crosses workspaces: keep the
+    // recorded id live, or reconcile and cleanup could no longer close it.
+    for (old, new) in done.moved.iter().filter(|(o, n)| o != n) {
+        conn.execute(
+            "UPDATE agent SET pane_id = ?2 WHERE pane_id = ?1 AND ended_ms IS NULL",
+            [old, new],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(done)
+}
+
 /// [`PaneOps`] over any [`HerdrClient`]: the one adapter from herdr replies.
 pub struct HerdrPanes<'a>(pub &'a dyn crate::herdr::HerdrClient);
 
@@ -326,6 +393,7 @@ fn text<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
 fn pane_from(
     p: &serde_json::Value,
     labels: &std::collections::HashMap<String, String>,
+    workspaces: &std::collections::HashMap<String, String>,
 ) -> Option<Pane> {
     let tokens = p.get("tokens");
     let token = |k: &str| tokens.and_then(|t| text(t, k)).map(String::from);
@@ -339,6 +407,15 @@ fn pane_from(
         role: token("grid_role"),
         owner: token("grid_owner"),
         farm: token("grid_farm"),
+        tab_id: text(p, "tab_id").unwrap_or_default().to_string(),
+        workspace: text(p, "workspace_id")
+            .map(|w| workspaces.get(w).map_or(w, String::as_str))
+            .unwrap_or_default()
+            .to_string(),
+        workspace_id: text(p, "workspace_id").unwrap_or_default().to_string(),
+        status: text(p, "agent_status").map(String::from),
+        grid_tab: token("grid_tab"),
+        group: token("grid_group"),
     })
 }
 
@@ -360,6 +437,30 @@ impl HerdrPanes<'_> {
             .collect())
     }
 
+    /// Workspace id -> label; a client without `workspace list` gives none and
+    /// a pane's workspace is then named by its id.
+    fn workspace_labels(&self) -> std::collections::HashMap<String, String> {
+        let Ok(r) = self.0.workspace_list() else {
+            return Default::default();
+        };
+        let Ok(v) = reply_json(r) else {
+            return Default::default();
+        };
+        v.pointer("/result/workspaces")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| {
+                        Some((
+                            text(w, "workspace_id")?.to_string(),
+                            text(w, "label")?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn find(&self, id: &str) -> std::io::Result<Option<Pane>> {
         Ok(self.panes()?.into_iter().find(|p| p.id == id))
     }
@@ -368,12 +469,16 @@ impl HerdrPanes<'_> {
 impl PaneOps for HerdrPanes<'_> {
     fn panes(&self) -> std::io::Result<Vec<Pane>> {
         let labels = self.tab_labels()?;
+        let workspaces = self.workspace_labels();
         let v = reply_json(self.0.pane_list()?)?;
         let list = v
             .pointer("/result/panes")
             .and_then(|x| x.as_array())
             .ok_or_else(|| std::io::Error::other("reply has no panes"))?;
-        Ok(list.iter().filter_map(|p| pane_from(p, &labels)).collect())
+        Ok(list
+            .iter()
+            .filter_map(|p| pane_from(p, &labels, &workspaces))
+            .collect())
     }
 
     /// `tab create` returns the new tab; its first pane is `/result/root_pane`
@@ -424,6 +529,20 @@ impl PaneOps for HerdrPanes<'_> {
 
     fn close_pane(&self, id: &str) -> std::io::Result<()> {
         reply_json(self.0.pane_close(id)?).map(|_| ())
+    }
+
+    fn move_pane(&self, pane: &str, to: &crate::herdr::MoveTo) -> std::io::Result<Option<String>> {
+        let v = reply_json(self.0.pane_move(pane, to)?)?;
+        let res = v.pointer("/result/move_result");
+        if res.and_then(|r| r.get("changed")).and_then(|c| c.as_bool()) == Some(false) {
+            return Ok(None);
+        }
+        Ok(Some(
+            res.and_then(|r| r.pointer("/pane/pane_id"))
+                .and_then(|x| x.as_str())
+                .unwrap_or(pane)
+                .to_string(),
+        ))
     }
 
     fn claim(&self, pane: &str, scope: &Scope) -> std::io::Result<()> {
@@ -525,8 +644,22 @@ fn register_reconcile(d: &mut crate::daemon::Daemon) -> Result<(), String> {
                 &filter,
             )
             .map_err(|e| RpcError::new("refused", e))?;
+            let arranged = arrange_filtered(
+                &HerdrPanes(herdr.as_ref()),
+                &conn,
+                &Scope::from_runs_dir(&runs),
+                &filter,
+            )
+            .map_err(|e| RpcError::new("refused", e))?;
             let closed: Vec<&str> = ops.iter().map(|Op::Close(id)| id.as_str()).collect();
-            Ok(serde_json::json!({ "closed": closed.len(), "panes": closed }))
+            let moved: Vec<&str> = arranged.moved.iter().map(|(_, n)| n.as_str()).collect();
+            Ok(serde_json::json!({
+                "closed": closed.len(),
+                "panes": closed,
+                "moved": moved,
+                "deferred": arranged.deferred,
+                "unplaced": arranged.unplaced,
+            }))
         }),
     )
 }

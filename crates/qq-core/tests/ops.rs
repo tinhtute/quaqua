@@ -692,8 +692,8 @@ fn placement_splits_a_two_by_two() {
         herdr.splits(),
         vec![
             (ids[0].clone(), "right".to_string()),
-            (ids[0].clone(), "down".to_string()),
             (ids[1].clone(), "down".to_string()),
+            (ids[0].clone(), "down".to_string()),
         ]
     );
 }
@@ -886,7 +886,10 @@ fn provider_error_classifier_table() {
         r(opencode, "Error: 429 rate limit exceeded"),
         retry("rate-limit")
     );
-    assert_eq!(r(opencode, "Error: 401 invalid api key"), fatal("signed-out"));
+    assert_eq!(
+        r(opencode, "Error: 401 invalid api key"),
+        fatal("signed-out")
+    );
     assert_eq!(r(opencode, "Error: 402 payment required"), fatal("billing"));
     assert_eq!(r(pi, "Error: 503: service unavailable"), retry("5xx"));
     assert_eq!(
@@ -910,7 +913,10 @@ fn provider_error_classifier_table() {
     assert_eq!(r(claude, "I fixed the API error handling"), None);
     // fatal beats an earlier retryable one; only the last 15 lines count
     assert_eq!(
-        r(opencode, "Error: 529 overloaded\nError: 401 invalid api key"),
+        r(
+            opencode,
+            "Error: 529 overloaded\nError: 401 invalid api key"
+        ),
         fatal("signed-out")
     );
     let old = format!("Error: 529 overloaded\n{}", "ok\n".repeat(15));
