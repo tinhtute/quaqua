@@ -56,3 +56,38 @@ fn verdict_line_shape_parse_verdict_reads_is_accepted() {
 fn prose_only_report_is_malformed() {
     assert!(!report_well_formed("I looked at it and it seems fine.\n"));
 }
+
+// The two real reports predate the ask and carry no machine field: still rejected.
+#[test]
+fn real_unstructured_reports_are_rejected() {
+    for r in [
+        include_str!("fixtures/real-reports/sude-dropomp.md"),
+        include_str!("fixtures/real-reports/sude-harnessdyn.md"),
+    ] {
+        assert!(!report_well_formed(r));
+    }
+}
+
+// The injected worker instruction names the fields the gate needs, and a
+// report written to it passes the gate.
+#[test]
+fn injected_ask_names_the_gate_fields_and_its_report_is_accepted() {
+    let body = qq_core::task::prompt::compose_prompt_body("w1", "do X");
+    assert!(body.starts_with("do X. "));
+    assert!(body.contains("runs/w1.md"));
+    assert!(body.contains("\nOutcome: "), "ask lacks the Outcome field");
+    assert!(body.contains("\n## Lessons\n"), "ask lacks the Lessons heading");
+    // fill the skeleton as a worker would: keep each line, drop the hints
+    let skeleton = body.split_once("\nOutcome: ").map(|(_, r)| format!("Outcome: {r}")).unwrap();
+    let report: String = skeleton
+        .lines()
+        .map(|l| match l.split_once("   (") {
+            Some((keep, _)) => keep.to_string(),
+            None => l.to_string(),
+        })
+        .map(|l| l.replace("COMPLETE | NO_CHANGES | BLOCKED", "COMPLETE"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(report.starts_with("Outcome: COMPLETE"));
+    assert!(report_well_formed(&report), "{report}");
+}

@@ -28,6 +28,26 @@ pub(crate) fn verdict_ask() -> String {
     )
 }
 
+/// The report skeleton a worker brief asks for. Rendered from the fields the
+/// gate (`well_formed`) checks, so the ask and the check cannot drift.
+pub(crate) fn report_skeleton() -> String {
+    format!(
+        "{OUTCOME_FIELD} COMPLETE | NO_CHANGES | BLOCKED   (first line, column 1)\n\
+         ## Changes\n<what changed>\n\
+         ## Verify\n<test command + result>\n\
+         ## Risks\n<risks, or none>\n\
+         ## {LESSONS_HEADING}\n<at most 2 lines, or none>   (last heading)"
+    )
+}
+
+/// The report instruction appended to a worker brief.
+pub(crate) fn report_ask(name: &str) -> String {
+    format!(
+        "When done, write a report shaped exactly like this skeleton to a temp file and rename it to ~/quaqua/runs/{name}.md (publish it atomically, never a partial file); reply only the path.\n{}",
+        report_skeleton()
+    )
+}
+
 /// The last `Verdict:` line of a report, trimmed. `Verdict:` or `verdict:`, as before.
 pub(crate) fn verdict_line(text: &str) -> Option<&str> {
     let lower = VERDICT_FIELD.to_ascii_lowercase();
