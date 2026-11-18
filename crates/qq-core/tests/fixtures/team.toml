@@ -59,7 +59,7 @@ fallback = "sude"
 can_review = false
 
 [kinds.sude]
-harness = "omp"
+harness = "pi"
 model = "google-antigravity/gemini-3.8-flash"
 effort = "high"
 fallback = "suhuynh"

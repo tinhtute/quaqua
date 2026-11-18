@@ -65,8 +65,7 @@ impl Fx {
         let team = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
         )
-        .unwrap()
-        .replace("harness = \"omp\"", "harness = \"opencode\"");
+        .unwrap();
         config::seed(&mut conn, &team).expect("seed");
         let herdr = FakeHerdr::new();
         let anchor = herdr.seed_pane("home", None, &[]);

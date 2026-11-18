@@ -226,7 +226,7 @@ fn open_agent(conn: &Connection, name: &str) -> Result<(i64, Option<String>), Op
 pub fn stop_keys(harness: &str) -> Option<&'static [&'static str]> {
     match harness {
         "opencode" => Some(&["esc", "esc"]),
-        "omp" | "agy" => Some(&["esc"]),
+        "agy" => Some(&["esc"]),
         _ => None,
     }
 }

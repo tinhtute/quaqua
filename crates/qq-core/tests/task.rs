@@ -50,14 +50,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
 
-/// The seeded team (the engine knows no `omp` harness yet: sude runs on
-/// opencode here). `ni` builds on claude, `sude` reviews on opencode.
+/// The seeded team: `ni` builds on claude, `sude` reviews on pi.
 fn seed(conn: &mut rusqlite::Connection) {
     let template =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
     let team = std::fs::read_to_string(template)
-        .unwrap()
-        .replace("harness = \"omp\"", "harness = \"opencode\"");
+        .unwrap();
     config::seed(conn, &team).expect("seed");
 }
 
