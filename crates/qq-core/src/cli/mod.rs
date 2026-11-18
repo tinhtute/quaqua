@@ -109,6 +109,7 @@ pub const MODULES: &[Install] = &[
     crate::transcripts::INSTALL,
     crate::identity::INSTALL,
     crate::init::INSTALL,
+    crate::auditor::INSTALL,
 ];
 
 /// The CLI registry and the daemon, both filled from the core and [`MODULES`].
