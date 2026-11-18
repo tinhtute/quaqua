@@ -1,3 +1,4 @@
+pub mod auditor;
 pub mod authority;
 pub mod bus;
 pub mod cli;
