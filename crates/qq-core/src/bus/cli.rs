@@ -1,4 +1,4 @@
-//! `qq mail send --to <agent> --kind <kind> [--body-file -|<path>]`.
+//! `quaqua mail send --to <agent> --kind <kind> [--body-file -|<path>]`.
 //!
 //! A client of `mail.send`. The sender is the caller the RPC layer names
 //! (named by the daemon from the socket peer; see [`crate::cli::rpc_call`]).
@@ -22,7 +22,7 @@ pub fn mail(env: &Env, args: &[String], stdin: &mut dyn Read) -> Result<String, 
     match args.split_first() {
         Some((v, rest)) if v == "send" => send(env, rest, stdin),
         _ => Err(usage(
-            "usage: qq mail send --to <agent> --kind <kind> [--body-file -|<path>]",
+            "usage: quaqua mail send --to <agent> --kind <kind> [--body-file -|<path>]",
         )),
     }
 }

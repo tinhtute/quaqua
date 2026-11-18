@@ -30,7 +30,7 @@ fn seeded(tag: &str) -> (std::path::PathBuf, Connection) {
     std::fs::create_dir_all(&dir).unwrap();
     let conn = db::open(&dir.join(db::path::DB_FILE)).unwrap();
     let team = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
     )
     .unwrap()
     .replace("harness = \"omp\"", "harness = \"opencode\"");
@@ -153,7 +153,7 @@ fn prompt_check_brief_and_resume() {
     );
     assert_eq!(
         code(Observed {
-            report: Some("Outcome: COMPLETE\n".into()),
+            report: Some("done, all green\n".into()),
             ..base.clone()
         }),
         Some(6)

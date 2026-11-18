@@ -1,5 +1,5 @@
 // The caps and the secret patterns live in the engine
-// (`crates/quaqua/src/memory.rs`, `TARGETS` and `check_text`). This module never
+// (`crates/qq-core/src/memory`, `TARGETS` and `check_text`). This module never
 // restates them: it pipes a synthetic PreToolUse payload to `quaqua memory hook
 // pre` and relays the verdict. No cap number, no pattern, no length here.
 

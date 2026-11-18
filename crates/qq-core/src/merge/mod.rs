@@ -1,4 +1,4 @@
-//! The merge queue (ported from `crates/quaqua/src/merge`): one branch at a
+//! The merge queue (ported from the legacy engine): one branch at a
 //! time into the project integration branch, a check after each merge, undo
 //! on failure, never a push.
 //!

@@ -95,7 +95,7 @@ the hook stops being wired.
 
 - The path is absolute, built from `$.session.root()`. The engine matches a
   target by suffix **and** by an ancestor holding `AGENTS.md` or `.quaqua/`
-  (`crates/quaqua/src/memory.rs:254`), so a relative path silently matches
+  (`crates/qq-core/src/memory/caps.rs:229`), so a relative path silently matches
   nothing and the write would be allowed.
 - Empty stdout is the engine's "no objection"; a `permissionDecision: "deny"` is
   returned as the tool's error text, verbatim.
@@ -103,7 +103,7 @@ the hook stops being wired.
   verdict — is a refusal. It is never a silent allow.
 
 No cap number, no secret pattern and no character count appears in this mod's
-source: `crates/quaqua/src/memory.rs` (`TARGETS`, `check_text`) is the only place
+source: `crates/qq-core/src/memory/caps.rs` (`TARGETS`, `check_text`) is the only place
 they exist, and `tests/install_smoke.sh` greps to keep it that way. The one size
 the mod reads is `$.fs.stat().size` beside `mtimeMs`, as a change stamp for the
 review guard — not a length compared against a limit.

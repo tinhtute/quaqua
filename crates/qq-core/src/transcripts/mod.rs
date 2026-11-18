@@ -1,4 +1,4 @@
-//! `qq transcripts tail`: the last N things the Principal said in one Claude
+//! `quaqua transcripts tail`: the last N things the Principal said in one Claude
 //! Code session, read straight from its JSONL (no index). The pre-compaction
 //! snapshot uses it. The corpus is read-only.
 
@@ -26,7 +26,7 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
 fn usage() -> CliError {
     CliError::new(
         2,
-        "usage: qq transcripts tail --session <id|path> [--last N] [--projects DIR]",
+        "usage: quaqua transcripts tail --session <id|path> [--last N] [--projects DIR]",
     )
 }
 

@@ -1,4 +1,4 @@
-//! T35: config seed and readers. `init` is `qq init` as a library call: it
+//! T35: config seed and readers. `init` is `quaqua init` as a library call: it
 //! seeds the config tables of `qq.db` from a team.toml once. After that the
 //! roster, harness, model and effort are read only from SQLite
 //! ([`resolve_spawn`], [`roster`], ...); the toml is never read again.
@@ -437,7 +437,7 @@ fn validate(p: &Parsed) -> Result<(), ConfigError> {
 
 // ---- seed -----------------------------------------------------------------
 
-/// `qq init` for the config tables: read `team_toml` and [`seed`] it.
+/// `quaqua init` for the config tables: read `team_toml` and [`seed`] it.
 pub fn init(conn: &mut Connection, team_toml: &Path) -> Result<Seeded, ConfigError> {
     let text = std::fs::read_to_string(team_toml)?;
     seed(conn, &text)

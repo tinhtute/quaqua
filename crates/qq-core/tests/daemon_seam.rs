@@ -75,7 +75,7 @@ fn recorder_factory() -> Factory {
 
 fn template() -> String {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../templates/workspace/team.toml");
+        .join("tests/fixtures/team.toml");
     std::fs::read_to_string(p)
         .expect("read template team.toml")
         .replace("harness = \"omp\"", "harness = \"claude\"")
@@ -321,7 +321,7 @@ fn mail_send_refused_off_edge() {
         refusals(&ws),
         vec![("peer-a".into(), "mail".into(), "peer-b".into())]
     );
-    let inbox = ok(&ws, None, "mail.inbox", json!({"to": "peer-b"}));
+    let inbox = ok(&ws, Some("peer-b"), "mail.inbox", Value::Null);
     assert_eq!(inbox["mail"].as_array().unwrap().len(), 0, "nothing stored");
     // An unknown sender is refused too, and journaled.
     let code = refusal(

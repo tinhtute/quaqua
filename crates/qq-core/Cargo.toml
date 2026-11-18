@@ -8,11 +8,11 @@ name = "qq_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "qq"
+name = "quaqua"
 path = "src/main.rs"
 
 [dependencies]
-# Same exact pins as crates/quaqua. Carried for the wave 2 modules:
+# Exact pins. Carried for the wave 2 modules:
 # rusqlite (db, engine journal), serde + serde_json (journal, herdr replies),
 # toml (team.toml seed and testkit temp config).
 rusqlite = { version = "=0.32.1", features = ["bundled"] }

@@ -457,3 +457,68 @@ fn inbox_limit_advances_only_past_returned_rows() {
     assert!(ids(&ok(&ws, "peer-a", "mail.inbox", json!({"advance": true}))).is_empty());
     daemon.stop().unwrap();
 }
+
+#[test]
+fn a_mailbox_is_read_and_acked_by_its_owner_only() {
+    let ws = TestWorkspace::new("mail-owner");
+    let daemon = start(&ws);
+    let b = ok(
+        &ws,
+        "lead",
+        "mail.send",
+        json!({"to": "peer-b", "body": "for b"}),
+    )["id"]
+        .as_i64()
+        .unwrap();
+
+    // Another agent can neither read nor advance B's mailbox, with or without
+    // `advance`, and each refusal is journaled with caller, op and mailbox.
+    for (verb, args) in [
+        ("mail.inbox", json!({"to": "peer-b"})),
+        ("mail.inbox", json!({"to": "peer-b", "advance": true})),
+        ("mail.ack", json!({"to": "peer-b", "upto": b})),
+    ] {
+        let err = call(&ws, "peer-a", verb, args)
+            .into_result()
+            .expect_err(&format!("{verb} on another mailbox must be refused"));
+        assert_eq!(err.code, "refused", "{verb}: {err}");
+    }
+    let conn = qq_core::db::open(&ws.db_path()).unwrap();
+    let rows = qq_core::authority::refusals(&conn).unwrap();
+    let got: Vec<_> = rows
+        .iter()
+        .map(|r| (r.caller.as_str(), r.edge.as_str(), r.target.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("peer-a", "mail.inbox", "peer-b"),
+            ("peer-a", "mail.inbox", "peer-b"),
+            ("peer-a", "mail.ack", "peer-b"),
+        ]
+    );
+
+    // Nothing moved: the owner still sees the mail. An absent `to` and
+    // `to` == caller both mean the caller's own mailbox.
+    assert_eq!(ids(&ok(&ws, "peer-b", "mail.inbox", Value::Null)), vec![b]);
+    assert_eq!(
+        ids(&ok(&ws, "peer-b", "mail.inbox", json!({"to": "peer-b"}))),
+        vec![b]
+    );
+    ok(
+        &ws,
+        "peer-b",
+        "mail.ack",
+        json!({"to": "peer-b", "upto": b}),
+    );
+    assert!(ids(&ok(&ws, "peer-b", "mail.inbox", Value::Null)).is_empty());
+
+    // No caller: still refused, as before.
+    let anon = rpc::call(
+        &rpc::socket_path(&ws.runs_dir()),
+        &Request::new("mail.inbox", Value::Null),
+    )
+    .expect("rpc transport");
+    assert!(anon.into_result().is_err());
+    daemon.stop().unwrap();
+}

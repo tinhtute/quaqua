@@ -7,7 +7,7 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/templates/workspace/scripts/hooks/herdr-gate.sh" }
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/crates/qq-core/templates/workspace/scripts/hooks/herdr-gate.sh" }
         ]
       }
     ]

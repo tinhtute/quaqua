@@ -1,4 +1,4 @@
-//! `qq playbook list|show`: parse and validate the workspace playbooks (ported
+//! `quaqua playbook list|show`: parse and validate the workspace playbooks (ported
 //! from the old crate; the workspace root is the parent of `runs/`).
 
 use std::collections::BTreeSet;
@@ -575,7 +575,7 @@ pub fn playbook_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     let usage = || {
         CliError::new(
             2,
-            "usage: qq playbook list | show <name> [--dir D] [--principles-dir D]",
+            "usage: quaqua playbook list | show <name> [--dir D] [--principles-dir D]",
         )
     };
     let (Some(sub), rest) = (args.first(), args.get(1..).unwrap_or_default()) else {

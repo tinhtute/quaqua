@@ -202,7 +202,7 @@ fn has_edge(conn: &Connection, from: Role, to: Role, edge: &str) -> Result<bool,
 }
 
 /// Journals a refusal and returns it as a decision.
-fn refuse(
+pub(crate) fn refuse(
     conn: &Connection,
     caller: &str,
     edge: &str,

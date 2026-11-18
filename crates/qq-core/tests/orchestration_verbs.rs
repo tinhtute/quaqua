@@ -25,7 +25,7 @@ struct Rig {
 }
 
 fn template() -> String {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml");
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
     std::fs::read_to_string(p)
         .expect("read template team.toml")
         .replace("harness = \"omp\"", "harness = \"claude\"")

@@ -1,4 +1,4 @@
-//! `qq identity heal` and the CoS pane re-tag that `memory hook session-start`
+//! `quaqua identity heal` and the CoS pane re-tag that `memory hook session-start`
 //! repeats: both restore the herdr pane tokens `grid_role=cos grid_owner=cos
 //! grid_farm=<farm>` after a herdr restart dropped them. Every step reads the
 //! pane first and writes only the difference, so a repeat is a no-op.
@@ -278,7 +278,7 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
 
 pub fn identity_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     if args != ["heal"] {
-        return Err(CliError::new(2, "usage: qq identity heal"));
+        return Err(CliError::new(2, "usage: quaqua identity heal"));
     }
     let actions = heal(cli_panes().as_ref(), &env.runs_dir).map_err(|e| CliError::new(1, e))?;
     Ok(if actions.is_empty() {

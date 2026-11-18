@@ -2,7 +2,7 @@
 //! against a real temp git repo, a real database and the fake herdr. Every case
 //! asserts what a caller observes: the result or error, the agent row, the
 //! worktree and branch on disk, the sidecar files and the herdr effects.
-//! Legacy contract: `crates/quaqua/src/worker/spawn.rs` (grammar, name rule,
+//! Legacy contract (the removed engine): `src/worker/spawn.rs` (grammar, name rule,
 //! `--base`, `--review`, `--solo`, metadata), `src/cap.rs` (owner cap) and
 //! `src/worker/leadgate.rs` (two signals block, one warns); `lead/spawn.rs`.
 
@@ -63,7 +63,7 @@ impl Fx {
         git(&repo, &["branch", "side"]);
         let mut conn = db::open(&ws.db_path()).expect("open db");
         let team = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/workspace/team.toml"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
         )
         .unwrap()
         .replace("harness = \"omp\"", "harness = \"opencode\"");

@@ -70,7 +70,7 @@ them. Bootstrap the skeleton — the dirs plus `memory/rules.md`,
 
 ```bash
 git clone git@github.com:tinhtute/quaqua.git ~/quaqua && cd ~/quaqua
-cargo install --path crates/quaqua --locked   # installs the quaqua binary to ~/.cargo/bin
+cargo install --path crates/qq-core --locked   # installs the quaqua binary to ~/.cargo/bin
 quaqua init
 ```
 
@@ -140,7 +140,7 @@ Requires a Rust toolchain (install `rustup` if `cargo --version` fails).
 
 ```bash
 git clone git@github.com:tinhtute/quaqua.git ~/quaqua && cd ~/quaqua
-cargo install --path crates/quaqua --locked   # installs the quaqua binary to ~/.cargo/bin
+cargo install --path crates/qq-core --locked   # installs the quaqua binary to ~/.cargo/bin
 ~/.cargo/bin/quaqua --version   # verify; an interactive `quaqua` shell function can shadow the binary, so call it by path
 quaqua init     # dirs + rules.md, INDEX.md, _template.md, USER.md
 bash templates/workspace/scripts/auditor/install-auditor.sh  # installs scheduling files; prints manual activation command

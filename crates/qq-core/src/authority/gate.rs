@@ -1,5 +1,5 @@
 //! The `gate` verb: the Claude Code PreToolUse(Bash) hook, ported from
-//! `crates/quaqua/src/gate`. Stateless: it tokenizes the hook's command and
+//! the legacy engine. Stateless: it tokenizes the hook's command and
 //! blocks what the daemon alone may do under R11 — a herdr pane, tab or
 //! workspace spawn/move/close, any `git push`, and a `gh` merge. Everything
 //! else is allowed. It fails closed: empty input, a read error, a body that
@@ -15,11 +15,11 @@ use crate::cli::{CliError, Command, Env};
 /// Exit status and stderr message of a block (Claude Code treats 2 as "refuse").
 pub const BLOCK_EXIT: i32 = 2;
 
-const PANE_MESSAGE: &str = "blocked: spawn/move panes and workspaces only through the qq daemon (qq call task.spawn / grid verbs)";
+const PANE_MESSAGE: &str = "blocked: spawn/move panes and workspaces only through the quaqua daemon (quaqua call task.spawn / grid verbs)";
 const PUSH_MESSAGE: &str =
-    "blocked: git push only through the qq daemon (the daemon is the one door for push)";
+    "blocked: git push only through the quaqua daemon (the daemon is the one door for push)";
 const MERGE_MESSAGE: &str =
-    "blocked: merge only through the qq daemon (the daemon is the one door for merge)";
+    "blocked: merge only through the quaqua daemon (the daemon is the one door for merge)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -345,7 +345,7 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
     Verdict::Allow
 }
 
-/// The rule-drift warning for an allowed `quaqua|qq worker|lead` dispatch from a
+/// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
 /// session whose rule files changed since it started (issue #72): which files
 /// to re-read. `None` when the command is no dispatch, the hook JSON names no
 /// session, or nothing changed. Never blocks; the caller prints it.
@@ -371,13 +371,13 @@ fn run(env: &Env, args: &[String]) -> Result<String, CliError> {
                 Err(_) => return Err(CliError::new(BLOCK_EXIT, PANE_MESSAGE)),
             }
         }
-        _ => return Err(CliError::new(2, "usage: qq gate [--json <hook-json>]")),
+        _ => return Err(CliError::new(2, "usage: quaqua gate [--json <hook-json>]")),
     };
     match evaluate(&json) {
         Verdict::Allow => {
             if let Some(ws) = env.runs_dir.parent() {
                 if let Some(msg) = drift_warning(ws, &json) {
-                    eprintln!("qq: {msg}");
+                    eprintln!("quaqua: {msg}");
                 }
             }
             Ok(String::new())
@@ -410,13 +410,13 @@ mod drift_tests {
         };
         std::fs::write(ws.join("rules/_all/new.md"), "rule").unwrap();
         assert!(
-            drift_warning(&ws, &hook("qq status")).is_none(),
+            drift_warning(&ws, &hook("quaqua status")).is_none(),
             "not a dispatch"
         );
         let msg = drift_warning(&ws, &hook("cd x && quaqua worker spawn a b c")).unwrap();
         assert!(msg.contains("rules/_all/new.md"), "{msg}");
         assert!(
-            drift_warning(&ws, &hook("qq lead prompt a")).is_none(),
+            drift_warning(&ws, &hook("quaqua lead prompt a")).is_none(),
             "warned once"
         );
         // The verdict and the exit code do not depend on the warning.

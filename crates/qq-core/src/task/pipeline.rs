@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::report_contract::{parse_verdict, verdict_ask};
 use super::worker_flow::{verified_line_ask, PASSING_LEVELS};
 use crate::engine::activity::{
     GitRequest, GitResult, HerdrRequest, HerdrResult, ReportFileRequest, ReportFileResult,
@@ -329,8 +330,8 @@ fn begin_review(s: &mut PipelineState) -> Decision {
         "Pipeline phase: REVIEW (round {round}) of task '{}'.\nReview exactly commit {sha} on branch {} \
          (repo {}); do not edit code; run the checks the brief names in the foreground.\nBrief:\n{}\n\n\
          Write your report to {report}. Tag each finding under '## Findings' as '- [critical|major|minor|trivial] <finding>'. \
-         End with exactly one line: 'Verdict: clean' or 'Verdict: <N> findings'. Dispute a wrong premise under '## Challenge'.",
-        i.task, i.branch, i.repo, i.brief
+         {} Dispute a wrong premise under '## Challenge'.",
+        i.task, i.branch, i.repo, i.brief, verdict_ask()
     );
     let to = i.reviewer(round);
     enter_prompt(s, Stage::Review, to, text)
@@ -809,30 +810,6 @@ fn verified_sha(text: &str) -> Result<String, (i32, String)> {
         ));
     }
     Ok(sha.to_string())
-}
-
-/// `Verdict: clean` or `Verdict: <N> findings`; the last verdict line wins and
-/// anything else fails closed.
-fn parse_verdict(text: &str) -> Result<u32, String> {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .rfind(|l| l.starts_with("Verdict:") || l.starts_with("verdict:"))
-        .ok_or("review report has no 'Verdict: clean | <N> findings' line")?;
-    let rest = line.split_once(':').map(|(_, r)| r.trim()).unwrap_or("");
-    if rest.eq_ignore_ascii_case("clean") {
-        return Ok(0);
-    }
-    let mut w = rest.split_whitespace();
-    if let (Some(n), Some(noun), None) = (w.next(), w.next(), w.next()) {
-        let noun = noun.trim_matches(|c: char| !c.is_alphanumeric());
-        if let Ok(n) = n.parse::<u32>() {
-            if noun.eq_ignore_ascii_case("findings") || noun.eq_ignore_ascii_case("finding") {
-                return Ok(n);
-            }
-        }
-    }
-    Err(format!("unparseable verdict line '{line}'"))
 }
 
 fn severity(tag: &str) -> Option<u8> {

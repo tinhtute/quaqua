@@ -1,5 +1,5 @@
-//! T40: the daily-use verbs over the config tables: `qq config
-//! get|set|import|validate` and `qq roster`. They open `runs/qq.db` directly
+//! T40: the daily-use verbs over the config tables: `quaqua config
+//! get|set|import|validate` and `quaqua roster`. They open `runs/qq.db` directly
 //! and go through the T35 readers and validators, so a kind written here is
 //! the one the next spawn reads ([`resolve_spawn`]). Every write is one
 //! transaction and converges: repeating a command leaves the same rows.
@@ -113,7 +113,7 @@ const FIELDS: &[&str] = &[
 const NULLABLE: &[&str] = &["effort", "fallback", "use_for", "avoid"];
 
 fn usage(m: &str) -> CliError {
-    CliError::new(2, format!("usage: qq config {m}"))
+    CliError::new(2, format!("usage: quaqua config {m}"))
 }
 
 fn fail(e: impl std::fmt::Display) -> CliError {
