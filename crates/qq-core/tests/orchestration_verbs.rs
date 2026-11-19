@@ -72,6 +72,7 @@ fn rig(tag: &str, peers: bool) -> Rig {
     });
     qq_core::task::create::register(&mut d, ws.runs_dir()).unwrap();
     authority::push::register(&mut d, ws.runs_dir()).unwrap();
+    qq_core::merge::register(&mut d).unwrap();
     if peers {
         d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
     }
@@ -436,4 +437,88 @@ fn push_refuses_main_master_and_the_remote_default_branch() {
     // Every other allowed push behaves as before.
     call(&r, "push", Some("lead-f"), push_args(&work)).unwrap();
     assert!(origin_has_feat(&origin));
+}
+
+/// `repo_with_origin`'s work repo plus `integ` (at the base) and `t1` (one commit ahead).
+fn merge_repo(r: &Rig) -> (std::path::PathBuf, String) {
+    let (work, _origin) = repo_with_origin(r);
+    git(&work, &["branch", "integ"]);
+    git(&work, &["checkout", "-q", "-b", "t1"]);
+    std::fs::write(work.join("t1.txt"), "t1").unwrap();
+    git(&work, &["add", "t1.txt"]);
+    git(&work, &["commit", "-qm", "t1"]);
+    let tip = git(&work, &["rev-parse", "t1"]);
+    git(&work, &["checkout", "-q", "feat"]);
+    (work, tip)
+}
+
+fn merge_args(work: &Path, integ: &str, tip: &str) -> Value {
+    json!({"repo": work, "integ": integ, "entries": [{"branch": "t1", "sha": tip}]})
+}
+
+#[test]
+fn merge_refuses_a_peer_and_no_caller_and_journals_it() {
+    let r = rig("g3-merge-caller", false);
+    let (work, tip) = merge_repo(&r);
+    let before = git(&work, &["rev-parse", "integ"]);
+    let peer = call(&r, "merge", Some("p1"), merge_args(&work, "integ", &tip)).unwrap_err();
+    let anon = call(&r, "merge", None, merge_args(&work, "integ", &tip)).unwrap_err();
+    assert_eq!((peer.code.as_str(), anon.code.as_str()), ("refused", "refused"));
+    assert_eq!(git(&work, &["rev-parse", "integ"]), before, "nothing merged");
+    let rows = authority::refusals(&conn(&r)).unwrap();
+    assert_eq!(
+        rows.iter().map(|x| (x.caller.as_str(), x.edge.as_str())).collect::<Vec<_>>(),
+        [("p1", "orchestration")]
+    );
+    // A Lead still merges into a plain integration branch.
+    let ok = call(&r, "merge", Some("lead-f"), merge_args(&work, "integ", &tip)).unwrap();
+    assert_eq!(ok["merged"][0]["merged_now"], true);
+}
+
+#[test]
+fn merge_never_runs_a_shell_string_from_the_request() {
+    let r = rig("g3-merge-check", false);
+    let (work, tip) = merge_repo(&r);
+    let marker = r.ws.root().join("pwned");
+    let mut args = merge_args(&work, "integ", &tip);
+    args["check"] = json!(format!("touch {}", marker.display()));
+    let e = call(&r, "merge", Some("lead-f"), args).unwrap_err();
+    assert_eq!(e.code, "bad_request");
+    assert!(!marker.exists(), "the request's check must never run");
+    // The check is the daemon's: the `merge.check` setting.
+    conn(&r)
+        .execute(
+            "INSERT OR REPLACE INTO setting (key, value_json) VALUES ('merge.check', '\"false\"')",
+            [],
+        )
+        .unwrap();
+    let e = call(&r, "merge", Some("lead-f"), merge_args(&work, "integ", &tip)).unwrap_err();
+    assert_eq!(e.code, "base_broken", "the configured check ran and failed");
+}
+
+#[test]
+fn merge_refuses_main_master_and_the_remote_default_branch() {
+    let r = rig("g3-merge-protected", false);
+    let (work, tip) = merge_repo(&r);
+    for b in ["main", "master", "trunk"] {
+        git(&work, &["branch", b, "feat"]);
+    }
+    git(
+        &work,
+        &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+    );
+    let heads: Vec<String> = ["main", "master", "trunk"]
+        .iter()
+        .map(|b| git(&work, &["rev-parse", b]))
+        .collect();
+    for b in ["main", "master", "trunk"] {
+        let e = call(&r, "merge", Some("lead-f"), merge_args(&work, b, &tip)).unwrap_err();
+        assert_eq!(e.code, "refused", "{b}");
+    }
+    let after: Vec<String> = ["main", "master", "trunk"]
+        .iter()
+        .map(|b| git(&work, &["rev-parse", b]))
+        .collect();
+    assert_eq!(heads, after, "no protected branch moved");
+    assert_eq!(authority::refusals(&conn(&r)).unwrap().len(), 3, "each refusal is journaled");
 }
