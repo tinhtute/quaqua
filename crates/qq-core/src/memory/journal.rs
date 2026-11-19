@@ -92,15 +92,30 @@ fn outcome_of(report: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// Appends `line` to `memory/<today>.md` unless that exact line is already in
-/// any dated memory file. Returns whether it was written.
-fn append_once(root: &Path, today: &str, line: &str, all_days: bool) -> bool {
+/// Serializes the check-then-append of this process's own writers (the daemon
+/// serves one thread per connection); other processes are covered by `O_APPEND`.
+static APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Appends `line` to `memory/<today>.md` unless the line is already there. With
+/// `cite` (a `raw/` file name) the scan covers every dated memory file and only
+/// lines containing that cite count; without it, only today's file is scanned.
+/// The file is only ever appended to (`O_APPEND`), never read back and rewritten,
+/// so a non-UTF-8 byte or a concurrent appender cannot cost anyone a line.
+/// Returns whether it was written.
+fn append_once(root: &Path, today: &str, line: &str, cite: Option<&str>) -> bool {
+    let _guard = APPEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = root.join("memory");
     let seen = |p: &Path| {
-        std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.trim_end() == line))
+        std::fs::read(p).is_ok_and(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .any(|l| l.trim_end() == line && cite.is_none_or(|c| l.contains(c)))
+        })
     };
     let file = dir.join(format!("{today}.md"));
-    let dup = if all_days {
+    let dup = if cite.is_some() {
         std::fs::read_dir(&dir).is_ok_and(|rd| {
             rd.flatten()
                 .any(|e| e.path().extension().is_some_and(|x| x == "md") && seen(&e.path()))
@@ -111,13 +126,27 @@ fn append_once(root: &Path, today: &str, line: &str, all_days: bool) -> bool {
     if dup {
         return false;
     }
-    let mut text = std::fs::read_to_string(&file).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(line);
-    text.push('\n');
-    std::fs::write(&file, text).is_ok()
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .read(true)
+        .open(&file)
+    else {
+        return false;
+    };
+    let mut last = *b"\n";
+    let lead = match f.metadata().map(|m| m.len()) {
+        Ok(n) if n > 0 => {
+            f.seek(SeekFrom::Start(n - 1)).is_ok()
+                && f.read_exact(&mut last).is_ok()
+                && last[0] != b'\n'
+        }
+        _ => false,
+    };
+    // one write call: with O_APPEND the kernel places it atomically at the end
+    let out = format!("{}{line}\n", if lead { "\n" } else { "" });
+    f.write_all(out.as_bytes()).is_ok()
 }
 
 /// Copies `report` to `raw/<today>-<slug>-<task>.md`, never overwriting: an
@@ -145,15 +174,22 @@ fn raw_copy(root: &Path, today: &str, slug: &str, task: &str, report: &str) -> O
         } else {
             format!("{today}{tail}-{i}.md")
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(raw.join(&n))
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                return f.write_all(report.as_bytes()).ok().map(|()| n);
-            }
+        let dest = raw.join(&n);
+        if dest.exists() {
+            continue;
+        }
+        // temp name, then a rename that never overwrites: a failed write leaves
+        // no partial `raw/` file
+        let tmp = raw.join(format!(".{n}.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, report).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        // hard_link fails instead of replacing a file that appeared meanwhile
+        let linked = std::fs::hard_link(&tmp, &dest);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => return Some(n),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return None,
         }
@@ -176,20 +212,40 @@ pub fn cleanup(runs: &Path, repo: &Path, name: &str, sha: &str, today: &str) -> 
     let raw = report
         .as_deref()
         .and_then(|r| raw_copy(&root, today, &slug, task_of(name), r));
-    let what = match (&report, &raw) {
-        (Some(r), Some(f)) => format!(
-            "{} {sha} · raw/{f}",
-            outcome_of(r).unwrap_or_else(|| "no Outcome line".into())
-        ),
-        (Some(_), None) => format!("report not copied (raw/ write failed) {sha}"),
-        (None, _) => format!("no report {sha}"),
+    let outcome = report
+        .as_deref()
+        .map(|r| outcome_of(r).unwrap_or_else(|| "no Outcome line".into()));
+    let line = match (&outcome, &raw) {
+        (Some(o), Some(f)) => cite_line(&slug, name, Some(o), sha, f),
+        (Some(_), None) => {
+            format!("- [{slug}] {name} cleanup: report not copied (raw/ write failed) {sha}")
+        }
+        (None, _) => format!("- [{slug}] {name} cleanup: no report {sha}"),
     };
-    let line = format!("- [{slug}] {name} cleanup: {what}");
-    let written = append_once(&root, today, &line, true);
+    let line = crate::memory::screen_line(&line).unwrap_or_else(|_| match &raw {
+        // the worker-controlled Outcome text carried the secret: keep name, sha, cite
+        Some(f) => cite_line(&slug, name, None, sha, f),
+        None => format!("- [{slug}] {name} cleanup: report withheld (screen refused it) {sha}"),
+    });
+    let cite = raw.as_deref().map(|f| format!("raw/{f}"));
+    let written = append_once(&root, today, &line, cite.as_deref());
     Journaled {
         line: written.then_some(line),
         raw,
         skipped: None,
+    }
+}
+
+/// `- [slug] name cleanup: <outcome> <sha> · raw/<file>`, the outcome cut so the
+/// whole line fits `LINE_CAP` and the cite is never the part that gets cut.
+fn cite_line(slug: &str, name: &str, outcome: Option<&str>, sha: &str, file: &str) -> String {
+    let head = format!("- [{slug}] {name} cleanup:");
+    let tail = format!("{sha} · raw/{file}");
+    let room =
+        crate::memory::LINE_CAP.saturating_sub(head.chars().count() + tail.chars().count() + 2);
+    match outcome.map(|o| o.chars().take(room).collect::<String>()) {
+        Some(o) if !o.is_empty() => format!("{head} {o} {tail}"),
+        _ => format!("{head} {tail}"),
     }
 }
 
@@ -212,5 +268,5 @@ pub fn watchdog_case(runs: &Path, name: &str, code: i32) -> Option<String> {
     let cause = cause(code)?;
     let root = workspace_of(runs)?;
     let line = format!("- [case] {name} exit {code}: {cause}");
-    append_once(&root, &today(), &line, false).then_some(line)
+    append_once(&root, &today(), &line, None).then_some(line)
 }
