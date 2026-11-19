@@ -573,6 +573,10 @@ const TRIPWIRES: &[Tripwire] = &[
             "gh api -X=DELETE repos/o/r/git/refs/heads/main",
             "gh api --method='DELETE' repos/o/r/git/refs/heads/main",
             "gh api --method \"PUT\" repos/o/r/contents/README.md",
+            "gh api -X GET -X DELETE repos/o/r/git/refs/heads/main",
+            "gh api --method GET --method PUT repos/o/r/contents/a.txt -f message=m",
+            "gh api --method=GET --method=PATCH repos/o/r/git/refs/heads/main",
+            "gh api -X GET -XPATCH repos/o/r/git/refs/heads/main",
             "gh api repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
         ],
         &[
@@ -647,6 +651,7 @@ const TRIPWIRES: &[Tripwire] = &[
             "sqlite3 --readonly runs/qq.db 'select 1'",
             "sqlite3 -readonly ~/quaqua/runs/qq.db < q.sql",
             "sqlite3 other.db 'select 1'",
+            "sqlite3 -readonly runs/qq.db 'select attached_at from t'",
         ],
     ),
     (
@@ -672,6 +677,7 @@ const TRIPWIRES: &[Tripwire] = &[
             "git branch main",
             "git branch -a",
             "git branch -D feat/main-x",
+            "git branch main && ls -d x",
         ],
     ),
 ];
@@ -718,6 +724,17 @@ fn gate_blocks_herdr_pane_input() {
     assert_tripwire("herdr pane input");
     // The fallback is a superset and cannot tell `--help`; the binary can.
     assert_eq!(gate_exit("herdr pane send-keys --help"), 0);
+}
+
+#[test]
+fn gate_last_method_flag_wins() {
+    // gh keeps the last -X/--method; the fallback is a superset and blocks both.
+    assert_eq!(
+        gate_exit("gh api -X DELETE -X GET repos/o/r/git/refs/heads/main"),
+        0
+    );
+    assert_eq!(gate_exit("gh api -X GET -X PUT repos/o/r/pulls/1/merge"), 2);
+    assert_eq!(gate_exit("gh api -X PUT -X GET repos/o/r/pulls/1/merge"), 0);
 }
 
 #[test]
