@@ -150,3 +150,15 @@ cdd727d and on the fix build. Report ALLOW→ASK and ALLOW→BLOCK, each move
 classified as a real write or a false ask. Target: false asks at most 0.5% of
 commands (about 24). Not met means reporting the number and the cause, not
 loosening the gate.
+
+## Round 3: git's own option, config and env surface (review 4 finding B)
+
+The allowlist premise now covers git itself (`gate.rs`, `check_git_at`).
+
+- **Global options.** An exact table (`GIT_NOVAL`, `GIT_VAL`, `GIT_GLUED`). A value-taking option consumes its value (`--attr-source HEAD`, `--super-prefix x`); an option not in the table makes the call unknown: ask for the CoS, block for workers, and a hard block when a `push` word follows.
+- **`-c` / `--config-env`.** Keys outside a short safe list (`user.name`, `user.email`, `commit.gpgsign`, `tag.gpgsign`, `core.quotepath`, `core.abbrev`, `core.autocrlf`, `init.defaultBranch`, `color.ui`, `safe.directory`, `protocol.version`, `gc.auto`, `advice.*`) are unknown. A plain alias (`alias.st=status`) stays free; `!…` aliases and aliases naming a push do not. `--config-env` values are env var names, so any alias key there is unknown.
+- **Env.** `GIT_CONFIG_KEY_n`, `GIT_CONFIG_PARAMETERS` keys, and `GIT_CONFIG`/`_GLOBAL`/`_SYSTEM` (anything but `/dev/null`) are checked like `-c`. Program-valued env (`GIT_EXTERNAL_DIFF`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_SSH(_COMMAND)`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_PROXY_COMMAND`, `EDITOR`, `VISUAL`, `PAGER`, `SSH_ASKPASS`) has its command line scanned; a push word asks, `GIT_EXEC_PATH` asks. Read from any assignment word, so `export` and bare assignments count.
+- **`git config`.** Setting a program-valued key (`core.fsmonitor`, `core.sshCommand`, `core.hooksPath`, `diff.external`, `*.textconv`, `*.clean`, …) asks. Reads and `user.name` stay free.
+- **Corpus measure (4,934 CoS commands).** git globals: `-C` ×395; `-c`: `user.name` ×1 (plus `user.email`); env: `GIT_CONFIG_GLOBAL=/dev/null` ×11, `GIT_EDITOR=true` ×2.
+- **Replay, base 9e5c7b6 vs fix.** ALLOW 4,717 / ASK 42 / BLOCK 175 on both; no command moved.
+- **Not covered.** Exec-carrying subcommand options (`rebase --exec`, `submodule foreach`, `bisect run`, `fetch --upload-pack`) and repo-level config set earlier (a stored alias); an unknown subcommand still passes.
