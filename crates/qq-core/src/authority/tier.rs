@@ -1,7 +1,7 @@
 //! Caller-aware tier verdict (R7): the strictest of the repo tier, the plan
 //! lane and the action class decides what the CoS may do alone.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -79,20 +79,84 @@ pub fn decide(cos: bool, action: Action, repo: Tier, lane: Tier) -> Decision {
     }
 }
 
-/// The repo's tier from the daemon-owned row. The writer and table arrive with
-/// the grant verb (R14); until then every repo is unlisted, so high.
-pub fn repo_tier(_runs_dir: &Path, _repo: &Path) -> Tier {
-    Tier::High
+/// The key a repo is stored under: the main checkout of the git repo that holds
+/// `path` (a linked worktree maps to its main repo), else the canonical path.
+/// The grant verbs and the gate both use it, so a write and a read meet.
+pub fn repo_key(path: &Path) -> String {
+    let dir = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let common = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    let root = match common {
+        Some(c) if c.file_name().is_some_and(|n| n == ".git") => {
+            c.parent().map_or(dir, Path::to_path_buf)
+        }
+        Some(c) => c,
+        None => dir,
+    };
+    root.to_string_lossy().into_owned()
+}
+
+fn parse_tier(s: &str) -> Option<Tier> {
+    match s {
+        "low" => Some(Tier::Low),
+        "medium" => Some(Tier::Medium),
+        "high" => Some(Tier::High),
+        _ => None,
+    }
+}
+
+pub fn tier_word(t: Tier) -> &'static str {
+    match t {
+        Tier::Low => "low",
+        Tier::Medium => "medium",
+        Tier::High => "high",
+    }
+}
+
+/// One tier from a `(key, tier)` table, read-only: a missing database, table,
+/// row or unreadable word is high (Q15), and a read never creates the file.
+fn stored_tier(runs_dir: &Path, table: &str, col: &str, key: &str) -> Tier {
+    let db = runs_dir.join("qq.db");
+    if !db.is_file() {
+        return Tier::High;
+    }
+    let read = || -> rusqlite::Result<Option<String>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut st = conn.prepare(&format!("SELECT tier FROM {table} WHERE {col} = ?1"))?;
+        let mut rows = st.query([key])?;
+        rows.next()?.map(|r| r.get(0)).transpose()
+    };
+    read()
+        .ok()
+        .flatten()
+        .and_then(|w| parse_tier(&w))
+        .unwrap_or(Tier::High)
+}
+
+/// The repo's tier from the daemon-owned `repo_tier` row (R14); an unlisted
+/// repo is high.
+pub fn repo_tier(runs_dir: &Path, repo: &Path) -> Tier {
+    stored_tier(runs_dir, "repo_tier", "repo", &repo_key(repo))
+}
+
+/// The tier of plan lane `lane` from the daemon-owned `plan_lane` row; an
+/// unknown lane is high.
+pub fn lane_tier_of(runs_dir: &Path, lane: &str) -> Tier {
+    stored_tier(runs_dir, "plan_lane", "lane", lane)
 }
 
 /// The plan lane's tier. The gate has no way to see the lane yet, so the
 /// default high-risk lane applies.
 pub fn lane_tier() -> Tier {
-    Tier::High
-}
-
-/// The tier of the named plan lane (stub until the grant rows exist).
-pub fn lane_tier_of(_runs_dir: &Path, _lane: &str) -> Tier {
     Tier::High
 }
 

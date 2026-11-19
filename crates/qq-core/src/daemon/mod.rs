@@ -7,6 +7,7 @@
 //! with [`Daemon::register_kind`]; this file holds only the built-in verbs.
 
 pub mod caller;
+pub mod grant;
 pub mod store;
 pub mod supervisor;
 pub mod watch;
@@ -296,6 +297,7 @@ impl Daemon {
 
     fn register_builtin(&mut self) {
         caller::register(self);
+        grant::register(self);
         let add = |d: &mut Daemon, name: &str, h: Handler| {
             d.verbs.insert(name.to_string(), h);
         };
