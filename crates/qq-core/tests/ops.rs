@@ -461,6 +461,359 @@ fn cleanup_refuses_dirty_and_wrong_repo_and_foreign_pane() {
     survive(&herdr, &f);
 }
 
+fn project_with_repo(conn: &Connection, slug: &str, repo: &Path) -> i64 {
+    let p = add_project(conn, slug);
+    conn.execute(
+        "UPDATE project SET repo_path = ?2 WHERE id = ?1",
+        rusqlite::params![p, repo.to_string_lossy()],
+    )
+    .unwrap();
+    p
+}
+
+/// A PaneOps whose close is a no-op: herdr said ok but the pane stayed.
+struct LyingClose<'a>(HerdrPanes<'a>);
+impl PaneOps for LyingClose<'_> {
+    fn panes(&self) -> std::io::Result<Vec<grid::Pane>> {
+        self.0.panes()
+    }
+    fn create_tab(&self, l: &str) -> std::io::Result<grid::Pane> {
+        self.0.create_tab(l)
+    }
+    fn split(&self, a: &str, d: grid::Dir) -> std::io::Result<grid::Pane> {
+        self.0.split(a, d)
+    }
+    fn close_pane(&self, _: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn claim(&self, p: &str, s: &grid::Scope) -> std::io::Result<()> {
+        self.0.claim(p, s)
+    }
+}
+
+#[test]
+fn cleanup_closes_the_live_pane_when_the_recorded_id_is_stale() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-stale", &herdr);
+    herdr.agent_start("w1", "pi", &pane, 1000, &[]).unwrap();
+    set_pane(&conn, "w1", "p999"); // the pane moved; the record kept the old id
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5).unwrap();
+    assert!(
+        !herdr.has_pane(&pane),
+        "the live pane is closed, not only the recorded id"
+    );
+    assert!(ended(&conn, "w1") && !wt.exists());
+    survive(&herdr, &f);
+}
+
+#[test]
+fn cleanup_closes_an_orphan_pane_whose_worktree_and_branch_are_gone() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-orphan", &herdr);
+    let p = project_with_repo(&conn, "proj", &repo);
+    conn.execute("UPDATE agent SET project_id = ?1 WHERE name = 'w1'", [p])
+        .unwrap();
+    herdr.agent_start("w1", "pi", &pane, 1000, &[]).unwrap();
+    git(
+        &repo,
+        &["worktree", "remove", "--force", &wt.to_string_lossy()],
+    );
+    git(&repo, &["branch", "-D", "quaqua/w1"]);
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5).unwrap();
+    assert!(!herdr.has_pane(&pane) && ended(&conn, "w1"));
+    survive(&herdr, &f);
+}
+
+#[test]
+fn cleanup_names_what_remains_instead_of_reporting_cleaned() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-remains", &herdr);
+    let panes = LyingClose(HerdrPanes(&herdr));
+    let t = target(&dir, &repo, &wt, false);
+    let r = cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t, 5);
+    assert_eq!(r, Err(OpsError::Remains(vec![format!("pane {pane}")])));
+    assert!(
+        !ended(&conn, "w1"),
+        "the agent row stays so a retry converges"
+    );
+}
+
+#[test]
+fn lead_cleanup_removes_the_lead_worktree_or_names_it() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, _wt, _pane) = worker_fixture("leadwt", &herdr);
+    let p = project_with_repo(&conn, "proj", &repo);
+    add_agent(&conn, "proj-lead", "lead", "ni", Some(p));
+    let lwt = dir.join(".wt").join("proj-lead");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(
+        !lwt.exists(),
+        "a Lead cleanup that reports cleaned leaves no worktree"
+    );
+    assert!(ended(&conn, "proj-lead"));
+}
+
+fn lead_fixture(
+    tag: &str,
+    herdr: &FakeHerdr,
+) -> (std::path::PathBuf, Connection, std::path::PathBuf, String) {
+    let (dir, conn, repo, _wt, _pane) = worker_fixture(tag, herdr);
+    let p = project_with_repo(&conn, "proj", &repo);
+    add_agent(&conn, "proj-lead", "lead", "ni", Some(p));
+    let mine = herdr.seed_pane(
+        "repo-workers",
+        Some("claude"),
+        &[("grid_role", "lead"), ("grid_farm", "f1")],
+    );
+    set_pane(&conn, "proj-lead", &mine);
+    (dir, conn, repo, mine)
+}
+
+#[test]
+fn lead_cleanup_closes_its_own_lead_pane() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (_d, conn, _repo, mine) = lead_fixture("lead-own-pane", &herdr);
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(!herdr.has_pane(&mine), "the Lead's own pane is closed");
+    assert!(ended(&conn, "proj-lead"));
+    survive(&herdr, &f);
+}
+
+#[test]
+fn lead_cleanup_closes_a_moved_lead_pane_by_live_lookup() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn, _repo, mine) = lead_fixture("lead-live", &herdr);
+    herdr
+        .agent_start("proj-lead", "ni", &mine, 1000, &[])
+        .unwrap();
+    set_pane(&conn, "proj-lead", "p999");
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead_live(&conn, &panes, &herdr, &scope_f1(), "proj", 9).unwrap();
+    assert!(!herdr.has_pane(&mine) && ended(&conn, "proj-lead"));
+}
+
+#[test]
+fn cleanup_refuses_to_claim_cleaned_when_herdr_lookup_fails_and_the_record_is_stale() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-lookup", &herdr);
+    herdr.agent_start("w1", "pi", &pane, 1000, &[]).unwrap();
+    set_pane(&conn, "w1", "p999");
+    herdr.set_fault(qq_core::herdr::Verb::Get, std::io::ErrorKind::TimedOut);
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    let r = cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5);
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.contains("pane"))),
+        "{r:?}"
+    );
+    assert!(!ended(&conn, "w1") && herdr.has_pane(&pane));
+}
+
+#[test]
+fn cleanup_falls_back_to_the_recorded_pane_when_herdr_lost_the_agent() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-lost", &herdr);
+    // herdr has no agent `w1` (agent_not_found); the record is right
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5).unwrap();
+    assert!(!herdr.has_pane(&pane) && ended(&conn, "w1"));
+}
+
+#[test]
+fn lead_cleanup_rerun_removes_the_worktree_an_older_cleanup_left() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, _mine) = lead_fixture("lead-rerun", &herdr);
+    let lwt = dir.join(".wt").join("proj-lead");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    conn.execute("UPDATE agent SET ended_ms = 3 WHERE name = 'proj-lead'", [])
+        .unwrap(); // an older cleanup ended the row and left the worktree
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(!lwt.exists(), "the rerun finishes the job");
+    // a repeat converges
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 10).unwrap();
+}
+
+#[test]
+fn lead_cleanup_of_an_unknown_project_is_an_error() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn) = seeded("lead-unknown");
+    let r = cleanup::cleanup_lead(&conn, &HerdrPanes(&herdr), &scope_f1(), "nope", 9);
+    assert!(r.is_err(), "{r:?}");
+}
+
+#[test]
+fn lead_cleanup_finds_a_worktree_registered_outside_the_convention_path() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, _mine) = lead_fixture("lead-elsewhere", &herdr);
+    let lwt = dir.join("side-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(!lwt.exists());
+    assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains("side-wt"));
+}
+
+#[test]
+fn lead_cleanup_names_a_dirty_worktree_and_releases_nothing() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, mine) = lead_fixture("lead-dirty", &herdr);
+    let lwt = dir.join(".wt").join("proj-lead");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    std::fs::write(lwt.join("scratch.txt"), "x").unwrap();
+    let panes = HerdrPanes(&herdr);
+    let r = cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9);
+    assert_eq!(r, Err(OpsError::Dirty(vec!["scratch.txt".into()])));
+    assert!(lwt.exists() && herdr.has_pane(&mine) && !ended(&conn, "proj-lead"));
+}
+
+#[test]
+fn cleanup_with_the_repo_gone_names_the_worktree_that_remains() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-norepo", &herdr);
+    let gone = dir.join("repo-moved");
+    std::fs::rename(&repo, &gone).unwrap();
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, true);
+    let r = cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t, 5);
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.starts_with("worktree "))),
+        "{r:?}"
+    );
+    assert!(!herdr.has_pane(&pane) && !ended(&conn, "w1"));
+}
+
+fn scope_me() -> grid::Scope {
+    grid::Scope {
+        owner: Some("me".into()),
+        farm: Some("f1".into()),
+    }
+}
+
+#[test]
+fn cleanup_names_a_live_pane_the_scope_rejects() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, _pane) = worker_fixture("cleanup-oos", &herdr);
+    let theirs = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[
+            ("grid_role", "worker"),
+            ("grid_owner", "x"),
+            ("grid_farm", "f1"),
+        ],
+    );
+    herdr.agent_start("w1", "pi", &theirs, 1000, &[]).unwrap();
+    set_pane(&conn, "w1", "p999");
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    let r = cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_me(), &t, 5);
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.contains(&theirs) && m.contains("out of scope"))),
+        "{r:?}"
+    );
+    assert!(herdr.has_pane(&theirs) && !ended(&conn, "w1"));
+}
+
+#[test]
+fn lead_cleanup_names_a_live_lead_pane_the_scope_rejects() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn, _repo, mine) = lead_fixture("lead-oos", &herdr);
+    herdr
+        .agent_start("proj-lead", "ni", &mine, 1000, &[])
+        .unwrap();
+    let panes = HerdrPanes(&herdr);
+    let r = cleanup::cleanup_lead_live(
+        &conn,
+        &panes,
+        &herdr,
+        &grid::Scope {
+            owner: None,
+            farm: Some("f2".into()),
+        },
+        "proj",
+        9,
+    );
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.contains(&mine) && m.contains("out of scope"))),
+        "{r:?}"
+    );
+    assert!(herdr.has_pane(&mine) && !ended(&conn, "proj-lead"));
+}
+
+#[test]
+fn lead_rerun_ignores_the_stale_recorded_pane_of_an_ended_row() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn, _repo, mine) = lead_fixture("lead-ended-stale", &herdr);
+    // the ended Lead's old id is now a live worker pane in scope
+    let reused = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[("grid_role", "worker"), ("grid_farm", "f1")],
+    );
+    set_pane(&conn, "proj-lead", &reused);
+    conn.execute("UPDATE agent SET ended_ms = 3 WHERE name = 'proj-lead'", [])
+        .unwrap();
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead_live(&conn, &panes, &herdr, &scope_f1(), "proj", 9).unwrap();
+    assert!(
+        herdr.has_pane(&reused),
+        "an ended row's recorded id is not trusted"
+    );
+    let _ = mine;
+}
+
 #[test]
 fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     let (_dir, conn) = seeded("stop");
@@ -1196,7 +1549,7 @@ fn lead_cleanup_closes_only_the_recorded_pane() {
     set_pane(&conn, "proj-lead", &mine);
     let panes = HerdrPanes(&herdr);
     cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
-    // the Lead's pane carries role=lead, which a worker-only scope never closes
+    // the Lead's own pane is closed; the CoS, human and other-farm panes are not
     survive(&herdr, &f);
     assert!(herdr.has_pane(&bystander));
     let ended: Option<i64> = conn
