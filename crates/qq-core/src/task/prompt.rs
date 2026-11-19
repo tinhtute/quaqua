@@ -1128,10 +1128,13 @@ fn send_brief(
     }
     match landing {
         crate::herdr::Landing::Landed => Ok(()),
-        crate::herdr::Landing::Blocked => Err(CliError::new(
-            5,
-            format!("WATCHDOG exit=5 blocked before the brief | name={name}"),
-        )),
+        crate::herdr::Landing::Blocked => {
+            let _ = crate::memory::journal::watchdog_case(runs, name, 5);
+            Err(CliError::new(
+                5,
+                format!("WATCHDOG exit=5 blocked before the brief | name={name}"),
+            ))
+        }
         crate::herdr::Landing::NotLanded(why) => Err(CliError::new(
             1,
             format!("the brief did not land | name={name} | {why}"),
@@ -1293,6 +1296,7 @@ pub fn prompt_run(
             ) {
                 eprintln!("{}", pane_tail_block(herdr, runs, name));
             }
+            let _ = crate::memory::journal::watchdog_case(runs, name, e.code());
             Err(CliError::new(
                 e.code(),
                 format!("WATCHDOG exit={} | name={name}", e.code()),
