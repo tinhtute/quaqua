@@ -52,4 +52,11 @@ if [ "$EVENT" = "Stop" ]; then
   FORMAT="hook-stop"
 fi
 
-"$QUAQUA" inbox --for cos --format "$FORMAT" || exit 0
+# The hook payload's session_id keys the once-per-session "daemon down" line.
+SESSION=$(printf '%s' "$INPUT" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9_-]*\)".*/\1/p' | head -n 1)
+
+if [ -n "$SESSION" ]; then
+  "$QUAQUA" inbox --for cos --format "$FORMAT" --session "$SESSION" || exit 0
+else
+  "$QUAQUA" inbox --for cos --format "$FORMAT" || exit 0
+fi
