@@ -208,15 +208,14 @@ fn judge(
         Caller::Unknown => return Verdict::Block(NO_CALLER_MESSAGE),
     }
     let dir = cwd.unwrap_or(Path::new("."));
-    let repo = runs_dir.map_or(Tier::High, |r| tier::repo_tier(r, dir));
-    let lane = tier::lane_tier();
+    let ctx = runs_dir.map_or(Tier::High, |r| tier::effective_context_tier(r, dir, true));
     let mut ask = None;
     for (p, reason) in f.listed {
         let action = match p {
             Pending::Act(a) => a,
             Pending::BranchDelete(b) => tier::branch_delete_action(dir, &b),
         };
-        match tier::decide(true, action, repo, lane) {
+        match tier::decide(true, action, ctx, ctx) {
             Decision::Deny => return Verdict::Block(TIER_DENY_MESSAGE),
             Decision::Ask => ask = Some(reason),
             Decision::Allow => {}

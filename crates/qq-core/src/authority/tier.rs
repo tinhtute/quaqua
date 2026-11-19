@@ -154,10 +154,55 @@ pub fn lane_tier_of(runs_dir: &Path, lane: &str) -> Tier {
     stored_tier(runs_dir, "plan_lane", "lane", lane)
 }
 
-/// The plan lane's tier. The gate has no way to see the lane yet, so the
-/// default high-risk lane applies.
+/// The default lane tier: high. No production caller reads it any more (the
+/// gate and `pr.merge` use [`lane_tier_of`]); `tests/authority.rs` still
+/// asserts it, so it stays until that test moves.
 pub fn lane_tier() -> Tier {
     Tier::High
+}
+
+/// True when the daemon-owned `grant_full` table holds a row for `repo`'s key
+/// (R14/Q17). Read-only: a missing database, table or row is no grant.
+pub fn grant_full(runs_dir: &Path, repo: &Path) -> bool {
+    let db = runs_dir.join("qq.db");
+    if !db.is_file() {
+        return false;
+    }
+    let key = repo_key(repo);
+    let read = || -> rusqlite::Result<bool> {
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.query_row(
+            "SELECT 1 FROM grant_full WHERE repo = ?1",
+            [key],
+            |_| Ok(()),
+        )
+        .map(|()| true)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            e => Err(e),
+        })
+    };
+    read().unwrap_or(false)
+}
+
+/// A full grant for `repo` lowers `base` to low for the CoS only; any other
+/// caller, or no grant, keeps `base`. The floor, push to main and the fence
+/// paths never read this: `decide` and `pr_tier` keep them.
+pub fn apply_grant(runs_dir: &Path, repo: &Path, caller_is_cos: bool, base: Tier) -> Tier {
+    if caller_is_cos && grant_full(runs_dir, repo) {
+        Tier::Low
+    } else {
+        base
+    }
+}
+
+/// The tier the gate and `pr.merge` judge an action in: the strictest of the
+/// repo's `repo_tier` row and its `plan_lane` row (keyed by the repo key; an
+/// unknown lane is high), lowered to low by a full grant for the CoS.
+pub fn effective_context_tier(runs_dir: &Path, dir: &Path, caller_is_cos: bool) -> Tier {
+    let base = repo_tier(runs_dir, dir).max(lane_tier_of(runs_dir, &repo_key(dir)));
+    apply_grant(runs_dir, dir, caller_is_cos, base)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
