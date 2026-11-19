@@ -39,7 +39,7 @@ fn project_repo(conn: &rusqlite::Connection, caller: &str) -> Option<String> {
 }
 
 /// A git command with the user's and the system's config out of the way.
-fn git(repo: &str) -> Proc {
+pub(crate) fn git(repo: &str) -> Proc {
     let mut p = Proc::new("git");
     p.arg("-C")
         .arg(repo)
@@ -50,7 +50,7 @@ fn git(repo: &str) -> Proc {
 }
 
 /// A plain branch name: no refspec syntax, and git accepts it as a branch.
-fn plain_branch(repo: &str, b: &str) -> bool {
+pub(crate) fn plain_branch(repo: &str, b: &str) -> bool {
     !b.is_empty()
         && !b.starts_with(['-', '+', '^', ':'])
         && !b.contains([':', '+', '^', '*', '?', '[', '\\'])
@@ -61,7 +61,7 @@ fn plain_branch(repo: &str, b: &str) -> bool {
 }
 
 /// A remote configured in `repo`, by name only (never a URL or path).
-fn configured_remote(repo: &str, name: &str) -> bool {
+pub(crate) fn configured_remote(repo: &str, name: &str) -> bool {
     git(repo).arg("remote").output().is_ok_and(|o| {
         String::from_utf8_lossy(&o.stdout)
             .lines()

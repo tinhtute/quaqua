@@ -10,6 +10,7 @@ pub mod caller;
 pub mod grant;
 pub mod memory_write;
 pub mod pr_merge;
+pub mod push_door;
 pub mod store;
 pub mod supervisor;
 pub mod watch;
@@ -300,6 +301,7 @@ impl Daemon {
     fn register_builtin(&mut self) {
         caller::register(self);
         pr_merge::register(self);
+        push_door::register(self);
         grant::register(self);
         memory_write::register(self);
         let add = |d: &mut Daemon, name: &str, h: Handler| {
