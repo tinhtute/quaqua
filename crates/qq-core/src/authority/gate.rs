@@ -1,19 +1,31 @@
-//! The `gate` verb: the Claude Code PreToolUse(Bash) hook, ported from
-//! the legacy engine. Stateless: it tokenizes the hook's command and
-//! blocks what the daemon alone may do under R11 — a herdr pane, tab or
-//! workspace spawn/move/close, any `git push`, and a `gh` merge — plus the
-//! U3 tripwires for the same powers by another name (alias push, `gh api` ref
-//! and contents writes, auto-merge, pane input, `grid_role` tokens, writes to
-//! `runs/qq.db`, deleting main/master). A tripwire, not a fence: a same-uid
-//! process can still route around it. Everything else is allowed. It fails closed: empty input, a read error, a body that
-//! is not JSON, or a missing or non-string `tool_input.command` all block.
+//! The `gate` verb: the Claude Code PreToolUse hook (Bash, and Write/Edit on
+//! the live instruction files). Stateless: it tokenizes the hook's command and
+//! sorts what it finds in three bins.
 //!
-//! Not ported: the old gate's `ask` prompts, `pkill -f`, removed worker
-//! scripts, and the CoS-pane lookup (every pane close is blocked instead: the
-//! daemon is the door).
+//! - Hard blocks, for everyone: a herdr pane, tab or workspace spawn/move/close,
+//!   any `git push` that is not a pure branch delete, a `gh` merge (by any
+//!   spelling), deleting main/master, and a ref or contents write that lands on
+//!   main/master.
+//! - The approval list, decided by caller and tier (R7, R14, R5): branch delete,
+//!   `git branch -m|-M|-f` on main/master, `git tag`, `gh release create`,
+//!   history rewrite on shared refs, the #297 bypass spellings (alias push,
+//!   `gh api` ref/contents writes off main, `query=@file`), pane input and
+//!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
+//!   AGENTS.md, SOUL.md and identity.md. Only a hit asks the daemon who is
+//!   calling (`caller.lookup`); only the CoS gets past `deny`, and the tier
+//!   table (`tier.rs`) says allow or ask. No daemon answer is `deny`.
+//! - Everything else is allowed, with no daemon call.
+//!
+//! A tripwire, not a fence: a same-uid process can still route around it. It
+//! fails closed: empty input, a read error, a body that is not JSON, or a
+//! missing or non-string `tool_input.command` all block.
 
+use std::path::{Component, Path, PathBuf};
+
+use super::tier::{self, Action, Decision, Tier};
 use super::tokenizer::tokenize;
 use crate::cli::{CliError, Command, Env};
+use crate::daemon::caller::{self, Caller};
 
 /// Exit status and stderr message of a block (Claude Code treats 2 as "refuse").
 pub const BLOCK_EXIT: i32 = 2;
@@ -23,32 +35,224 @@ const PUSH_MESSAGE: &str =
     "blocked: git push only through the quaqua daemon (the daemon is the one door for push)";
 const MERGE_MESSAGE: &str =
     "blocked: merge only through the quaqua daemon (the daemon is the one door for merge)";
-const QUERY_FILE_MESSAGE: &str =
-    "blocked: a gh api query read from a file hides the mutation; pass the query inline";
-const INPUT_MESSAGE: &str = "blocked: pane input and grid_role tokens only through the quaqua daemon (herdr pane send-keys|send-text|run, report-metadata grid_role=)";
-const DB_MESSAGE: &str =
-    "blocked: runs/qq.db is the daemon's; read it with `sqlite3 -readonly`, write it only through quaqua verbs";
 const BRANCH_MESSAGE: &str = "blocked: deleting main or master is anh iu's call, never a worker's";
+const NOT_COS_MESSAGE: &str =
+    "blocked: this needs the CoS's approval; report to the CoS, who asks anh iu";
+const NO_CALLER_MESSAGE: &str = "blocked: the quaqua daemon did not identify the caller (daemon down or unmapped peer); start the daemon, or report to the CoS";
+const TIER_DENY_MESSAGE: &str = "blocked: pushing to main and force-pushing are anh iu's call";
 
+const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
+const ASK_TRUNK_MOVE: &str = "approval list: rename or force-move main/master";
+const ASK_TAG: &str = "approval list: git tag";
+const ASK_RELEASE: &str = "approval list: gh release create";
+const ASK_REWRITE: &str = "approval list: history rewrite on shared refs";
+const ASK_BYPASS: &str = "approval list: a push or merge door by another name";
+const ASK_INPUT: &str = "approval list: pane input or a grid_role token";
+const ASK_DB: &str = "approval list: runs/qq.db belongs to the daemon";
+const ASK_FILE: &str = "approval list: the CoS's live instruction files";
+
+/// What the gate decided. `Ask` prompts the person; `Block` refuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
+    Ask(&'static str),
     Block(&'static str),
 }
 
-/// Decide for the hook's stdin JSON. Anything the gate cannot read as a
-/// command string blocks.
+/// An approval-list hit: a fixed action, or a branch delete whose class
+/// (merged or not) is read from git only once the caller is known to be the CoS.
+#[derive(Debug)]
+enum Pending {
+    Act(Action),
+    BranchDelete(String),
+}
+
+/// What a scan found: the first hard block, and every approval-list hit.
+#[derive(Debug, Default)]
+struct Found {
+    block: Option<&'static str>,
+    listed: Vec<(Pending, &'static str)>,
+}
+
+impl Found {
+    fn pass() -> Self {
+        Self::default()
+    }
+
+    fn block(m: &'static str) -> Self {
+        Found {
+            block: Some(m),
+            listed: Vec::new(),
+        }
+    }
+
+    fn act(a: Action, reason: &'static str) -> Self {
+        Found {
+            block: None,
+            listed: vec![(Pending::Act(a), reason)],
+        }
+    }
+
+    fn is_pass(&self) -> bool {
+        self.block.is_none() && self.listed.is_empty()
+    }
+
+    fn absorb(&mut self, o: Found) {
+        self.block = self.block.or(o.block);
+        self.listed.extend(o.listed);
+    }
+}
+
+/// Decide for the hook's stdin JSON with no daemon to ask: an approval-list hit
+/// is denied. Anything the gate cannot read as a command string blocks.
 pub fn evaluate(hook_json: &str) -> Verdict {
+    decide_for(None, hook_json)
+}
+
+/// [`evaluate`] for a gate running in `env`'s workspace: an approval-list hit
+/// asks that workspace's daemon who is calling.
+pub fn evaluate_in(env: &Env, hook_json: &str) -> Verdict {
+    decide_for(Some(env), hook_json)
+}
+
+/// The PreToolUse JSON that makes Claude Code prompt, even in auto mode.
+pub fn ask_json(reason: &str) -> String {
+    serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason,
+    }})
+    .to_string()
+}
+
+fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(hook_json) else {
         return Verdict::Block(PANE_MESSAGE);
     };
-    match v
-        .get("tool_input")
-        .and_then(|t| t.get("command"))
-        .and_then(|c| c.as_str())
-    {
-        Some(cmd) if !cmd.trim().is_empty() => check(cmd),
-        _ => Verdict::Block(PANE_MESSAGE),
+    let input = v.get("tool_input");
+    let cwd = v.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from);
+    let tool = v.get("tool_name").and_then(|t| t.as_str());
+    let found = match (input.and_then(|t| t.get("command")), tool) {
+        (Some(c), _) if c.is_string() => {
+            let cmd = c.as_str().unwrap_or_default();
+            if cmd.trim().is_empty() {
+                return Verdict::Block(PANE_MESSAGE);
+            }
+            scan(cmd)
+        }
+        (_, Some("Write" | "Edit" | "MultiEdit" | "NotebookEdit")) => {
+            let path = input
+                .and_then(|t| t.get("file_path").or_else(|| t.get("notebook_path")))
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty());
+            match (path, env) {
+                (None, _) => return Verdict::Block(PANE_MESSAGE),
+                (Some(p), Some(env)) => edit_found(env, p, cwd.as_deref()),
+                // No workspace to resolve against: treat as a hit and deny.
+                (Some(_), None) => Found::act(Action::InstructionFile, ASK_FILE),
+            }
+        }
+        (_, None | Some("Bash")) => return Verdict::Block(PANE_MESSAGE),
+        _ => return Verdict::Allow,
+    };
+    judge(
+        found,
+        &|| env.map_or(Caller::Unknown, |e| caller::lookup(&e.runs_dir)),
+        env.map(|e| e.runs_dir.as_path()),
+        cwd.as_deref(),
+    )
+}
+
+/// The verdict for a scan. The daemon is asked only when something is on the
+/// approval list and nothing hard-blocked already.
+fn judge(
+    f: Found,
+    who: &dyn Fn() -> Caller,
+    runs_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Verdict {
+    if let Some(m) = f.block {
+        return Verdict::Block(m);
+    }
+    if f.listed.is_empty() {
+        return Verdict::Allow;
+    }
+    match who() {
+        Caller::Cos => {}
+        Caller::Other(_) => return Verdict::Block(NOT_COS_MESSAGE),
+        Caller::Unknown => return Verdict::Block(NO_CALLER_MESSAGE),
+    }
+    let dir = cwd.unwrap_or(Path::new("."));
+    let repo = runs_dir.map_or(Tier::High, |r| tier::repo_tier(r, dir));
+    let lane = tier::lane_tier();
+    let mut ask = None;
+    for (p, reason) in f.listed {
+        let action = match p {
+            Pending::Act(a) => a,
+            Pending::BranchDelete(b) => tier::branch_delete_action(dir, &b),
+        };
+        match tier::decide(true, action, repo, lane) {
+            Decision::Deny => return Verdict::Block(TIER_DENY_MESSAGE),
+            Decision::Ask => ask = Some(reason),
+            Decision::Allow => {}
+        }
+    }
+    ask.map_or(Verdict::Allow, Verdict::Ask)
+}
+
+/// A Write/Edit to the live AGENTS.md, SOUL.md or identity.md: the path is
+/// resolved (cwd, `..`, symlinks) and compared under the CoS workspace root, so
+/// a template or a repo AGENTS.md with the same basename is not a hit.
+fn edit_found(env: &Env, file: &str, cwd: Option<&Path>) -> Found {
+    let Some(root) = env.runs_dir.parent() else {
+        return Found::act(Action::InstructionFile, ASK_FILE);
+    };
+    let root = resolve(root);
+    let mut p = PathBuf::from(file);
+    if p.is_relative() {
+        p = cwd
+            .map_or_else(
+                || std::env::current_dir().unwrap_or_default(),
+                Path::to_path_buf,
+            )
+            .join(p);
+    }
+    let p = resolve(&p);
+    let live = ["AGENTS.md", "SOUL.md", "identity.md"]
+        .iter()
+        .any(|n| p == root.join(n));
+    if live {
+        Found::act(Action::InstructionFile, ASK_FILE)
+    } else {
+        Found::pass()
+    }
+}
+
+/// Lexical `.`/`..` removal, then symlinks resolved on the longest existing prefix.
+fn resolve(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c.as_os_str()),
+        }
+    }
+    let mut tail = Vec::new();
+    let mut head = out.clone();
+    loop {
+        if let Ok(c) = head.canonicalize() {
+            return tail.iter().rev().fold(c, |acc, t| acc.join(t));
+        }
+        match (head.file_name().map(|f| f.to_owned()), head.parent()) {
+            (Some(f), Some(par)) => {
+                tail.push(f);
+                head = par.to_path_buf();
+            }
+            _ => return out,
+        }
     }
 }
 
@@ -61,21 +265,25 @@ pub fn evaluate_reader<R: std::io::Read>(mut r: R) -> Verdict {
     }
 }
 
-/// Check one shell command: every simple command in it, nested ones included.
+/// Check one shell command with no daemon to ask (an approval-list hit denies).
 pub fn check(command: &str) -> Verdict {
+    judge(scan(command), &|| Caller::Unknown, None, None)
+}
+
+/// Every simple command in `command`, nested ones included.
+fn scan(command: &str) -> Found {
     let segs = tokenize(command);
+    let mut f = Found::pass();
     for seg in &segs {
-        if let v @ Verdict::Block(_) = check_words(seg) {
-            return v;
-        }
+        f.absorb(check_words(seg));
     }
     // A shell that reads its script from stdin (`| bash`, `bash -s`, a
     // here-string or heredoc) hides the script from the tokenizer: block when
     // the command text names a push.
     if mentions_push(command) && segs.iter().any(|s| reads_stdin_script(s)) {
-        return Verdict::Block(PUSH_MESSAGE);
+        f.absorb(Found::block(PUSH_MESSAGE));
     }
-    Verdict::Allow
+    f
 }
 
 fn mentions_push(text: &str) -> bool {
@@ -178,15 +386,17 @@ fn guarded_pair(a: &str, b: &str) -> bool {
             | ("workspace", "create")
             | ("workspace", "close")
             | ("agent", "start")
-            | ("pane", "send-keys")
-            | ("pane", "send-text")
-            | ("pane", "run")
     )
 }
 
-fn check_words(w: &[String]) -> Verdict {
+/// `herdr pane send-keys|send-text|run`: typing into another agent's pane.
+fn input_pair(a: &str, b: &str) -> bool {
+    a == "pane" && matches!(b, "send-keys" | "send-text" | "run")
+}
+
+fn check_words(w: &[String]) -> Found {
     let Some(i) = w.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
-        return Verdict::Allow;
+        return Found::pass();
     };
     let base = w[i].rsplit('/').next().unwrap_or(&w[i]);
     let a = &w[i + 1..];
@@ -197,25 +407,68 @@ fn check_words(w: &[String]) -> Verdict {
         "sqlite3" => check_sqlite(a),
         b if is_shell(b) => check_shell(a),
         "busybox" if a.first().is_some_and(|x| is_shell(x)) => check_shell(&a[1..]),
-        "eval" if !a.is_empty() => check(&a.join(" ")),
+        "eval" if !a.is_empty() => scan(&a.join(" ")),
         "find" => check_find(a),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
         | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
-        _ => Verdict::Allow,
+        b => names_db(b, a),
     }
 }
 
-fn check_shell(a: &[String]) -> Verdict {
+/// Any other command naming the daemon's `qq.db`, bar the read-only tools.
+fn names_db(base: &str, a: &[String]) -> Found {
+    const READ_ONLY: &[&str] = &[
+        "cat",
+        "ls",
+        "stat",
+        "file",
+        "head",
+        "tail",
+        "wc",
+        "du",
+        "less",
+        "more",
+        "md5sum",
+        "sha1sum",
+        "sha256sum",
+        "shasum",
+        "strings",
+        "grep",
+        "rg",
+        "echo",
+        "printf",
+        "diff",
+        "cmp",
+        "test",
+        "[",
+        "realpath",
+        "readlink",
+        "basename",
+        "dirname",
+        "xxd",
+        "hexdump",
+        "od",
+    ];
+    let names = a.iter().any(|x| x.rsplit('/').next() == Some("qq.db"));
+    if names && !READ_ONLY.contains(&base) {
+        Found::act(Action::DbWrite, ASK_DB)
+    } else {
+        Found::pass()
+    }
+}
+
+fn check_shell(a: &[String]) -> Found {
     for k in 0..a.len() {
         if is_c_flag(&a[k]) && k + 1 < a.len() {
-            return check(&a[k + 1]);
+            return scan(&a[k + 1]);
         }
     }
-    Verdict::Allow
+    Found::pass()
 }
 
 /// `find … -exec|-execdir|-ok|-okdir CMD … ;|+`: CMD is checked.
-fn check_find(a: &[String]) -> Verdict {
+fn check_find(a: &[String]) -> Found {
+    let mut f = Found::pass();
     for (k, w) in a.iter().enumerate() {
         if matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
             let cmd: Vec<String> = a[k + 1..]
@@ -223,16 +476,14 @@ fn check_find(a: &[String]) -> Verdict {
                 .take_while(|x| x.as_str() != ";" && x.as_str() != "+")
                 .cloned()
                 .collect();
-            if let v @ Verdict::Block(_) = check_words(&cmd) {
-                return v;
-            }
+            f.absorb(check_words(&cmd));
         }
     }
-    Verdict::Allow
+    f
 }
 
 /// `sqlite3` on the daemon's `qq.db` without `-readonly`.
-fn check_sqlite(a: &[String]) -> Verdict {
+fn check_sqlite(a: &[String]) -> Found {
     let readonly = a.iter().any(|x| x == "-readonly" || x == "--readonly");
     // `.open` and `ATTACH` reopen a database read-write, past `-readonly`.
     let reopens = a.iter().any(|x| {
@@ -242,9 +493,9 @@ fn check_sqlite(a: &[String]) -> Verdict {
                 .any(|t| t == "attach")
     });
     if (!readonly || reopens) && a.iter().any(|x| x.contains("qq.db")) {
-        return Verdict::Block(DB_MESSAGE);
+        return Found::act(Action::DbWrite, ASK_DB);
     }
-    Verdict::Allow
+    Found::pass()
 }
 
 /// What `gh api`'s own flag parser (pflag) sees in the words after `api`.
@@ -347,12 +598,35 @@ fn parse_gh_api(a: &[String]) -> ApiCall {
     call
 }
 
-/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation, or a
-/// ref/contents write that is a push by another name.
-fn check_gh(a: &[String]) -> Verdict {
+/// `main` or `master`, bare or as `refs/heads/…`.
+fn is_trunk(x: &str) -> bool {
+    matches!(
+        x.strip_prefix("refs/heads/").unwrap_or(x),
+        "main" | "master"
+    )
+}
+
+/// A word that targets main/master as a ref (`…/heads/main`, `ref=refs/heads/main`)
+/// or a branch field (`branch=main`).
+fn targets_trunk(x: &str) -> bool {
+    let at_end = |rest: &str| {
+        !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    };
+    ["heads/main", "heads/master", "branch=main", "branch=master"]
+        .iter()
+        .any(|p| x.match_indices(p).any(|(i, _)| at_end(&x[i + p.len()..])))
+}
+
+/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation (hard
+/// blocks); a ref/contents write or a hidden query is a push by another name:
+/// blocked when it lands on main/master, else on the approval list.
+fn check_gh(a: &[String]) -> Found {
     let pr = a.iter().position(|x| x == "pr");
     if pr.is_some_and(|p| a[p + 1..].iter().any(|x| x == "merge")) {
-        return Verdict::Block(MERGE_MESSAGE);
+        return Found::block(MERGE_MESSAGE);
+    }
+    if a.windows(2).any(|w| w[0] == "release" && w[1] == "create") {
+        return Found::act(Action::Release, ASK_RELEASE);
     }
     if a.iter().any(|x| x == "api") {
         let merge_path = a.iter().any(|x| {
@@ -365,50 +639,63 @@ fn check_gh(a: &[String]) -> Verdict {
             || a.iter()
                 .any(|x| x.contains("mergePullRequest") || x.contains("enablePullRequestAutoMerge"))
         {
-            return Verdict::Block(MERGE_MESSAGE);
+            return Found::block(MERGE_MESSAGE);
         }
         if a.iter().any(|x| x.contains("query=@")) {
-            return Verdict::Block(QUERY_FILE_MESSAGE);
+            return Found::act(Action::Bypass, ASK_BYPASS);
         }
         let writes_ref = a
             .iter()
             .any(|x| !x.starts_with('-') && (x.contains("/git/refs") || x.contains("/contents/")));
         if writes_ref && call.writes() {
-            return Verdict::Block(PUSH_MESSAGE);
+            let contents = a
+                .iter()
+                .any(|x| !x.starts_with('-') && x.contains("/contents/"));
+            // A contents write with no explicit branch lands on the default branch.
+            let off_main = a.iter().any(|x| x.starts_with("branch="))
+                || a.windows(2).any(|w| w[1].starts_with("branch="));
+            if a.iter().any(|x| targets_trunk(x)) || (contents && !off_main) {
+                return Found::block(PUSH_MESSAGE);
+            }
+            return Found::act(Action::Bypass, ASK_BYPASS);
         }
     }
-    Verdict::Allow
+    Found::pass()
 }
 
 /// A guarded pair counts only as the command's verb: every word before it is
 /// a global option or that option's value, and no `--help` follows.
-fn check_herdr(a: &[String]) -> Verdict {
+fn check_herdr(a: &[String]) -> Found {
     if matches!(a.first().map(String::as_str), Some("--help" | "-h")) {
-        return Verdict::Allow;
+        return Found::pass();
     }
     // `report-metadata … grid_role=…` forges the CoS identity (a pane token).
     if let Some(k) =
         (0..a.len().saturating_sub(1)).find(|&k| a[k] == "pane" && a[k + 1] == "report-metadata")
     {
         if a[k + 2..].iter().any(|x| x.contains("grid_role=")) {
-            return Verdict::Block(INPUT_MESSAGE);
+            return Found::act(Action::PaneInput, ASK_INPUT);
         }
     }
-    let Some(first) = (0..a.len().saturating_sub(1)).find(|&k| guarded_pair(&a[k], &a[k + 1]))
+    let Some(first) = (0..a.len().saturating_sub(1))
+        .find(|&k| guarded_pair(&a[k], &a[k + 1]) || input_pair(&a[k], &a[k + 1]))
     else {
-        return Verdict::Allow;
+        return Found::pass();
     };
     let is_verb = (0..first).all(|k| a[k].starts_with('-') || (k > 0 && a[k - 1].starts_with('-')));
     let help = a.get(first + 2).is_some_and(|x| x == "--help" || x == "-h");
-    if is_verb && !help {
-        Verdict::Block(PANE_MESSAGE)
+    if !is_verb || help {
+        Found::pass()
+    } else if input_pair(&a[first], &a[first + 1]) {
+        Found::act(Action::PaneInput, ASK_INPUT)
     } else {
-        Verdict::Allow
+        Found::block(PANE_MESSAGE)
     }
 }
 
-/// `git [global options] push …`: every push is blocked, `--help` aside.
-fn check_git(a: &[String]) -> Verdict {
+/// `git [global options] <verb> …`: a push is blocked (a pure branch delete is
+/// on the approval list), `--help` aside.
+fn check_git(a: &[String]) -> Found {
     let mut i = 0;
     while i < a.len() {
         let w = a[i].as_str();
@@ -421,14 +708,14 @@ fn check_git(a: &[String]) -> Verdict {
                     .split_whitespace()
                     .any(|t| t.trim_start_matches('!') == "push")
                 {
-                    return Verdict::Block(PUSH_MESSAGE);
+                    return Found::act(Action::Bypass, ASK_BYPASS);
                 }
             }
             i += if w == "-c" { 2 } else { 1 };
         } else if w == "-C" {
             i += 2;
         } else if w == "--help" || w == "-h" {
-            return Verdict::Allow;
+            return Found::pass();
         } else if matches!(
             w,
             "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
@@ -440,18 +727,66 @@ fn check_git(a: &[String]) -> Verdict {
             break;
         }
     }
+    let rest = a.get(i + 1..).unwrap_or_default();
     match a.get(i).map(String::as_str) {
-        Some("config") => return check_git_config(&a[i + 1..]),
-        Some("branch") => return check_git_branch(&a[i + 1..]),
-        _ => {}
+        Some("config") => check_git_config(rest),
+        Some("branch") => check_git_branch(rest),
+        Some("tag") => check_git_tag(rest),
+        Some("filter-branch" | "filter-repo") => Found::act(Action::HistoryRewrite, ASK_REWRITE),
+        Some("update-ref") => {
+            let shared = rest.iter().any(|x| {
+                x.starts_with("refs/remotes/")
+                    || x.starts_with("refs/tags/")
+                    || is_trunk(x) && x.starts_with("refs/")
+            });
+            if shared {
+                Found::act(Action::HistoryRewrite, ASK_REWRITE)
+            } else {
+                Found::pass()
+            }
+        }
+        Some("push") => {
+            if rest.iter().any(|x| x == "--help" || x == "-h") {
+                return Found::pass();
+            }
+            match push_deletes(rest) {
+                Some(names) if names.iter().any(|n| is_trunk(n)) => Found::block(BRANCH_MESSAGE),
+                Some(names) if !names.is_empty() => delete_hits(names),
+                _ => Found::block(PUSH_MESSAGE),
+            }
+        }
+        _ => Found::pass(),
     }
-    if a.get(i).map(String::as_str) != Some("push") {
-        return Verdict::Allow;
+}
+
+fn delete_hits(names: Vec<String>) -> Found {
+    let mut f = Found::pass();
+    for n in names {
+        f.listed.push((Pending::BranchDelete(n), ASK_BRANCH_DELETE));
     }
-    if a[i + 1..].iter().any(|x| x == "--help" || x == "-h") {
-        return Verdict::Allow;
+    f
+}
+
+/// The branches a push deletes, when it only deletes: `--delete`/`-d`, or every
+/// refspec is `:name`. `None` when it pushes anything.
+fn push_deletes(a: &[String]) -> Option<Vec<String>> {
+    let flag = a.iter().any(|x| x == "--delete" || x == "-d");
+    let words: Vec<&str> = a
+        .iter()
+        .filter(|x| !x.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    // The first word is the remote.
+    let specs = words.get(1..).unwrap_or_default();
+    if specs.is_empty() || (!flag && !specs.iter().all(|s| s.starts_with(':') && s.len() > 1)) {
+        return None;
     }
-    Verdict::Block(PUSH_MESSAGE)
+    Some(
+        specs
+            .iter()
+            .map(|s| s.trim_start_matches(':').to_string())
+            .collect(),
+    )
 }
 
 /// The part after `alias.`: git config keys are case-insensitive.
@@ -461,44 +796,90 @@ fn strip_alias(s: &str) -> Option<&str> {
 }
 
 /// `git config … alias.<x> <value naming push>`: a push by another name.
-fn check_git_config(a: &[String]) -> Verdict {
+fn check_git_config(a: &[String]) -> Found {
     let Some(k) = a.iter().position(|x| strip_alias(x).is_some()) else {
-        return Verdict::Allow;
+        return Found::pass();
     };
     let names_push = a[k + 1..].iter().any(|v| {
         v.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
             .any(|t| t == "push")
     });
     if names_push {
-        Verdict::Block(PUSH_MESSAGE)
+        Found::act(Action::Bypass, ASK_BYPASS)
     } else {
-        Verdict::Allow
+        Found::pass()
     }
 }
 
-/// `git branch` deleting `main` or `master` (`-d`, `-D`, `--delete`, `-df`…).
-fn check_git_branch(a: &[String]) -> Verdict {
-    let delete = a.iter().any(|x| {
-        x == "--delete"
-            || (x.starts_with('-')
-                && !x.starts_with("--")
-                && x[1..].chars().any(|c| c == 'd' || c == 'D'))
+/// `git branch`: deleting main/master blocks; deleting any other branch and
+/// renaming or force-moving main/master are on the approval list.
+fn check_git_branch(a: &[String]) -> Found {
+    let short = |c: char| {
+        a.iter()
+            .any(|x| x.starts_with('-') && !x.starts_with("--") && x[1..].chars().any(|k| k == c))
+    };
+    let long = |n: &str| a.iter().any(|x| x == n);
+    let names: Vec<&str> = a
+        .iter()
+        .filter(|x| !x.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    if long("--delete") || short('d') || short('D') {
+        if names.iter().any(|n| is_trunk(n)) {
+            return Found::block(BRANCH_MESSAGE);
+        }
+        return delete_hits(names.iter().map(|n| n.to_string()).collect());
+    }
+    let moves = long("--move") || short('m') || short('M');
+    let forces = long("--force") || short('f');
+    if (moves && names.iter().any(|n| is_trunk(n)))
+        || (forces && names.first().is_some_and(|n| is_trunk(n)))
+    {
+        return Found::act(Action::TrunkMove, ASK_TRUNK_MOVE);
+    }
+    Found::pass()
+}
+
+/// `git tag` that creates, moves or deletes a tag; listing and reading are free.
+fn check_git_tag(a: &[String]) -> Found {
+    let reads = a.iter().any(|x| {
+        matches!(
+            x.as_str(),
+            "-l" | "--list"
+                | "-v"
+                | "--verify"
+                | "--contains"
+                | "--no-contains"
+                | "--points-at"
+                | "--merged"
+                | "--no-merged"
+        ) || x.starts_with("-n")
+            || x.starts_with("--sort")
+            || x.starts_with("--format")
     });
-    let names_trunk = a.iter().any(|x| {
+    let writes = a.iter().any(|x| {
         !x.starts_with('-')
-            && matches!(
-                x.strip_prefix("refs/heads/").unwrap_or(x),
-                "main" | "master"
+            || matches!(
+                x.as_str(),
+                "-a" | "-s"
+                    | "-f"
+                    | "-d"
+                    | "-m"
+                    | "-u"
+                    | "--delete"
+                    | "--annotate"
+                    | "--sign"
+                    | "--force"
             )
     });
-    if delete && names_trunk {
-        Verdict::Block(BRANCH_MESSAGE)
+    if writes && !reads {
+        Found::act(Action::Tag, ASK_TAG)
     } else {
-        Verdict::Allow
+        Found::pass()
     }
 }
 
-fn wrapper(base: &str, a: &[String]) -> Verdict {
+fn wrapper(base: &str, a: &[String]) -> Found {
     let value_flags: &str = match base {
         "sudo" => " u g h p C T U R t D ",
         "env" => " u C S ",
@@ -515,8 +896,9 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
                 // `env -S 'cmd args'`: the value is a command line.
                 if base == "env" && f == 'S' {
                     if let Some(p) = a.get(k + 1) {
-                        if let v @ Verdict::Block(_) = check(p) {
-                            return v;
+                        let f = scan(p);
+                        if !f.is_pass() {
+                            return f;
                         }
                     }
                 }
@@ -525,8 +907,9 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
             }
         }
         if let Some(p) = a[k].strip_prefix("--split-string=") {
-            if let v @ Verdict::Block(_) = check(p) {
-                return v;
+            let f = scan(p);
+            if !f.is_pass() {
+                return f;
             }
         }
         if a[k].starts_with('-') || is_assignment(&a[k]) {
@@ -540,7 +923,7 @@ fn wrapper(base: &str, a: &[String]) -> Verdict {
         }
         return check_words(&a[k..]);
     }
-    Verdict::Allow
+    Found::pass()
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
@@ -571,7 +954,7 @@ fn run(env: &Env, args: &[String]) -> Result<String, CliError> {
         }
         _ => return Err(CliError::new(2, "usage: quaqua gate [--json <hook-json>]")),
     };
-    match evaluate(&json) {
+    match evaluate_in(env, &json) {
         Verdict::Allow => {
             if let Some(ws) = env.runs_dir.parent() {
                 if let Some(msg) = drift_warning(ws, &json) {
@@ -580,6 +963,7 @@ fn run(env: &Env, args: &[String]) -> Result<String, CliError> {
             }
             Ok(String::new())
         }
+        Verdict::Ask(msg) => Ok(ask_json(msg)),
         Verdict::Block(msg) => Err(CliError::new(BLOCK_EXIT, msg)),
     }
 }
