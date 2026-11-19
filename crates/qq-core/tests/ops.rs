@@ -21,7 +21,7 @@ use qq_core::task::worker_flow::place_pane;
 use rusqlite::Connection;
 
 const BRIEF: &str = "Topology: solo — one unit\nPlaybook: feature\nContext: none, test\n\
-Goal: g\nHard constraints: h\nCurrent design (open to challenge): d\n\
+Goal: g\nHard constraints: h; `tests/qq-test.sh foo`\nCurrent design (open to challenge): d\n\
 Unknowns: u\nEvidence: e\nTime budget: 15 min\nCost budget: $2\n";
 
 fn seeded(tag: &str) -> (std::path::PathBuf, Connection) {
@@ -92,9 +92,6 @@ fn prompt_check_brief_and_resume() {
         prompt::check_brief(BRIEF, Some(60), None).unwrap().source,
         "env"
     );
-    let no_time = BRIEF.replace("Time budget: 15 min\n", "");
-    let d = prompt::check_brief(&no_time, None, None).unwrap();
-    assert_eq!((d.budget_sec, d.source), (2700, "default"));
     // rejected briefs
     for bad in [
         BRIEF.replace("Topology: solo — one unit\n", ""),
@@ -102,6 +99,8 @@ fn prompt_check_brief_and_resume() {
         format!("{BRIEF}Must fix: urgent\n"),
         format!("{BRIEF}Review rounds: 0\n"),
         BRIEF.replace("15 min", "soon"),
+        BRIEF.replace("Time budget: 15 min\n", ""),
+        BRIEF.replace("Cost budget: $2\n", ""),
     ] {
         assert!(prompt::check_brief(&bad, None, None).is_err(), "{bad}");
     }
@@ -1642,4 +1641,231 @@ fn prompt_archives_the_previous_report_and_waits_for_a_new_one() {
         std::fs::read_to_string(runs.join(&archived[0])).unwrap(),
         old
     );
+}
+
+#[test]
+fn pane_tail_block_has_one_header_and_the_last_40_lines() {
+    let (runs, _c) = seeded("tail40");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    let text: Vec<String> = (1..=60).map(|i| format!("line{i}")).collect();
+    h.set_pane_text("p1", &text.join("\n"));
+    let out = prompt::pane_tail_block(&h, &runs, "w");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "WATCHDOG pane tail w");
+    assert_eq!(lines.len(), 41, "{out}");
+    assert_eq!((lines[1], lines[40]), ("line21", "line60"));
+    assert_eq!(out.matches("WATCHDOG pane tail").count(), 1);
+}
+
+#[test]
+fn pane_tail_reads_the_recorded_pane_when_the_core_died() {
+    let (runs, conn) = seeded("tail8");
+    let h = FakeHerdr::new();
+    add_agent(&conn, "w", "peer", "tieude", None);
+    conn.execute("UPDATE agent SET pane_id = 'p9' WHERE name = 'w'", [])
+        .unwrap();
+    h.set_pane_text("p9", "last words");
+    // herdr has no agent `w` (exit 8), yet the recorded pane still reads
+    let cfg_journal = |_: &str, _: serde_json::Value| {};
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    assert_eq!(
+        prompt::wait(&h, &clock, &wait_cfg(&runs, &cfg_journal, 7200)),
+        Exit::CoreDied
+    );
+    assert_eq!(
+        prompt::pane_tail_block(&h, &runs, "w"),
+        "WATCHDOG pane tail w\nlast words"
+    );
+}
+
+#[test]
+fn pane_tail_failed_read_is_one_line_and_keeps_the_exit_code() {
+    let (runs, conn) = seeded("tailfail");
+    let h = FakeHerdr::new();
+    add_agent(&conn, "w", "peer", "tieude", None);
+    // no pane known anywhere: header plus one reason line
+    let out = prompt::pane_tail_block(&h, &runs, "w");
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(out.contains("pane read failed"), "{out}");
+    // a recorded pane herdr cannot find: the herdr error code is the reason
+    conn.execute("UPDATE agent SET pane_id = 'gone' WHERE name = 'w'", [])
+        .unwrap();
+    let out = prompt::pane_tail_block(&h, &runs, "w");
+    assert!(out.ends_with("pane read failed: pane_not_found"), "{out}");
+    // the CLI path still exits 8
+    let tuning = Tuning {
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+    };
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    let args: Vec<String> = ["w", "--resume"].iter().map(|s| s.to_string()).collect();
+    let e = prompt::prompt_run(&h, &clock, &runs, &args, &tuning).unwrap_err();
+    assert_eq!(e.code, 8);
+}
+
+fn set_pilot_budget(runs: &Path, v: &str) {
+    let c = db::open(&runs.join(db::path::DB_FILE)).unwrap();
+    c.execute(
+        "INSERT OR REPLACE INTO setting (key, value_json) VALUES ('timers.pilot_budget', ?1)",
+        [format!("\"{v}\"")],
+    )
+    .unwrap();
+}
+
+#[test]
+fn pilot_budget_rejects_a_prototype_brief_over_the_db_value() {
+    let (runs, _c) = seeded("pilot");
+    let proto = |min: u32| {
+        BRIEF
+            .replace("Playbook: feature", "Playbook: prototype")
+            .replace("Time budget: 15 min", &format!("Time budget: {min} min"))
+    };
+    set_pilot_budget(&runs, "30m");
+    let limit = prompt::pilot_budget_sec(&runs);
+    assert_eq!(limit, Some(1800));
+    assert!(prompt::check_pilot_budget(&proto(30), 1800, limit).is_ok());
+    let e = prompt::check_pilot_budget(&proto(45), 2700, limit).unwrap_err();
+    assert!(e.contains("45 min") && e.contains("30 min"), "{e}");
+    // not a pilot: the same budget passes
+    let long = BRIEF.replace("15 min", "45 min");
+    assert!(prompt::check_pilot_budget(&long, 2700, limit).is_ok());
+    // the database, not team.toml, is the source: change it and the verdict follows
+    set_pilot_budget(&runs, "60m");
+    let limit = prompt::pilot_budget_sec(&runs);
+    assert_eq!(limit, Some(3600));
+    assert!(prompt::check_pilot_budget(&proto(45), 2700, limit).is_ok());
+    // an unset key skips the check
+    assert!(prompt::check_pilot_budget(&proto(999), 59940, None).is_ok());
+}
+
+#[test]
+fn pilot_budget_judges_the_effective_budget_not_the_brief_line() {
+    let (runs, _c) = seeded("piloteff");
+    set_pilot_budget(&runs, "30m");
+    let limit = prompt::pilot_budget_sec(&runs);
+    let proto = BRIEF.replace("Playbook: feature", "Playbook: prototype");
+    let no_line = proto.replace("Time budget: 15 min\n", "");
+    assert!(!no_line.contains("Time budget:"));
+    // no line: the brief is rejected before the pilot cap is asked
+    assert!(prompt::check_brief(&no_line, None, None).is_err());
+    // an env override above the cap beats a brief line under it
+    let ok = prompt::check_brief(&proto, Some(3600), None).unwrap();
+    assert_eq!(ok.budget_sec, 3600);
+    assert!(prompt::check_pilot_budget(&proto, ok.budget_sec, limit).is_err());
+    // an env override under the cap passes
+    assert!(prompt::check_pilot_budget(&proto, 600, limit).is_ok());
+}
+
+#[test]
+fn check_brief_requires_both_budget_lines() {
+    for key in ["Time budget: 15 min\n", "Cost budget: $2\n"] {
+        let e = prompt::check_brief(&BRIEF.replace(key, ""), None, None).unwrap_err();
+        assert!(e.contains(key.split(':').next().unwrap()), "{e}");
+    }
+}
+
+#[test]
+fn check_brief_rejects_an_absolute_home_path_and_names_the_line() {
+    // built at runtime: the repo's pre-commit hook rejects literal home paths
+    let (home, users) = (format!("/{}/", "home"), format!("/{}/", "Users"));
+    for p in [
+        format!("{home}bob/x"),
+        format!("{users}bob/x"),
+        format!("see ({home}bob/), ok"),
+    ] {
+        let b = BRIEF.replace("Goal: g\n", &format!("Goal: g\nContext2: {p}\n"));
+        let e = prompt::check_brief(&b, None, None).unwrap_err();
+        assert!(e.contains("line 5") && e.contains(&p), "{e}");
+    }
+    // /tmp, a placeholder and a relative path that contains it are fine
+    for p in [
+        format!("/tmp{home}bob/x"),
+        format!("{home}<user>/x"),
+        format!("crates{home}bob/x"),
+        "/tmp/a".to_string(),
+    ] {
+        let b = BRIEF.replace("Goal: g\n", &format!("Goal: g {p}\n"));
+        assert!(prompt::check_brief(&b, None, None).is_ok(), "{p}");
+    }
+}
+
+#[test]
+fn check_brief_warns_on_missing_unknowns_and_evidence() {
+    for key in ["Unknowns: u\n", "Evidence: e\n"] {
+        let w = prompt::check_brief(&BRIEF.replace(key, ""), None, None).unwrap();
+        let name = key.split(':').next().unwrap();
+        assert!(
+            w.warnings.iter().any(|m| m.contains(name)),
+            "{:?}",
+            w.warnings
+        );
+    }
+}
+
+#[test]
+fn check_brief_warns_when_hard_constraints_name_no_test_command() {
+    let bare = BRIEF.replace("; `tests/qq-test.sh foo`", "; run the tests");
+    let w = prompt::check_brief(&bare, None, None).unwrap();
+    assert!(
+        w.warnings.iter().any(|m| m.contains("Hard constraints")),
+        "{:?}",
+        w.warnings
+    );
+    // a bullet list under the header counts
+    let list = BRIEF.replace(
+        "Hard constraints: h; `tests/qq-test.sh foo`\n",
+        "Hard constraints:\n- own x\n- `cargo test foo`\n",
+    );
+    assert!(prompt::check_brief(&list, None, None)
+        .unwrap()
+        .warnings
+        .is_empty());
+    // a test command after the next header does not count
+    let late = BRIEF.replace("; `tests/qq-test.sh foo`", "");
+    let late = late.replace("Unknowns: u", "Unknowns: u `cargo test x`");
+    assert!(!prompt::check_brief(&late, None, None)
+        .unwrap()
+        .warnings
+        .is_empty());
+}
+
+#[test]
+fn check_brief_warns_on_pgrep_f() {
+    let b = BRIEF.replace("Goal: g", "Goal: g, wait with `pgrep -f foo`");
+    let w = prompt::check_brief(&b, None, None).unwrap();
+    assert!(
+        w.warnings.iter().any(|m| m.contains("pgrep -f")),
+        "{:?}",
+        w.warnings
+    );
+}
+
+#[test]
+fn pilot_budget_blocks_the_prompt_before_anything_is_sent() {
+    let (runs, _c) = seeded("pilotsend");
+    set_pilot_budget(&runs, "10m");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    let tuning = Tuning {
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+    };
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    let brief = BRIEF.replace("Playbook: feature", "Playbook: prototype");
+    let args: Vec<String> = vec!["w".into(), brief];
+    let e = prompt::prompt_run(&h, &clock, &runs, &args, &tuning).unwrap_err();
+    assert_eq!(e.code, 1);
+    assert!(h.prompts().is_empty());
 }
