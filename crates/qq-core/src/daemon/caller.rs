@@ -35,8 +35,7 @@ pub fn register(d: &mut Daemon) {
     let _ = d.register_verb(
         VERB,
         Box::new(|_, req| {
-            let (Some(who), Some(_pane)) = (req.caller.as_deref(), req.caller_pane.as_deref())
-            else {
+            let Some(who) = identified(req) else {
                 return Err(RpcError::new(
                     UNMAPPED_PEER,
                     "caller not identified: the daemon names no callers from the socket peer",
@@ -45,6 +44,18 @@ pub fn register(d: &mut Daemon) {
             Ok(json!({ "caller": who, "cos": who == "cos" }))
         }),
     );
+}
+
+/// The caller's name when the peer gate named it (it also sets `caller_pane`);
+/// a claim the daemon did not verify is `None`.
+pub fn identified(req: &Request) -> Option<&str> {
+    req.caller_pane.as_ref()?;
+    req.caller.as_deref()
+}
+
+/// True only for the agent `cos`, named by the peer gate.
+pub fn is_cos(req: &Request) -> bool {
+    identified(req) == Some("cos")
 }
 
 /// Asks the daemon of `runs_dir`'s workspace who is calling.

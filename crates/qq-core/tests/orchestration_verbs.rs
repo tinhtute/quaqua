@@ -598,6 +598,7 @@ mod pr_merge_door {
     /// A rig whose peer (this test process) is `who`, a fake `gh` that logs its
     /// argv and answers from `diff`/`head`/`checks`, and a workflow `wf` whose
     /// journal says `reviewed` passed review at stage `stage`.
+    #[allow(clippy::too_many_arguments)]
     fn door(
         tag: &str,
         who: Who,
@@ -623,6 +624,7 @@ mod pr_merge_door {
                 r.herdr.set_pane_pids(&p, pid, &[]);
             }
         }
+        std::fs::create_dir_all(r.ws.root().join("work")).unwrap();
         let log = r.ws.root().join("gh.log");
         let gh = r.ws.root().join("fake-gh");
         let script = format!(
@@ -676,8 +678,10 @@ mod pr_merge_door {
         std::fs::read_to_string(&d.log).unwrap_or_default()
     }
 
-    fn assert_refused_no_merge(d: &Door, res: Result<Value, rpc::RpcError>) {
-        assert_eq!(res.unwrap_err().code, "refused");
+    fn assert_refused_no_merge(d: &Door, res: Result<Value, rpc::RpcError>, why: &str) {
+        let e = res.unwrap_err();
+        assert_eq!(e.code, "refused");
+        assert!(e.message.contains(why), "want '{why}' in: {}", e.message);
         assert!(
             !gh_log(d).contains("pr merge"),
             "gh merge ran: {}",
@@ -689,7 +693,7 @@ mod pr_merge_door {
     fn pr_merge_refuses_a_non_cos_caller() {
         let d = green("prm-worker", Who::Worker, Tier::Medium);
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "only the CoS");
     }
 
     #[test]
@@ -709,7 +713,7 @@ mod pr_merge_door {
     fn pr_merge_refuses_a_sha_that_is_not_the_reviewed_sha() {
         let d = green("prm-sha", Who::Cos, Tier::Medium);
         let res = merge(&d, OTHER);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "not the reviewed sha");
     }
 
     #[test]
@@ -725,7 +729,7 @@ mod pr_merge_door {
             "review",
         );
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "no clean reviewed sha");
     }
 
     #[test]
@@ -741,7 +745,7 @@ mod pr_merge_door {
             "gate",
         );
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "checks are not green");
     }
 
     #[test]
@@ -757,14 +761,14 @@ mod pr_merge_door {
             "gate",
         );
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "PR head");
     }
 
     #[test]
     fn pr_merge_refuses_a_high_tier_repo() {
         let d = green("prm-high", Who::Cos, Tier::High);
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "tier High");
     }
 
     #[test]
@@ -792,7 +796,7 @@ mod pr_merge_door {
             None,
             json!({"workflow": "wf-1", "pr": bad, "sha": SHA}),
         );
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "PR number");
         assert!(!marker.exists());
     }
 
@@ -846,7 +850,7 @@ mod pr_merge_door {
             "gate",
         );
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "tier High");
     }
 
     #[test]
@@ -862,6 +866,6 @@ mod pr_merge_door {
             "gate",
         );
         let res = merge(&d, SHA);
-        assert_refused_no_merge(&d, res);
+        assert_refused_no_merge(&d, res, "tier High");
     }
 }
