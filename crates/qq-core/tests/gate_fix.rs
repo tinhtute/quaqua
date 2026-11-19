@@ -1544,3 +1544,44 @@ fn gate_fix4_tier_escapes_through_wrappers_block_workers() {
         }
     }
 }
+
+/// An option the wrapper table does not know must not switch off the checks the
+/// ordinary command path runs (db writes, `names_db`).
+#[test]
+fn gate_fix4_unknown_wrapper_flag_keeps_the_db_checks() {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig("gf4-unk-db", who);
+        for cmd in [
+            "env -Z rm runs/qq.db",
+            "nohup --x v tee runs/qq.db",
+            "env -Z mv x runs/qq.db",
+            "sudo --zz truncate -s0 runs/qq.db",
+        ] {
+            let v = r.bash(cmd);
+            if who == Who::Cos {
+                assert!(ask(&v), "cos must ask: {cmd}");
+            } else {
+                assert!(block(&v), "non-cos must deny: {cmd}");
+            }
+        }
+    }
+}
+
+/// A command line glued to a flag (`--command=…`, `-qc'…'`) or sitting in the
+/// command-word slot is scanned like any other quoted command line.
+#[test]
+fn gate_fix4_glued_and_slot_command_lines_block() {
+    gf2_blocks(
+        "gf4-glued",
+        &[
+            "script --command='git push origin feat' /dev/null",
+            "su --command='git push origin feat' root",
+            "script -qc'git push origin feat' /dev/null",
+            "sudo -s 'git push origin feat'",
+            "env -S'git push origin feat'",
+            "su -c'herdr pane split p1' root",
+            "script --command='herdr workspace create' /dev/null",
+            "sudo -s 'herdr pane close p1'",
+        ],
+    );
+}
