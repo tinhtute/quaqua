@@ -1,8 +1,9 @@
-// The four capped memory tools. Every write goes through `memory-gate.js`
-// first, so the engine's cap and secret check is the only authority on what
-// lands; a refusal comes back as the tool's error text, verbatim.
+// The four capped memory tools. Every write goes through the daemon verb
+// `memory.write` (`memory-gate.js`), so the daemon's caller check, cap, threat
+// scan and drift guard are the only authority on what lands; a refusal comes
+// back as the tool's error text, verbatim. This mod never writes the files.
 
-import { FILES, gate } from './memory-gate.js'
+import { FILES, write } from './memory-gate.js'
 
 const FILE_SCHEMA = { type: 'string', enum: FILES }
 
@@ -135,27 +136,26 @@ function withCurrent(reason, files) {
 export async function apply($, { root, op, file, input }) {
   if (!FILES.includes(file)) return { deny: `not a capped memory file: ${file}` }
 
-  const path = `${root}/${file}`
-  const current = await readOrEmpty($, path)
+  const current = await readOrEmpty($, `${root}/${file}`)
   const step = compute(op, current, input)
   if (step.refuse) return { deny: step.refuse, current }
 
-  const verdict = await gate($, { root, rel: file, content: step.next })
-  if (!verdict.ok) return { deny: verdict.reason, current }
-
-  await $.fs.write(path, step.next)
+  const verdict = await write($, { root, files: { [file]: { before: current, after: step.next } } })
+  if (!verdict.ok) return { deny: verdict.reason, current: await readOrEmpty($, `${root}/${file}`) }
   return { result: `updated ${file}` }
 }
 
 /**
  * Apply a list of operations as one write: every file's final text is
- * simulated first, the engine checks each final text, and nothing is written
- * unless all pass. A failed write rolls the earlier ones back.
+ * simulated first and the daemon checks each final text; nothing is written
+ * unless all pass.
  *
- * @returns `{ result }` or `{ deny, current }` where `current` maps each
- *   touched file to its text before the batch.
+ * @param loaded optional `{ [file]: text }`: what the caller read earlier (the
+ *   review fork's baseline); the daemon refuses if a file moved since.
+ * @returns `{ result }` or `{ deny, current }` where `current` lists each
+ *   touched file with its text (as it stands now after a daemon refusal).
  */
-export async function applyBatch($, { root, ops }) {
+export async function applyBatch($, { root, ops, loaded }) {
   if (!Array.isArray(ops) || ops.length === 0) return { deny: 'ops is empty' }
   const before = {}
   const next = {}
@@ -163,7 +163,7 @@ export async function applyBatch($, { root, ops }) {
     const file = String(o?.file ?? '')
     if (!FILES.includes(file)) return { deny: `ops[${i}]: not a capped memory file: ${file}` }
     if (!(file in before)) {
-      before[file] = await readOrEmpty($, `${root}/${file}`)
+      before[file] = loaded?.[file] ?? (await readOrEmpty($, `${root}/${file}`))
       next[file] = before[file]
     }
   }
@@ -173,28 +173,12 @@ export async function applyBatch($, { root, ops }) {
     if (step.refuse) return { deny: `ops[${i}]: ${step.refuse}`, current: touched }
     next[o.file] = step.next
   }
-  const reasons = []
-  for (const [file] of touched) {
-    const verdict = await gate($, { root, rel: file, content: next[file] })
-    if (!verdict.ok) reasons.push(verdict.reason)
-  }
-  if (reasons.length) return { deny: reasons.join('; '), current: touched }
-
-  const done = []
-  try {
-    for (const [file] of touched) {
-      await $.fs.write(`${root}/${file}`, next[file])
-      done.push(file)
-    }
-  } catch (e) {
-    for (const file of done) {
-      try {
-        await $.fs.write(`${root}/${file}`, before[file])
-      } catch {
-        // Nothing more can be done; the error below names the failure.
-      }
-    }
-    return { deny: `write failed, nothing kept: ${e?.message ?? e}`, current: touched }
+  const files = Object.fromEntries(touched.map(([f]) => [f, { before: before[f], after: next[f] }]))
+  const verdict = await write($, { root, files })
+  if (!verdict.ok) {
+    const now = []
+    for (const [file] of touched) now.push([file, await readOrEmpty($, `${root}/${file}`)])
+    return { deny: verdict.reason, current: now }
   }
   return { result: `updated ${touched.map(([f]) => f).join(', ')}` }
 }

@@ -1,57 +1,46 @@
 // The caps and the secret patterns live in the engine
 // (`crates/qq-core/src/memory`, `TARGETS` and `check_text`). This module never
-// restates them: it pipes a synthetic PreToolUse payload to `quaqua memory hook
-// pre` and relays the verdict. No cap number, no pattern, no length here.
+// restates them: capped writes go to the daemon verb `memory.write` and its
+// verdict is relayed; a corrections line goes to `quaqua memory scan`. No cap
+// number, no pattern, no length here.
 
 /** The files the engine caps, workspace-relative. */
 export const FILES = ['memory/rules.md', 'USER.md']
 
 /**
- * Ask the engine whether `content` may land in `<root>/<rel>`.
+ * Write capped files through the daemon: `quaqua call memory.write`. The daemon
+ * names the caller from the socket peer (this process is a child of the
+ * session), refuses any caller but `cos`, checks the cap and the strict threat
+ * scan on each final text, guards against an outside edit since `before`, journals
+ * and writes. This mod never writes those files itself.
  *
- * @returns `{ ok: true }` when the engine allows it, else `{ ok: false, reason }`
- *   with the engine's own reason verbatim. A gate that cannot answer — a missing
- *   binary, a non-zero exit, an unreadable verdict — is a refusal, never an allow.
+ * @param files `{ [rel]: { before, after } }`: the text loaded and the text wanted
+ * @returns `{ ok: true }` or `{ ok: false, reason }` with the daemon's own reason.
+ *   A daemon that cannot answer — a missing binary, a daemon that is down, an
+ *   unreadable reply — is a refusal, never an allow.
  */
-export async function gate($, { root, rel, content }) {
-  const payload = JSON.stringify({
-    tool_name: 'Write',
-    tool_input: { file_path: `${root}/${rel}`, content },
-  })
-
+export async function write($, { root, files }) {
   let out
   try {
-    out = await $.process.run(['quaqua', 'memory', 'hook', 'pre'], {
+    out = await $.process.run(['quaqua', 'call', 'memory.write', JSON.stringify({ files })], {
       cwd: root,
-      stdin: payload,
     })
   } catch (e) {
-    return { ok: false, reason: `memory gate unavailable: ${e?.message ?? e}` }
+    return { ok: false, reason: `memory write unavailable: ${e?.message ?? e}` }
   }
 
   if (out.exitCode !== 0) {
-    const why = String(out.stderr ?? '').trim()
-    return {
-      ok: false,
-      reason: `memory gate failed (exit ${out.exitCode})${why ? `: ${why}` : ''}`,
-    }
+    const why = String(out.stderr ?? '').trim().replace(/^quaqua: /, '')
+    return { ok: false, reason: why || `memory write failed (exit ${out.exitCode})` }
   }
-
-  // The engine prints nothing when it has no objection.
-  const stdout = String(out.stdout ?? '').trim()
-  if (stdout === '') return { ok: true }
 
   let doc
   try {
-    doc = JSON.parse(stdout)
+    doc = JSON.parse(String(out.stdout ?? '').trim())
   } catch {
-    return { ok: false, reason: 'memory gate returned no verdict' }
+    return { ok: false, reason: 'memory write returned no verdict' }
   }
-
-  const decision = doc?.hookSpecificOutput
-  if (decision?.permissionDecision === 'deny') {
-    return { ok: false, reason: String(decision.permissionDecisionReason ?? 'denied') }
-  }
+  if (!Array.isArray(doc?.written)) return { ok: false, reason: 'memory write returned no verdict' }
   return { ok: true }
 }
 
