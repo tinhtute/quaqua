@@ -469,3 +469,79 @@ fn cos_push_door_url_as_remote_refused() {
     assert_eq!(push(&r, a).unwrap_err().code, "refused");
     assert!(!has_ref(&origin, "feat"));
 }
+
+/// Flips `key` between `a` and `b` on the work repo while `door` pushes `trunk`
+/// (the real origin's default branch) up to 150 times; the real trunk must
+/// never move, whichever way the flip lands relative to the check.
+fn flip_race(r: &Rig, work: &Path, origin: &Path, key: &str, a: &str, b: &str) {
+    let before = rev(origin, "refs/heads/trunk");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipper = {
+        let (stop, work) = (stop.clone(), work.to_path_buf());
+        let (key, a, b) = (key.to_string(), a.to_string(), b.to_string());
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let v = if n % 2 == 0 { &a } else { &b };
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&work)
+                    .args(["config", &key, v])
+                    .output();
+                n += 1;
+            }
+        })
+    };
+    let mut moved = None;
+    for i in 0..150 {
+        let _ = push(r, args(work, "trunk"));
+        if rev(origin, "refs/heads/trunk") != before {
+            moved = Some(i);
+            break;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flipper.join().unwrap();
+    assert_eq!(
+        moved, None,
+        "the real default branch moved on call {moved:?}"
+    );
+}
+
+/// The push URL flips between a decoy (HEAD `other`) and the real origin
+/// (HEAD `trunk`) between the door's check and its push.
+#[test]
+fn cos_push_door_pushurl_flip_race_never_moves_default() {
+    let r = rig("cpd-race-pushurl", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let decoy = decoy_bare(&r, &work, "decoy.git", "other", true);
+    flip_race(
+        &r,
+        &work,
+        &origin,
+        "remote.origin.pushurl",
+        decoy.to_str().unwrap(),
+        origin.to_str().unwrap(),
+    );
+}
+
+/// A `pushInsteadOf` rule that flips on and off redirects the decoy URL to the
+/// real origin between the check and the push.
+#[test]
+fn cos_push_door_insteadof_flip_race_never_moves_default() {
+    let r = rig("cpd-race-instead", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let decoy = decoy_bare(&r, &work, "decoy.git", "other", true);
+    git(
+        &work,
+        &["config", "remote.origin.url", decoy.to_str().unwrap()],
+    );
+    flip_race(
+        &r,
+        &work,
+        &origin,
+        &format!("url.{}.pushInsteadOf", origin.display()),
+        decoy.to_str().unwrap(),
+        "no-match",
+    );
+}

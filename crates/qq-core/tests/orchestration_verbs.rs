@@ -455,6 +455,102 @@ fn push_refuses_main_master_and_the_remote_default_branch() {
     assert!(origin_has_feat(&origin));
 }
 
+/// The Lead verb refuses a remote with no refs: its unborn HEAD is invisible,
+/// so a first push could create the remote's default branch.
+#[test]
+fn push_refuses_an_empty_remote() {
+    let r = rig("g1-push-empty", false);
+    let (work, _origin) = repo_with_origin(&r);
+    git(
+        r.ws.root(),
+        &["init", "-q", "--bare", "-b", "trunk", "empty.git"],
+    );
+    git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "empty",
+            r.ws.root().join("empty.git").to_str().unwrap(),
+        ],
+    );
+    let e = call(
+        &r,
+        "push",
+        Some("lead-f"),
+        json!({"repo": work, "remote": "empty", "branch": "feat"}),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "refused", "{e:?}");
+    assert!(origin_ref(&r.ws.root().join("empty.git"), "refs/heads/feat").is_none());
+}
+
+/// The push URL flips between a decoy (HEAD `other`) and the real origin (HEAD
+/// `trunk`) while the Lead pushes `trunk`: the real trunk must never move.
+#[test]
+fn push_pushurl_flip_race_never_moves_default() {
+    let r = rig("g1-push-race", false);
+    let (work, origin) = repo_with_origin(&r);
+    git(&work, &["checkout", "-q", "-b", "trunk"]);
+    std::fs::write(work.join("f"), "y").unwrap();
+    git(&work, &["commit", "-qam", "ahead"]);
+    git(&work, &["checkout", "-q", "feat"]);
+    let decoy = r.ws.root().join("decoy.git");
+    git(
+        r.ws.root(),
+        &["init", "-q", "--bare", "-b", "other", "decoy.git"],
+    );
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            decoy.to_str().unwrap(),
+            "feat:refs/heads/other",
+        ],
+    );
+    let before = origin_ref(&origin, "refs/heads/trunk");
+    let (o, d) = (
+        origin.to_str().unwrap().to_string(),
+        decoy.to_str().unwrap().to_string(),
+    );
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipper = {
+        let (stop, work) = (stop.clone(), work.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let u = if n % 2 == 0 { &d } else { &o };
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&work)
+                    .args(["config", "remote.origin.pushurl", u])
+                    .output();
+                n += 1;
+            }
+        })
+    };
+    let mut moved = None;
+    for i in 0..150 {
+        let _ = call(
+            &r,
+            "push",
+            Some("lead-f"),
+            json!({"repo": work, "remote": "origin", "branch": "trunk"}),
+        );
+        if origin_ref(&origin, "refs/heads/trunk") != before {
+            moved = Some(i);
+            break;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flipper.join().unwrap();
+    assert_eq!(
+        moved, None,
+        "the real default branch moved on call {moved:?}"
+    );
+}
+
 /// `repo_with_origin`'s work repo plus `integ` (at the base) and `t1` (one commit ahead).
 fn merge_repo(r: &Rig) -> (std::path::PathBuf, String) {
     let (work, _origin) = repo_with_origin(r);
