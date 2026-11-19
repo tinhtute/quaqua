@@ -5,9 +5,16 @@
 //! the workspace root (`projects/INDEX.md` beside `cwd`, never a worker
 //! worktree). Any other cwd — a worker, a Lead, an unknown caller — is not
 //! fenced. The fence only ever answers `ask`, and every input it cannot read
-//! falls through to the cap logic.
+//! falls through to the cap logic. It runs after the cap logic, so a cap or
+//! threat `deny` always wins over the fence `ask`.
+//!
+//! Known gaps, by design: the fence is advisory. `Bash` writes (`sed -i`,
+//! `cat >`) are not seen, and a CoS whose cwd moved off the workspace root
+//! (a `cd` into a worktree) is judged as a non-CoS. Conversely a worker or
+//! Lead that runs `cd` into the workspace root is judged as the CoS, so its
+//! own worktree writes get an `ask`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -30,14 +37,15 @@ pub fn cos_fence(doc: &Value) -> Option<Value> {
         .get("file_path")
         .or_else(|| input.get("notebook_path"))?
         .as_str()?;
-    let target = Path::new(target);
-    if !target.is_absolute()
+    if !cwd.is_absolute()
         || !is_eligible_workspace(cwd, cwd)
         || !cwd.join("projects/INDEX.md").is_file()
     {
         return None;
     }
-    if is_fenced(target, cwd) {
+    // A relative target is relative to the payload cwd.
+    let target = lexical(&cwd.join(target));
+    if is_fenced(&target, cwd) {
         return Some(json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -47,6 +55,22 @@ pub fn cos_fence(doc: &Value) -> Option<Value> {
         }));
     }
     None
+}
+
+/// Drop `.` and fold `..` without touching the disk, so a `..` behind a
+/// missing directory cannot hide a worktree.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn same(a: &Path, b: &Path) -> bool {
@@ -74,23 +98,8 @@ fn resolve(path: &Path) -> PathBuf {
 
 fn is_fenced(target: &Path, ws: &Path) -> bool {
     let target = resolve(target);
-    // `..` would hide a worktree behind the workspace.
-    if target
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return false;
-    }
     let ws = resolve(ws);
     if target.starts_with(&ws) && !ws.join(".git").exists() {
-        return false;
-    }
-    if target.starts_with("/tmp")
-        && target
-            .components()
-            .nth(2)
-            .is_some_and(|c| c.as_os_str().to_string_lossy().starts_with("claude-"))
-    {
         return false;
     }
     // Nearest repo or worktree root above the target (`.git` dir or file).

@@ -138,12 +138,15 @@ pub fn screen_line(text: &str) -> Result<String, String> {
 }
 
 /// The `PreToolUse` decision for a `Write|Edit|MultiEdit` call: `Some(json)`
-/// to deny or (CoS code fence) ask, `None` for "no decision". Fails open on any input it cannot read.
+/// to deny or (CoS code fence) ask, `None` for "no decision". Fails open on any
+/// input it cannot read. The cap/threat `deny` is decided first and wins over
+/// the fence `ask`; every cap path that gives no decision lets the fence run.
 pub fn pre_decision(input: &str) -> Option<Value> {
     let doc = serde_json::from_str::<Value>(input).ok()?;
-    if let Some(ask) = super::fence::cos_fence(&doc) {
-        return Some(ask);
-    }
+    cap_decision(&doc).or_else(|| super::fence::cos_fence(&doc))
+}
+
+fn cap_decision(doc: &Value) -> Option<Value> {
     let tool = doc.get("tool_name")?.as_str()?;
     let tool_input = doc.get("tool_input")?;
     let path = Path::new(tool_input.get("file_path")?.as_str()?);
