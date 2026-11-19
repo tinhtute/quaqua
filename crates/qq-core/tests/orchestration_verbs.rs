@@ -26,8 +26,7 @@ struct Rig {
 
 fn template() -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
-    std::fs::read_to_string(p)
-        .expect("read template team.toml")
+    std::fs::read_to_string(p).expect("read template team.toml")
 }
 
 fn agent(conn: &Connection, name: &str, role: &str, kind: Option<&str>, project: Option<i64>) {
@@ -105,7 +104,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-/// A work repo with one commit on `feat` and a local bare `origin` that lacks it.
+/// A work repo with one commit on `feat` and a local bare `origin` whose default
+/// branch is `trunk` (seeded) and which lacks `feat`.
 fn repo_with_origin(r: &Rig) -> (std::path::PathBuf, std::path::PathBuf) {
     let work = r.ws.root().join("work");
     let origin = r.ws.root().join("origin.git");
@@ -118,12 +118,15 @@ fn repo_with_origin(r: &Rig) -> (std::path::PathBuf, std::path::PathBuf) {
     git(&work, &["commit", "-qm", "c"]);
     git(
         origin.parent().unwrap(),
-        &["init", "-q", "--bare", "origin.git"],
+        &["init", "-q", "--bare", "-b", "trunk", "origin.git"],
     );
     git(
         &work,
         &["remote", "add", "origin", origin.to_str().unwrap()],
     );
+    // A real default branch: a bare remote whose HEAD names an unborn branch
+    // has no provable default, and the push guard refuses it (fail closed).
+    git(&work, &["push", "-q", "origin", "feat:refs/heads/trunk"]);
     // The caller's project (alpha) owns this repo.
     conn(r)
         .execute(
@@ -416,9 +419,16 @@ fn push_refuses_main_master_and_the_remote_default_branch() {
     git(&work, &["branch", "master"]);
     git(
         &work,
-        &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
     );
     let protected = ["main", "master", "trunk"];
+    // `trunk` is the remote's seeded default: it must stay exactly where it is.
+    let trunk0 = origin_ref(&origin, "refs/heads/trunk");
+    assert!(trunk0.is_some());
     for branch in protected {
         let e = call(
             &r,
@@ -428,8 +438,13 @@ fn push_refuses_main_master_and_the_remote_default_branch() {
         )
         .unwrap_err();
         assert_eq!(e.code, "refused", "{branch}");
-        assert!(
-            origin_ref(&origin, &format!("refs/heads/{branch}")).is_none(),
+        assert_eq!(
+            origin_ref(&origin, &format!("refs/heads/{branch}")),
+            if branch == "trunk" {
+                trunk0.clone()
+            } else {
+                None
+            },
             "{branch} must not reach the remote"
         );
     }
@@ -464,15 +479,30 @@ fn merge_refuses_a_peer_and_no_caller_and_journals_it() {
     let before = git(&work, &["rev-parse", "integ"]);
     let peer = call(&r, "merge", Some("p1"), merge_args(&work, "integ", &tip)).unwrap_err();
     let anon = call(&r, "merge", None, merge_args(&work, "integ", &tip)).unwrap_err();
-    assert_eq!((peer.code.as_str(), anon.code.as_str()), ("refused", "refused"));
-    assert_eq!(git(&work, &["rev-parse", "integ"]), before, "nothing merged");
+    assert_eq!(
+        (peer.code.as_str(), anon.code.as_str()),
+        ("refused", "refused")
+    );
+    assert_eq!(
+        git(&work, &["rev-parse", "integ"]),
+        before,
+        "nothing merged"
+    );
     let rows = authority::refusals(&conn(&r)).unwrap();
     assert_eq!(
-        rows.iter().map(|x| (x.caller.as_str(), x.edge.as_str())).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|x| (x.caller.as_str(), x.edge.as_str()))
+            .collect::<Vec<_>>(),
         [("p1", "orchestration")]
     );
     // A Lead still merges into a plain integration branch.
-    let ok = call(&r, "merge", Some("lead-f"), merge_args(&work, "integ", &tip)).unwrap();
+    let ok = call(
+        &r,
+        "merge",
+        Some("lead-f"),
+        merge_args(&work, "integ", &tip),
+    )
+    .unwrap();
     assert_eq!(ok["merged"][0]["merged_now"], true);
 }
 
@@ -493,7 +523,13 @@ fn merge_never_runs_a_shell_string_from_the_request() {
             [],
         )
         .unwrap();
-    let e = call(&r, "merge", Some("lead-f"), merge_args(&work, "integ", &tip)).unwrap_err();
+    let e = call(
+        &r,
+        "merge",
+        Some("lead-f"),
+        merge_args(&work, "integ", &tip),
+    )
+    .unwrap_err();
     assert_eq!(e.code, "base_broken", "the configured check ran and failed");
 }
 
@@ -506,7 +542,11 @@ fn merge_refuses_main_master_and_the_remote_default_branch() {
     }
     git(
         &work,
-        &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
     );
     let heads: Vec<String> = ["main", "master", "trunk"]
         .iter()
@@ -521,7 +561,11 @@ fn merge_refuses_main_master_and_the_remote_default_branch() {
         .map(|b| git(&work, &["rev-parse", b]))
         .collect();
     assert_eq!(heads, after, "no protected branch moved");
-    assert_eq!(authority::refusals(&conn(&r)).unwrap().len(), 3, "each refusal is journaled");
+    assert_eq!(
+        authority::refusals(&conn(&r)).unwrap().len(),
+        3,
+        "each refusal is journaled"
+    );
 }
 
 fn cfg(r: &Rig, caller: Option<&str>, argv: &[&str]) -> Result<Value, rpc::RpcError> {
@@ -530,7 +574,11 @@ fn cfg(r: &Rig, caller: Option<&str>, argv: &[&str]) -> Result<Value, rpc::RpcEr
 
 fn setting_of(r: &Rig, key: &str) -> Option<String> {
     conn(r)
-        .query_row("SELECT value_json FROM setting WHERE key = ?1", [key], |x| x.get(0))
+        .query_row(
+            "SELECT value_json FROM setting WHERE key = ?1",
+            [key],
+            |x| x.get(0),
+        )
         .ok()
 }
 
@@ -540,17 +588,23 @@ fn config_writes_refuse_a_peer_and_no_caller_but_reads_stay_open() {
     let toml = r.ws.root().join("t.toml");
     std::fs::write(&toml, template()).unwrap();
     let toml = toml.to_str().unwrap();
-    for argv in [
-        vec!["set", "limits.depth", "9"],
-        vec!["import", toml],
-    ] {
-        assert_eq!(cfg(&r, Some("p1"), &argv).unwrap_err().code, "refused", "{argv:?}");
-        assert_eq!(cfg(&r, None, &argv).unwrap_err().code, "refused", "{argv:?}");
+    for argv in [vec!["set", "limits.depth", "9"], vec!["import", toml]] {
+        assert_eq!(
+            cfg(&r, Some("p1"), &argv).unwrap_err().code,
+            "refused",
+            "{argv:?}"
+        );
+        assert_eq!(
+            cfg(&r, None, &argv).unwrap_err().code,
+            "refused",
+            "{argv:?}"
+        );
     }
     assert_ne!(setting_of(&r, "limits.depth").as_deref(), Some("9"));
     let rows = authority::refusals(&conn(&r)).unwrap();
     assert!(
-        rows.iter().any(|x| x.caller == "p1" && x.edge == "orchestration"),
+        rows.iter()
+            .any(|x| x.caller == "p1" && x.edge == "orchestration"),
         "{rows:?}"
     );
     // reads stay open to a Peer
@@ -569,7 +623,12 @@ fn a_peer_cannot_plant_a_merge_check_for_the_next_lead_merge() {
     let marker = r.ws.root().join("pwned");
     let planted = format!("touch {}", marker.display());
     let _ = cfg(&r, Some("p1"), &["set", "merge.check", &planted]);
-    let ok = call(&r, "merge", Some("lead-f"), merge_args(&work, "integ", &tip));
+    let ok = call(
+        &r,
+        "merge",
+        Some("lead-f"),
+        merge_args(&work, "integ", &tip),
+    );
     assert!(ok.is_ok(), "{ok:?}");
     assert!(!marker.exists(), "a Peer's planted check must never run");
 }
