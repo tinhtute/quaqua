@@ -30,7 +30,7 @@ pub const INSTALL: Install = install;
 fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
     registry.register(Command {
         name: "memory",
-        help: "memory hook pre|batch|session-start (Claude Code hooks, JSON on stdin) | situation",
+        help: "memory hook pre|batch|session-start (Claude Code hooks, JSON on stdin)",
         run: memory_cmd,
     })?;
     registry.register(Command {
@@ -38,30 +38,6 @@ fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
         help: "inbox [--for NAME] [--peek] [--all] [--format plain|hook-ups|hook-stop]",
         run: inbox::inbox_cmd,
     })
-}
-
-/// `quaqua memory situation`: the computed situation of this workspace, with
-/// herdr statuses when herdr answers (a missing herdr only drops the status).
-fn situation_cli(env: &Env) -> String {
-    let ws = env.runs_dir.parent().unwrap_or_else(|| Path::new("."));
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    let mut s = situation::compute(ws, now_ms);
-    let statuses = crate::herdr::HerdrClient::agent_list(&crate::herdr::CliHerdr::new())
-        .ok()
-        .filter(|r| r.ok)
-        .and_then(|r| serde_json::from_str::<Value>(&r.body).ok())
-        .and_then(|v| v.pointer("/result/agents").cloned())
-        .and_then(|a| a.as_array().cloned())
-        .unwrap_or_default();
-    s.set_status(|pane| {
-        statuses
-            .iter()
-            .find(|a| a.get("pane_id").and_then(Value::as_str) == Some(pane))
-            .and_then(|a| a.get("agent_status")?.as_str().map(String::from))
-    });
-    situation::render_cli(&s)
 }
 
 /// The hook's JSON. Claude Code hands it over on a pipe it closes; a terminal
@@ -86,15 +62,12 @@ pub fn memory_cmd_with(
     args: &[String],
     input: impl FnOnce() -> String,
 ) -> Result<String, CliError> {
-    if args == ["situation"] {
-        return Ok(situation_cli(env));
-    }
     let mode = match args {
         [h, m] if h == "hook" => m.as_str(),
         _ => {
             return Err(CliError::new(
                 2,
-                "usage: quaqua memory hook pre|batch|session-start | situation",
+                "usage: quaqua memory hook pre|batch|session-start",
             ))
         }
     };
@@ -114,7 +87,7 @@ pub fn memory_cmd_with(
         _ => {
             return Err(CliError::new(
                 2,
-                "usage: quaqua memory hook pre|batch|session-start | situation",
+                "usage: quaqua memory hook pre|batch|session-start",
             ))
         }
     };

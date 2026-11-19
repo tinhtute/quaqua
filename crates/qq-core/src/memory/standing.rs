@@ -70,13 +70,24 @@ pub fn render_standing(root: &Path) -> String {
     render_standing_at(root, now_ms)
 }
 
+/// Today's local date as `date +%F` prints it; empty when `date` cannot run.
+fn today_local() -> String {
+    std::process::Command::new("date")
+        .arg("+%F")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn render_standing_at(root: &Path, now_ms: u64) -> String {
     let sections = load(root);
     if sections.is_empty() {
         return String::new();
     }
     let size = |s: &str| s.chars().count();
-    let now = situation::render_block(&situation::compute(root, now_ms));
+    let now = situation::render_block(&situation::compute(root, now_ms, &today_local()));
     let head = format!("{HEADER} (rendered at session start from the files named in each header; these outrank the global persona)\n\n");
     let mut parts: Vec<String> = sections.iter().map(Section::render).collect();
     let total = |parts: &[String]| {
@@ -192,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn capped_sections_carry_a_fill_header_and_now_comes_last() {
+    fn fill_header_on_capped_sections_and_now_comes_last() {
         let d = ws(
             "t9",
             &[
@@ -221,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn now_section_counts_toward_the_budget() {
+    fn now_block_counts_toward_the_budget() {
         // Rules alone fit; rules + a full Now section do not, so the INDEX yields.
         let reports: Vec<(String, &str)> = (0..20)
             .map(|i| (format!("reports/audit-{i:02}.md"), "x"))
