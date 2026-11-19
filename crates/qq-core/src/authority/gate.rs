@@ -2096,16 +2096,10 @@ fn strip_alias(s: &str) -> Option<&str> {
 /// more config, a shell alias or an alias naming a push. A literal push in the
 /// value of a non-alias key is a hard deny. Reads stay free.
 fn check_git_config(a: &[String]) -> Found {
-    let reads = a.iter().any(|x| {
-        x.starts_with("--get")
-            || x.starts_with("--unset")
-            || matches!(
-                x.as_str(),
-                "-l" | "--list" | "-e" | "--edit" | "--remove-section"
-            )
-    });
-    // Positional words, without the values of the flags that take one.
+    // One pass over the arguments: a flag that takes a value consumes it (so the
+    // value is neither a flag nor a word); the rest are flags and positionals.
     let mut p: Vec<&str> = Vec::new();
+    let mut reads = false;
     let mut it = a.iter();
     while let Some(x) = it.next() {
         if matches!(
@@ -2113,7 +2107,14 @@ fn check_git_config(a: &[String]) -> Found {
             "-f" | "--file" | "--blob" | "-t" | "--type" | "--default" | "--comment"
         ) {
             it.next();
-        } else if !x.starts_with('-') {
+        } else if x.starts_with('-') {
+            reads |= x.starts_with("--get")
+                || x.starts_with("--unset")
+                || matches!(
+                    x.as_str(),
+                    "-l" | "--list" | "-e" | "--edit" | "--remove-section"
+                );
+        } else {
             p.push(x);
         }
     }
