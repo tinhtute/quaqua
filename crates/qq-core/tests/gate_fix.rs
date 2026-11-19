@@ -13,7 +13,7 @@ use qq_core::testkit::TestWorkspace;
 use rusqlite::params;
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Who {
     Cos,
     Worker,
@@ -1108,4 +1108,195 @@ fn gate_fix2_m2_fallback_ignores_cwd_and_word_fragments() {
         assert_eq!(fallback_exit_cwd(ok), 0, "{ok}");
     }
     assert_eq!(fallback_exit_cwd("sed -i s/a/b/ ~/quaqua/SOUL.md"), 2);
+}
+
+// ---- gatefix3 round 2: A. read-path tools that can write, B. old binary ----
+
+/// Memory-file spellings that write or truncate through a tool the read path
+/// used to wave through. `f` is the file as the command names it.
+fn writer_spellings(f: &str) -> Vec<String> {
+    vec![
+        format!("sed -n 'w {f}' /dev/null"),
+        format!("sed -n 'W {f}' /dev/null"),
+        format!("sed 's/a/b/w {f}' /dev/null"),
+        format!("sed -e 'w {f}' -n /dev/null"),
+        format!("sed --expression='w {f}' /dev/null"),
+        format!("sed '1e tee {f}' /dev/null"),
+        format!("sed -I '' s/u/v/ {f}"),
+        format!("sed -nI '' s/u/v/ {f}"),
+        format!("uniq /dev/null {f}"),
+        format!("uniq -c /dev/null {f}"),
+        format!("uniq -f 1 /dev/null {f}"),
+        format!("git grep -O'tee {f}' x"),
+        format!("git grep --open-files-in-pager='tee {f}' x"),
+        format!("git grep --open-files-in-pager 'tee {f}' x"),
+        format!("git -c core.editor=true grep -Otee x -- {f}"),
+    ]
+}
+
+#[test]
+fn gate_fix3_a_read_path_writers_are_denied_for_workers_and_cos_memory() {
+    for who in [Who::Worker, Who::Cos, Who::Down] {
+        let r = rig("gf3-a", who);
+        for name in ["USER.md", "memory/rules.md"] {
+            let abs = r.root().join(name).display().to_string();
+            for cmd in writer_spellings(&abs) {
+                let v = r.bash(&cmd);
+                assert!(block(&v), "{who:?} absolute: {cmd}");
+            }
+            for cmd in writer_spellings(name) {
+                let v = r.bash_in(r.root(), &cmd);
+                assert!(block(&v), "{who:?} relative: {cmd}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_a_read_path_writers_on_instruction_files_ask_cos_deny_workers() {
+    for who in [Who::Worker, Who::Cos] {
+        let r = rig("gf3-a-i", who);
+        for name in ["AGENTS.md", "SOUL.md", "identity.md"] {
+            let abs = r.root().join(name).display().to_string();
+            for cmd in writer_spellings(&abs) {
+                let v = r.bash(&cmd);
+                if who == Who::Cos {
+                    assert!(ask(&v), "cos must ask: {cmd}");
+                } else {
+                    assert!(block(&v), "worker must be denied: {cmd}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_a_provable_reads_stay_free() {
+    let r = rig("gf3-a-ok", Who::Worker);
+    for name in ["USER.md", "memory/rules.md", "AGENTS.md"] {
+        let f = r.root().join(name).display().to_string();
+        for ok in [
+            format!("sed -n 1,5p {f}"),
+            format!("git diff -- {f}"),
+            format!("git log -p -- {f}"),
+            format!("awk 1 {f}"),
+            format!("jq -R . {f}"),
+            format!("sort {f}"),
+            format!("uniq {f}"),
+            format!("uniq -c {f}"),
+            format!("uniq -f 1 {f}"),
+            format!("sed 's/a/b/g' {f}"),
+            format!("sed -E -n -e 's/u/v/p' {f}"),
+            format!("sed -ne 3p {f}"),
+            format!("sed -n '/new/p;$=' {f}"),
+            format!("sed -s -n '1~2p;/x/!d' {f}"),
+            format!("sed 'y/abc/xyz/;3q' {f}"),
+            format!("git grep foo -- {f}"),
+            format!("git grep -n -e foo -- {f}"),
+        ] {
+            assert_eq!(r.bash(&ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+}
+
+/// Run the fallback-capable hook with `bin` as the installed binary.
+fn hook_exit_with(bin: &Path, tool: &str, input: Value) -> i32 {
+    use std::io::Write;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/workspace/scripts/hooks/herdr-gate.sh");
+    let json = json!({"tool_name": tool, "tool_input": input, "cwd": "/tmp"});
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .env("QUAQUA_BIN", bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.to_string().as_bytes())
+        .unwrap();
+    child.wait().unwrap().code().unwrap()
+}
+
+/// A stand-in `quaqua` that runs `body` (shell) with the hook JSON in `$IN`.
+fn stub_bin(tag: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("qq-gf3-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("quaqua");
+    std::fs::write(&p, format!("#!/bin/sh\nIN=$(cat)\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// What the binary at main (e723967) does with every Write: no Write arm, so the
+/// pane-spawn block, exit 2, for any tool name that is not Bash either.
+const OLD_BIN: &str = "echo 'quaqua: blocked: spawn/move panes and workspaces only through the quaqua daemon (quaqua call task.spawn / grid verbs)' >&2; exit 2";
+
+const EDIT_TOOLS: [(&str, &str); 4] = [
+    ("Write", "file_path"),
+    ("Edit", "file_path"),
+    ("MultiEdit", "file_path"),
+    ("NotebookEdit", "notebook_path"),
+];
+
+#[test]
+fn gate_fix3_b_old_binary_keeps_write_and_edit_on_ordinary_files() {
+    let bin = stub_bin("old-ok", OLD_BIN);
+    for (tool, key) in EDIT_TOOLS {
+        for p in [
+            "/tmp/ws/projects/p/notes.md",
+            "/tmp/ws/memory/notes.md",
+            "/tmp/ws/src/main.rs",
+        ] {
+            assert_eq!(hook_exit_with(&bin, tool, json!({ key: p })), 0, "{tool} {p}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_b_old_binary_still_protects_memory_and_instruction_files() {
+    let bin = stub_bin("old-prot", OLD_BIN);
+    for (tool, key) in EDIT_TOOLS {
+        for p in [
+            "/tmp/ws/memory/rules.md",
+            "/tmp/ws/USER.md",
+            "/tmp/ws/AGENTS.md",
+            "/tmp/ws/SOUL.md",
+            "/tmp/ws/identity.md",
+        ] {
+            assert_eq!(hook_exit_with(&bin, tool, json!({ key: p })), 2, "{tool} {p}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_b_old_binary_bash_still_goes_to_the_binary() {
+    let bin = stub_bin("old-bash", OLD_BIN);
+    assert_eq!(hook_exit_with(&bin, "Bash", json!({"command": "echo hi"})), 2);
+}
+
+#[test]
+fn gate_fix3_b_a_binary_with_the_write_gate_keeps_its_verdict() {
+    // Knows Write: allows ordinary paths, blocks one named path with its own reason.
+    let bin = stub_bin(
+        "new",
+        "case \"$IN\" in *blocked-by-new*) echo 'new gate says no' >&2; exit 2;; esac; exit 0",
+    );
+    for (tool, key) in EDIT_TOOLS {
+        assert_eq!(
+            hook_exit_with(&bin, tool, json!({ key: "/tmp/ws/blocked-by-new.txt" })),
+            2,
+            "{tool}: the binary's block must stand"
+        );
+        assert_eq!(
+            hook_exit_with(&bin, tool, json!({ key: "/tmp/ws/ok.txt" })),
+            0,
+            "{tool}"
+        );
+    }
 }
