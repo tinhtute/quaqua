@@ -73,6 +73,7 @@ fn rig(tag: &str, peers: bool) -> Rig {
     qq_core::task::create::register(&mut d, ws.runs_dir()).unwrap();
     authority::push::register(&mut d, ws.runs_dir()).unwrap();
     qq_core::merge::register(&mut d).unwrap();
+    qq_core::config::INSTALL(&mut qq_core::cli::Registry::new(), &mut d).unwrap();
     if peers {
         d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
     }
@@ -521,4 +522,54 @@ fn merge_refuses_main_master_and_the_remote_default_branch() {
         .collect();
     assert_eq!(heads, after, "no protected branch moved");
     assert_eq!(authority::refusals(&conn(&r)).unwrap().len(), 3, "each refusal is journaled");
+}
+
+fn cfg(r: &Rig, caller: Option<&str>, argv: &[&str]) -> Result<Value, rpc::RpcError> {
+    call(r, "config", caller, json!({ "argv": argv }))
+}
+
+fn setting_of(r: &Rig, key: &str) -> Option<String> {
+    conn(r)
+        .query_row("SELECT value_json FROM setting WHERE key = ?1", [key], |x| x.get(0))
+        .ok()
+}
+
+#[test]
+fn config_writes_refuse_a_peer_and_no_caller_but_reads_stay_open() {
+    let r = rig("g3-config-write", false);
+    let toml = r.ws.root().join("t.toml");
+    std::fs::write(&toml, template()).unwrap();
+    let toml = toml.to_str().unwrap();
+    for argv in [
+        vec!["set", "limits.depth", "9"],
+        vec!["import", toml],
+    ] {
+        assert_eq!(cfg(&r, Some("p1"), &argv).unwrap_err().code, "refused", "{argv:?}");
+        assert_eq!(cfg(&r, None, &argv).unwrap_err().code, "refused", "{argv:?}");
+    }
+    assert_ne!(setting_of(&r, "limits.depth").as_deref(), Some("9"));
+    let rows = authority::refusals(&conn(&r)).unwrap();
+    assert!(
+        rows.iter().any(|x| x.caller == "p1" && x.edge == "orchestration"),
+        "{rows:?}"
+    );
+    // reads stay open to a Peer
+    assert!(cfg(&r, Some("p1"), &["get", "limits.depth"]).is_ok());
+    assert!(cfg(&r, Some("p1"), &["validate"]).is_ok());
+    assert!(call(&r, "roster", Some("p1"), json!({"argv": []})).is_ok());
+    // a Lead still writes
+    cfg(&r, Some("lead-f"), &["set", "limits.depth", "9"]).unwrap();
+    assert_eq!(setting_of(&r, "limits.depth").as_deref(), Some("9"));
+}
+
+#[test]
+fn a_peer_cannot_plant_a_merge_check_for_the_next_lead_merge() {
+    let r = rig("g3-config-merge", false);
+    let (work, tip) = merge_repo(&r);
+    let marker = r.ws.root().join("pwned");
+    let planted = format!("touch {}", marker.display());
+    let _ = cfg(&r, Some("p1"), &["set", "merge.check", &planted]);
+    let ok = call(&r, "merge", Some("lead-f"), merge_args(&work, "integ", &tip));
+    assert!(ok.is_ok(), "{ok:?}");
+    assert!(!marker.exists(), "a Peer's planted check must never run");
 }

@@ -1241,3 +1241,12 @@ fn pipeline_start_refuses_a_protected_integ() {
     assert!(herdr.prompts().is_empty());
     daemon.stop().unwrap();
 }
+
+#[test]
+fn pipeline_start_without_a_caller_fails_closed() {
+    let (ws, fx, herdr, anchor, daemon) = pipeline_rig("pstart-anon");
+    let args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    assert_eq!(refused(verb_call(&ws, args)), "refused");
+    assert!(herdr.prompts().is_empty(), "a refusal starts nothing");
+    daemon.stop().unwrap();
+}
