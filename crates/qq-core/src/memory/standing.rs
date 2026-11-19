@@ -235,7 +235,7 @@ mod tests {
     fn now_block_counts_toward_the_budget() {
         // Rules alone fit; rules + a full Now section do not, so the INDEX yields.
         let reports: Vec<(String, &str)> = (0..20)
-            .map(|i| (format!("reports/audit-{i:02}.md"), "x"))
+            .map(|i| (format!(".quaqua/pending/file-{i:02}.md"), "x"))
             .collect();
         let mut files: Vec<(&str, &str)> = reports.iter().map(|(p, c)| (p.as_str(), *c)).collect();
         let big = "x".repeat(BUDGET - 1000);

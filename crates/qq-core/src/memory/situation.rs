@@ -347,7 +347,8 @@ mod tests {
         let s = compute(d.root(), 0, "");
         assert_eq!(s.unread, 2);
         assert!(render_block(&s).contains("inbox 2 unread → `quaqua inbox`"));
-        assert_eq!(compute(ws("nb3b", &[]).root(), 0, "").unread, 0);
+        let none = d.root().join("elsewhere");
+        assert_eq!(compute(&none, 0, "").unread, 0, "no database reads as 0");
     }
 
     #[test]
