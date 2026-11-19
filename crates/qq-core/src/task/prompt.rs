@@ -62,6 +62,35 @@ fn at_col1<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+/// The body of `key`: its own line plus the lines after it up to the next
+/// header (a line that starts with an uppercase letter at column 1).
+fn field_body(text: &str, key: &str) -> Option<String> {
+    let mut lines = text.lines().skip_while(|l| !l.starts_with(key));
+    let mut body = lines.next()?[key.len()..].to_string();
+    for l in lines.take_while(|l| !l.starts_with(|c: char| c.is_ascii_uppercase())) {
+        body.push('\n');
+        body.push_str(l);
+    }
+    Some(body)
+}
+
+/// First line holding an absolute `/home/<user>` or `/Users/<user>` path
+/// (1-based line number, trimmed line). A path under `/tmp/` or a relative
+/// path that merely contains `/home/` is not one: the match must start a path.
+fn home_path_line(text: &str) -> Option<(usize, &str)> {
+    let path_char = |c: char| c.is_alphanumeric() || "._-/~".contains(c);
+    text.lines().enumerate().find_map(|(i, l)| {
+        let hit = ["/home/", "/Users/"].iter().any(|root| {
+            l.match_indices(root).any(|(at, _)| {
+                let starts_path = !l[..at].chars().next_back().is_some_and(path_char);
+                let user = l[at + root.len()..].chars().next();
+                starts_path && user.is_some_and(|c| c.is_alphanumeric() || "._-".contains(c))
+            })
+        });
+        hit.then_some((i + 1, l.trim()))
+    })
+}
+
 fn header_block(text: &str) -> &str {
     text.split("\n\n").next().unwrap_or("")
 }
@@ -111,7 +140,39 @@ pub fn check_brief(
             return Err(format!("brief has no '{key}' line"));
         }
     }
+    for key in ["Time budget:", "Cost budget:"] {
+        if at_col1(text, key).is_none() {
+            return Err(format!("brief has no '{key}' line"));
+        }
+    }
+    if let Some((n, line)) = home_path_line(text) {
+        return Err(format!(
+            "brief line {n} holds an absolute home path (use worktree-relative paths): {line}"
+        ));
+    }
     let mut warnings = Vec::new();
+    for key in ["Unknowns:", "Evidence:"] {
+        if at_col1(text, key).is_none() {
+            warnings.push(format!("warning: brief has no '{key}' line"));
+        }
+    }
+    if !field_body(text, "Hard constraints:").is_some_and(|b| {
+        b.split('`')
+            .skip(1)
+            .step_by(2)
+            .any(|c| c.to_lowercase().contains("test"))
+    }) {
+        warnings.push(
+            "warning: 'Hard constraints:' names no test command or filter (e.g. `<cmd> <filter>`)"
+                .into(),
+        );
+    }
+    if text.contains("pgrep -f") {
+        warnings.push(
+            "warning: brief uses 'pgrep -f' (it matches its own shell; wait on a pid or file)"
+                .into(),
+        );
+    }
     match at_col1(head, "Playbook:") {
         None => warnings.push("warning: brief has no 'Playbook:' header".into()),
         Some("none") => warnings.push("warning: 'Playbook: none' needs a reason".into()),
@@ -197,6 +258,86 @@ pub fn check_brief(
         source,
         warnings,
     })
+}
+
+/// `Playbook: prototype` is the pilot/spike playbook; the budget the worker
+/// actually gets (`budget_sec`: brief line, env override or default) may not
+/// exceed `limit_sec` (`timers.pilot_budget`). `None` limit: nothing to compare.
+pub fn check_pilot_budget(
+    text: &str,
+    budget_sec: u64,
+    limit_sec: Option<u64>,
+) -> Result<(), String> {
+    let Some(limit) = limit_sec else {
+        return Ok(());
+    };
+    let pilot = at_col1(header_block(text), "Playbook:")
+        .and_then(|p| p.split([',', ';', ' ']).next())
+        == Some("prototype");
+    if pilot && budget_sec > limit {
+        return Err(format!(
+            "Playbook 'prototype' time budget {} exceeds timers.pilot_budget {}",
+            fmt_sec(budget_sec),
+            fmt_sec(limit)
+        ));
+    }
+    Ok(())
+}
+
+fn fmt_sec(s: u64) -> String {
+    if s.is_multiple_of(60) {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// `"30m"`, `"2h"`, `"90s"` (or a bare number of seconds) as seconds.
+fn parse_duration_sec(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (n, mult) = match s.chars().last()? {
+        'h' => (&s[..s.len() - 1], 3600),
+        'm' => (&s[..s.len() - 1], 60),
+        's' => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    n.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// `timers.pilot_budget` from the config database (team.toml only seeds it).
+pub fn pilot_budget_sec(runs: &Path) -> Option<u64> {
+    let c = crate::db::open(&runs.join(crate::db::path::DB_FILE)).ok()?;
+    let v = crate::config::setting(&c, "timers.pilot_budget").ok()??;
+    parse_duration_sec(v.as_str()?)
+}
+
+const PANE_TAIL_LINES: u32 = 40;
+
+/// The pane tail block the CoS reads after exit 3, 4, 5, 7 or 8: one
+/// `WATCHDOG pane tail <name>` header, then the last lines or one line why not.
+/// The pane comes from herdr, else (a dead core) from the agent record.
+pub fn pane_tail_block(herdr: &dyn HerdrClient, runs: &Path, name: &str) -> String {
+    let head = format!("WATCHDOG pane tail {name}");
+    let pane = agent_state(herdr, name).1.or_else(|| {
+        let c = crate::db::open(&runs.join(crate::db::path::DB_FILE)).ok()?;
+        c.query_row(
+            "SELECT pane_id FROM agent WHERE name = ?1 ORDER BY started_ms DESC LIMIT 1",
+            [name],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()?
+    });
+    let Some(pane) = pane else {
+        return format!("{head}\npane read failed: no pane known for '{name}'");
+    };
+    match herdr.pane_read(&pane, PANE_TAIL_LINES) {
+        Ok(r) if r.ok => format!("{head}\n{}", r.body.trim_end()),
+        Ok(r) => format!(
+            "{head}\npane read failed: {}",
+            r.error_code().unwrap_or_else(|| "herdr error".into())
+        ),
+        Err(e) => format!("{head}\npane read failed: {e}"),
+    }
 }
 
 /// What the wait observed at one poll.
@@ -969,10 +1110,7 @@ impl Tuning {
 
 /// The brief plus the report instruction, as the old binary composed it.
 pub fn compose_prompt_body(name: &str, task: &str) -> String {
-    format!(
-        "{task}. {}",
-        super::report_contract::report_ask(name)
-    )
+    format!("{task}. {}", super::report_contract::report_ask(name))
 }
 
 /// Sends the brief through herdr and checks it reached the turn. A stalled
@@ -990,10 +1128,13 @@ fn send_brief(
     }
     match landing {
         crate::herdr::Landing::Landed => Ok(()),
-        crate::herdr::Landing::Blocked => Err(CliError::new(
-            5,
-            format!("WATCHDOG exit=5 blocked before the brief | name={name}"),
-        )),
+        crate::herdr::Landing::Blocked => {
+            let _ = crate::memory::journal::watchdog_case(runs, name, 5);
+            Err(CliError::new(
+                5,
+                format!("WATCHDOG exit=5 blocked before the brief | name={name}"),
+            ))
+        }
         crate::herdr::Landing::NotLanded(why) => Err(CliError::new(
             1,
             format!("the brief did not land | name={name} | {why}"),
@@ -1090,6 +1231,8 @@ pub fn prompt_run(
             .and_then(|v| v.parse().ok());
         let ok = check_brief(text, env_budget, playbooks_dir(runs).as_deref())
             .map_err(|e| CliError::new(1, e))?;
+        check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(runs))
+            .map_err(|e| CliError::new(1, e))?;
         for w in &ok.warnings {
             eprintln!("{w}");
         }
@@ -1142,10 +1285,23 @@ pub fn prompt_run(
     };
     match wait(herdr, clock, &cfg) {
         Exit::ReportReady => Ok(report.display().to_string()),
-        e => Err(CliError::new(
-            e.code(),
-            format!("WATCHDOG exit={} | name={name}", e.code()),
-        )),
+        e => {
+            if matches!(
+                e,
+                Exit::Stalled
+                    | Exit::BudgetExceeded
+                    | Exit::Blocked
+                    | Exit::ProviderError
+                    | Exit::CoreDied
+            ) {
+                eprintln!("{}", pane_tail_block(herdr, runs, name));
+            }
+            let _ = crate::memory::journal::watchdog_case(runs, name, e.code());
+            Err(CliError::new(
+                e.code(),
+                format!("WATCHDOG exit={} | name={name}", e.code()),
+            ))
+        }
     }
 }
 
@@ -1161,6 +1317,8 @@ fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
                     .ok()
                     .and_then(|v| v.parse().ok());
                 let ok = check_brief(text, env_budget, playbooks_dir(&env.runs_dir).as_deref())
+                    .map_err(|e| CliError::new(1, e))?;
+                check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(&env.runs_dir))
                     .map_err(|e| CliError::new(1, e))?;
                 let mut out = ok.warnings.join("\n");
                 if !out.is_empty() {
