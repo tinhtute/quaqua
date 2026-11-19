@@ -69,6 +69,28 @@ fn configured_remote(repo: &str, name: &str) -> bool {
     })
 }
 
+/// A branch the verb never publishes: `main`, `master`, the remote's HEAD
+/// branch (`refs/remotes/<remote>/HEAD`, local only, may be unset), or the
+/// repo's configured `init.defaultBranch`.
+fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
+    let out = |args: &[&str]| {
+        git(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    matches!(b, "main" | "master")
+        || out(&[
+            "symbolic-ref",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ])
+        .is_some_and(|h| h.strip_prefix(&format!("{remote}/")) == Some(b))
+        || out(&["config", "init.defaultBranch"]).is_some_and(|d| d == b)
+}
+
 fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
     let kind: Option<String> = resolve(conn, caller)
         .ok()
@@ -130,6 +152,9 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
             }
             if !configured_remote(repo, remote) {
                 return deny("remote is not configured in the repo", remote);
+            }
+            if protected_branch(repo, remote, branch) {
+                return deny("branch is the repo's main or default branch", branch);
             }
             let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
             let out = git(repo)
