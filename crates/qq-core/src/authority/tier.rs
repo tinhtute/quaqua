@@ -91,6 +91,11 @@ pub fn lane_tier() -> Tier {
     Tier::High
 }
 
+/// The tier of the named plan lane (stub until the grant rows exist).
+pub fn lane_tier_of(_runs_dir: &Path, _lane: &str) -> Tier {
+    Tier::High
+}
+
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     std::process::Command::new("git")
         .arg("-C")
