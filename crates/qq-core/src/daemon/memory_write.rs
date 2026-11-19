@@ -160,5 +160,5 @@ fn put_raw(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 pub fn register(d: &mut Daemon) {
-    let _ = d.register_verb(VERB, Box::new(|ctx, req| handle(ctx, req)));
+    let _ = d.register_verb(VERB, Box::new(handle));
 }
