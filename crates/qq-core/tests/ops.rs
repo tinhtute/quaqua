@@ -133,6 +133,45 @@ fn prompt_check_brief_and_resume() {
     let missing = BRIEF.replace("Playbook: feature", "Playbook: nope");
     let e = prompt::check_brief(&missing, None, Some(&pb)).unwrap_err();
     assert!(e.contains("nope"), "{e}");
+    // `none, <reason>` is the documented trivial-unit form: accepted, no warning,
+    // even with an index; bare `none` still warns; an unknown name still fails
+    let nr = BRIEF.replace("Playbook: feature", "Playbook: none, one-command unit");
+    let ok = prompt::check_brief(&nr, None, Some(&pb)).unwrap();
+    assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+    let bare = BRIEF.replace("Playbook: feature", "Playbook: none");
+    let w = prompt::check_brief(&bare, None, Some(&pb)).unwrap();
+    assert!(
+        w.warnings.iter().any(|m| m.contains("needs a reason")),
+        "{:?}",
+        w.warnings
+    );
+    assert!(prompt::check_brief(&missing, None, Some(&pb)).is_err());
+    // an empty reason warns as a missing reason; a '<…>' reason as a placeholder
+    for v in ["none,", "none,   ", "none;"] {
+        let b = BRIEF.replace("Playbook: feature", &format!("Playbook: {v}"));
+        for idx in [Some(pb.as_path()), None] {
+            let w = prompt::check_brief(&b, None, idx).unwrap();
+            assert!(
+                w.warnings.iter().any(|m| m.contains("needs a reason")),
+                "{v:?}: {:?}",
+                w.warnings
+            );
+        }
+    }
+    for v in ["none, <reason>", "none, <…>"] {
+        let b = BRIEF.replace("Playbook: feature", &format!("Playbook: {v}"));
+        for idx in [Some(pb.as_path()), None] {
+            let w = prompt::check_brief(&b, None, idx).unwrap();
+            assert!(
+                w.warnings.iter().any(|m| m.contains("placeholder")),
+                "{v:?}: {:?}",
+                w.warnings
+            );
+        }
+    }
+    // `none <word>` is not the none form: it goes to the name lookup
+    let nw = BRIEF.replace("Playbook: feature", "Playbook: none of the above");
+    assert!(prompt::check_brief(&nw, None, Some(&pb)).is_err());
     // no index at all: the name is not checked
     assert!(prompt::check_brief(&missing, None, Some(&pb.join("absent"))).is_ok());
 

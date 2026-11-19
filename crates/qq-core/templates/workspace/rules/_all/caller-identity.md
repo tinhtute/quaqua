@@ -2,7 +2,6 @@
 # Caller identity
 
 - Infer caller identity from the harness (herdr pane get/agent list), never ambient env; fail closed — 2026-10-15, runs/tieude-orchtag2.md
-- A pane's token set is evidence, not proof: a pane with no `grid_farm` is attributed by its `cwd`, so never infer its farm from the token alone — 2026-10-29, runs/tieude-farmdoc.md
 
 ## Pane tokens
 
