@@ -577,6 +577,10 @@ const TRIPWIRES: &[Tripwire] = &[
             "gh api --method GET --method PUT repos/o/r/contents/a.txt -f message=m",
             "gh api --method=GET --method=PATCH repos/o/r/git/refs/heads/main",
             "gh api -X GET -XPATCH repos/o/r/git/refs/heads/main",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main -p -XGET",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main --jq -XGET",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main -H -XGET",
+            "gh api -X DELETE -X GET repos/o/r/git/refs/heads/main",
             "gh api repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
         ],
         &[
@@ -727,14 +731,17 @@ fn gate_blocks_herdr_pane_input() {
 }
 
 #[test]
-fn gate_last_method_flag_wins() {
-    // gh keeps the last -X/--method; the fallback is a superset and blocks both.
+fn gate_any_non_get_method_blocks() {
+    // gh keeps the last -X/--method, but `-p -XGET` smuggles a GET token after a
+    // DELETE: any explicit non-GET method blocks, whatever the order.
     assert_eq!(
         gate_exit("gh api -X DELETE -X GET repos/o/r/git/refs/heads/main"),
-        0
+        2
     );
     assert_eq!(gate_exit("gh api -X GET -X PUT repos/o/r/pulls/1/merge"), 2);
-    assert_eq!(gate_exit("gh api -X PUT -X GET repos/o/r/pulls/1/merge"), 0);
+    assert_eq!(gate_exit("gh api -X PUT -X GET repos/o/r/pulls/1/merge"), 2);
+    // Every explicit method GET stays a read.
+    assert_eq!(gate_exit("gh api -X GET -XGET repos/o/r/pulls/1/merge"), 0);
 }
 
 #[test]
