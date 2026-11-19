@@ -1524,3 +1524,23 @@ fn gate_fix4_ordinary_commands_stay_free() {
         assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
     }
 }
+
+/// A worker never gets a tag through a wrapper either (predicate (a): ASK for
+/// the CoS, BLOCK for a worker).
+#[test]
+fn gate_fix4_tier_escapes_through_wrappers_block_workers() {
+    for who in [Who::Worker, Who::Down] {
+        let r = rig("gf4-tier-w", who);
+        let b = r.b.display();
+        for cmd in [
+            format!("env -iC {b} git tag v1"),
+            format!("sudo -nD {b} git tag v1"),
+            format!("env -vC {b} git tag v1"),
+            format!("sudo -nkD {b} git tag v1"),
+            format!("direnv exec {b} git tag v1"),
+            format!("chroot {b} git tag v1"),
+        ] {
+            assert!(block(&r.bash_in(&r.a, &cmd)), "{who:?}: {cmd}");
+        }
+    }
+}
