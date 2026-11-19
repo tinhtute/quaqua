@@ -303,3 +303,87 @@ fn cos_push_door_empty_remote_has_no_default() {
     assert!(push(&r, args(&work, "feat")).is_ok());
     assert!(has_ref(&origin, "feat"));
 }
+
+/// A bare repo `name` under the rig root with HEAD `head`, optionally holding a
+/// `decoy`-style branch so it is not empty.
+fn decoy_bare(r: &Rig, work: &Path, name: &str, head: &str, seed: bool) -> PathBuf {
+    let p = r.ws.root().join(name);
+    git(
+        r.ws.root(),
+        &["init", "-q", "--bare", "-b", head, p.to_str().unwrap()],
+    );
+    if seed {
+        git(
+            work,
+            &[
+                "push",
+                "-q",
+                p.to_str().unwrap(),
+                &format!("HEAD:refs/heads/{head}"),
+            ],
+        );
+    }
+    p
+}
+
+/// The fetch URL names a decoy whose HEAD is not `trunk`, while the push URL
+/// is the real origin (HEAD `trunk`). The door must check what git pushes to.
+#[test]
+fn cos_push_door_pushurl_decoy_fetch_url_refused() {
+    let r = rig("cpd-pushurl-a", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let decoy = decoy_bare(&r, &work, "decoy.git", "decoy", true);
+    git(
+        &work,
+        &["config", "remote.origin.url", decoy.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &["config", "remote.origin.pushurl", origin.to_str().unwrap()],
+    );
+    let before = rev(&origin, "refs/heads/trunk");
+    assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+/// An empty fetch URL reads as "no default"; the push URL is the real origin.
+#[test]
+fn cos_push_door_pushurl_empty_fetch_url_refused() {
+    let r = rig("cpd-pushurl-b", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let empty = decoy_bare(&r, &work, "empty.git", "decoy", false);
+    git(
+        &work,
+        &["config", "remote.origin.url", empty.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &["config", "remote.origin.pushurl", origin.to_str().unwrap()],
+    );
+    let before = rev(&origin, "refs/heads/trunk");
+    assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+/// `url.<real>.pushInsteadOf=<decoy>` redirects the push, not the fetch.
+#[test]
+fn cos_push_door_push_insteadof_refused() {
+    let r = rig("cpd-pushurl-c", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let empty = decoy_bare(&r, &work, "empty3.git", "decoy", false);
+    git(
+        &work,
+        &["config", "remote.origin.url", empty.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &[
+            "config",
+            &format!("url.{}.pushInsteadOf", origin.display()),
+            empty.to_str().unwrap(),
+        ],
+    );
+    let before = rev(&origin, "refs/heads/trunk");
+    assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
