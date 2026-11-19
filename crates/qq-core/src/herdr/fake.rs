@@ -564,11 +564,9 @@ impl HerdrClient for FakeHerdr {
     }
 
     fn notification_show(&self, title: &str, body: &str, sound: Option<&str>) -> io::Result<Reply> {
-        self.lock().notifications.push((
-            title.to_string(),
-            body.to_string(),
-            sound.map(String::from),
-        ));
+        let mut st = enter!(self, Verb::NotificationShow);
+        st.notifications
+            .push((title.to_string(), body.to_string(), sound.map(String::from)));
         Ok(Reply::ok(r#"{"result":{"shown":true}}"#))
     }
 
