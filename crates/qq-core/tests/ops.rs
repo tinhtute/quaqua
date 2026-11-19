@@ -461,6 +461,116 @@ fn cleanup_refuses_dirty_and_wrong_repo_and_foreign_pane() {
     survive(&herdr, &f);
 }
 
+fn project_with_repo(conn: &Connection, slug: &str, repo: &Path) -> i64 {
+    let p = add_project(conn, slug);
+    conn.execute(
+        "UPDATE project SET repo_path = ?2 WHERE id = ?1",
+        rusqlite::params![p, repo.to_string_lossy()],
+    )
+    .unwrap();
+    p
+}
+
+/// A PaneOps whose close is a no-op: herdr said ok but the pane stayed.
+struct LyingClose<'a>(HerdrPanes<'a>);
+impl PaneOps for LyingClose<'_> {
+    fn panes(&self) -> std::io::Result<Vec<grid::Pane>> {
+        self.0.panes()
+    }
+    fn create_tab(&self, l: &str) -> std::io::Result<grid::Pane> {
+        self.0.create_tab(l)
+    }
+    fn split(&self, a: &str, d: grid::Dir) -> std::io::Result<grid::Pane> {
+        self.0.split(a, d)
+    }
+    fn close_pane(&self, _: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn claim(&self, p: &str, s: &grid::Scope) -> std::io::Result<()> {
+        self.0.claim(p, s)
+    }
+}
+
+#[test]
+fn cleanup_closes_the_live_pane_when_the_recorded_id_is_stale() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-stale", &herdr);
+    herdr.agent_start("w1", "pi", &pane, 1000, &[]).unwrap();
+    set_pane(&conn, "w1", "p999"); // the pane moved; the record kept the old id
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5).unwrap();
+    assert!(
+        !herdr.has_pane(&pane),
+        "the live pane is closed, not only the recorded id"
+    );
+    assert!(ended(&conn, "w1") && !wt.exists());
+    survive(&herdr, &f);
+}
+
+#[test]
+fn cleanup_closes_an_orphan_pane_whose_worktree_and_branch_are_gone() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-orphan", &herdr);
+    let p = project_with_repo(&conn, "proj", &repo);
+    conn.execute("UPDATE agent SET project_id = ?1 WHERE name = 'w1'", [p])
+        .unwrap();
+    herdr.agent_start("w1", "pi", &pane, 1000, &[]).unwrap();
+    git(
+        &repo,
+        &["worktree", "remove", "--force", &wt.to_string_lossy()],
+    );
+    git(&repo, &["branch", "-D", "quaqua/w1"]);
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5).unwrap();
+    assert!(!herdr.has_pane(&pane) && ended(&conn, "w1"));
+    survive(&herdr, &f);
+}
+
+#[test]
+fn cleanup_names_what_remains_instead_of_reporting_cleaned() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-remains", &herdr);
+    let panes = LyingClose(HerdrPanes(&herdr));
+    let t = target(&dir, &repo, &wt, false);
+    let r = cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t, 5);
+    assert_eq!(r, Err(OpsError::Remains(vec![format!("pane {pane}")])));
+    assert!(
+        !ended(&conn, "w1"),
+        "the agent row stays so a retry converges"
+    );
+}
+
+#[test]
+fn lead_cleanup_removes_the_lead_worktree_or_names_it() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, _wt, _pane) = worker_fixture("leadwt", &herdr);
+    let p = project_with_repo(&conn, "proj", &repo);
+    add_agent(&conn, "proj-lead", "lead", "ni", Some(p));
+    let lwt = dir.join(".wt").join("proj-lead");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(
+        !lwt.exists(),
+        "a Lead cleanup that reports cleaned leaves no worktree"
+    );
+    assert!(ended(&conn, "proj-lead"));
+}
+
 #[test]
 fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     let (_dir, conn) = seeded("stop");

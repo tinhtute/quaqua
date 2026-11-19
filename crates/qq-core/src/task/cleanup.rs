@@ -31,6 +31,8 @@ pub enum OpsError {
     Dirty(Vec<String>),
     /// The repo does not own this worker; nothing was touched (#170 F1).
     WrongRepo(String),
+    /// The cleanup ran but these still exist (`pane p1`, `worktree /x`...).
+    Remains(Vec<String>),
     Git(String),
     Other(String),
 }
@@ -53,6 +55,7 @@ impl std::fmt::Display for OpsError {
                 p.join(", ")
             ),
             OpsError::WrongRepo(m) => write!(f, "{m}"),
+            OpsError::Remains(r) => write!(f, "not cleaned, still present: {}", r.join(", ")),
             OpsError::Git(m) | OpsError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -200,6 +203,19 @@ pub fn cleanup_worker(
     git(t.repo, &["worktree", "prune"])?;
     remove_sidecars(t.runs_dir, t.name);
     end_agent(conn, t.name, now_ms).map_err(other)
+}
+
+/// [`cleanup_worker`] that also finds the pane by asking herdr where `name`
+/// lives now (red stub: not implemented yet).
+pub fn cleanup_worker_live(
+    conn: &Connection,
+    panes: &dyn PaneOps,
+    _live: &dyn HerdrClient,
+    scope: &Scope,
+    t: &Target,
+    now_ms: u64,
+) -> Result<(), OpsError> {
+    cleanup_worker(conn, panes, scope, t, now_ms)
 }
 
 fn end_agent(conn: &Connection, name: &str, now_ms: u64) -> rusqlite::Result<()> {
