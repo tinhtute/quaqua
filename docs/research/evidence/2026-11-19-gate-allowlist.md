@@ -1,0 +1,119 @@
+# Gate: allow only known spellings (sude-gateallow)
+
+Base: `quaqua/hermes3-integ` at cdd727d. Scope: `crates/qq-core/src/authority/gate.rs`
+(hook script `herdr-gate.sh` is covered below). Closes review-3 findings 1, 3, 4 and 10.
+
+## Premise under test
+
+> The gate can enumerate the unsafe shell spellings.
+
+Three reviews found holes of one class each time: a wrapper flag the gate did not
+list (`env --chdir`, then `env -iC`), a reader flag it did not list (`sed w`, then
+`sed r\<nl>w`, then `rg --pre`), a wrapper it did not list (`caffeinate`, `watch`).
+Each fix added the spellings the reviewer had just found. The next review found
+the next ones.
+
+### The test
+
+1. Write at least 12 spellings in the same classes that no review has listed
+   (other clustered flags, other wrappers, other reader flags that exec or
+   write). Commit them red, on the unchanged gate.
+2. Change the gate by structure only. Those spellings must go green with no
+   case added for them.
+
+The first half is a measurement: if the premise held, the held-out set would
+already be refused. It is not (see the red commit). The second half is the
+check on the new structure.
+
+## Chosen structure: the fast path is a known spelling; everything else is the strict answer
+
+The old shape: a command is a pass-through unless it matches a list of bad
+spellings. The new shape: a command takes the cheap path only when it matches an
+exactly known spelling; every other shape takes the fail-closed path.
+
+### 1. Wrappers (`sudo env nice timeout xargs …`)
+
+- Each wrapper has an exact table: no-value short flags, value short flags,
+  optional-attached-value short flags, no-value long flags, value long flags.
+- A short cluster (`-iC`, `-Eu`, `-tn`, `-vs`) is exploded letter by letter through
+  the table. A value letter takes the rest of the token, or the next token.
+- The leading flags are skipped only if every token is in the table. The first
+  token that is not (an unknown flag, an unknown letter in a cluster) makes the
+  command word unknown.
+- Unknown command word means: every suffix of the remaining words is checked as
+  a command (a superset of every reading of which word is the command), every
+  word that holds a space is scanned as a command line, and the target is
+  unknown (high tier). This replaces the both-readings fork and the six-fork cap:
+  one linear scan covers all readings, so no table of value-taking options has to
+  stay complete, and no fork budget can be exhausted.
+
+### 2. Unlisted commands (`caffeinate script doas flock watch parallel ssh …`)
+
+A command word that is not a known wrapper, git, gh, herdr, quaqua, a shell or a
+provable reader gets the same scan as an unknown wrapper word: suffixes as
+commands, spaced words as command lines, unknown target. A guarded pair that
+appears as consecutive argv words, or inside one quoted word, is treated as that
+guarded command. Provable readers (below) are exempt, so `echo git push` and
+`grep -rn git push docs/` stay free.
+
+### 3. READ_ONLY
+
+- Readers that have a flag or program that can write or execute (`sed sort uniq
+  awk rg bat diff file git`) carry an exact flag table or a grammar; any flag or
+  operand shape outside it means not read-only (`sort -oUSER.md`,
+  `sort -ruoX`, `rg --pre=tee`, `bat --pager=…` all fall out of the table).
+- Readers that have no such flag in any implementation (`cat ls stat head tail wc
+  du hexdump od strings checksum tools cmp realpath readlink basename dirname nl
+  cut tac jq echo printf test [`) stay on the list unconditionally. Each was
+  checked against the GNU and BSD man pages for an output-file, an exec or a
+  program-text option. This is the one place the design still relies on a claim
+  about a tool; the held-out tests name USER.md through each of them.
+- Dropped from the list: `xxd` (the second operand is the output; the operand
+  count is not provable once `-r`, `-p`, `-i` and `-s` change it), `less` and
+  `more` (`-o`, `--log-file`, `+cmd`, `!cmd`). A pager has no use in a hook-run
+  Bash call.
+- `sed`: the existing allow-list parser stays. Fix: `r` and `R` file names end at
+  the newline (no backslash continuation), so a following `w` line is parsed and
+  rejected. A script that does not parse completely is not read-only.
+- `awk`: read-only only when the program text has none of `>`, `|`, `system`,
+  `getline`, `@`, and no flag but `-F`, `-v`, `--`.
+
+### 4. Kept from gatefix3
+
+The both-readings idea (now subsumed by the suffix scan), the fail-closed rules,
+the cd and `GIT_DIR` retargeting, the grant tripwires, and the Write/Edit gate
+are unchanged.
+
+## Hook fallback (`herdr-gate.sh`)
+
+The fallback is a text scan that only adds blocks when the binary is missing or
+stale; it never allows something the binary refuses, because the binary runs
+whenever it exists. It has no wrapper parser to widen: its regexes use
+`git[^"]*[[:space:]]push`, which already matches a push after any wrapper words.
+Findings 1, 3, 4 and 10 are binary-path holes, so the script is left unchanged
+unless the held-out run shows a fallback miss that the structure above can close.
+
+## Rejected alternatives
+
+- **Add the review's spellings** (cluster letters `C u t n s S`, wrappers
+  `caffeinate script doas …`, `xxd`, `rg --pre`, `bat --pager`, `-o` attached).
+  This is rounds 1-3 again. Refused by the premise test.
+- **Block any unknown flag on a wrapper, outright.** Closes the class but turns
+  every `env --some-new-flag ls` into a block. The suffix scan keeps the strict
+  answer only where a guarded command is actually present.
+- **Reconstruct the real argv grammar of each wrapper** (a full getopt per tool).
+  Tables of known spellings plus a strict fallback give the same safety without
+  the grammar having to be complete or version-correct.
+- **Exact allowlist for every reader, with no inert group.** More typing, more
+  false asks on `ls`/`cat` flag drift, no safety gain for tools that cannot write
+  or exec. Revisit if a held-out probe finds a writing flag on an inert reader.
+- **Scan the whole command text for `git` + `push`.** Already used for
+  stdin-fed shells; as a general rule it blocks prose (commit messages, prompts).
+
+## Measurement plan
+
+Replay `corpus.jsonl` (4,934 real CoS Bash commands) through the CoS rig on
+cdd727d and on the fix build. Report ALLOW→ASK and ALLOW→BLOCK, each move
+classified as a real write or a false ask. Target: false asks at most 0.5% of
+commands (about 24). Not met means reporting the number and the cause, not
+loosening the gate.
