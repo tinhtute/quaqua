@@ -629,7 +629,7 @@ mod pr_merge_door {
         let gh = r.ws.root().join("fake-gh");
         let script = format!(
             "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
-             'pr diff') printf '%s\\n' {diff} ;;\n\
+             'pr diff') {diff} ;;\n\
              'pr view') echo {head} ;;\n\
              'pr checks') {checks} ;;\n\
              'pr merge') exit 0 ;;\n\
@@ -652,12 +652,17 @@ mod pr_merge_door {
         Door { r, log }
     }
 
+    /// A shell snippet that prints `diff --git` headers for the named files.
+    fn names(files: &str) -> String {
+        format!("for f in {files}; do printf 'diff --git a/%s b/%s\\n' \"$f\" \"$f\"; done")
+    }
+
     fn green(tag: &str, who: Who, base: Tier) -> Door {
         door(
             tag,
             who,
             base,
-            "src/lib.rs",
+            &names("src/lib.rs"),
             SHA,
             "echo '[{\"bucket\":\"pass\"}]'",
             SHA,
@@ -722,7 +727,7 @@ mod pr_merge_door {
             "prm-stage",
             Who::Cos,
             Tier::Medium,
-            "src/lib.rs",
+            &names("src/lib.rs"),
             SHA,
             "echo '[{\"bucket\":\"pass\"}]'",
             SHA,
@@ -738,7 +743,7 @@ mod pr_merge_door {
             "prm-red",
             Who::Cos,
             Tier::Medium,
-            "src/lib.rs",
+            &names("src/lib.rs"),
             SHA,
             "echo '[{\"bucket\":\"fail\"}]'; exit 1",
             SHA,
@@ -754,7 +759,7 @@ mod pr_merge_door {
             "prm-head",
             Who::Cos,
             Tier::Medium,
-            "src/lib.rs",
+            &names("src/lib.rs"),
             OTHER,
             "echo '[{\"bucket\":\"pass\"}]'",
             SHA,
@@ -843,7 +848,7 @@ mod pr_merge_door {
             "prm-fence",
             Who::Cos,
             Tier::Medium,
-            "src/lib.rs crates/qq-core/src/daemon/mod.rs",
+            &names("src/lib.rs crates/qq-core/src/daemon/mod.rs"),
             SHA,
             "echo '[{\"bucket\":\"pass\"}]'",
             SHA,
@@ -860,6 +865,42 @@ mod pr_merge_door {
             Who::Cos,
             Tier::Medium,
             "x; exit 1",
+            SHA,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "gate",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res, "tier High");
+    }
+
+    #[test]
+    fn fence_path_tier_sees_a_rename_out_of_a_fence_dir() {
+        // `--name-only` lists only the new side; the old side is the fence.
+        let rename = "printf 'diff --git a/crates/qq-core/src/authority/gate.rs b/elsewhere/gate.rs\\nsimilarity index 100%%\\nrename from crates/qq-core/src/authority/gate.rs\\nrename to elsewhere/gate.rs\\n'";
+        let d = door(
+            "prm-rename",
+            Who::Cos,
+            Tier::Medium,
+            rename,
+            SHA,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "gate",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res, "tier High");
+    }
+
+    #[test]
+    fn fence_path_tier_sees_a_quoted_fence_path() {
+        let quoted =
+            "printf 'diff --git \"a/crates/qq-core/src/daemon/\\\\303\\\\251.rs\" \"b/x\"\\n'";
+        let d = door(
+            "prm-quoted",
+            Who::Cos,
+            Tier::Medium,
+            quoted,
             SHA,
             "echo '[{\"bucket\":\"pass\"}]'",
             SHA,
