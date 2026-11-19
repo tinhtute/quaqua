@@ -403,3 +403,37 @@ fn push_of_a_repo_outside_the_callers_project_is_refused() {
     assert_eq!(e.code, "refused");
     assert!(!origin_has_feat(&origin));
 }
+
+#[test]
+fn push_refuses_main_master_and_the_remote_default_branch() {
+    let r = rig("g1-push-mainguard", false);
+    let (work, origin) = repo_with_origin(&r);
+    // A default branch named neither main nor master, known only via the remote HEAD.
+    git(&work, &["branch", "trunk"]);
+    git(&work, &["branch", "main"]);
+    git(&work, &["branch", "master"]);
+    git(
+        &work,
+        &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+    );
+    let protected = ["main", "master", "trunk"];
+    for branch in protected {
+        let e = call(
+            &r,
+            "push",
+            Some("lead-f"),
+            json!({"repo": work, "remote": "origin", "branch": branch}),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "refused", "{branch}");
+        assert!(
+            origin_ref(&origin, &format!("refs/heads/{branch}")).is_none(),
+            "{branch} must not reach the remote"
+        );
+    }
+    let rows = authority::refusals(&conn(&r)).unwrap();
+    assert_eq!(rows.len(), protected.len(), "each refusal is journaled");
+    // Every other allowed push behaves as before.
+    call(&r, "push", Some("lead-f"), push_args(&work)).unwrap();
+    assert!(origin_has_feat(&origin));
+}
