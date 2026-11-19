@@ -384,15 +384,137 @@ fn memory_write_owner_worker_reads_and_other_files_pass() {
 }
 
 #[test]
-fn memory_write_owner_cos_direct_write_is_not_denied() {
-    let r = rig("mw-gate-cos", Who::Cos);
-    assert_eq!(r.gate_file("Write", "USER.md"), GateVerdict::Allow);
-    assert_eq!(r.gate_bash("echo x >> memory/rules.md"), GateVerdict::Allow);
-}
-
-#[test]
 fn memory_write_owner_unidentified_direct_write_denied() {
     let r = rig("mw-gate-anon", Who::Nobody);
     assert!(blocked(&r.gate_file("Write", "USER.md")));
     assert!(blocked(&r.gate_bash("echo x >> USER.md")));
+}
+
+// ---- memory_fix_* (T3 review M2, M3, minors) ----
+
+fn names_tools(v: &GateVerdict) -> bool {
+    let GateVerdict::Block(m) = v else {
+        return false;
+    };
+    ["memory_add", "memory_replace", "memory_remove"]
+        .iter()
+        .all(|t| m.contains(t))
+}
+
+#[test]
+fn memory_fix_cos_direct_write_denied_with_tool_hint() {
+    let r = rig("mf-cos", Who::Cos);
+    for rel in ["USER.md", "memory/rules.md"] {
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let v = r.gate_file(tool, rel);
+            assert!(names_tools(&v), "{tool} {rel}: {v:?}");
+        }
+    }
+    for cmd in [
+        "echo x >> USER.md",
+        "sed -i s/a/b/ memory/rules.md",
+        "printf x | tee USER.md",
+        "dd of=USER.md if=/dev/null",
+        "python3 -c \"open('USER.md','a').write('x')\"",
+    ] {
+        let v = r.gate_bash(cmd);
+        assert!(names_tools(&v), "{cmd}: {v:?}");
+    }
+    // other files and reads stay free for the CoS
+    assert_eq!(r.gate_file("Write", "memory/2026-11-19.md"), GateVerdict::Allow);
+    assert_eq!(r.gate_bash("cat USER.md"), GateVerdict::Allow);
+}
+
+#[test]
+fn memory_fix_cos_verb_call_is_not_blocked_and_still_writes() {
+    let r = rig("mf-verb", Who::Cos);
+    // the gate lets the cos-memory path through: a call naming the verb
+    let cmd = "quaqua call memory.write '{\"files\":{\"USER.md\":{\"before\":\"\",\"after\":\"- a\\n\"}}}'";
+    assert_eq!(r.gate_bash(cmd), GateVerdict::Allow);
+    // and the verb, running as the daemon, writes
+    r.call(one("USER.md", "", "- a\n")).unwrap();
+    assert_eq!(r.read("USER.md").as_deref(), Some("- a\n"));
+    assert_eq!(r.journal(), 1);
+}
+
+#[test]
+fn memory_fix_pwd_spellings_denied() {
+    let r = rig("mf-pwd", Who::Lead);
+    for cmd in [
+        "echo x >> \"$PWD/USER.md\"",
+        "echo x >> ${PWD}/memory/rules.md",
+        "cp /dev/null $PWD/USER.md",
+        "dd of=memory/rules.md if=/dev/null",
+        "dd if=/dev/null of=$PWD/USER.md",
+        "python3 -c \"open('USER.md','a').write('x')\"",
+        "python3 -c \"open('memory/rules.md', 'w')\"",
+        "node -e \"require('fs').appendFileSync('USER.md','x')\"",
+        "sort -o USER.md USER.md",
+        "sed --in-place s/a/b/ USER.md",
+        "sed -ni 1p USER.md",
+        "git checkout -- USER.md",
+        "awk 'BEGIN{print 1 > \"USER.md\"}'",
+    ] {
+        let v = r.gate_bash(cmd);
+        assert!(blocked(&v), "{cmd}: {v:?}");
+    }
+}
+
+#[test]
+fn memory_fix_read_only_commands_pass() {
+    let r = rig("mf-ro", Who::Lead);
+    for cmd in [
+        "sed -n 1,5p USER.md",
+        "sed -n '1,5p' memory/rules.md",
+        "git diff -- USER.md",
+        "git log -p memory/rules.md",
+        "git show HEAD:USER.md",
+        "git -C . blame USER.md",
+        "awk 1 USER.md",
+        "awk '{print $1}' memory/rules.md",
+        "jq -R . USER.md",
+        "sort USER.md",
+        "sort -u memory/rules.md",
+        "nl USER.md",
+        "cat USER.md | grep x",
+        "grep -n x memory/rules.md",
+    ] {
+        assert_eq!(r.gate_bash(cmd), GateVerdict::Allow, "{cmd}");
+    }
+}
+
+#[test]
+fn memory_fix_rollback_after_partial_write_leaves_no_empty_file() {
+    let r = rig("mf-rollback", Who::Cos);
+    // Neither file exists. The second put fails (its temp path is a directory),
+    // after the first file has landed: nothing may remain, not even an empty file.
+    std::fs::create_dir_all(r.root().join("memory/rules.md.tmp")).unwrap();
+    let err = r
+        .call(json!({ "files": {
+            "USER.md": { "before": "", "after": "- u\n" },
+            "memory/rules.md": { "before": "", "after": "- r\n" },
+        }}))
+        .unwrap_err();
+    assert!(err.contains("nothing kept"), "{err}");
+    assert!(
+        !r.root().join("USER.md").exists(),
+        "a file that did not exist is removed, not left empty"
+    );
+    assert_eq!(r.journal(), 0);
+}
+
+#[test]
+fn memory_fix_rollback_restores_existing_text() {
+    let r = rig("mf-rollback2", Who::Cos);
+    r.put("USER.md", "- old\n");
+    std::fs::create_dir_all(r.root().join("memory/rules.md.tmp")).unwrap();
+    let err = r
+        .call(json!({ "files": {
+            "USER.md": { "before": "- old\n", "after": "- new\n" },
+            "memory/rules.md": { "before": "", "after": "- r\n" },
+        }}))
+        .unwrap_err();
+    assert!(err.contains("nothing kept"), "{err}");
+    assert_eq!(r.read("USER.md").as_deref(), Some("- old\n"));
+    assert_eq!(r.journal(), 0);
 }

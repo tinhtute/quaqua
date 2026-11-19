@@ -1021,7 +1021,7 @@ mod caller_gate {
     }
     #[test]
     fn tier_table_delete_unmerged_branch() {
-        row(Action::BranchDeleteUnmerged, [A, A, K]);
+        row(Action::BranchDeleteUnmerged, [K, K, K]);
     }
     #[test]
     fn tier_table_merge_request() {
