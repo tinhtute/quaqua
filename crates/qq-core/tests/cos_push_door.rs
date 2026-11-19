@@ -218,7 +218,10 @@ fn rev(dir: &Path, rf: &str) -> String {
 /// ahead of the remote's, so pushing it is a fast-forward.
 fn repo_with_trunk_remote(r: &Rig) -> (PathBuf, PathBuf) {
     let (work, origin) = repo_with_origin(r);
-    git(r.ws.root(), &["init", "-q", "--bare", "-b", "trunk", "o2.git"]);
+    git(
+        r.ws.root(),
+        &["init", "-q", "--bare", "-b", "trunk", "o2.git"],
+    );
     std::fs::remove_dir_all(&origin).unwrap();
     std::fs::rename(r.ws.root().join("o2.git"), &origin).unwrap();
     git(&work, &["branch", "trunk"]);
@@ -271,7 +274,10 @@ fn cos_push_door_case_variants_refused() {
     for b in ["Main", "MAIN", "Master", "MASTER", "Trunk", "TRUNK"] {
         let e = push(&r, args(&work, b)).unwrap_err();
         assert_eq!(e.code, "refused", "{b}: {e:?}");
-        assert!(!has_ref(&origin, b) || b.eq_ignore_ascii_case("trunk"), "{b}");
+        assert!(
+            !has_ref(&origin, b) || b.eq_ignore_ascii_case("trunk"),
+            "{b}"
+        );
     }
 }
 
@@ -280,7 +286,10 @@ fn cos_push_door_unreadable_remote_refused() {
     let r = rig("cpd-unread", Who::Cos);
     let (work, _origin) = repo_with_trunk_remote(&r);
     let gone = r.ws.root().join("gone.git");
-    git(&work, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
+    git(
+        &work,
+        &["remote", "set-url", "origin", gone.to_str().unwrap()],
+    );
     let e = push(&r, args(&work, "feat")).unwrap_err();
     assert_eq!(e.code, "refused", "{e:?}");
 }
