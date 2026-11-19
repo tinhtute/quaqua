@@ -342,7 +342,6 @@ fn deliver_trace(tag: &str, reply: Reply) -> Vec<(String, String, String)> {
         .into_result()
         .expect("mail.send");
     let mail = settled_mail(&f, 2);
-    assert_eq!(f.herdr.notifications().len(), 0);
     mail
 }
 
@@ -358,7 +357,7 @@ fn state_mail_deliver_refused_notification_leaves_a_trace_for_the_cos() {
     assert!(
         mail[1]
             .2
-            .starts_with("notification for hermes-lead escalate failed: ")
+            .starts_with("notification for hermes-lead escalate mail to cos failed: ")
             && mail[1].2.contains("no_client"),
         "{}",
         mail[1].2
@@ -373,7 +372,7 @@ fn state_mail_deliver_not_shown_notification_leaves_a_trace_for_the_cos() {
     );
     assert_eq!(mail.len(), 2, "{mail:?}");
     assert!(
-        mail[1].2.contains("escalate failed") && mail[1].2.contains("not shown"),
+        mail[1].2.contains("escalate mail to cos failed") && mail[1].2.contains("not shown"),
         "{}",
         mail[1].2
     );

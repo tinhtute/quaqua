@@ -242,7 +242,8 @@ const WHY_MAX: usize = 200;
 
 /// Why a notification reply counts as failed, or `None` when it was shown. A
 /// reply that is an error, refused (`ok` false) or says `shown` is not `true`
-/// fails; a body that is not JSON cannot say, so an `ok` one passes.
+/// fails, and so does an `ok` body that is not JSON (nothing proves it was
+/// shown). An empty body reads `no output`.
 fn failed_why(reply: io::Result<Reply>) -> Option<String> {
     let cap = |s: String| {
         s.split_whitespace()
@@ -252,14 +253,21 @@ fn failed_why(reply: io::Result<Reply>) -> Option<String> {
             .take(WHY_MAX)
             .collect::<String>()
     };
-    match reply {
-        Err(e) => Some(cap(e.to_string())),
-        Ok(r) if !r.ok => Some(cap(r.body)),
-        Ok(r) => {
-            let v = serde_json::from_str::<Value>(&r.body).ok()?;
-            (v.pointer("/result/shown").and_then(Value::as_bool) != Some(true))
-                .then(|| cap(format!("not shown: {}", r.body)))
+    let text = |s: &str| {
+        if s.trim().is_empty() {
+            "no output".to_string()
+        } else {
+            s.to_string()
         }
+    };
+    match reply {
+        Err(e) => Some(cap(text(&e.to_string()))),
+        Ok(r) if !r.ok => Some(cap(text(&r.body))),
+        Ok(r) => match serde_json::from_str::<Value>(&r.body) {
+            Err(_) => Some(cap(format!("unreadable reply: {}", text(&r.body)))),
+            Ok(v) => (v.pointer("/result/shown").and_then(Value::as_bool) != Some(true))
+                .then(|| cap(format!("not shown: {}", text(&r.body)))),
+        },
     }
 }
 
@@ -364,7 +372,7 @@ fn deliver(
             notify_or_trace(
                 ctx,
                 from,
-                kind,
+                &format!("{kind} mail to {to}"),
                 &format!("quaqua mail: {kind}"),
                 &format!("{from} -> {to}: {kind}"),
             );
@@ -530,5 +538,21 @@ mod tests {
         }
         assert!(failed_why(Ok(Reply::ok(r#"{"result":{"shown":true}}"#))).is_none());
         assert!(failed_why(Ok(Reply::ok(r#"{"result":{}}"#))).is_some());
+        assert_eq!(
+            failed_why(Ok(Reply::ok("done\n"))).as_deref(),
+            Some("unreadable reply: done")
+        );
+        assert_eq!(
+            failed_why(Ok(Reply::ok(""))).as_deref(),
+            Some("unreadable reply: no output")
+        );
+        assert_eq!(
+            failed_why(Ok(Reply {
+                ok: false,
+                body: " \n".into()
+            }))
+            .as_deref(),
+            Some("no output")
+        );
     }
 }
