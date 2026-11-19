@@ -7,6 +7,7 @@ mod drift;
 mod inbox;
 mod situation;
 mod standing;
+pub mod threat;
 
 pub use caps::*;
 pub use drift::{

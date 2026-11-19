@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use super::threat::{self, Scope};
+
 /// Cap on `memory/rules.md`, in Unicode chars (AGENTS.md '## Memory').
 pub const RULES_CAP: usize = 2200;
 /// Cap on `USER.md`, in Unicode chars (AGENTS.md '## Memory').
@@ -57,6 +59,8 @@ pub enum Problem {
     OverCap { chars: usize, cap: usize },
     /// A secret pattern matched, named for the message.
     Secret(&'static str),
+    /// A threat pattern (or invisible codepoint) matched, by id.
+    Threat(String),
 }
 
 /// One violation: a capped file and what is wrong with it.
@@ -75,6 +79,7 @@ impl Problem {
                 format!("{chars} chars > {cap} cap — merge or drop entries")
             }
             Problem::Secret(name) => format!("contains a {name}"),
+            Problem::Threat(id) => format!("matches threat pattern {id}"),
         }
     }
 }
@@ -144,7 +149,18 @@ pub fn pre_decision(input: &str) -> Option<Value> {
     // An edit we cannot simulate (stale `old_string`) is one Claude Code
     // rejects on its own: nothing is written, so there is nothing to gate.
     let next = simulate(tool, tool_input, &current)?;
-    let violations = check_text(target.rel, &next);
+    let mut violations = check_text(target.rel, &next);
+    // Strict scan, on what this edit adds: a line already in the file must not
+    // lock every later edit out of it.
+    let before = threat::scan(&current, Scope::Strict);
+    for id in threat::scan(&next, Scope::Strict) {
+        if !before.contains(&id) {
+            violations.push(Violation {
+                file: target.rel.to_string(),
+                problem: Problem::Threat(id),
+            });
+        }
+    }
     if violations.is_empty() {
         return None;
     }
