@@ -1732,18 +1732,39 @@ fn pilot_budget_rejects_a_prototype_brief_over_the_db_value() {
     set_pilot_budget(&runs, "30m");
     let limit = prompt::pilot_budget_sec(&runs);
     assert_eq!(limit, Some(1800));
-    assert!(prompt::check_pilot_budget(&proto(30), limit).is_ok());
-    let e = prompt::check_pilot_budget(&proto(45), limit).unwrap_err();
+    assert!(prompt::check_pilot_budget(&proto(30), 1800, limit).is_ok());
+    let e = prompt::check_pilot_budget(&proto(45), 2700, limit).unwrap_err();
     assert!(e.contains("45 min") && e.contains("30 min"), "{e}");
     // not a pilot: the same budget passes
-    assert!(prompt::check_pilot_budget(BRIEF.replace("15 min", "45 min").as_str(), limit).is_ok());
+    let long = BRIEF.replace("15 min", "45 min");
+    assert!(prompt::check_pilot_budget(&long, 2700, limit).is_ok());
     // the database, not team.toml, is the source: change it and the verdict follows
     set_pilot_budget(&runs, "60m");
     let limit = prompt::pilot_budget_sec(&runs);
     assert_eq!(limit, Some(3600));
-    assert!(prompt::check_pilot_budget(&proto(45), limit).is_ok());
+    assert!(prompt::check_pilot_budget(&proto(45), 2700, limit).is_ok());
     // an unset key skips the check
-    assert!(prompt::check_pilot_budget(&proto(999), None).is_ok());
+    assert!(prompt::check_pilot_budget(&proto(999), 59940, None).is_ok());
+}
+
+#[test]
+fn pilot_budget_judges_the_effective_budget_not_the_brief_line() {
+    let (runs, _c) = seeded("piloteff");
+    set_pilot_budget(&runs, "30m");
+    let limit = prompt::pilot_budget_sec(&runs);
+    let proto = BRIEF.replace("Playbook: feature", "Playbook: prototype");
+    let no_line = proto.replace("Time budget: 15 min\n", "");
+    assert!(!no_line.contains("Time budget:"));
+    // no line: the default (45 min) is what the worker gets
+    let ok = prompt::check_brief(&no_line, None, None).unwrap();
+    assert_eq!(ok.budget_sec, 2700);
+    assert!(prompt::check_pilot_budget(&no_line, ok.budget_sec, limit).is_err());
+    // an env override above the cap beats a brief line under it
+    let ok = prompt::check_brief(&proto, Some(3600), None).unwrap();
+    assert_eq!(ok.budget_sec, 3600);
+    assert!(prompt::check_pilot_budget(&proto, ok.budget_sec, limit).is_err());
+    // an env override under the cap passes
+    assert!(prompt::check_pilot_budget(&no_line, 600, limit).is_ok());
 }
 
 #[test]

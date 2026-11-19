@@ -199,26 +199,28 @@ pub fn check_brief(
     })
 }
 
-/// `Playbook: prototype` is the pilot/spike playbook; its brief's `Time budget:`
-/// may not exceed `limit_sec` (`timers.pilot_budget`). `None` limit or no
-/// budget line: nothing to compare.
-pub fn check_pilot_budget(text: &str, limit_sec: Option<u64>) -> Result<(), String> {
+/// `Playbook: prototype` is the pilot/spike playbook; the budget the worker
+/// actually gets (`budget_sec`: brief line, env override or default) may not
+/// exceed `limit_sec` (`timers.pilot_budget`). `None` limit: nothing to compare.
+pub fn check_pilot_budget(
+    text: &str,
+    budget_sec: u64,
+    limit_sec: Option<u64>,
+) -> Result<(), String> {
     let Some(limit) = limit_sec else {
         return Ok(());
     };
     let pilot = at_col1(header_block(text), "Playbook:")
         .and_then(|p| p.split([',', ';', ' ']).next())
         == Some("prototype");
-    let min = at_col1(text, "Time budget:")
-        .and_then(|v| v.strip_suffix("min"))
-        .and_then(|n| n.trim().parse::<u64>().ok());
-    match min {
-        Some(n) if pilot && n * 60 > limit => Err(format!(
-            "Playbook 'prototype' Time budget {n} min exceeds timers.pilot_budget {}",
+    if pilot && budget_sec > limit {
+        return Err(format!(
+            "Playbook 'prototype' time budget {} exceeds timers.pilot_budget {}",
+            fmt_sec(budget_sec),
             fmt_sec(limit)
-        )),
-        _ => Ok(()),
+        ));
     }
+    Ok(())
 }
 
 fn fmt_sec(s: u64) -> String {
@@ -1168,7 +1170,8 @@ pub fn prompt_run(
             .and_then(|v| v.parse().ok());
         let ok = check_brief(text, env_budget, playbooks_dir(runs).as_deref())
             .map_err(|e| CliError::new(1, e))?;
-        check_pilot_budget(text, pilot_budget_sec(runs)).map_err(|e| CliError::new(1, e))?;
+        check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(runs))
+            .map_err(|e| CliError::new(1, e))?;
         for w in &ok.warnings {
             eprintln!("{w}");
         }
@@ -1253,7 +1256,7 @@ fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
                     .and_then(|v| v.parse().ok());
                 let ok = check_brief(text, env_budget, playbooks_dir(&env.runs_dir).as_deref())
                     .map_err(|e| CliError::new(1, e))?;
-                check_pilot_budget(text, pilot_budget_sec(&env.runs_dir))
+                check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(&env.runs_dir))
                     .map_err(|e| CliError::new(1, e))?;
                 let mut out = ok.warnings.join("\n");
                 if !out.is_empty() {
