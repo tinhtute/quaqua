@@ -149,3 +149,41 @@ fn start_again(ws: &TestWorkspace) -> DaemonHandle {
     qq_core::bus::install(&mut Registry::new(), &mut d).expect("bus installs");
     d.spawn().expect("daemon restarts")
 }
+
+#[test]
+fn inbox_daemon_down_not_for_a_daemon_refusal() {
+    let ws = TestWorkspace::new("inbox-down-refusal");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let daemon = start(&ws);
+    // The daemon answers, but refuses another mailbox: it is up, not down.
+    let refused = |session: &str| {
+        memory::inbox_as(
+            &env,
+            Some("peer-a".into()),
+            &args(&[
+                "--for",
+                "lead",
+                "--format",
+                "hook-ups",
+                "--session",
+                session,
+            ]),
+        )
+        .expect("hook fails open")
+    };
+    assert_eq!(refused("s1"), "", "a refusal is not a dead daemon");
+    daemon.stop().unwrap();
+
+    // Down: the line, once. A refusal after the daemon is back clears it.
+    assert!(context(&hook(&env, &["--session", "s1"])).contains("daemon down"));
+    let daemon = start_again(&ws);
+    assert_eq!(refused("s1"), "");
+    daemon.stop().unwrap();
+    let again = context(&hook(&env, &["--session", "s1"]));
+    assert!(
+        again.contains("daemon down"),
+        "marker cleared by an answer: {again}"
+    );
+}

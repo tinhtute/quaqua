@@ -77,12 +77,18 @@ pub fn inbox_as(env: &Env, claim: Option<String>, args: &[String]) -> Result<Str
     // A hook never fails the turn: with no answer it injects nothing.
     let res = match rpc_call_as(env, claim.clone(), "mail.inbox", call) {
         Ok(r) => r,
-        Err(_) if hook => return Ok(daemon_down(env, session.as_deref(), format)),
+        Err(e) if hook => {
+            // Only a failure to reach the daemon is "down"; a refusal or an
+            // internal error is an answer, so it clears the marker.
+            if !transport_error(&e) {
+                clear_down(env, session.as_deref());
+                return Ok(String::new());
+            }
+            return Ok(daemon_down(env, session.as_deref(), format));
+        }
         Err(e) => return Err(e),
     };
-    if let Some(m) = down_marker(env, session.as_deref()) {
-        let _ = std::fs::remove_file(m);
-    }
+    clear_down(env, session.as_deref());
     let mail = res["mail"].as_array().cloned().unwrap_or_default();
     if mail.is_empty() {
         return Ok(String::new());
@@ -138,6 +144,18 @@ fn down_marker(env: &Env, session: Option<&str>) -> Option<PathBuf> {
             .join(".sessions")
             .join(format!("{id}.inbox-down"))
     })
+}
+
+/// `rpc_call_as` words a failure to reach the daemon as "daemon not running"
+/// or "rpc failed"; every other error is the daemon's own answer.
+fn transport_error(e: &CliError) -> bool {
+    e.message.starts_with("daemon not running") || e.message.starts_with("rpc failed:")
+}
+
+fn clear_down(env: &Env, session: Option<&str>) {
+    if let Some(m) = down_marker(env, session) {
+        let _ = std::fs::remove_file(m);
+    }
 }
 
 /// The hook output when the daemon did not answer: the "daemon down" line the
