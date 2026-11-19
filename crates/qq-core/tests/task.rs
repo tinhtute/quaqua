@@ -57,6 +57,12 @@ fn seed(conn: &mut rusqlite::Connection) {
     let team = std::fs::read_to_string(template)
         .unwrap();
     config::seed(conn, &team).expect("seed");
+    // A pipeline start needs a named caller that may merge: the CoS.
+    conn.execute(
+        "INSERT OR IGNORE INTO agent (name, role, started_ms) VALUES ('cos', 'cos', 1)",
+        [],
+    )
+    .unwrap();
 }
 
 struct Fixture {
@@ -1016,6 +1022,10 @@ fn daemon_with(
 }
 
 fn verb_call(ws: &TestWorkspace, args: Value) -> rpc::Response {
+    verb_call_as(ws, "cos", args)
+}
+
+fn verb_call_anon(ws: &TestWorkspace, args: Value) -> rpc::Response {
     rpc::call(
         &rpc::socket_path(&ws.runs_dir()),
         &Request::new("pipeline", args),
@@ -1081,7 +1091,7 @@ fn pipeline_verb_enforces_cross_harness_review_and_converges() {
     assert_eq!(again.result["running"], json!(true));
     assert_eq!(herdr.prompts().len(), 1, "the repeat prompts nobody again");
     let agents: i64 = conn
-        .query_row("SELECT count(*) FROM agent", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM agent WHERE name != 'cos'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(agents, 1, "one builder, no second spawn");
 
@@ -1153,5 +1163,100 @@ fn revived_flow_rearms_its_report_watcher() {
     wait_for("watcher re-registered after the restart", || {
         seen2.lock().unwrap().contains(&path)
     });
+    daemon.stop().unwrap();
+}
+
+/// Round 2 (G3): no daemon path lands on a protected branch, and the pipeline
+/// start checks its caller like the merge verb does.
+#[test]
+fn merge_run_refuses_a_protected_integ_for_every_caller() {
+    let fx = Fixture::new("protected-run");
+    let tip = fx.commit_on_t1("a.txt");
+    let main_before = git(&fx.repo, &["rev-parse", "main"]);
+    let r = merge::run(&merge::Request {
+        repo: fx.repo.clone(),
+        integ: "main".into(),
+        entries: vec![Entry { branch: "t1".into(), sha: Some(tip) }],
+        check: None,
+    });
+    assert!(matches!(r, Err(MergeError::Operational(_))), "{r:?}");
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), main_before);
+}
+
+/// A pipeline verb daemon with a Peer `p1` and a Lead `l1` of project 1.
+fn pipeline_rig(tag: &str) -> (TestWorkspace, Fixture, Arc<FakeHerdr>, String, qq_core::daemon::DaemonHandle) {
+    let ws = TestWorkspace::new(tag);
+    let fx = Fixture::new(tag);
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", [])
+        .unwrap();
+    for (n, role) in [("p1", "peer"), ("l1", "lead")] {
+        conn.execute(
+            "INSERT INTO agent (name, role, kind, project_id, started_ms) VALUES (?1, ?2, 'ni', 1, 1)",
+            rusqlite::params![n, role],
+        )
+        .unwrap();
+    }
+    let herdr = Arc::new(FakeHerdr::new());
+    let anchor = herdr.seed_pane("work", None, &[]);
+    let daemon = daemon_with(&ws, herdr.clone(), None);
+    (ws, fx, herdr, anchor, daemon)
+}
+
+fn verb_call_as(ws: &TestWorkspace, caller: &str, args: Value) -> rpc::Response {
+    let mut req = Request::new("pipeline", args);
+    req.caller = Some(caller.into());
+    rpc::call(&rpc::socket_path(&ws.runs_dir()), &req).expect("rpc transport")
+}
+
+#[test]
+fn pipeline_start_refuses_a_peer_and_journals_it() {
+    let (ws, fx, herdr, anchor, daemon) = pipeline_rig("pstart-peer");
+    let args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    assert_eq!(refused(verb_call_as(&ws, "p1", args.clone())), "refused");
+    assert!(herdr.prompts().is_empty(), "a refusal starts nothing");
+    let conn = db::open(&ws.db_path()).unwrap();
+    let rows = qq_core::authority::refusals(&conn).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].caller.as_str(), rows[0].edge.as_str()), ("p1", "orchestration"));
+    // A Lead still starts the same flow.
+    let ok = verb_call_as(&ws, "l1", args);
+    assert!(ok.ok, "{:?}", ok.error);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn pipeline_start_by_a_refused_caller_never_runs_its_check() {
+    let (ws, fx, herdr, anchor, daemon) = pipeline_rig("pstart-check");
+    let marker = ws.root().join("pwned");
+    let mut args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    args["check"] = json!(format!("touch {}", marker.display()));
+    assert_eq!(refused(verb_call_as(&ws, "p1", args)), "refused");
+    let n: i64 = db::open(&ws.db_path())
+        .unwrap()
+        .query_row("SELECT count(*) FROM agent WHERE name LIKE '%t1%'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "no builder spawned for the refused flow");
+    assert!(herdr.prompts().is_empty() && !marker.exists());
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn pipeline_start_refuses_a_protected_integ() {
+    let (ws, fx, herdr, anchor, daemon) = pipeline_rig("pstart-main");
+    let mut args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    args["integ"] = json!("main");
+    assert_eq!(refused(verb_call_as(&ws, "l1", args)), "refused");
+    assert!(herdr.prompts().is_empty());
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn pipeline_start_without_a_caller_fails_closed() {
+    let (ws, fx, herdr, anchor, daemon) = pipeline_rig("pstart-anon");
+    let args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    assert_eq!(refused(verb_call_anon(&ws, args)), "refused");
+    assert!(herdr.prompts().is_empty(), "a refusal starts nothing");
     daemon.stop().unwrap();
 }

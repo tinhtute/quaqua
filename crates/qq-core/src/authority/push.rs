@@ -72,7 +72,7 @@ fn configured_remote(repo: &str, name: &str) -> bool {
 /// A branch the verb never publishes: `main`, `master`, the remote's HEAD
 /// branch (`refs/remotes/<remote>/HEAD`, local only, may be unset), or the
 /// repo's configured `init.defaultBranch`.
-fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
+pub(crate) fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
     let out = |args: &[&str]| {
         git(repo)
             .args(args)

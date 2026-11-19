@@ -110,7 +110,16 @@ fn start(ws: &TestWorkspace) -> (Registry, DaemonHandle) {
         herdr: Arc::new(FakeHerdr::new()),
     });
     config::INSTALL(&mut registry, &mut daemon).expect("config installs");
-    (registry, daemon.spawn().expect("daemon starts"))
+    let handle = daemon.spawn().expect("daemon starts");
+    // Config writes need a named caller that may orchestrate: the CoS.
+    open(ws)
+        .execute(
+            "INSERT OR IGNORE INTO agent (name, role, started_ms) VALUES ('cos', 'cos', 1)",
+            [],
+        )
+        .unwrap();
+    std::env::set_var("QQ_AGENT", "cos");
+    (registry, handle)
 }
 
 fn strs(a: &[&str]) -> Vec<String> {

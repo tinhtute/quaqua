@@ -29,16 +29,19 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
         help: "list kinds with harness, model, use_for and avoid",
         run: roster_cmd,
     })?;
-    daemon.register_verb("config", Box::new(|ctx, req| serve(ctx, req, exec_config)))?;
+    daemon.register_verb("config", Box::new(|ctx, req| serve(ctx, req, exec_config, true)))?;
     daemon.register_verb(
         "roster",
-        Box::new(|ctx, req| serve(ctx, req, |c, _| exec_roster(c))),
+        Box::new(|ctx, req| serve(ctx, req, |c, _| exec_roster(c), false)),
     )
 }
 
 type Exec = fn(&mut Connection, &[String]) -> Result<String, CliError>;
 
-fn serve(ctx: &Ctx, req: &Request, exec: Exec) -> Result<Value, RpcError> {
+/// `guarded`: every subcommand but `get` and `validate` is a write (so a new
+/// one is guarded by default) and needs a caller that may run an orchestration
+/// call: a Peer and a caller the daemon could not name never write a setting.
+fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, RpcError> {
     let argv: Vec<String> = req
         .args
         .get("argv")
@@ -51,6 +54,24 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec) -> Result<Value, RpcError> {
         .unwrap_or_default();
     let mut conn = crate::db::open(&ctx.runs_dir.join(DB_FILE))
         .map_err(|e| RpcError::new("internal", e.to_string()))?;
+    if guarded && !matches!(argv.first().map(String::as_str), Some("get" | "validate")) {
+        let Some(caller) = req.caller.as_deref() else {
+            return Err(RpcError::new("refused", "a config write needs an identified caller"));
+        };
+        let d = crate::authority::check_orchestration(
+            &conn,
+            caller,
+            crate::authority::Op::ConfigWrite,
+            crate::authority::Fence::Fenced,
+        )
+        .map_err(|e| RpcError::new("internal", e.0))?;
+        if let crate::authority::Decision::Refused(r) = d {
+            return Err(RpcError::new(
+                "refused",
+                format!("{} -> {}: {}", r.caller, r.target, r.reason),
+            ));
+        }
+    }
     match exec(&mut conn, &argv) {
         Ok(out) => Ok(json!({ "out": out })),
         Err(e) if e.code == 2 => Err(RpcError::new(BAD_REQUEST, e.message)),
