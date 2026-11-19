@@ -258,9 +258,123 @@ fn state_mail_refused_notification_leaves_a_trace_for_the_cos() {
 
     wait_for("the trace mail", || cos_mail(&f.ws).len() >= 2);
 
+    settle();
+
     let mail = cos_mail(&f.ws);
+    assert_eq!(mail.len(), 2, "state line plus exactly one trace: {mail:?}");
     assert!(
         mail[1].2.contains("failed") && mail[1].2.contains("no_client"),
         "{mail:?}"
+    );
+}
+
+/// Waits for `want` mails to `cos`, lets the sweeper settle, then returns them.
+fn settled_mail(f: &Farm, want: usize) -> Vec<(String, String, String)> {
+    wait_for("the trace mail", || cos_mail(&f.ws).len() >= want);
+    settle();
+    cos_mail(&f.ws)
+}
+
+#[test]
+fn state_mail_ok_but_not_shown_leaves_a_trace_for_the_cos() {
+    let f = farm("state-notify-unshown", &[("sude-u", "peer")]);
+    f.herdr.set_reply(
+        Verb::NotificationShow,
+        Reply::ok(r#"{"result":{"shown":false}}"#),
+    );
+    f.herdr.set_status("sude-u", "blocked");
+
+    let mail = settled_mail(&f, 2);
+    assert_eq!(mail.len(), 2, "state line plus exactly one trace: {mail:?}");
+    assert!(
+        mail[1]
+            .2
+            .starts_with("notification for sude-u blocked failed: ")
+            && mail[1].2.contains("not shown"),
+        "{}",
+        mail[1].2
+    );
+}
+
+#[test]
+fn state_mail_trace_reason_is_bounded() {
+    let f = farm("state-notify-long", &[("sude-l", "peer")]);
+    f.herdr
+        .set_reply(Verb::NotificationShow, Reply::err(&"x".repeat(5000)));
+    f.herdr.set_status("sude-l", "blocked");
+
+    let mail = settled_mail(&f, 2);
+    assert_eq!(mail.len(), 2, "{mail:?}");
+    let prefix = "notification for sude-l blocked failed: ";
+    assert!(mail[1].2.starts_with(prefix), "{}", mail[1].2);
+    assert!(
+        mail[1].2.chars().count() <= prefix.len() + 200,
+        "{}",
+        mail[1].2
+    );
+}
+
+/// A lead's `escalate` mail raises a notification through `deliver`; its
+/// failure leaves the same trace, once, and the trace never notifies again.
+fn deliver_trace(tag: &str, reply: Reply) -> Vec<(String, String, String)> {
+    let f = farm(tag, &[("hermes-lead", "lead")]);
+    f.herdr.set_reply(Verb::NotificationShow, reply);
+    {
+        let conn = db(&f.ws);
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('cos', 'cos', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO topology_edge (from_role, to_role, edge) VALUES ('lead', 'cos', 'mail')",
+            [],
+        )
+        .unwrap();
+    }
+    let mut req = qq_core::rpc::Request::new(
+        "mail.send",
+        serde_json::json!({"to": "cos", "kind": "escalate", "body": "help"}),
+    );
+    req.caller = Some("hermes-lead".into());
+    qq_core::rpc::call(&qq_core::rpc::socket_path(&f.ws.runs_dir()), &req)
+        .expect("rpc transport")
+        .into_result()
+        .expect("mail.send");
+    let mail = settled_mail(&f, 2);
+    assert_eq!(f.herdr.notifications().len(), 0);
+    mail
+}
+
+#[test]
+fn state_mail_deliver_refused_notification_leaves_a_trace_for_the_cos() {
+    let mail = deliver_trace("deliver-refused", Reply::err("no_client"));
+    assert_eq!(mail.len(), 2, "the escalate plus one trace: {mail:?}");
+    assert_eq!(mail[0].1, "escalate");
+    assert_eq!(
+        (mail[1].0.as_str(), mail[1].1.as_str()),
+        ("daemon", "state")
+    );
+    assert!(
+        mail[1]
+            .2
+            .starts_with("notification for hermes-lead escalate failed: ")
+            && mail[1].2.contains("no_client"),
+        "{}",
+        mail[1].2
+    );
+}
+
+#[test]
+fn state_mail_deliver_not_shown_notification_leaves_a_trace_for_the_cos() {
+    let mail = deliver_trace(
+        "deliver-unshown",
+        Reply::ok(r#"{"result":{"shown":false}}"#),
+    );
+    assert_eq!(mail.len(), 2, "{mail:?}");
+    assert!(
+        mail[1].2.contains("escalate failed") && mail[1].2.contains("not shown"),
+        "{}",
+        mail[1].2
     );
 }

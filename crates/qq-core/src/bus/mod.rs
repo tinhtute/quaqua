@@ -9,6 +9,7 @@
 //! transaction, so a re-read never redelivers. `ack` is the form that
 //! survives a lost response.
 
+use std::io;
 use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -18,6 +19,7 @@ use crate::authority::{self, Decision};
 use crate::cli::{Install, Registry};
 use crate::daemon::store::Store;
 use crate::daemon::{Ctx, Daemon};
+use crate::herdr::Reply;
 use crate::rpc::{self, Request, RpcError};
 
 pub mod cli;
@@ -231,18 +233,47 @@ pub fn state_mail(ctx: &Ctx, agent: &str, role: &str, state: AgentState, detail:
         .unwrap_or(false);
     if created && state.notifies() {
         let title = format!("quaqua: {agent} {}", state.word());
-        let why = match ctx.herdr.notification_show(&title, &line, Some("request")) {
-            Ok(r) if r.ok => return,
-            Ok(r) => r.body.trim().chars().take(200).collect::<String>(),
-            Err(e) => e.to_string(),
-        };
-        // The state mail is stored but no one saw a notification: leave the
-        // reason where the CoS reads it.
+        notify_or_trace(ctx, agent, state.word(), &title, &line);
+    }
+}
+
+/// Longest failure reason a trace mail carries.
+const WHY_MAX: usize = 200;
+
+/// Why a notification reply counts as failed, or `None` when it was shown. A
+/// reply that is an error, refused (`ok` false) or says `shown` is not `true`
+/// fails; a body that is not JSON cannot say, so an `ok` one passes.
+fn failed_why(reply: io::Result<Reply>) -> Option<String> {
+    let cap = |s: String| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(WHY_MAX)
+            .collect::<String>()
+    };
+    match reply {
+        Err(e) => Some(cap(e.to_string())),
+        Ok(r) if !r.ok => Some(cap(r.body)),
+        Ok(r) => {
+            let v = serde_json::from_str::<Value>(&r.body).ok()?;
+            (v.pointer("/result/shown").and_then(Value::as_bool) != Some(true))
+                .then(|| cap(format!("not shown: {}", r.body)))
+        }
+    }
+}
+
+/// Raises one herdr notification; when it errors, is refused or is not shown,
+/// leaves one `notification for <agent> <state> failed: <reason>` mail (kind
+/// `state`, which never notifies again) where the CoS reads it. Best effort.
+fn notify_or_trace(ctx: &Ctx, agent: &str, state: &str, title: &str, body: &str) {
+    let reply = ctx.herdr.notification_show(title, body, Some("request"));
+    if let Some(why) = failed_why(reply) {
         let _ = daemon_mail(
             ctx,
             "cos",
             "state",
-            &format!("notification for {agent} {} failed: {why}", state.word()),
+            &format!("notification for {agent} {state} failed: {why}"),
             None,
         );
     }
@@ -330,10 +361,12 @@ fn deliver(
         // Best effort: the mail is stored, so a herdr that is down or does not
         // support a verb never fails the send.
         if kind == "escalate" || kind == "blocked" {
-            let _ = ctx.herdr.notification_show(
+            notify_or_trace(
+                ctx,
+                from,
+                kind,
                 &format!("quaqua mail: {kind}"),
                 &format!("{from} -> {to}: {kind}"),
-                Some("request"),
             );
         }
         if !signalled {
@@ -477,4 +510,25 @@ fn advance(c: &Connection, who: &str, upto: i64) -> rusqlite::Result<()> {
         params![who, upto],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_why_bounds_every_reason() {
+        let long = "x".repeat(5000);
+        let err = failed_why(Err(io::Error::other(long.clone()))).unwrap();
+        let refused = failed_why(Ok(Reply::err(&long))).unwrap();
+        let unshown = failed_why(Ok(Reply::ok(format!(
+            r#"{{"result":{{"shown":false,"m":"{long}"}}}}"#
+        ))))
+        .unwrap();
+        for why in [err, refused, unshown] {
+            assert_eq!(why.chars().count(), WHY_MAX);
+        }
+        assert!(failed_why(Ok(Reply::ok(r#"{"result":{"shown":true}}"#))).is_none());
+        assert!(failed_why(Ok(Reply::ok(r#"{"result":{}}"#))).is_some());
+    }
 }
