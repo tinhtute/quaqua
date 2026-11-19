@@ -303,12 +303,67 @@ pub fn run(req: &Request) -> Result<Vec<Merged>, MergeError> {
     Ok(merged)
 }
 
-/// The `merge {repo, integ, entries:[{branch, sha?}], [check]}` verb.
+/// A branch no merge lands on: `main`, `master`, the default branch of any
+/// configured remote, or `init.defaultBranch` (the push verb's own rule).
+fn protected_integ(repo: &Path, integ: &str) -> bool {
+    let r = repo.to_string_lossy();
+    let remotes: Vec<String> = git(repo, &["remote"])
+        .map(|o| stdout(&o).lines().map(String::from).collect())
+        .unwrap_or_default();
+    let remotes = if remotes.is_empty() { vec!["origin".to_string()] } else { remotes };
+    remotes
+        .iter()
+        .any(|m| crate::authority::push::protected_branch(&r, m, integ))
+}
+
+fn refused(r: &crate::authority::Refusal) -> RpcError {
+    RpcError::new("refused", format!("{} -> {}: {}", r.caller, r.target, r.reason))
+}
+
+/// The `merge {repo, integ, entries:[{branch, sha?}]}` verb. The caller must
+/// pass `check_orchestration(Op::Merge)`, `integ` may not be a protected
+/// branch, and the post-merge check is the daemon's `merge.check` setting:
+/// a `check` in the request is refused, never run.
 pub fn register(daemon: &mut Daemon) -> Result<(), String> {
-    let handler: Handler = Box::new(|_, req| {
+    use crate::authority::{check_orchestration, refuse, Decision, Fence, Op};
+    let handler: Handler = Box::new(|ctx, req| {
+        if req.args.get("check").is_some() {
+            return Err(RpcError::new(
+                rpc::BAD_REQUEST,
+                "merge takes no 'check': the check is the daemon's merge.check setting",
+            ));
+        }
         let r: Request = serde_json::from_value(req.args.clone())
             .map_err(|e| RpcError::new(rpc::BAD_REQUEST, e.to_string()))?;
-        match run(&r) {
+        let internal = |e: &dyn std::fmt::Display| RpcError::new("internal", e.to_string());
+        let conn = crate::db::open(&ctx.runs_dir.join(crate::db::path::DB_FILE))
+            .map_err(|e| internal(&e))?;
+        let Some(caller) = req.caller.as_deref() else {
+            return Err(RpcError::new("refused", "merge needs an identified caller"));
+        };
+        if let Decision::Refused(d) =
+            check_orchestration(&conn, caller, Op::Merge, Fence::Fenced).map_err(|e| internal(&e))?
+        {
+            return Err(refused(&d));
+        }
+        if protected_integ(&r.repo, &r.integ) {
+            return match refuse(
+                &conn,
+                caller,
+                "merge",
+                &r.integ,
+                "integ is the repo's main or default branch",
+            )
+            .map_err(|e| internal(&e))?
+            {
+                Decision::Refused(d) => Err(refused(&d)),
+                Decision::Allowed => unreachable!("refuse always refuses"),
+            };
+        }
+        let check = crate::config::setting(&conn, "merge.check")
+            .map_err(|e| internal(&e))?
+            .and_then(|v| v.as_str().map(String::from));
+        match run(&Request { check, ..r }) {
             Ok(m) => Ok(json!({ "merged": m })),
             Err(e) => Err(RpcError::new(e.code(), e.to_string())),
         }
