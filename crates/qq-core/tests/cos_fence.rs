@@ -185,3 +185,53 @@ fn cos_fence_workspace_that_is_a_repo_fences_only_code_dirs() {
         );
     }
 }
+
+#[test]
+fn memory_fix_cos_fence_denies_direct_memory_file_writes() {
+    let f = fixture();
+    for tool in ["Write", "Edit", "MultiEdit"] {
+        for p in [f.ws.join("USER.md"), f.ws.join("memory/rules.md")] {
+            let r = memory::pre_decision(&call(tool, &f.ws, &p));
+            assert_eq!(decision(&r), Some("deny"), "{tool} {p:?}");
+            let why = r.unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            for t in ["memory_add", "memory_replace", "memory_remove"] {
+                assert!(why.contains(t), "{why}");
+            }
+        }
+    }
+    // relative and `..` spellings resolve against the payload cwd
+    for rel in [
+        "USER.md",
+        "memory/rules.md",
+        "projects/../USER.md",
+        "nope/../memory/rules.md",
+    ] {
+        let r = memory::pre_decision(&call("Edit", &f.ws, Path::new(rel)));
+        assert_eq!(decision(&r), Some("deny"), "{rel}");
+    }
+    // a notebook path too
+    let nb = json!({"tool_name": "NotebookEdit", "cwd": f.ws,
+        "tool_input": {"notebook_path": f.ws.join("USER.md")}})
+    .to_string();
+    assert_eq!(decision(&memory::pre_decision(&nb)), Some("deny"));
+    // other workspace files stay free; so do the engine copies, and workers
+    for p in [f.ws.join("memory/notes.md"), f.ws.join("projects/USER.md")] {
+        assert_eq!(
+            decision(&memory::pre_decision(&call("Write", &f.ws, &p))),
+            None,
+            "{p:?}"
+        );
+    }
+    assert_eq!(
+        decision(&memory::pre_decision(&call(
+            "Write",
+            &f.wt,
+            &f.ws.join("USER.md")
+        ))),
+        None,
+        "a worker is the gate's, not the fence's"
+    );
+}

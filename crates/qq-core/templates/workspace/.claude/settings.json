@@ -26,6 +26,30 @@
         ]
       },
       {
+        "matcher": "^mcp__plugin_tinyfish_tinyfish__(run_deep_research(_async)?|run_web_automation(_async)?|create_dataset|populate_dataset|top_up_wallet)$",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh" }
+        ]
+      },
+      {
+        "matcher": "^mcp__claude_ai_Claude_Data__share_(connector|live_queries)$",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh" }
+        ]
+      },
+      {
+        "matcher": "^mcp__claude_ai_(Asana|Atlassian|Box|Canva|Gmail|Google_Calendar|Google_Docs|Google_Drive|Google_Sheets|Google_Slides|Higgsfield|HubSpot|Intercom|Linear|Notion|Slack|monday_com)__.*(send|post|reply|publish|share|invite|comment|message|upload|generate)",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh" }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/herdr-gate.sh" }
+        ]
+      },
+      {
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "q=${QUAQUA_BIN:-$(command -v quaqua || echo \"$HOME/.cargo/bin/quaqua\")}; [ -x \"$q\" ] || exit 0; exec \"$q\" memory hook pre" }

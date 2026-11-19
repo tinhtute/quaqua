@@ -5,8 +5,10 @@
 //! no resolvable kind counts as unfenced (fail closed), and a request with no
 //! caller is refused.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command as Proc;
+use std::process::{Command as Proc, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -39,7 +41,7 @@ fn project_repo(conn: &rusqlite::Connection, caller: &str) -> Option<String> {
 }
 
 /// A git command with the user's and the system's config out of the way.
-fn git(repo: &str) -> Proc {
+pub(crate) fn git(repo: &str) -> Proc {
     let mut p = Proc::new("git");
     p.arg("-C")
         .arg(repo)
@@ -50,7 +52,7 @@ fn git(repo: &str) -> Proc {
 }
 
 /// A plain branch name: no refspec syntax, and git accepts it as a branch.
-fn plain_branch(repo: &str, b: &str) -> bool {
+pub(crate) fn plain_branch(repo: &str, b: &str) -> bool {
     !b.is_empty()
         && !b.starts_with(['-', '+', '^', ':'])
         && !b.contains([':', '+', '^', '*', '?', '[', '\\'])
@@ -61,7 +63,7 @@ fn plain_branch(repo: &str, b: &str) -> bool {
 }
 
 /// A remote configured in `repo`, by name only (never a URL or path).
-fn configured_remote(repo: &str, name: &str) -> bool {
+pub(crate) fn configured_remote(repo: &str, name: &str) -> bool {
     git(repo).arg("remote").output().is_ok_and(|o| {
         String::from_utf8_lossy(&o.stdout)
             .lines()
@@ -69,9 +71,16 @@ fn configured_remote(repo: &str, name: &str) -> bool {
     })
 }
 
-/// A branch the verb never publishes: `main`, `master`, the remote's HEAD
-/// branch (`refs/remotes/<remote>/HEAD`, local only, may be unset), or the
-/// repo's configured `init.defaultBranch`.
+/// Branch names compare case-insensitively: a case-insensitive remote or
+/// filesystem makes `Main` and `main` the same ref.
+pub(crate) fn same_branch(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// A branch the verb never publishes: `main`, `master` (any case), the
+/// remote's HEAD branch (`refs/remotes/<remote>/HEAD`, local only, may be
+/// unset), or the repo's configured `init.defaultBranch`. Local refs only;
+/// [`remote_default`] asks the remote itself.
 pub(crate) fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
     let out = |args: &[&str]| {
         git(repo)
@@ -81,14 +90,265 @@ pub(crate) fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    matches!(b, "main" | "master")
+    same_branch(b, "main")
+        || same_branch(b, "master")
         || out(&[
             "symbolic-ref",
             "--short",
             &format!("refs/remotes/{remote}/HEAD"),
         ])
-        .is_some_and(|h| h.strip_prefix(&format!("{remote}/")) == Some(b))
-        || out(&["config", "init.defaultBranch"]).is_some_and(|d| d == b)
+        .and_then(|h| h.strip_prefix(&format!("{remote}/")).map(str::to_string))
+        .is_some_and(|h| same_branch(&h, b))
+        || out(&["config", "init.defaultBranch"]).is_some_and(|d| same_branch(&d, b))
+}
+
+/// What the remote itself says its default branch is.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RemoteDefault {
+    /// Every push URL's HEAD is a symref; these are the branches (deduplicated).
+    Branches(Vec<String>),
+    /// No push URL has any refs: there is no default branch to read yet. The
+    /// remote's unborn HEAD is invisible to `ls-remote`, so this is unproven.
+    Empty,
+    /// Unproven: a read failed or timed out, a push URL is not stable under
+    /// URL rewriting, HEAD names no branch, or the push URLs disagree on
+    /// whether the remote is empty.
+    Unknown,
+}
+
+/// How long one `ls-remote` may take before the remote counts as unproven.
+const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Runs `cmd` with stdin closed and stderr dropped, killing it after
+/// `limit`. `None` on a spawn failure, a non-zero exit or a timeout.
+pub(crate) fn stdout_within(mut cmd: Proc, limit: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    // Drain on a thread so a long listing cannot fill the pipe and stall git.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let buf = reader.join().ok()?;
+    status.filter(|s| s.success()).map(|_| buf)
+}
+
+/// The URLs `git push <remote>` goes to: `pushurl` entries, else the URL, with
+/// `insteadOf` / `pushInsteadOf` applied. Not the fetch URL.
+fn push_urls(repo: &str, remote: &str) -> Option<Vec<String>> {
+    let out = stdout_within(
+        {
+            let mut c = git(repo);
+            c.args(["remote", "get-url", "--push", "--all", "--", remote]);
+            c
+        },
+        LS_REMOTE_TIMEOUT,
+    )?;
+    let urls: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (!urls.is_empty() && urls.iter().all(|u| !u.is_empty())).then_some(urls)
+}
+
+/// `u` survives git's URL handling unchanged, so `ls-remote -- u` and
+/// `push -- remote` cannot land on different repos: no `insteadOf` rewrites
+/// it again, no `pushInsteadOf` prefix matches it, and it is not a remote name.
+fn url_is_stable(repo: &str, u: &str) -> bool {
+    let clean = git(repo)
+        .args([
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^url\..*\.(insteadof|pushinsteadof)$",
+        ])
+        .output()
+        .is_ok_and(|o| match o.status.code() {
+            // Exit 1: no rewrite rules at all.
+            Some(1) => true,
+            Some(0) => String::from_utf8_lossy(&o.stdout)
+                .split('\0')
+                .filter_map(|e| e.split_once('\n'))
+                .all(|(_, prefix)| !u.starts_with(prefix)),
+            _ => false,
+        });
+    clean
+        && stdout_within(
+            {
+                let mut c = git(repo);
+                c.args(["ls-remote", "--get-url", "--", u]);
+                c
+            },
+            LS_REMOTE_TIMEOUT,
+        )
+        .is_some_and(|b| String::from_utf8_lossy(&b).trim_end_matches('\n') == u)
+}
+
+/// `ls-remote --symref` against one URL.
+fn url_default(repo: &str, url: &str) -> RemoteDefault {
+    if !url_is_stable(repo, url) {
+        return RemoteDefault::Unknown;
+    }
+    let Some(out) = stdout_within(
+        {
+            let mut c = git(repo);
+            c.args(["ls-remote", "--symref", "--", url]);
+            c
+        },
+        LS_REMOTE_TIMEOUT,
+    ) else {
+        return RemoteDefault::Unknown;
+    };
+    let text = String::from_utf8_lossy(&out);
+    if text.trim().is_empty() {
+        return RemoteDefault::Empty;
+    }
+    text.lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD"))
+        .map_or(RemoteDefault::Unknown, |b| {
+            RemoteDefault::Branches(vec![b.to_string()])
+        })
+}
+
+/// Resolves the URLs `git push <remote>` goes to, once, and asks each of them
+/// (`ls-remote --symref`, not the fetch URL) for its default branch. Any
+/// unproven URL makes the answer [`Unknown`](RemoteDefault::Unknown). The URLs
+/// come back with the answer so the caller pushes to exactly what was checked
+/// ([`push_checked`]); they are empty when the answer is `Unknown`.
+pub(crate) fn resolve_remote(repo: &str, remote: &str) -> (Vec<String>, RemoteDefault) {
+    let Some(urls) = push_urls(repo, remote) else {
+        return (Vec::new(), RemoteDefault::Unknown);
+    };
+    let (mut branches, mut empty) = (Vec::<String>::new(), 0);
+    for u in &urls {
+        match url_default(repo, u) {
+            RemoteDefault::Unknown => return (Vec::new(), RemoteDefault::Unknown),
+            RemoteDefault::Empty => empty += 1,
+            RemoteDefault::Branches(b) => branches.extend(b),
+        }
+    }
+    let default = match (branches.is_empty(), empty) {
+        (true, _) => RemoteDefault::Empty,
+        (false, 0) => {
+            branches.sort();
+            branches.dedup();
+            RemoteDefault::Branches(branches)
+        }
+        (false, _) => RemoteDefault::Unknown,
+    };
+    (urls, default)
+}
+
+/// Pushes `refs/heads/<branch>` to exactly the `urls` that were checked, as a
+/// plain non-forcing `git push -- <url> <refspec>`. The push runs from a
+/// scratch bare repo with an empty config (the work repo's objects through
+/// `alternates`, the branch tip pinned once), so no `insteadOf`, `pushurl`,
+/// `remote.<name>.*` or `url.*` change made after the check can send it
+/// anywhere else. The URLs are used as given, relative to `repo` as when they
+/// were read. First failure stops, as `git push <remote>` does.
+pub(crate) fn push_checked(repo: &str, urls: &[String], branch: &str) -> Result<(), String> {
+    let out = |args: &[&str]| {
+        git(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let tip = out(&[
+        "rev-parse",
+        "--verify",
+        "-q",
+        &format!("refs/heads/{branch}^{{commit}}"),
+    ])
+    .ok_or_else(|| format!("branch {branch} does not exist"))?;
+    let objects = out(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ])
+    .ok_or("cannot find the repo's object store")?;
+    let scratch = std::env::temp_dir().join(format!(
+        "qq-push-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let result = push_from_scratch(repo, &scratch, &objects, &tip, urls, branch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+fn push_from_scratch(
+    repo: &str,
+    scratch: &std::path::Path,
+    objects: &str,
+    tip: &str,
+    urls: &[String],
+    branch: &str,
+) -> Result<(), String> {
+    let s = scratch.to_string_lossy().into_owned();
+    let run = |mut c: Proc| -> Result<(), String> {
+        let o = c.output().map_err(|e| e.to_string())?;
+        o.status
+            .success()
+            .then_some(())
+            .ok_or_else(|| String::from_utf8_lossy(&o.stderr).trim().to_string())
+    };
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    run({
+        let mut c = git(&s);
+        c.args(["init", "-q", "--bare"]);
+        c
+    })?;
+    std::fs::write(
+        scratch.join("objects/info/alternates"),
+        format!("{objects}\n"),
+    )
+    .map_err(|e| e.to_string())?;
+    run({
+        let mut c = git(&s);
+        c.args(["update-ref", &format!("refs/heads/{branch}"), tip]);
+        c
+    })?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    for u in urls {
+        run({
+            let mut c = Proc::new("git");
+            c.arg("--git-dir")
+                .arg(scratch)
+                .current_dir(repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["push", "--", u, &refspec]);
+            c
+        })?;
+    }
+    Ok(())
 }
 
 fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
@@ -153,20 +413,20 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
             if !configured_remote(repo, remote) {
                 return deny("remote is not configured in the repo", remote);
             }
-            if protected_branch(repo, remote, branch) {
+            // Resolve the push URLs once; the push goes to these URLs, not to
+            // the remote name, so a config flip after this read changes nothing.
+            // An empty remote has no readable default (its unborn HEAD is
+            // invisible), so it is refused like an unproven one.
+            let (urls, default) = resolve_remote(repo, remote);
+            if protected_branch(repo, remote, branch)
+                || match default {
+                    RemoteDefault::Branches(d) => d.iter().any(|d| same_branch(d, branch)),
+                    RemoteDefault::Empty | RemoteDefault::Unknown => true,
+                }
+            {
                 return deny("branch is the repo's main or default branch", branch);
             }
-            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-            let out = git(repo)
-                .args(["push", "--", remote, &refspec])
-                .output()
-                .map_err(internal)?;
-            if !out.status.success() {
-                return Err(RpcError::new(
-                    "push_failed",
-                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                ));
-            }
+            push_checked(repo, &urls, branch).map_err(|e| RpcError::new("push_failed", e))?;
             Ok(json!({ "pushed": true, "remote": remote, "branch": branch }))
         }),
     )
@@ -174,7 +434,10 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
 
 fn push_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
     let [repo, remote, branch] = args else {
-        return Err(CliError::new(2, "usage: quaqua push <repo> <remote> <branch>"));
+        return Err(CliError::new(
+            2,
+            "usage: quaqua push <repo> <remote> <branch>",
+        ));
     };
     crate::cli::rpc_call(
         env,
@@ -191,4 +454,27 @@ pub(super) fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<()
         help: "push <repo> <remote> <branch>: git push through the daemon (fenced Lead only)",
         run: push_cli,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_within_kills_a_hang_and_keeps_fast_output() {
+        let mut slow = Proc::new("sleep");
+        slow.arg("30");
+        let t = Instant::now();
+        assert!(stdout_within(slow, Duration::from_millis(200)).is_none());
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "did not kill the hang"
+        );
+        let mut fast = Proc::new("echo");
+        fast.arg("hi");
+        assert_eq!(
+            stdout_within(fast, Duration::from_secs(5)).unwrap(),
+            b"hi\n"
+        );
+    }
 }

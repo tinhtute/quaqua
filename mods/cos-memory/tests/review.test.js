@@ -14,9 +14,11 @@ function engine({
   fork = null,
   files = {},
   stamps = {},
-  gate = allowVerdict,
+  verb = allowVerdict,
+  caller = 'cos',
+  cap = null,
 } = {}) {
-  const made = fakeEngine({ files, stamps, gate, fork })
+  const made = fakeEngine({ files, stamps, verb, fork, caller, cap })
   made.store.review = {
     prompts,
     stops,
@@ -290,7 +292,7 @@ test('an engine refusal is reported and the file is left alone', async () => {
     prompts: 10,
     stops: 9,
     files: { [RULES]: 'old\n' },
-    gate: denyVerdict('over the cap'),
+    verb: denyVerdict('over the cap'),
     fork: answered('[{"op":"add","file":"memory/rules.md","text":"new"}]'),
   })
   const hooks = await wire(made)
@@ -317,6 +319,7 @@ test('a fork reply whose final state is over the cap writes nothing', async () =
     prompts: 10,
     stops: 9,
     files: { [RULES]: 'aaaaaaaaaaaaaaaa\nstale\n' },
+    cap: 20,
     fork: answered(
       JSON.stringify([
         { op: 'add', file: 'memory/rules.md', text: 'x'.repeat(30) },
@@ -324,13 +327,6 @@ test('a fork reply whose final state is over the cap writes nothing', async () =
       ]),
     ),
   })
-  const run = made.$.process.run
-  made.$.process.run = async (argv, init) => {
-    await run(argv, init)
-    const { content } = JSON.parse(init.stdin).tool_input
-    if ([...content].length <= 20) return allowVerdict
-    return denyVerdict(`${[...content].length} chars > 20 cap`)
-  }
   const hooks = await wire(made)
 
   await stops(hooks, made.$, 1)
@@ -338,4 +334,54 @@ test('a fork reply whose final state is over the cap writes nothing', async () =
 
   assert.equal(made.files[RULES], 'aaaaaaaaaaaaaaaa\nstale\n')
   assert.equal(made.calls.writes?.length ?? 0, 0)
+})
+
+test('a review that is not run by cos is refused by the daemon and writes nothing', async () => {
+  const made = engine({
+    prompts: 10,
+    stops: 9,
+    caller: 'worker-1',
+    files: { [RULES]: 'old\n' },
+    fork: answered('[{"op":"add","file":"memory/rules.md","text":"new"}]'),
+  })
+  const hooks = await wire(made)
+
+  await stops(hooks, made.$, 1)
+  await settle()
+
+  assert.equal(made.files[RULES], 'old\n')
+  assert.equal(made.calls.verbWrites.length, 0)
+})
+
+test('a fork-remove goes through the verb with the text the fork saw as before', async () => {
+  const made = engine({
+    prompts: 10,
+    stops: 9,
+    files: { [RULES]: 'keep\nstale\n' },
+    fork: answered('[{"op":"remove","file":"memory/rules.md","text":"stale"}]'),
+  })
+  const hooks = await wire(made)
+
+  await stops(hooks, made.$, 1)
+  await settle()
+
+  const asked = made.calls.process.find(c => c.argv[2] === 'memory.write')
+  assert.deepEqual(JSON.parse(asked.argv[3]), { files: { 'memory/rules.md': { before: 'keep\nstale\n', after: 'keep\n' } } })
+  assert.equal(made.calls.writes.length, 0)
+  assert.equal(made.files[RULES], 'keep\n')
+})
+
+test('a file edited outside while the fork ran is not overwritten', async () => {
+  const made = engine({ prompts: 10, stops: 9, files: { [RULES]: 'old\n' } })
+  made.$.model.fork = async () => {
+    made.files[RULES] = 'old\nedited by hand\n'
+    return answered('[{"op":"add","file":"memory/rules.md","text":"new"}]')
+  }
+  const hooks = await wire(made)
+
+  await stops(hooks, made.$, 1)
+  await settle()
+
+  assert.equal(made.files[RULES], 'old\nedited by hand\n')
+  assert.equal(made.calls.verbWrites.length, 0)
 })
