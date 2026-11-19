@@ -201,3 +201,105 @@ fn cos_push_door_daemon_down_refuse() {
     let err = push_door::push(&ws.runs_dir(), Path::new("/nowhere"), "origin", "feat").unwrap_err();
     assert!(err.contains("no daemon answer"), "{err}");
 }
+
+fn rev(dir: &Path, rf: &str) -> String {
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", rf])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A work repo plus a bare `origin` whose HEAD is `trunk` and holds `trunk`.
+/// The work repo has no `refs/remotes/origin/HEAD`, and `trunk` is one commit
+/// ahead of the remote's, so pushing it is a fast-forward.
+fn repo_with_trunk_remote(r: &Rig) -> (PathBuf, PathBuf) {
+    let (work, origin) = repo_with_origin(r);
+    git(
+        r.ws.root(),
+        &["init", "-q", "--bare", "-b", "trunk", "o2.git"],
+    );
+    std::fs::remove_dir_all(&origin).unwrap();
+    std::fs::rename(r.ws.root().join("o2.git"), &origin).unwrap();
+    git(&work, &["branch", "trunk"]);
+    git(&work, &["push", "-q", "origin", "trunk"]);
+    git(&work, &["checkout", "-q", "trunk"]);
+    std::fs::write(work.join("f"), "y").unwrap();
+    git(&work, &["commit", "-qam", "ahead"]);
+    git(&work, &["checkout", "-q", "feat"]);
+    (work, origin)
+}
+
+#[test]
+fn cos_push_door_remote_default_refused_without_local_head() {
+    let r = rig("cpd-rdef", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let before = rev(&origin, "refs/heads/trunk");
+    let e = push(&r, args(&work, "trunk")).unwrap_err();
+    assert_eq!(e.code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+#[test]
+fn cos_push_door_remote_default_refused_after_set_head_delete() {
+    let r = rig("cpd-sethead", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    git(&work, &["fetch", "-q", "origin"]);
+    git(&work, &["remote", "set-head", "origin", "trunk"]);
+    git(&work, &["remote", "set-head", "origin", "-d"]);
+    let before = rev(&origin, "refs/heads/trunk");
+    assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+#[test]
+fn cos_push_door_remote_default_refused_via_second_remote() {
+    let r = rig("cpd-o2", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    git(&work, &["remote", "add", "o2", origin.to_str().unwrap()]);
+    let before = rev(&origin, "refs/heads/trunk");
+    let mut a = args(&work, "trunk");
+    a["remote"] = json!("o2");
+    assert_eq!(push(&r, a).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+#[test]
+fn cos_push_door_case_variants_refused() {
+    let r = rig("cpd-case", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    for b in ["Main", "MAIN", "Master", "MASTER", "Trunk", "TRUNK"] {
+        let e = push(&r, args(&work, b)).unwrap_err();
+        assert_eq!(e.code, "refused", "{b}: {e:?}");
+        assert!(
+            !has_ref(&origin, b) || b.eq_ignore_ascii_case("trunk"),
+            "{b}"
+        );
+    }
+}
+
+#[test]
+fn cos_push_door_unreadable_remote_refused() {
+    let r = rig("cpd-unread", Who::Cos);
+    let (work, _origin) = repo_with_trunk_remote(&r);
+    let gone = r.ws.root().join("gone.git");
+    git(
+        &work,
+        &["remote", "set-url", "origin", gone.to_str().unwrap()],
+    );
+    let e = push(&r, args(&work, "feat")).unwrap_err();
+    assert_eq!(e.code, "refused", "{e:?}");
+}
+
+/// An empty bare remote has no refs, so no default branch to protect: a
+/// non-main branch goes through (decision: "no default", not "cannot learn").
+#[test]
+fn cos_push_door_empty_remote_has_no_default() {
+    let r = rig("cpd-empty", Who::Cos);
+    let (work, origin) = repo_with_origin(&r);
+    assert!(push(&r, args(&work, "feat")).is_ok());
+    assert!(has_ref(&origin, "feat"));
+}

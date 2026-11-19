@@ -69,9 +69,16 @@ pub(crate) fn configured_remote(repo: &str, name: &str) -> bool {
     })
 }
 
-/// A branch the verb never publishes: `main`, `master`, the remote's HEAD
-/// branch (`refs/remotes/<remote>/HEAD`, local only, may be unset), or the
-/// repo's configured `init.defaultBranch`.
+/// Branch names compare case-insensitively: a case-insensitive remote or
+/// filesystem makes `Main` and `main` the same ref.
+pub(crate) fn same_branch(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// A branch the verb never publishes: `main`, `master` (any case), the
+/// remote's HEAD branch (`refs/remotes/<remote>/HEAD`, local only, may be
+/// unset), or the repo's configured `init.defaultBranch`. Local refs only;
+/// [`remote_default`] asks the remote itself.
 pub(crate) fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
     let out = |args: &[&str]| {
         git(repo)
@@ -81,14 +88,49 @@ pub(crate) fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    matches!(b, "main" | "master")
+    same_branch(b, "main")
+        || same_branch(b, "master")
         || out(&[
             "symbolic-ref",
             "--short",
             &format!("refs/remotes/{remote}/HEAD"),
         ])
-        .is_some_and(|h| h.strip_prefix(&format!("{remote}/")) == Some(b))
-        || out(&["config", "init.defaultBranch"]).is_some_and(|d| d == b)
+        .and_then(|h| h.strip_prefix(&format!("{remote}/")).map(str::to_string))
+        .is_some_and(|h| same_branch(&h, b))
+        || out(&["config", "init.defaultBranch"]).is_some_and(|d| same_branch(&d, b))
+}
+
+/// What the remote itself says its default branch is.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RemoteDefault {
+    /// HEAD is a symref to this branch.
+    Branch(String),
+    /// The remote has no refs at all: there is no default branch yet.
+    Empty,
+    /// The read failed, or the remote has refs but HEAD names no branch.
+    Unknown,
+}
+
+/// Asks the remote (`git ls-remote --symref`) for its default branch.
+pub(crate) fn remote_default(repo: &str, remote: &str) -> RemoteDefault {
+    let Ok(o) = git(repo)
+        .args(["ls-remote", "--symref", "--", remote])
+        .output()
+    else {
+        return RemoteDefault::Unknown;
+    };
+    if !o.status.success() {
+        return RemoteDefault::Unknown;
+    }
+    let text = String::from_utf8_lossy(&o.stdout);
+    if text.trim().is_empty() {
+        return RemoteDefault::Empty;
+    }
+    text.lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD"))
+        .map_or(RemoteDefault::Unknown, |b| {
+            RemoteDefault::Branch(b.to_string())
+        })
 }
 
 fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
@@ -153,7 +195,13 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
             if !configured_remote(repo, remote) {
                 return deny("remote is not configured in the repo", remote);
             }
-            if protected_branch(repo, remote, branch) {
+            if protected_branch(repo, remote, branch)
+                || match remote_default(repo, remote) {
+                    RemoteDefault::Branch(d) => same_branch(&d, branch),
+                    RemoteDefault::Empty => false,
+                    RemoteDefault::Unknown => true,
+                }
+            {
                 return deny("branch is the repo's main or default branch", branch);
             }
             let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
@@ -174,7 +222,10 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
 
 fn push_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
     let [repo, remote, branch] = args else {
-        return Err(CliError::new(2, "usage: quaqua push <repo> <remote> <branch>"));
+        return Err(CliError::new(
+            2,
+            "usage: quaqua push <repo> <remote> <branch>",
+        ));
     };
     crate::cli::rpc_call(
         env,

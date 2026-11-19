@@ -11,7 +11,10 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use super::{caller, Ctx, Daemon};
-use crate::authority::push::{configured_remote, git, plain_branch, protected_branch};
+use crate::authority::push::{
+    configured_remote, git, plain_branch, protected_branch, remote_default, same_branch,
+    RemoteDefault,
+};
 use crate::authority::tier::{self, Action, Decision};
 use crate::rpc::{self, Request, RpcError};
 
@@ -83,6 +86,32 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             branch,
             "branch is the repo's main or default branch",
         ));
+    }
+    // Ask the remote itself: the local remote-HEAD ref is the caller's to
+    // clear. A failed or unreadable answer refuses (fail closed); an empty
+    // remote has no default branch yet.
+    match remote_default(repo, remote) {
+        RemoteDefault::Unknown => {
+            return Err(refused(
+                ctx,
+                req,
+                remote,
+                "cannot learn the remote's default branch",
+            ))
+        }
+        RemoteDefault::Branch(d)
+            if same_branch(&d, branch)
+                && tier::decide(true, Action::PushMain, tier::Tier::Low, tier::Tier::Low)
+                    != Decision::Allow =>
+        {
+            return Err(refused(
+                ctx,
+                req,
+                branch,
+                "branch is the repo's main or default branch",
+            ));
+        }
+        _ => {}
     }
     let base = tier::effective_context_tier(&ctx.runs_dir, &repo_dir, true);
     if tier::decide(true, Action::PushNonMain, base, base) != Decision::Allow {
