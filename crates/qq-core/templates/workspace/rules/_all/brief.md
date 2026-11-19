@@ -20,7 +20,6 @@ Review rounds: <N>                        (optional, default the pipeline's --ro
 - `Topology:` is required (exit 1 without it). `solo — <reason>` for one worker with no Lead; `lead — <reason>` when the unit is part of a project Lead's plan. It is the coordinator's declaration, not a promise the engine can check on its own.
 - A brief over 240 min of `Time budget` or $10 of `Cost budget` also warns: that size is a Lead signal (`rules/_all/lead-gate.md`).
 - `Playbook:` and `Context:` warn when missing, on a `none` without a reason, or on an unfilled `<…>` placeholder; with the workspace's `playbooks/` and `principles/` index present, a playbook name that index cannot resolve is rejected (an absent or incomplete index only warns). No playbook fits, or the work is large and cross-cutting → `figure-it-out`, never a blank.
-- `worker prompt` appends the playbook's `## Worker` steps and each cited leaf to the submitted prompt, and pins the name + step ids in `runs/.<name>.playbook` once the prompt has landed; a missing pin means no check. The `## Orchestrator` section is the coordinator's and never reaches the worker.
 - `Context:` is a relay: an upstream unit's report pasted in full is exempt from brief sizing. Only the header block counts — a `Playbook:` line inside pasted text is prose, not this brief's header.
 
 - `Time budget` and `Cost budget` are the two caps; the time one is machine-read (`rules/_all/worker-timebox.md`), the cost one is recorded at acceptance in the project card.
@@ -57,12 +56,12 @@ none
 ```
 
 - `Outcome:` starts its line at column 1, no list marker: delivery rejects a missing or unrecognised Outcome (allowed: `COMPLETE`, `NO_CHANGES`, `BLOCKED`, `DISPUTED`, `REOPEN_REQUEST`, `DEPENDENCY_REQUEST`; `no changes` counts as `NO_CHANGES`). The pipeline reads it to tell an unfinished phase (`BLOCKED`) or clean no-op (`NO_CHANGES`) from a finished one.
-- `## Blockers` body: write `none` when there are none. Any other non-empty line is read as an unfinished-work blocker and the pipeline stops.
+- `## Blockers` body: write `none` when there are none.
 - `## Lessons` may be numbered (`## 5. Lessons` passes) but must be an `##` heading (`###` fails). The watchdog checks that the heading exists, not where it sits; keep it last so the machine-read tail stays one block.
 - Pipeline reviewers end with exactly one `Verdict: clean` or `Verdict: <N> findings` line instead of `## Lessons`.
-- A builder's proof line is `Verified: <level> <sha>`, with the last commit's SHA: `<level>` is one of `unit-test-verified`, `type-check-only`, `review-clean`, `verifier-blocked`, `verifier-failed`, `inconclusive`. Any other word records `inconclusive` and prints a warning at accept naming these six, so this list is the only place the vocabulary is stated (`VerdictLevel::ALL`; a test fails if the two drift).
-- Brief names a playbook? The submitted prompt ends with a pre-filled `## Playbook` block — copy it into the report and mark every step id `1: done` or `1: skip: <reason>`.
-- Put any extra section before `## Blockers`, never after `## Lessons`, so the machine-read tail stays one block.
+- A builder's proof line is `Verified: <level> <sha>`, with the last commit's SHA: `<level>` is one of `unit-test-verified`, `type-check-only`, `review-clean`, `verifier-blocked`, `verifier-failed`, `inconclusive`. Any other word records `inconclusive` and prints a warning at accept naming these six.
+
+Not built yet (tracked in hermes-cos-3 open items, Q19 2026-11-19): playbook `## Worker` append and `.playbook` pin, `## Orchestrator` filter, `## Blockers` stopping the pipeline, `VerdictLevel::ALL` drift test, pre-filled `## Playbook` block, extra-sections-before-Blockers tail rule.
 
 `runs/<name>.md` ends with `## Lessons` — ≤2 lines of durable lessons worth a `rules/` entry, or `none`. CoS promotes 0–1 at cleanup.
 
