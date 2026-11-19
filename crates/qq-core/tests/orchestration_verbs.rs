@@ -573,3 +573,295 @@ fn a_peer_cannot_plant_a_merge_check_for_the_next_lead_merge() {
     assert!(ok.is_ok(), "{ok:?}");
     assert!(!marker.exists(), "a Peer's planted check must never run");
 }
+
+// ---- pr_merge_* / fence_path_tier_*: the one merge door (R10, R13) ----
+
+mod pr_merge_door {
+    use super::*;
+    use qq_core::authority::tier::Tier;
+    use qq_core::daemon::pr_merge;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Who {
+        Cos,
+        Worker,
+    }
+
+    struct Door {
+        r: Rig,
+        log: std::path::PathBuf,
+    }
+
+    /// A rig whose peer (this test process) is `who`, a fake `gh` that logs its
+    /// argv and answers from `diff`/`head`/`checks`, and a workflow `wf` whose
+    /// journal says `reviewed` passed review at stage `stage`.
+    fn door(
+        tag: &str,
+        who: Who,
+        base: Tier,
+        diff: &str,
+        head: &str,
+        checks: &str,
+        reviewed: &str,
+        stage: &str,
+    ) -> Door {
+        let r = rig(tag, true);
+        let pid = std::process::id();
+        match who {
+            Who::Cos => {
+                let p = r
+                    .herdr
+                    .seed_pane("c", Some("claude"), &[("grid_role", "cos")]);
+                r.herdr.set_pane_pids(&p, pid, &[]);
+            }
+            Who::Worker => {
+                let p = r.herdr.seed_pane("w", None, &[]);
+                r.herdr.agent_start("w-1", "claude", &p, 0, &[]).unwrap();
+                r.herdr.set_pane_pids(&p, pid, &[]);
+            }
+        }
+        let log = r.ws.root().join("gh.log");
+        let gh = r.ws.root().join("fake-gh");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
+             'pr diff') printf '%s\\n' {diff} ;;\n\
+             'pr view') echo {head} ;;\n\
+             'pr checks') {checks} ;;\n\
+             'pr merge') exit 0 ;;\n\
+             *) exit 9 ;;\nesac\n",
+            log = log.display()
+        );
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        pr_merge::set_test_hooks(&r.ws.runs_dir(), gh, base, base);
+        let state = json!({
+            "input": { "repo": r.ws.root().join("work") },
+            "stage": stage, "reviewed": reviewed, "findings": 0,
+        });
+        conn(&r)
+            .execute(
+                "INSERT INTO snapshots (workflow_id, seq, state_json) VALUES ('wf-1', 1, ?1)",
+                params![state.to_string()],
+            )
+            .unwrap();
+        Door { r, log }
+    }
+
+    fn green(tag: &str, who: Who, base: Tier) -> Door {
+        door(
+            tag,
+            who,
+            base,
+            "src/lib.rs",
+            SHA,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "gate",
+        )
+    }
+
+    fn merge(d: &Door, sha: &str) -> Result<Value, rpc::RpcError> {
+        call(
+            &d.r,
+            "pr.merge",
+            None,
+            json!({"workflow": "wf-1", "pr": "7", "sha": sha}),
+        )
+    }
+
+    fn gh_log(d: &Door) -> String {
+        std::fs::read_to_string(&d.log).unwrap_or_default()
+    }
+
+    fn assert_refused_no_merge(d: &Door, res: Result<Value, rpc::RpcError>) {
+        assert_eq!(res.unwrap_err().code, "refused");
+        assert!(
+            !gh_log(d).contains("pr merge"),
+            "gh merge ran: {}",
+            gh_log(d)
+        );
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_non_cos_caller() {
+        let d = green("prm-worker", Who::Worker, Tier::Medium);
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_claimed_cos_without_a_peer_gate() {
+        // No resolver: the request's own claim of `cos` must not stand.
+        let r = rig("prm-claim", false);
+        let res = call(
+            &r,
+            "pr.merge",
+            Some("cos"),
+            json!({"workflow": "wf-1", "pr": "7", "sha": SHA}),
+        );
+        assert_eq!(res.unwrap_err().code, "refused");
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_sha_that_is_not_the_reviewed_sha() {
+        let d = green("prm-sha", Who::Cos, Tier::Medium);
+        let res = merge(&d, OTHER);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_sha_still_under_review() {
+        let d = door(
+            "prm-stage",
+            Who::Cos,
+            Tier::Medium,
+            "src/lib.rs",
+            SHA,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "review",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_red_check() {
+        let d = door(
+            "prm-red",
+            Who::Cos,
+            Tier::Medium,
+            "src/lib.rs",
+            SHA,
+            "echo '[{\"bucket\":\"fail\"}]'; exit 1",
+            SHA,
+            "gate",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn pr_merge_refuses_when_the_pr_head_is_not_the_sha() {
+        let d = door(
+            "prm-head",
+            Who::Cos,
+            Tier::Medium,
+            "src/lib.rs",
+            OTHER,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "gate",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn pr_merge_refuses_a_high_tier_repo() {
+        let d = green("prm-high", Who::Cos, Tier::High);
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn pr_merge_happy_path_runs_gh_with_match_head_commit() {
+        let d = green("prm-ok", Who::Cos, Tier::Medium);
+        let v = merge(&d, SHA).unwrap();
+        assert_eq!(v["merged"], true, "{v}");
+        let log = gh_log(&d);
+        assert!(
+            log.lines().any(|l| l.starts_with("pr merge 7")
+                && l.contains(&format!("--match-head-commit {SHA}"))),
+            "{log}"
+        );
+        assert!(!log.contains("--admin") && !log.contains("--auto"), "{log}");
+    }
+
+    #[test]
+    fn pr_merge_never_runs_a_request_string_through_a_shell() {
+        let d = green("prm-inject", Who::Cos, Tier::Medium);
+        let marker = d.r.ws.root().join("pwned");
+        let bad = format!("7; touch {}", marker.display());
+        let res = call(
+            &d.r,
+            "pr.merge",
+            None,
+            json!({"workflow": "wf-1", "pr": bad, "sha": SHA}),
+        );
+        assert_refused_no_merge(&d, res);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn fence_path_tier_names_every_fence_path_and_no_neighbour() {
+        for p in [
+            "crates/qq-core/src/authority/gate.rs",
+            "crates/qq-core/src/identity/peer.rs",
+            "crates/qq-core/src/merge/mod.rs",
+            "crates/qq-core/src/daemon/pr_merge.rs",
+            "crates/qq-core/templates/workspace/scripts/hooks/herdr-gate.sh",
+            ".claude/settings.json",
+            "crates/qq-core/templates/workspace/AGENTS.md",
+            "crates/qq-core/templates/workspace/.claude/settings.json",
+        ] {
+            assert!(pr_merge::fence_path(p), "{p}");
+        }
+        for p in [
+            "crates/qq-core/src/authority_x/a.rs",
+            "crates/qq-core/src/task/spawn.rs",
+            "crates/qq-core/templates/workspace/rules/_all/a.md",
+            "crates/qq-core/templates/seed/AGENTS.md",
+            "docs/AGENTS.md",
+            "README.md",
+        ] {
+            assert!(!pr_merge::fence_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn fence_path_tier_is_high_whatever_the_base_tier() {
+        let fence = vec![
+            "README.md".to_string(),
+            "crates/qq-core/src/authority/tier.rs".to_string(),
+        ];
+        let plain = vec!["README.md".to_string()];
+        assert_eq!(pr_merge::pr_tier(Tier::Low, Tier::Low, &fence), Tier::High);
+        assert_eq!(pr_merge::pr_tier(Tier::Low, Tier::Low, &plain), Tier::Low);
+    }
+
+    #[test]
+    fn fence_path_tier_refuses_a_fence_diff_under_a_medium_grant() {
+        let d = door(
+            "prm-fence",
+            Who::Cos,
+            Tier::Medium,
+            "src/lib.rs crates/qq-core/src/daemon/mod.rs",
+            SHA,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "gate",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+
+    #[test]
+    fn fence_path_tier_treats_an_unreadable_diff_as_high() {
+        let d = door(
+            "prm-nodiff",
+            Who::Cos,
+            Tier::Medium,
+            "x; exit 1",
+            SHA,
+            "echo '[{\"bucket\":\"pass\"}]'",
+            SHA,
+            "gate",
+        );
+        let res = merge(&d, SHA);
+        assert_refused_no_merge(&d, res);
+    }
+}
