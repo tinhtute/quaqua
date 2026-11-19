@@ -20,8 +20,12 @@ fn refused(why: impl Into<String>) -> RpcError {
 /// The caller of a write, or the refusal: `cos` only, and only when the
 /// orchestration check lets it run a config write.
 fn cos_caller(conn: &Connection, req: &Request) -> Result<String, RpcError> {
-    let Some(caller) = req.caller.as_deref() else {
-        return Err(refused("a grant write needs an identified caller"));
+    // `caller_pane` is set only when the peer gate named the caller; a bare
+    // `caller` off the wire is a claim, never identity.
+    let (Some(caller), Some(_pane)) = (req.caller.as_deref(), req.caller_pane.as_deref()) else {
+        return Err(refused(
+            "a grant write needs a caller the daemon identified",
+        ));
     };
     if caller != "cos" {
         return Err(refused(format!("{caller}: only cos writes a grant")));
@@ -49,13 +53,29 @@ fn tier_arg(args: &Value) -> Result<Tier, RpcError> {
     }
 }
 
+/// The caller check, before any argument is read or any path touched.
+fn guard(ctx: &Ctx, req: &Request) -> Result<String, RpcError> {
+    let conn = crate::db::open(&ctx.runs_dir.join(DB_FILE)).map_err(internal)?;
+    cos_caller(&conn, req)
+}
+
+/// The repo key of an absolute `repo` argument: the daemon's cwd is not the
+/// caller's, so a relative path means nothing here.
+fn repo_arg(args: &Value) -> Result<String, RpcError> {
+    let p = std::path::Path::new(str_arg(args, "repo")?);
+    if !p.is_absolute() {
+        return Err(RpcError::new(BAD_REQUEST, "repo must be an absolute path"));
+    }
+    Ok(repo_key(p))
+}
+
 fn internal(e: impl ToString) -> RpcError {
     RpcError::new("internal", e.to_string())
 }
 
-/// Writes one change and its `grant_note` row in one transaction, then raises
-/// the herdr notification and records whether it went out. The write stands
-/// when the notification fails; `notified` says so.
+/// Writes one change and its `grant_note` row in one transaction and raises the
+/// herdr notification before the commit: a failed notification rolls the whole
+/// change back (fail closed, R14).
 fn change(
     ctx: &Ctx,
     caller: &str,
@@ -74,28 +94,34 @@ fn change(
     )
     .map_err(internal)?;
     let id = tx.last_insert_rowid();
-    tx.commit().map_err(internal)?;
+    // Notify before the commit: a change anh iu was not told about never stands.
     let body = format!("{caller} set {kind} {subject} = {value}");
-    let notified = matches!(
-        ctx.herdr
-            .notification_show("quaqua: grant change", &body, Some("request")),
-        Ok(r) if r.ok
-    );
-    if notified {
-        conn.execute("UPDATE grant_note SET notified = 1 WHERE id = ?1", [id])
-            .map_err(internal)?;
+    let why = match ctx
+        .herdr
+        .notification_show("quaqua: grant change", &body, Some("request"))
+    {
+        Ok(r) if r.ok => None,
+        Ok(r) => Some(r.body.trim().chars().take(200).collect::<String>()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(why) = why {
+        return Err(RpcError::new(
+            "notify_failed",
+            format!("no grant change without anh iu's notification: {why}"),
+        ));
     }
-    Ok(json!({ "kind": kind, "subject": subject, "value": value, "notified": notified }))
+    tx.execute("UPDATE grant_note SET notified = 1 WHERE id = ?1", [id])
+        .map_err(internal)?;
+    tx.commit().map_err(internal)?;
+    Ok(json!({ "kind": kind, "subject": subject, "value": value, "notified": true }))
 }
 
 pub fn register(d: &mut Daemon) {
     let _ = d.register_verb(
         "grant.full",
         Box::new(|ctx, req| {
-            let repo = repo_key(std::path::Path::new(str_arg(&req.args, "repo")?));
-            let conn = crate::db::open(&ctx.runs_dir.join(DB_FILE)).map_err(internal)?;
-            let caller = cos_caller(&conn, req)?;
-            drop(conn);
+            let caller = guard(ctx, req)?;
+            let repo = repo_arg(&req.args)?;
             change(ctx, &caller, "full-grant", &repo, "on", |tx, now| {
                 tx.execute(
                     "INSERT INTO grant_full (repo, granted_ms, granted_by) VALUES (?1, ?2, ?3) \
@@ -109,11 +135,9 @@ pub fn register(d: &mut Daemon) {
     let _ = d.register_verb(
         "grant.tier",
         Box::new(|ctx, req| {
-            let repo = repo_key(std::path::Path::new(str_arg(&req.args, "repo")?));
+            let caller = guard(ctx, req)?;
+            let repo = repo_arg(&req.args)?;
             let tier = tier_arg(&req.args)?;
-            let conn = crate::db::open(&ctx.runs_dir.join(DB_FILE)).map_err(internal)?;
-            let caller = cos_caller(&conn, req)?;
-            drop(conn);
             change(
                 ctx,
                 &caller,
@@ -134,11 +158,9 @@ pub fn register(d: &mut Daemon) {
     let _ = d.register_verb(
         "grant.lane",
         Box::new(|ctx, req| {
+            let caller = guard(ctx, req)?;
             let lane = str_arg(&req.args, "lane")?.to_string();
             let tier = tier_arg(&req.args)?;
-            let conn = crate::db::open(&ctx.runs_dir.join(DB_FILE)).map_err(internal)?;
-            let caller = cos_caller(&conn, req)?;
-            drop(conn);
             change(
                 ctx,
                 &caller,
