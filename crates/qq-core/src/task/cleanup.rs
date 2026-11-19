@@ -11,7 +11,7 @@ use std::process::Command;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::daemon::Daemon;
-use crate::grid::{HerdrPanes, PaneOps, Scope};
+use crate::grid::{HerdrPanes, Pane, PaneOps, Scope};
 use crate::herdr::HerdrClient;
 use crate::rpc::{self, Request, RpcError};
 use serde_json::json;
@@ -33,6 +33,8 @@ pub enum OpsError {
     Dirty(Vec<String>),
     /// The repo does not own this worker; nothing was touched (#170 F1).
     WrongRepo(String),
+    /// No project with that slug; nothing was touched.
+    NoProject(String),
     /// The cleanup ran but these still exist (`pane p1`, `worktree /x`...).
     Remains(Vec<String>),
     Git(String),
@@ -57,6 +59,7 @@ impl std::fmt::Display for OpsError {
                 p.join(", ")
             ),
             OpsError::WrongRepo(m) => write!(f, "{m}"),
+            OpsError::NoProject(p) => write!(f, "no project '{p}'"),
             OpsError::Remains(r) => write!(f, "not cleaned, still present: {}", r.join(", ")),
             OpsError::Git(m) | OpsError::Other(m) => write!(f, "{m}"),
         }
@@ -97,27 +100,43 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Where `name`'s pane is now: herdr's answer when it has the agent (a pane
-/// move renumbers the pane, so the recorded id can be stale), else the id the
-/// spawn recorded.
-fn pane_of(
-    conn: &Connection,
-    live: Option<&dyn HerdrClient>,
-    name: &str,
-) -> Result<Option<String>, OpsError> {
-    let from_herdr = live
-        .and_then(|h| h.agent_get(name).ok())
-        .filter(|r| r.ok)
-        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
-        .and_then(|v| {
-            v.pointer("/result/agent/pane_id")?
-                .as_str()
-                .map(String::from)
-        })
-        .filter(|p| !p.is_empty());
-    if from_herdr.is_some() {
-        return Ok(from_herdr);
+/// What releasing an agent's pane found.
+#[derive(Default)]
+struct Released {
+    /// Ours and closed; the caller proves it is gone.
+    closed: Option<String>,
+    /// Ours but could not be located or checked: it must be named, never
+    /// counted as gone. (A pane held by another open agent, or one the scope
+    /// does not admit, is not this agent's and is left out on purpose.)
+    unverified: Option<String>,
+}
+
+/// A pane the scope admits; a Lead cleanup also admits the project's own
+/// `grid_role=lead` pane (owner and farm still have to match).
+fn admitted(scope: &Scope, p: &Pane, lead: bool) -> bool {
+    if scope.admits(p) {
+        return true;
     }
+    if lead && p.role.as_deref() == Some("lead") {
+        let mut q = p.clone();
+        q.role = None;
+        return scope.admits(&q);
+    }
+    false
+}
+
+/// Closes `name`'s pane. Where it is: herdr's answer when it has the agent (a
+/// pane move renumbers it, so the recorded id can be stale), else the id the
+/// spawn recorded. When herdr cannot answer (not a clean `agent_not_found`)
+/// and the recorded id is not listed, the pane is unverified.
+fn release_pane(
+    conn: &Connection,
+    panes: &dyn PaneOps,
+    live: Option<&dyn HerdrClient>,
+    scope: &Scope,
+    name: &str,
+    lead: bool,
+) -> Result<Released, OpsError> {
     let recorded: Option<String> = conn
         .query_row(
             "SELECT pane_id FROM agent WHERE name = ?1 ORDER BY id DESC LIMIT 1",
@@ -126,22 +145,32 @@ fn pane_of(
         )
         .optional()
         .map_err(other)?
-        .flatten();
-    Ok(recorded.filter(|p| !p.is_empty()))
-}
-
-/// Closes `name`'s pane when herdr still has it, the scope admits it and no
-/// other open agent holds it. Returns the pane that was ours to close, so the
-/// caller can check it is gone.
-fn release_pane(
-    conn: &Connection,
-    panes: &dyn PaneOps,
-    live: Option<&dyn HerdrClient>,
-    scope: &Scope,
-    name: &str,
-) -> Result<Option<String>, OpsError> {
-    let Some(pane) = pane_of(conn, live, name)? else {
-        return Ok(None);
+        .flatten()
+        .filter(|p: &String| !p.is_empty());
+    let mut lookup_failed = false;
+    let mut from_herdr = None;
+    if let Some(h) = live {
+        match h.agent_get(name) {
+            Ok(r) if r.ok => {
+                from_herdr = serde_json::from_str::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/result/agent/pane_id")?
+                            .as_str()
+                            .map(String::from)
+                    })
+                    .filter(|p| !p.is_empty());
+                lookup_failed = from_herdr.is_none();
+            }
+            Ok(r) if r.error_code().as_deref() == Some("agent_not_found") => {}
+            _ => lookup_failed = true,
+        }
+    }
+    let Some(pane) = from_herdr.or(recorded) else {
+        return Ok(Released {
+            unverified: lookup_failed.then(|| "pane unknown (herdr lookup failed)".to_string()),
+            ..Released::default()
+        });
     };
     let shared: i64 = conn
         .query_row(
@@ -151,27 +180,43 @@ fn release_pane(
         )
         .map_err(other)?;
     if shared > 0 {
-        return Ok(None);
+        return Ok(Released::default());
     }
     let found = panes
         .panes()
         .map_err(other)?
         .into_iter()
         .find(|p| p.id == pane);
-    match found {
-        Some(p) if scope.admits(&p) => {
+    Ok(match found {
+        Some(p) if admitted(scope, &p, lead) => {
             panes.close_pane(&p.id).map_err(other)?;
-            Ok(Some(p.id))
+            Released {
+                closed: Some(p.id),
+                ..Released::default()
+            }
         }
-        _ => Ok(None),
-    }
+        Some(_) => Released::default(),
+        None if lookup_failed => Released {
+            unverified: Some(format!(
+                "pane {pane} (herdr lookup failed; cannot tell whether it is gone)"
+            )),
+            ..Released::default()
+        },
+        None => Released::default(),
+    })
 }
 
-/// `pane <id>` when `closed` is still listed by herdr.
-fn pane_remains(panes: &dyn PaneOps, closed: Option<String>) -> Result<Option<String>, OpsError> {
-    let Some(id) = closed else { return Ok(None) };
-    let alive = panes.panes().map_err(other)?.iter().any(|p| p.id == id);
-    Ok(alive.then(|| format!("pane {id}")))
+/// What of a release is still there: the closed pane when herdr still lists
+/// it, plus any unverified pane.
+fn pane_remains(panes: &dyn PaneOps, rel: Released) -> Result<Vec<String>, OpsError> {
+    let mut out = Vec::new();
+    if let Some(id) = rel.closed {
+        if panes.panes().map_err(other)?.iter().any(|p| p.id == id) {
+            out.push(format!("pane {id}"));
+        }
+    }
+    out.extend(rel.unverified);
+    Ok(out)
 }
 
 /// Whether the agent's project is `repo` (an orphan of this repo, not of
@@ -239,12 +284,22 @@ fn worker(
     t: &Target,
     now_ms: u64,
 ) -> Result<(), OpsError> {
-    let registered = git(t.repo, &["worktree", "list", "--porcelain"])?
-        .lines()
-        .filter_map(|l| l.strip_prefix("worktree "))
-        .any(|p| canon(Path::new(p)) == canon(t.worktree));
-    let branch = format!("refs/heads/quaqua/{}", t.name);
-    let has_branch = git(t.repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
+    // A repo that is gone cannot be asked: the worktree directory (if any)
+    // is then reported as remaining, never guessed away.
+    let repo_ok = t.repo.is_dir();
+    let (registered, has_branch) = if repo_ok {
+        let registered = git(t.repo, &["worktree", "list", "--porcelain"])?
+            .lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|p| canon(Path::new(p)) == canon(t.worktree));
+        let branch = format!("refs/heads/quaqua/{}", t.name);
+        (
+            registered,
+            git(t.repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok(),
+        )
+    } else {
+        (false, false)
+    };
     if !t.worktree.is_dir() && !registered && !has_branch && !agent_in_repo(conn, t.name, t.repo)? {
         return Err(OpsError::WrongRepo(format!(
             "nothing to remove in {}: no worktree {} and no branch quaqua/{} (wrong repo?)",
@@ -254,7 +309,7 @@ fn worker(
         )));
     }
     let mut dirty = Vec::new();
-    if t.worktree.is_dir() {
+    if t.worktree.is_dir() && repo_ok {
         dirty = git(
             t.worktree,
             &["status", "--porcelain", "--untracked-files=all"],
@@ -266,8 +321,8 @@ fn worker(
             return Err(OpsError::Dirty(dirty));
         }
     }
-    let closed = release_pane(conn, panes, live, scope, t.name)?;
-    if t.worktree.is_dir() {
+    let rel = release_pane(conn, panes, live, scope, t.name, false)?;
+    if t.worktree.is_dir() && repo_ok {
         if dirty.is_empty() {
             git(
                 t.repo,
@@ -277,13 +332,11 @@ fn worker(
             std::fs::remove_dir_all(t.worktree).map_err(other)?;
         }
     }
-    // `repo` may be gone (an orphan): prune is best effort then.
-    let pruned = git(t.repo, &["worktree", "prune"]);
-    if t.repo.is_dir() {
-        pruned?;
+    if repo_ok {
+        git(t.repo, &["worktree", "prune"])?;
     }
     remove_sidecars(t.runs_dir, t.name);
-    let mut remains: Vec<String> = pane_remains(panes, closed)?.into_iter().collect();
+    let mut remains = pane_remains(panes, rel)?;
     if t.worktree.exists() {
         remains.push(format!("worktree {}", t.worktree.display()));
     }
@@ -377,18 +430,27 @@ pub fn cleanup_lead_live(
     lead(conn, panes, Some(live), scope, project, now_ms)
 }
 
-/// `<repo>/../.wt/<name>`, where a worktree of the project's agent lives.
-fn lead_worktree(conn: &Connection, project: &str, name: &str) -> Option<(PathBuf, PathBuf)> {
-    let repo: String = conn
-        .query_row(
-            "SELECT repo_path FROM project WHERE slug = ?1",
-            [project],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()??;
-    let repo = PathBuf::from(repo);
-    let wt = repo.parent().unwrap_or(&repo).join(".wt").join(name);
-    wt.is_dir().then_some((repo, wt))
+/// The worktrees of Lead `name`: the ones git lists on branch
+/// `quaqua/<name>` (wherever they are) plus the conventional
+/// `<repo>/../.wt/<name>` when that directory exists.
+fn lead_worktrees(repo: &Path, name: &str) -> Result<Vec<PathBuf>, OpsError> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if repo.is_dir() {
+        let branch = format!("branch refs/heads/quaqua/{name}");
+        for block in git(repo, &["worktree", "list", "--porcelain"])?.split("\n\n") {
+            let path = block.lines().find_map(|l| l.strip_prefix("worktree "));
+            if let Some(path) = path.filter(|_| block.lines().any(|l| l == branch)) {
+                if canon(Path::new(path)) != canon(repo) {
+                    out.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    let conv = repo.parent().unwrap_or(repo).join(".wt").join(name);
+    if conv.is_dir() && !out.iter().any(|p| canon(p) == canon(&conv)) {
+        out.push(conv);
+    }
+    Ok(out)
 }
 
 fn lead(
@@ -399,56 +461,76 @@ fn lead(
     project: &str,
     now_ms: u64,
 ) -> Result<(), OpsError> {
-    let mut st = conn
-        .prepare(
-            "SELECT a.name, a.role FROM agent a JOIN project p ON p.id = a.project_id \
-             WHERE p.slug = ?1 AND a.ended_ms IS NULL",
+    let (pid, repo): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT id, repo_path FROM project WHERE slug = ?1",
+            [project],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(other)?;
-    let rows: Vec<(String, String)> = st
-        .query_map([project], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .map_err(other)?
+        .ok_or_else(|| OpsError::NoProject(project.to_string()))?;
+    let peers: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM agent WHERE project_id = ?1 AND role = 'peer' AND ended_ms IS NULL",
+        )
+        .map_err(other)?
+        .query_map([pid], |r| r.get(0))
         .map_err(other)?
         .collect::<Result<_, _>>()
         .map_err(other)?;
-    let peers: Vec<String> = rows
-        .iter()
-        .filter(|r| r.1 == "peer")
-        .map(|r| r.0.clone())
-        .collect();
     if !peers.is_empty() {
         return Err(OpsError::PeersOpen(peers));
     }
-    let leads: Vec<&String> = rows
-        .iter()
-        .filter(|r| r.1 == "lead")
-        .map(|r| &r.0)
-        .collect();
-    // A dirty Lead worktree is named before anything is released.
+    // Every Lead row of the project, ended or not: a rerun finishes what an
+    // older cleanup left behind.
+    let leads: Vec<String> = conn
+        .prepare("SELECT DISTINCT name FROM agent WHERE project_id = ?1 AND role = 'lead'")
+        .map_err(other)?
+        .query_map([pid], |r| r.get(0))
+        .map_err(other)?
+        .collect::<Result<_, _>>()
+        .map_err(other)?;
+    let repo = repo.map(PathBuf::from);
+    let mut trees: Vec<(String, Vec<PathBuf>)> = Vec::new();
     for name in &leads {
-        if let Some((_, wt)) = lead_worktree(conn, project, name) {
-            let dirty = git(&wt, &["status", "--porcelain", "--untracked-files=all"])?;
-            if !dirty.is_empty() {
-                return Err(OpsError::Remains(vec![format!(
-                    "worktree {} (uncommitted work; commit or discard it)",
-                    wt.display()
-                )]));
+        let wts = match &repo {
+            Some(r) => lead_worktrees(r, name)?,
+            None => Vec::new(),
+        };
+        // A dirty worktree is refused before anything is released.
+        for wt in wts.iter().filter(|w| w.is_dir()) {
+            if repo.as_deref().is_some_and(Path::is_dir) {
+                let dirty: Vec<String> =
+                    git(wt, &["status", "--porcelain", "--untracked-files=all"])?
+                        .lines()
+                        .map(|l| l.get(3..).unwrap_or(l).to_string())
+                        .collect();
+                if !dirty.is_empty() {
+                    return Err(OpsError::Dirty(dirty));
+                }
             }
         }
+        trees.push((name.clone(), wts));
     }
-    for name in leads {
-        let closed = release_pane(conn, panes, live, scope, name)?;
-        let mut remains: Vec<String> = pane_remains(panes, closed)?.into_iter().collect();
-        if let Some((repo, wt)) = lead_worktree(conn, project, name) {
-            git(&repo, &["worktree", "remove", &wt.to_string_lossy()])?;
-            git(&repo, &["worktree", "prune"])?;
-            if wt.exists() {
-                remains.push(format!("worktree {}", wt.display()));
+    for (name, wts) in trees {
+        let rel = release_pane(conn, panes, live, scope, &name, true)?;
+        let mut remains = pane_remains(panes, rel)?;
+        if let Some(r) = repo.as_deref().filter(|r| r.is_dir()) {
+            for wt in wts.iter().filter(|w| w.is_dir()) {
+                git(r, &["worktree", "remove", &wt.to_string_lossy()])?;
             }
+            git(r, &["worktree", "prune"])?;
         }
+        remains.extend(
+            wts.iter()
+                .filter(|w| w.exists())
+                .map(|w| format!("worktree {}", w.display())),
+        );
         if !remains.is_empty() {
             return Err(OpsError::Remains(remains));
         }
-        end_agent(conn, name, now_ms).map_err(other)?;
+        end_agent(conn, &name, now_ms).map_err(other)?;
     }
     Ok(())
 }

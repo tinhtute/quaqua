@@ -677,7 +677,7 @@ fn lead_cleanup_of_an_unknown_project_is_an_error() {
 fn lead_cleanup_finds_a_worktree_registered_outside_the_convention_path() {
     let herdr = FakeHerdr::new();
     let (dir, conn, repo, _mine) = lead_fixture("lead-elsewhere", &herdr);
-    let lwt = dir.join("elsewhere");
+    let lwt = dir.join("side-wt");
     git(
         &repo,
         &[
@@ -692,7 +692,7 @@ fn lead_cleanup_finds_a_worktree_registered_outside_the_convention_path() {
     let panes = HerdrPanes(&herdr);
     cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
     assert!(!lwt.exists());
-    assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains("elsewhere"));
+    assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains("side-wt"));
 }
 
 #[test]
@@ -1469,7 +1469,7 @@ fn lead_cleanup_closes_only_the_recorded_pane() {
     set_pane(&conn, "proj-lead", &mine);
     let panes = HerdrPanes(&herdr);
     cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
-    // the Lead's pane carries role=lead, which a worker-only scope never closes
+    // the Lead's own pane is closed; the CoS, human and other-farm panes are not
     survive(&herdr, &f);
     assert!(herdr.has_pane(&bystander));
     let ended: Option<i64> = conn
