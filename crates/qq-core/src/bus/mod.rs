@@ -179,6 +179,74 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         ));
     }
 
+    deliver(bus, ctx, from, to, kind, body, key)
+}
+
+/// A mail the daemon itself sends: no caller, so no edge check.
+pub fn daemon_mail(
+    ctx: &Ctx,
+    to: &str,
+    kind: &str,
+    body: &str,
+    key: Option<&str>,
+) -> Result<Value, RpcError> {
+    deliver(&Bus, ctx, DAEMON, to, kind, body, key)
+}
+
+/// Sender of the mail the daemon writes on its own.
+pub const DAEMON: &str = "daemon";
+
+/// A state a watched agent moved into that the CoS hears about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgentState {
+    Stalled,
+    Blocked,
+    Done,
+    Exited,
+}
+
+impl AgentState {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Stalled => "stalled",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Exited => "exited",
+        }
+    }
+
+    /// Done is news for the digest, not for anh iu's screen.
+    fn notifies(self) -> bool {
+        self != Self::Done
+    }
+}
+
+/// One `kind=state` mail to the CoS for `agent`'s move into `state`, and a
+/// herdr notification for the states that need a person. Best effort.
+pub fn state_mail(ctx: &Ctx, agent: &str, role: &str, state: AgentState, detail: &str) {
+    let line = format!("{agent} ({role}) {}{detail}", state.word());
+    let created = daemon_mail(ctx, "cos", "state", &line, None)
+        .ok()
+        .and_then(|r| r["created"].as_bool())
+        .unwrap_or(false);
+    if created && state.notifies() {
+        let _ = ctx.herdr.notification_show(
+            &format!("quaqua: {agent} {}", state.word()),
+            &line,
+            Some("request"),
+        );
+    }
+}
+
+fn deliver(
+    bus: &Bus,
+    ctx: &Ctx,
+    from: &str,
+    to: &str,
+    kind: &str,
+    body: &str,
+    key: Option<&str>,
+) -> Result<Value, RpcError> {
     // Row and journal line commit together, so a mail is never delivered
     // unjournaled; a retry finds both and writes neither.
     let outcome = bus.with(ctx, |c| {

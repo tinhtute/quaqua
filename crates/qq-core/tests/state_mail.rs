@@ -122,7 +122,10 @@ fn state_mail_exited_peer_mails_and_notifies_once() {
 
     let mail = cos_mail(&f.ws);
     assert_eq!(mail.len(), 1, "one mail for one exit: {mail:?}");
-    assert_eq!((mail[0].0.as_str(), mail[0].1.as_str()), ("daemon", "state"));
+    assert_eq!(
+        (mail[0].0.as_str(), mail[0].1.as_str()),
+        ("daemon", "state")
+    );
     assert!(
         mail[0].2.contains("sude-x") && mail[0].2.contains("exited"),
         "{}",

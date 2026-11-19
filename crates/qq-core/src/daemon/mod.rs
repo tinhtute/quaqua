@@ -419,6 +419,7 @@ impl Daemon {
         });
         let _ = link.set(Arc::downgrade(&ctx));
         ctx.rearm_watches().map_err(DaemonError::Store)?;
+        watch::state_sweeper(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());
