@@ -11,7 +11,8 @@ pub mod threat;
 
 pub use caps::*;
 pub use drift::{
-    compact_hint, drift, drift_message, is_dispatch, session_start as record_session, snapshot, tracked,
+    compact_hint, drift, drift_message, is_dispatch, session_start as record_session, snapshot,
+    tracked,
 };
 pub use inbox::{inbox_as, inbox_cmd};
 pub use standing::{render_standing, BUDGET as STANDING_BUDGET, HEADER as STANDING_HEADER};
@@ -154,8 +155,13 @@ pub fn session_start(
     } else {
         String::new()
     };
-    let hint = record_session(ws_root, sid, source)
-        .map(|full| if block.is_empty() { full } else { compact_hint(ws_root, true) });
+    let hint = record_session(ws_root, sid, source).map(|full| {
+        if block.is_empty() {
+            full
+        } else {
+            compact_hint(ws_root, true)
+        }
+    });
     let text = standing_output(block, hint);
     if let Some(Err(e)) = identity::session_retag(panes, pane, &cwd, ws_root) {
         eprintln!("quaqua: CoS pane re-tag failed: {e}");

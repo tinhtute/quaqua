@@ -114,7 +114,8 @@ impl Effects {
 
     fn spawn_reviewer(&self, name: &str, kind: &str) -> Result<(), String> {
         let db = self.deps.runs_dir.join(crate::db::path::DB_FILE);
-        let conn = crate::db::open(&db).map_err(|e| format!("cannot open the run database: {e}"))?;
+        let conn =
+            crate::db::open(&db).map_err(|e| format!("cannot open the run database: {e}"))?;
         // A restart re-enters this step: an agent already open under this name
         // and kind is reused, herdr is not asked to start it again.
         let open: Option<String> = conn
@@ -197,10 +198,14 @@ impl Activity for Effects {
             ActivityRequest::Herdr(HerdrRequest::Prompt { name, task }) => {
                 Ok(ActivityResult::Herdr(
                     match crate::herdr::prompt_landed(self.deps.herdr.as_ref(), name, task).0 {
-                        crate::herdr::Landing::Landed => HerdrResult::Prompted { name: name.clone() },
+                        crate::herdr::Landing::Landed => {
+                            HerdrResult::Prompted { name: name.clone() }
+                        }
                         crate::herdr::Landing::Blocked => HerdrResult::PromptFailed {
                             name: name.clone(),
-                            cause: format!("{name} is blocked on a question; the prompt did not land"),
+                            cause: format!(
+                                "{name} is blocked on a question; the prompt did not land"
+                            ),
                         },
                         crate::herdr::Landing::NotLanded(cause) => HerdrResult::PromptFailed {
                             name: name.clone(),
@@ -209,15 +214,15 @@ impl Activity for Effects {
                     },
                 ))
             }
-            ActivityRequest::Herdr(HerdrRequest::Spawn { name, kind, .. }) => {
-                Ok(ActivityResult::Herdr(match self.spawn_reviewer(name, kind) {
+            ActivityRequest::Herdr(HerdrRequest::Spawn { name, kind, .. }) => Ok(
+                ActivityResult::Herdr(match self.spawn_reviewer(name, kind) {
                     Ok(()) => HerdrResult::Spawned { name: name.clone() },
                     Err(cause) => HerdrResult::SpawnFailed {
                         name: name.clone(),
                         cause,
                     },
-                }))
-            }
+                }),
+            ),
             ActivityRequest::ReportFile(ReportFileRequest::Exists { path }) => {
                 Ok(ActivityResult::ReportFile(self.arm(path)))
             }
@@ -489,7 +494,10 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             authority::Decision::Allowed => Ok(()),
         };
         let Some(caller) = req.caller.as_deref() else {
-            return Err(RpcError::new("refused", "a pipeline needs an identified caller"));
+            return Err(RpcError::new(
+                "refused",
+                "a pipeline needs an identified caller",
+            ));
         };
         denied(
             authority::check_orchestration(

@@ -6,6 +6,7 @@
 //! Other modules add verbs with [`Daemon::register_verb`] and workflow kinds
 //! with [`Daemon::register_kind`]; this file holds only the built-in verbs.
 
+pub mod caller;
 pub mod store;
 pub mod supervisor;
 pub mod watch;

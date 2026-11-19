@@ -74,10 +74,8 @@ fn recorder_factory() -> Factory {
 }
 
 fn template() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/team.toml");
-    std::fs::read_to_string(p)
-        .expect("read template team.toml")
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
+    std::fs::read_to_string(p).expect("read template team.toml")
 }
 
 /// A seeded database: project 1, a task, and the edges the cases need.

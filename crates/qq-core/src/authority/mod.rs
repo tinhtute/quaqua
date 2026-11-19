@@ -17,6 +17,7 @@
 
 mod gate;
 pub mod push;
+pub mod tier;
 mod tokenizer;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -28,7 +29,8 @@ use crate::daemon::Daemon;
 use crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL;
 
 pub use gate::{
-    check as gate_check, evaluate as gate_evaluate, evaluate_reader as gate_evaluate_reader,
+    ask_json as gate_ask_json, check as gate_check, evaluate as gate_evaluate,
+    evaluate_in as gate_evaluate_in, evaluate_reader as gate_evaluate_reader,
     Verdict as GateVerdict,
 };
 

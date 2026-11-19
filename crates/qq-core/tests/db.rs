@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use qq_core::db::migrate::{latest_version, LADDER};
 use qq_core::db::old::{read_runs_dir, OldDb, OldDbError};
 use qq_core::db::path::{
-    default_db_path, is_live_db, is_test_environment, live_db_files, live_runs_dir,
-    old_db_path, resolve_workspace_root,
+    default_db_path, is_live_db, is_test_environment, live_db_files, live_runs_dir, old_db_path,
+    resolve_workspace_root,
 };
 use qq_core::db::{open, DbError};
 use rusqlite::Connection;
@@ -38,7 +38,8 @@ impl Drop for Tmp {
 }
 
 fn user_version(conn: &Connection) -> u32 {
-    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
 }
 
 fn tables(conn: &Connection) -> BTreeSet<String> {
@@ -53,7 +54,8 @@ fn tables(conn: &Connection) -> BTreeSet<String> {
 fn attempt(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
     conn.execute_batch("SAVEPOINT attempt").unwrap();
     let res = conn.execute(sql, []);
-    conn.execute_batch("ROLLBACK TO attempt; RELEASE attempt").unwrap();
+    conn.execute_batch("ROLLBACK TO attempt; RELEASE attempt")
+        .unwrap();
     res
 }
 
@@ -113,7 +115,9 @@ fn declared_foreign_keys(conn: &Connection) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for t in tables(conn) {
         let mut stmt = conn
-            .prepare(&format!("SELECT \"from\" FROM pragma_foreign_key_list('{t}')"))
+            .prepare(&format!(
+                "SELECT \"from\" FROM pragma_foreign_key_list('{t}')"
+            ))
             .unwrap();
         for col in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
             out.insert(format!("{t}.{}", col.unwrap()));
@@ -127,7 +131,9 @@ fn ontology_schema_relations() {
     let tmp = Tmp::new();
     let conn = open(&tmp.join("runs/qq.db")).unwrap();
 
-    let on: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+    let on: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(on, 1, "the opener turns foreign keys on");
 
     // R20 entities exist.
@@ -159,8 +165,16 @@ fn db_task_dep_rejects_self_parent() {
     let tmp = Tmp::new();
     let conn = open(&tmp.join("qq.db")).unwrap();
     conn.execute_batch(SEED).unwrap();
-    assert!(attempt(&conn, "INSERT INTO task_dep(task_id, parent_id) VALUES (1, 1)").is_err());
-    assert!(attempt(&conn, "INSERT INTO task_dep(task_id, parent_id) VALUES (2, 1)").is_ok());
+    assert!(attempt(
+        &conn,
+        "INSERT INTO task_dep(task_id, parent_id) VALUES (1, 1)"
+    )
+    .is_err());
+    assert!(attempt(
+        &conn,
+        "INSERT INTO task_dep(task_id, parent_id) VALUES (2, 1)"
+    )
+    .is_ok());
 }
 
 #[test]
@@ -173,18 +187,34 @@ fn db_agent_active_lead_unique() {
          INSERT INTO agent(name, role, project_id, started_ms) VALUES ('l1', 'lead', 1, 0);",
     )
     .unwrap();
-    let second = "INSERT INTO agent(name, role, project_id, started_ms) VALUES ('l2', 'lead', 1, 1)";
-    assert!(attempt(&conn, second).is_err(), "second active Lead in a project");
+    let second =
+        "INSERT INTO agent(name, role, project_id, started_ms) VALUES ('l2', 'lead', 1, 1)";
     assert!(
-        attempt(&conn, "INSERT INTO agent(name, role, project_id, started_ms) VALUES ('l2', 'lead', 2, 1)").is_ok(),
+        attempt(&conn, second).is_err(),
+        "second active Lead in a project"
+    );
+    assert!(
+        attempt(
+            &conn,
+            "INSERT INTO agent(name, role, project_id, started_ms) VALUES ('l2', 'lead', 2, 1)"
+        )
+        .is_ok(),
         "a Lead in another project"
     );
     assert!(
-        attempt(&conn, "INSERT INTO agent(name, role, project_id, started_ms) VALUES ('p2', 'peer', 1, 1)").is_ok(),
+        attempt(
+            &conn,
+            "INSERT INTO agent(name, role, project_id, started_ms) VALUES ('p2', 'peer', 1, 1)"
+        )
+        .is_ok(),
         "Peers are not limited"
     );
-    conn.execute("UPDATE agent SET ended_ms = 5 WHERE name = 'l1'", []).unwrap();
-    assert!(attempt(&conn, second).is_ok(), "a new Lead after the old one ended");
+    conn.execute("UPDATE agent SET ended_ms = 5 WHERE name = 'l1'", [])
+        .unwrap();
+    assert!(
+        attempt(&conn, second).is_ok(),
+        "a new Lead after the old one ended"
+    );
 }
 
 #[test]
@@ -203,8 +233,14 @@ fn db_run_cost_state_check() {
     };
     assert!(run("unknown", "NULL").is_ok());
     assert!(run("reported", "1.5").is_ok());
-    assert!(run("unknown", "1.5").is_err(), "unknown cost must carry no number");
-    assert!(run("reported", "NULL").is_err(), "reported cost must carry a number");
+    assert!(
+        run("unknown", "1.5").is_err(),
+        "unknown cost must carry no number"
+    );
+    assert!(
+        run("reported", "NULL").is_err(),
+        "reported cost must carry a number"
+    );
 }
 
 #[test]
@@ -212,13 +248,20 @@ fn db_rejects_omp_harness() {
     let tmp = Tmp::new();
     let conn = open(&tmp.join("qq.db")).unwrap();
     let ins = |name: &str| {
-        attempt(&conn, &format!("INSERT INTO harness(name, driver) VALUES ('{name}', 'generic')"))
+        attempt(
+            &conn,
+            &format!("INSERT INTO harness(name, driver) VALUES ('{name}', 'generic')"),
+        )
     };
     assert!(ins("opencode").is_ok());
     assert!(ins("omp").is_err());
     assert!(ins("OMP").is_err());
     // A kind cannot name a harness that is not a row.
-    assert!(attempt(&conn, "INSERT INTO kind(name, harness, model) VALUES ('s', 'omp', 'm')").is_err());
+    assert!(attempt(
+        &conn,
+        "INSERT INTO kind(name, harness, model) VALUES ('s', 'omp', 'm')"
+    )
+    .is_err());
 }
 
 #[test]
@@ -239,14 +282,22 @@ fn db_migrate_idempotent_beside_journal_tables() {
     let conn = open(&path).unwrap();
     assert_eq!(user_version(&conn), latest_version());
     assert_eq!(latest_version() as usize, LADDER.len());
-    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('keep', 0)", []).unwrap();
+    conn.execute(
+        "INSERT INTO project(slug, created_ms) VALUES ('keep', 0)",
+        [],
+    )
+    .unwrap();
     drop(conn);
 
     let again = open(&path).unwrap();
     assert_eq!(user_version(&again), latest_version());
-    let n: i64 = again.query_row("SELECT COUNT(*) FROM project", [], |r| r.get(0)).unwrap();
+    let n: i64 = again
+        .query_row("SELECT COUNT(*) FROM project", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n, 1, "reopen keeps rows");
-    let ev: i64 = again.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+    let ev: i64 = again
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(ev, 1, "journal rows survive the migration");
 
     // A fresh database gets no journal tables: the journal creates its own.
@@ -261,7 +312,8 @@ fn db_migrate_refuses_newer_schema() {
     let path = tmp.join("qq.db");
     {
         let raw = Connection::open(&path).unwrap();
-        raw.pragma_update(None, "user_version", latest_version() + 1).unwrap();
+        raw.pragma_update(None, "user_version", latest_version() + 1)
+            .unwrap();
     }
     match open(&path) {
         Err(DbError::TooNew { found, known }) => {
@@ -271,7 +323,10 @@ fn db_migrate_refuses_newer_schema() {
     }
     let raw = Connection::open(&path).unwrap();
     assert_eq!(user_version(&raw), latest_version() + 1);
-    assert!(tables(&raw).is_empty(), "a newer database is left as it was");
+    assert!(
+        tables(&raw).is_empty(),
+        "a newer database is left as it was"
+    );
 }
 
 fn exists_state(paths: &[PathBuf]) -> Vec<bool> {
@@ -285,7 +340,10 @@ fn db_live_guard_refuses_before_fs_access() {
     std::fs::create_dir_all(tmp.join("runs")).unwrap();
     let live = vec![tmp.join("runs/qq.db")];
     assert!(is_live_db(&tmp.join("runs/qq.db"), &live));
-    assert!(is_live_db(&tmp.join("runs/../runs/qq.db"), &live), "dot-dot path");
+    assert!(
+        is_live_db(&tmp.join("runs/../runs/qq.db"), &live),
+        "dot-dot path"
+    );
     assert!(!is_live_db(&tmp.join("runs/other.db"), &live));
     assert!(!is_live_db(&tmp.join("qq.db"), &live));
 
@@ -302,11 +360,19 @@ fn db_live_guard_refuses_before_fs_access() {
     let mut watch: Vec<PathBuf> = vec![runs.clone()];
     for f in &live_files {
         let s = f.to_string_lossy().into_owned();
-        watch.extend([f.clone(), PathBuf::from(format!("{s}-wal")), PathBuf::from(format!("{s}-shm"))]);
+        watch.extend([
+            f.clone(),
+            PathBuf::from(format!("{s}-wal")),
+            PathBuf::from(format!("{s}-shm")),
+        ]);
     }
     let before = exists_state(&watch);
     for f in &live_files {
-        assert!(matches!(open(f), Err(DbError::LiveDb(_))), "open {}", f.display());
+        assert!(
+            matches!(open(f), Err(DbError::LiveDb(_))),
+            "open {}",
+            f.display()
+        );
         assert!(
             matches!(OldDb::open(f), Err(OldDbError::LiveDb(_))),
             "OldDb::open {}",
@@ -388,7 +454,10 @@ fn old_fixture(path: &Path, wal: bool) {
 }
 
 fn fingerprint(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
-    (std::fs::read(path).unwrap(), std::fs::metadata(path).unwrap().modified().unwrap())
+    (
+        std::fs::read(path).unwrap(),
+        std::fs::metadata(path).unwrap().modified().unwrap(),
+    )
 }
 
 fn listing(dir: &Path) -> BTreeSet<String> {
@@ -415,7 +484,10 @@ fn legacy_omp_sude_rows_read() {
     assert_eq!(events[1].kind, "verdict");
     assert_eq!(events[1].payload().unwrap()["builder_kind"], "sude");
     assert_eq!(events[1].payload().unwrap()["harness"], "omp");
-    assert_eq!(db.snapshots().unwrap()[0].state_json, "{\"harness\":\"omp\"}");
+    assert_eq!(
+        db.snapshots().unwrap()[0].state_json,
+        "{\"harness\":\"omp\"}"
+    );
 
     let triggers = db.triggers().unwrap();
     let sources: Vec<&str> = triggers.iter().map(|t| t.source.as_str()).collect();
@@ -434,7 +506,11 @@ fn legacy_omp_sude_rows_read() {
     assert_eq!(db.source_state().unwrap()[0].value, "etag-1");
     drop(db);
 
-    assert_eq!(fingerprint(&path), before, "the old database is not written");
+    assert_eq!(
+        fingerprint(&path),
+        before,
+        "the old database is not written"
+    );
     assert_eq!(listing(&tmp.0), files, "no file is created beside it");
 }
 
@@ -473,8 +549,10 @@ fn legacy_omp_sude_rows_read_runs_dir() {
     std::fs::create_dir_all(runs.join("sub.owner")).unwrap();
 
     let rows = read_runs_dir(&runs).unwrap();
-    let got: Vec<(&str, &str, &str)> =
-        rows.iter().map(|r| (r.worker.as_str(), r.file.as_str(), r.content.as_str())).collect();
+    let got: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.worker.as_str(), r.file.as_str(), r.content.as_str()))
+        .collect();
     assert_eq!(
         got,
         [
@@ -493,7 +571,10 @@ fn legacy_omp_sude_rows_read_refusals() {
 
     // Missing: an error, and no file appears.
     let missing = tmp.join("none.db");
-    assert!(matches!(OldDb::open(&missing), Err(OldDbError::NotFound(_))));
+    assert!(matches!(
+        OldDb::open(&missing),
+        Err(OldDbError::NotFound(_))
+    ));
     assert!(!missing.exists());
 
     // Pre-bus schema is not read.

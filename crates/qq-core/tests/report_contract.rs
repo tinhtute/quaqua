@@ -76,9 +76,15 @@ fn injected_ask_names_the_gate_fields_and_its_report_is_accepted() {
     assert!(body.starts_with("do X. "));
     assert!(body.contains("runs/w1.md"));
     assert!(body.contains("\nOutcome: "), "ask lacks the Outcome field");
-    assert!(body.contains("\n## Lessons\n"), "ask lacks the Lessons heading");
+    assert!(
+        body.contains("\n## Lessons\n"),
+        "ask lacks the Lessons heading"
+    );
     // fill the skeleton as a worker would: keep each line, drop the hints
-    let skeleton = body.split_once("\nOutcome: ").map(|(_, r)| format!("Outcome: {r}")).unwrap();
+    let skeleton = body
+        .split_once("\nOutcome: ")
+        .map(|(_, r)| format!("Outcome: {r}"))
+        .unwrap();
     let report: String = skeleton
         .lines()
         .map(|l| match l.split_once("   (") {

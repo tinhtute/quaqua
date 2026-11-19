@@ -174,7 +174,10 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
 
 fn push_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
     let [repo, remote, branch] = args else {
-        return Err(CliError::new(2, "usage: quaqua push <repo> <remote> <branch>"));
+        return Err(CliError::new(
+            2,
+            "usage: quaqua push <repo> <remote> <branch>",
+        ));
     };
     crate::cli::rpc_call(
         env,

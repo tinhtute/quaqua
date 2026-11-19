@@ -33,6 +33,7 @@ const BRANCH_MESSAGE: &str = "blocked: deleting main or master is anh iu's call,
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
+    Ask(&'static str),
     Block(&'static str),
 }
 
@@ -50,6 +51,16 @@ pub fn evaluate(hook_json: &str) -> Verdict {
         Some(cmd) if !cmd.trim().is_empty() => check(cmd),
         _ => Verdict::Block(PANE_MESSAGE),
     }
+}
+
+/// [`evaluate`] for a gate running in `env`'s workspace.
+pub fn evaluate_in(_env: &Env, hook_json: &str) -> Verdict {
+    evaluate(hook_json)
+}
+
+/// The PreToolUse JSON that makes Claude Code prompt.
+pub fn ask_json(_reason: &str) -> String {
+    String::new()
 }
 
 /// [`evaluate`] over a reader (the hook's stdin); a read error blocks.
@@ -580,6 +591,7 @@ fn run(env: &Env, args: &[String]) -> Result<String, CliError> {
             }
             Ok(String::new())
         }
+        Verdict::Ask(msg) => Ok(ask_json(msg)),
         Verdict::Block(msg) => Err(CliError::new(BLOCK_EXIT, msg)),
     }
 }

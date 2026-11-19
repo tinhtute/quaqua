@@ -790,3 +790,697 @@ fn fallback_exit(cmd: &str) -> i32 {
         .unwrap();
     child.wait().unwrap().code().unwrap()
 }
+
+// ---- caller-aware tier gate (R5, R7, R14) -------------------------------
+
+mod caller_gate {
+    use super::*;
+    use qq_core::authority::tier::{self, Action, Decision, Tier};
+    use qq_core::authority::{gate_evaluate_in, GateVerdict};
+    use qq_core::daemon::DaemonHandle;
+    use qq_core::herdr::{HerdrClient, Verb};
+    use qq_core::identity::peer::HerdrPeers;
+    use qq_core::rpc::{self, Request};
+    use serde_json::{json, Value};
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum Who {
+        Cos,
+        Worker,
+        Lead,
+        Unmapped,
+        Down,
+    }
+
+    pub struct Rig {
+        pub ws: TestWorkspace,
+        herdr: Arc<FakeHerdr>,
+        daemon: Option<DaemonHandle>,
+    }
+
+    fn me() -> u32 {
+        std::process::id()
+    }
+
+    pub fn rig(tag: &str, who: Who) -> Rig {
+        let ws = TestWorkspace::new(tag);
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        if who == Who::Down {
+            return Rig {
+                ws,
+                herdr,
+                daemon: None,
+            };
+        }
+        let mut d = Daemon::new(Config {
+            runs_dir: ws.runs_dir(),
+            herdr: herdr.clone() as Arc<dyn HerdrClient>,
+        });
+        d.require_peer(Arc::new(HerdrPeers::new(herdr.clone())));
+        let daemon = d.spawn().unwrap();
+        match who {
+            Who::Cos => {
+                let p = herdr.seed_pane("c", Some("claude"), &[("grid_role", "cos")]);
+                herdr.set_pane_pids(&p, me(), &[]);
+            }
+            Who::Worker | Who::Lead | Who::Unmapped => {
+                let p = herdr.seed_pane("w", None, &[]);
+                let name = if who == Who::Lead { "lead-1" } else { "w-1" };
+                herdr.agent_start(name, "claude", &p, 0, &[]).unwrap();
+                herdr.set_pane_pids(&p, if who == Who::Unmapped { 1 } else { me() }, &[]);
+            }
+            Who::Down => unreachable!(),
+        }
+        Rig {
+            ws,
+            herdr,
+            daemon: Some(daemon),
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            if let Some(d) = self.daemon.take() {
+                self.herdr.clear(Verb::PaneList);
+                let p = self.herdr.seed_pane("stop", None, &[]);
+                self.herdr
+                    .agent_start("stopper", "claude", &p, 0, &[])
+                    .unwrap();
+                self.herdr.set_pane_pids(&p, me(), &[]);
+                let _ = d.stop();
+            }
+        }
+    }
+
+    impl Rig {
+        fn env(&self) -> Env {
+            Env {
+                runs_dir: self.ws.runs_dir(),
+            }
+        }
+        pub fn bash(&self, cmd: &str) -> GateVerdict {
+            self.run(json!({"tool_name": "Bash", "tool_input": {"command": cmd}}))
+        }
+        pub fn edit(&self, tool: &str, path: &str) -> GateVerdict {
+            self.run(json!({"tool_name": tool, "tool_input": {"file_path": path}}))
+        }
+        pub fn run(&self, hook: Value) -> GateVerdict {
+            gate_evaluate_in(&self.env(), &hook.to_string())
+        }
+        pub fn lookup(&self) -> Result<Value, rpc::RpcError> {
+            let sock = rpc::socket_path(&self.ws.runs_dir());
+            rpc::call(&sock, &Request::new("caller.lookup", Value::Null))
+                .map_err(|e| rpc::RpcError::new("io", e.to_string()))?
+                .into_result()
+        }
+    }
+
+    pub fn is_block(v: &GateVerdict) -> bool {
+        matches!(v, GateVerdict::Block(_))
+    }
+    pub fn is_ask(v: &GateVerdict) -> bool {
+        matches!(v, GateVerdict::Ask(_))
+    }
+
+    /// cos asks, worker/Lead/unmapped/daemon-down block.
+    pub fn assert_ask_for_cos_deny_for_rest(tag: &str, cmd: &str) {
+        let r = rig(&format!("{tag}-cos"), Who::Cos);
+        assert!(is_ask(&r.bash(cmd)), "{tag}: cos must ask: {cmd}");
+        assert_denied_for_rest(tag, cmd);
+    }
+
+    pub fn assert_denied_for_rest(tag: &str, cmd: &str) {
+        for (who, n) in [
+            (Who::Worker, "w"),
+            (Who::Lead, "l"),
+            (Who::Unmapped, "u"),
+            (Who::Down, "d"),
+        ] {
+            let r = rig(&format!("{tag}-{n}"), who);
+            assert!(is_block(&r.bash(cmd)), "{tag}: non-cos must deny: {cmd}");
+        }
+    }
+
+    // ---- caller_lookup_* ----
+
+    #[test]
+    fn caller_lookup_cos_passes() {
+        let r = rig("cl-cos", Who::Cos);
+        let v = r.lookup().unwrap();
+        assert_eq!(v["caller"], "cos");
+        assert_eq!(v["cos"], true);
+    }
+
+    #[test]
+    fn caller_lookup_worker_is_not_cos() {
+        let r = rig("cl-worker", Who::Worker);
+        let v = r.lookup().unwrap();
+        assert_eq!(v["caller"], "w-1");
+        assert_eq!(v["cos"], false);
+        let r = rig("cl-lead", Who::Lead);
+        assert_eq!(r.lookup().unwrap()["cos"], false);
+    }
+
+    #[test]
+    fn caller_lookup_unmapped_peer_is_refused() {
+        let r = rig("cl-unmapped", Who::Unmapped);
+        assert_eq!(r.lookup().unwrap_err().code, "unmapped_peer");
+        assert!(is_block(&r.bash("git tag v1")));
+    }
+
+    #[test]
+    fn caller_lookup_daemon_down_denies_listed_hit_only() {
+        let r = rig("cl-down", Who::Down);
+        assert!(is_block(&r.bash("git tag v1")));
+        assert!(is_block(&r.bash("gh release create v1")));
+        // Never asked on an ordinary call: no daemon, still allowed.
+        for ok in ["git status", "ls -la", "git branch --list", "cargo test"] {
+            assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+        }
+        assert_eq!(r.edit("Write", "/tmp/notes.md"), GateVerdict::Allow);
+    }
+
+    #[test]
+    fn caller_lookup_without_a_peer_resolver_is_refused() {
+        // A daemon that does not name callers must not let a claim stand.
+        let ws = TestWorkspace::new("cl-nopeer");
+        ws.seal_herdr();
+        let d = Daemon::new(Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::new(FakeHerdr::new()),
+        })
+        .spawn()
+        .unwrap();
+        let mut req = Request::new("caller.lookup", Value::Null);
+        req.caller = Some("cos".into());
+        let sock = rpc::socket_path(&ws.runs_dir());
+        let res = rpc::call(&sock, &req).unwrap().into_result();
+        assert!(res.is_err(), "{res:?}");
+        let _ = d.stop();
+    }
+
+    // ---- tier_table_* ----
+
+    const A: Decision = Decision::Allow;
+    const K: Decision = Decision::Ask;
+    const D: Decision = Decision::Deny;
+
+    /// One cos case per (tier, action): repo tier low/medium/high, lane low.
+    fn row(action: Action, want: [Decision; 3]) {
+        for (i, t) in [Tier::Low, Tier::Medium, Tier::High]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                tier::decide(true, action, t, Tier::Low),
+                want[i],
+                "cos {action:?} at repo tier {t:?}"
+            );
+            assert_eq!(
+                tier::decide(false, action, t, Tier::Low),
+                D,
+                "non-cos {action:?} at {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_table_push_non_main() {
+        row(Action::PushNonMain, [A, A, A]);
+    }
+    #[test]
+    fn tier_table_open_pr() {
+        row(Action::OpenPr, [A, A, A]);
+    }
+    #[test]
+    fn tier_table_delete_merged_branch() {
+        row(Action::BranchDeleteMerged, [A, A, K]);
+    }
+    #[test]
+    fn tier_table_delete_unmerged_branch() {
+        row(Action::BranchDeleteUnmerged, [A, A, K]);
+    }
+    #[test]
+    fn tier_table_merge_request() {
+        row(Action::MergeRequest, [A, A, K]);
+    }
+    #[test]
+    fn tier_table_tag_release_delete_data() {
+        row(Action::Tag, [A, A, K]);
+        row(Action::Release, [A, A, K]);
+        row(Action::DeleteData, [A, A, K]);
+    }
+    #[test]
+    fn tier_table_history_rewrite() {
+        row(Action::HistoryRewrite, [K, K, K]);
+    }
+    #[test]
+    fn tier_table_floor_asks_at_every_tier() {
+        row(Action::Floor, [K, K, K]);
+    }
+    #[test]
+    fn tier_table_main_push_and_force_push_deny_always() {
+        row(Action::PushMain, [D, D, D]);
+        row(Action::ForcePush, [D, D, D]);
+    }
+    #[test]
+    fn tier_table_guard_actions() {
+        row(Action::TrunkMove, [K, K, K]);
+        row(Action::Bypass, [K, K, K]);
+        row(Action::DbWrite, [K, K, K]);
+        row(Action::InstructionFile, [K, K, K]);
+        for t in [Tier::Low, Tier::Medium, Tier::High] {
+            assert_eq!(tier::decide(true, Action::PaneInput, t, Tier::Low), A);
+            assert_eq!(tier::decide(false, Action::PaneInput, t, Tier::Low), D);
+        }
+    }
+    #[test]
+    fn tier_table_strictest_of_repo_lane_and_action_wins() {
+        // Low repo, low action, high lane: the lane decides.
+        assert_eq!(tier::decide(true, Action::Tag, Tier::Low, Tier::High), K);
+        assert_eq!(
+            tier::decide(true, Action::PushNonMain, Tier::Low, Tier::High),
+            A
+        );
+        assert_eq!(
+            tier::decide(true, Action::Tag, Tier::Medium, Tier::Medium),
+            A
+        );
+        assert_eq!(
+            tier::action_tier(Action::BranchDeleteMerged),
+            Some(Tier::Low)
+        );
+        assert_eq!(tier::action_tier(Action::Tag), Some(Tier::Medium));
+        assert_eq!(tier::action_tier(Action::HistoryRewrite), Some(Tier::High));
+    }
+
+    // ---- ask_tier_* ----
+
+    #[test]
+    fn ask_tier_unlisted_repo_is_high() {
+        // The stub reader: no daemon row, so high.
+        let ws = TestWorkspace::new("ask-repo");
+        assert_eq!(tier::repo_tier(&ws.runs_dir(), ws.root()), Tier::High);
+        assert_eq!(tier::lane_tier(), Tier::High);
+    }
+
+    #[test]
+    fn ask_tier_tag_and_release() {
+        assert_ask_for_cos_deny_for_rest("ask-tag", "git tag v1.2.3");
+        assert_ask_for_cos_deny_for_rest("ask-tag-a", "git tag -a v1 -m x");
+        assert_ask_for_cos_deny_for_rest("ask-tag-d", "git tag -d v1");
+        assert_ask_for_cos_deny_for_rest("ask-rel", "gh release create v1 --notes x");
+    }
+
+    #[test]
+    fn ask_tier_reading_tags_is_not_a_hit() {
+        let r = rig("ask-tag-read", Who::Down);
+        for ok in [
+            "git tag",
+            "git tag -l",
+            "git tag --list 'v*'",
+            "git tag --contains abc",
+            "gh release list",
+            "gh release view v1",
+        ] {
+            assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+
+    #[test]
+    fn ask_tier_branch_delete_local_and_remote() {
+        assert_ask_for_cos_deny_for_rest("ask-bd", "git branch -D feat");
+        assert_ask_for_cos_deny_for_rest("ask-bd2", "git branch -d feat/main-x");
+        assert_ask_for_cos_deny_for_rest("ask-bd3", "git branch --delete feat");
+        assert_ask_for_cos_deny_for_rest("ask-bdr", "git push origin --delete feat");
+        assert_ask_for_cos_deny_for_rest("ask-bdr2", "git push origin :feat");
+    }
+
+    #[test]
+    fn ask_tier_delete_of_main_stays_blocked_for_cos() {
+        let r = rig("ask-bd-main", Who::Cos);
+        for cmd in [
+            "git branch -D main",
+            "git push origin --delete main",
+            "git push origin :master",
+            "git push origin x --delete main",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn ask_tier_raw_push_and_merge_stay_blocked_for_cos() {
+        let r = rig("ask-raw", Who::Cos);
+        for cmd in [
+            "git push origin feat",
+            "git push origin main",
+            "git push --force origin feat",
+            "gh pr merge 5",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn ask_tier_branch_move_of_trunk() {
+        for cmd in [
+            "git branch -m main old-main",
+            "git branch -M master old",
+            "git branch -f main abc123",
+            "git branch --move main x",
+            "git branch --force master HEAD~1",
+            "git branch -m feat main",
+        ] {
+            assert_ask_for_cos_deny_for_rest("ask-bm", cmd);
+        }
+        let r = rig("ask-bm-ok", Who::Down);
+        for ok in [
+            "git branch -m feat feat2",
+            "git branch -f feat abc",
+            "git branch feat",
+        ] {
+            assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+
+    #[test]
+    fn ask_tier_history_rewrite_on_shared_refs() {
+        for cmd in [
+            "git filter-branch --all",
+            "git filter-repo --path x",
+            "git update-ref -d refs/heads/main",
+            "git update-ref refs/remotes/origin/main abc",
+            "git update-ref refs/tags/v1 abc",
+        ] {
+            assert_ask_for_cos_deny_for_rest("ask-hr", cmd);
+        }
+        let r = rig("ask-hr-ok", Who::Down);
+        assert_eq!(
+            r.bash("git update-ref refs/heads/feat abc"),
+            GateVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn ask_tier_branch_merged_is_low() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        let ws = TestWorkspace::new("ask-merged");
+        let up = ws.root().join("up");
+        let cl = ws.root().join("cl");
+        std::fs::create_dir_all(&up).unwrap();
+        git(&up, &["init", "-q", "-b", "main"]);
+        git(&up, &["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(ws.root(), &["clone", "-q", up.to_str().unwrap(), "cl"]);
+        git(&cl, &["branch", "merged"]);
+        git(&cl, &["checkout", "-q", "-b", "unmerged"]);
+        git(&cl, &["commit", "-q", "--allow-empty", "-m", "b"]);
+        git(&cl, &["checkout", "-q", "main"]);
+        assert_eq!(
+            tier::branch_delete_action(&cl, "merged"),
+            Action::BranchDeleteMerged
+        );
+        assert_eq!(
+            tier::branch_delete_action(&cl, "unmerged"),
+            Action::BranchDeleteUnmerged
+        );
+        assert_eq!(
+            tier::branch_delete_action(&cl, "nonexistent"),
+            Action::BranchDeleteUnmerged
+        );
+        assert_eq!(
+            tier::branch_delete_action(ws.root(), "merged"),
+            Action::BranchDeleteUnmerged
+        );
+    }
+
+    #[test]
+    fn ask_tier_hook_output_is_pre_tool_use_ask_json() {
+        let out = qq_core::authority::gate_ask_json("needs anh iu");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecisionReason"],
+            "needs anh iu"
+        );
+    }
+
+    #[test]
+    fn ask_tier_deny_says_report_to_the_cos() {
+        let r = rig("ask-msg", Who::Worker);
+        match r.bash("git tag v1") {
+            GateVerdict::Block(m) => assert!(m.contains("report to the CoS"), "{m}"),
+            v => panic!("{v:?}"),
+        }
+        let r = rig("ask-msg-down", Who::Down);
+        match r.bash("git tag v1") {
+            GateVerdict::Block(m) => assert!(m.contains("daemon"), "{m}"),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    // ---- gate_bypass_* (one per #297 spelling, through the caller verdict) ----
+
+    #[test]
+    fn gate_bypass_alias_push() {
+        for cmd in [
+            "git config alias.p push",
+            "git config alias.p '!git push'",
+            "git -c alias.p=push status",
+            "git -c ALIAS.p=push status",
+        ] {
+            assert_ask_for_cos_deny_for_rest("gb-alias", cmd);
+        }
+    }
+
+    #[test]
+    fn gate_bypass_gh_api_ref_write_off_main() {
+        for cmd in [
+            "gh api -X PATCH repos/o/r/git/refs/heads/feat -f sha=abc",
+            "gh api -X DELETE repos/o/r/git/refs/heads/feat",
+            "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/feat -f sha=abc",
+        ] {
+            assert_ask_for_cos_deny_for_rest("gb-ref", cmd);
+        }
+    }
+
+    #[test]
+    fn gate_bypass_gh_api_ref_write_on_main_is_denied_for_cos() {
+        let r = rig("gb-ref-main", Who::Cos);
+        for cmd in [
+            "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api -X DELETE repos/o/r/git/refs/heads/master",
+            "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/main -f sha=abc",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gate_bypass_gh_api_contents_write() {
+        assert_ask_for_cos_deny_for_rest(
+            "gb-contents",
+            "gh api -X PUT repos/o/r/contents/a.md -f message=m -f content=eA== -f branch=feat",
+        );
+        // No branch: the write lands on the default branch.
+        let r = rig("gb-contents-main", Who::Cos);
+        for cmd in [
+            "gh api -X PUT repos/o/r/contents/a.md -f message=m -f content=eA==",
+            "gh api -X PUT repos/o/r/contents/a.md -f message=m -f branch=main",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gate_bypass_auto_merge_and_merge_spellings_stay_blocked_for_cos() {
+        let r = rig("gb-merge", Who::Cos);
+        for cmd in [
+            "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+            "gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+            "gh api -X PUT repos/o/r/pulls/1/merge",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gate_bypass_graphql_query_from_file() {
+        assert_ask_for_cos_deny_for_rest("gb-qfile", "gh api graphql -F query=@auto.graphql");
+    }
+
+    #[test]
+    fn gate_bypass_reads_stay_allowed() {
+        let r = rig("gb-reads", Who::Down);
+        for ok in [
+            "git config alias.st status",
+            "gh api repos/o/r/git/refs/heads/main",
+            "gh api graphql -f query='{ viewer { login } }'",
+        ] {
+            assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+
+    // ---- instruction_file_gate_* (R5) ----
+
+    fn file_case(tag: &str, name: &str) {
+        let r = rig(&format!("{tag}-cos"), Who::Cos);
+        let live = r.ws.root().join(name);
+        std::fs::write(&live, "x").unwrap();
+        let live = live.to_str().unwrap();
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            assert!(is_ask(&r.edit(tool, live)), "cos {tool} {name} must ask");
+        }
+        // `..` and a relative path with the hook's cwd resolve to the same file.
+        let dotted = format!("{}/sub/../{name}", r.ws.root().display());
+        assert!(is_ask(&r.edit("Write", &dotted)), "{dotted}");
+        let rel = r.run(json!({
+            "tool_name": "Edit", "cwd": r.ws.root().to_str().unwrap(),
+            "tool_input": {"file_path": name}
+        }));
+        assert!(is_ask(&rel), "relative {name}");
+        // A symlink to the live file is the live file.
+        let link = r.ws.root().join(format!("link-{name}"));
+        std::os::unix::fs::symlink(live, &link).unwrap();
+        assert!(
+            is_ask(&r.edit("Write", link.to_str().unwrap())),
+            "symlink {name}"
+        );
+        for (who, n) in [
+            (Who::Worker, "w"),
+            (Who::Lead, "l"),
+            (Who::Unmapped, "u"),
+            (Who::Down, "d"),
+        ] {
+            let r = rig(&format!("{tag}-{n}"), who);
+            let live = r.ws.root().join(name);
+            assert!(
+                is_block(&r.edit("Write", live.to_str().unwrap())),
+                "{n} {name} must deny"
+            );
+            assert!(
+                is_block(&r.edit("Edit", live.to_str().unwrap())),
+                "{n} {name} must deny"
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_file_gate_agents_md() {
+        file_case("ifg-agents", "AGENTS.md");
+    }
+    #[test]
+    fn instruction_file_gate_soul_md() {
+        file_case("ifg-soul", "SOUL.md");
+    }
+    #[test]
+    fn instruction_file_gate_identity_md() {
+        file_case("ifg-ident", "identity.md");
+    }
+
+    #[test]
+    fn instruction_file_gate_only_the_live_paths() {
+        // Same basename elsewhere (a template, a repo AGENTS.md, a worktree) is
+        // engine code workers edit under review; other live files are free.
+        for who in [Who::Worker, Who::Cos] {
+            let r = rig("ifg-scope", who);
+            let root = r.ws.root();
+            for p in [
+                root.join("crates/qq-core/templates/workspace/AGENTS.md"),
+                root.join("projects/x/AGENTS.md"),
+                root.join("runs/AGENTS.md"),
+                root.join("USER.md"),
+                root.join("notes.md"),
+                std::path::PathBuf::from("/tmp/elsewhere/SOUL.md"),
+            ] {
+                assert_eq!(
+                    r.edit("Write", p.to_str().unwrap()),
+                    GateVerdict::Allow,
+                    "{p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn instruction_file_gate_other_tools_are_not_asked() {
+        let r = rig("ifg-tools", Who::Down);
+        let p = r.ws.root().join("AGENTS.md");
+        let v =
+            r.run(json!({"tool_name": "Read", "tool_input": {"file_path": p.to_str().unwrap()}}));
+        assert_eq!(v, GateVerdict::Allow);
+        // A write with no readable path fails closed.
+        assert!(is_block(
+            &r.run(json!({"tool_name": "Write", "tool_input": {}}))
+        ));
+    }
+
+    // ---- pane_input_gate_* (R14 gate half) ----
+
+    const PANE_INPUT: &[&str] = &[
+        "herdr pane send-keys w1:p1 enter",
+        "herdr pane send-text w1:p1 hello",
+        "herdr pane run w1:p1 'ls'",
+        "herdr pane report-metadata p --source s --token grid_role=cos",
+    ];
+
+    #[test]
+    fn pane_input_gate_denies_non_cos() {
+        for cmd in PANE_INPUT {
+            assert_denied_for_rest("pig", cmd);
+        }
+    }
+
+    #[test]
+    fn pane_input_gate_lets_cos_through() {
+        let r = rig("pig-cos", Who::Cos);
+        for cmd in PANE_INPUT {
+            assert_eq!(r.bash(cmd), GateVerdict::Allow, "{cmd}");
+        }
+        // Spawn, move and close stay the daemon's, cos included.
+        assert!(is_block(&r.bash("herdr pane split w1:p1")));
+        assert!(is_block(&r.bash("herdr pane close w1:p1")));
+    }
+
+    #[test]
+    fn pane_input_gate_qq_db_naming_commands() {
+        for cmd in [
+            "sqlite3 runs/qq.db 'delete from agent'",
+            "cp /tmp/x.db runs/qq.db",
+            "sed -i s/a/b/ runs/qq.db",
+            "rm runs/qq.db",
+        ] {
+            assert_ask_for_cos_deny_for_rest("pig-db", cmd);
+        }
+        let r = rig("pig-db-ro", Who::Worker);
+        for ok in [
+            "sqlite3 -readonly runs/qq.db 'select 1'",
+            "cat runs/qq.db",
+            "ls -l runs/qq.db",
+            "sqlite3 other.db 'select 1'",
+        ] {
+            assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+}

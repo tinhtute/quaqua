@@ -44,10 +44,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn seed(conn: &mut rusqlite::Connection) {
-    let template =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
-    let team = std::fs::read_to_string(template)
-        .unwrap();
+    let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
+    let team = std::fs::read_to_string(template).unwrap();
     config::seed(conn, &team).expect("seed");
 }
 
@@ -852,17 +850,30 @@ fn a_daemon_in_no_pane_arms_the_report_watcher_for_a_pipeline() {
 fn a_builder_prompt_that_never_lands_pauses_with_its_cause_and_waits_for_no_report() {
     use qq_core::herdr::Lose;
     let fx = Fixture::new("lost");
-    let r = Run::start_with(&fx, fx.input(false, 2), |h| h.lose_prompts("t1-b", Lose::Always));
-    let (code, reason) = r.blocked().expect("a prompt that did not land pauses the flow");
+    let r = Run::start_with(&fx, fx.input(false, 2), |h| {
+        h.lose_prompts("t1-b", Lose::Always)
+    });
+    let (code, reason) = r
+        .blocked()
+        .expect("a prompt that did not land pauses the flow");
     assert_eq!(code, i64::from(qq_core::task::pipeline::PROMPT_FAILED));
-    assert!(reason.contains("t1-b") && reason.contains("did not land"), "{reason}");
+    assert!(
+        reason.contains("t1-b") && reason.contains("did not land"),
+        "{reason}"
+    );
 }
 
 #[test]
 fn a_builder_prompt_that_needs_one_enter_still_runs_the_flow() {
     use qq_core::herdr::Lose;
     let fx = Fixture::new("enter");
-    let r = Run::start_with(&fx, fx.input(false, 2), |h| h.lose_prompts("t1-b", Lose::UntilEnter));
-    assert!(r.blocked().is_none(), "one enter lands it: {:?}", r.blocked());
+    let r = Run::start_with(&fx, fx.input(false, 2), |h| {
+        h.lose_prompts("t1-b", Lose::UntilEnter)
+    });
+    assert!(
+        r.blocked().is_none(),
+        "one enter lands it: {:?}",
+        r.blocked()
+    );
     assert_eq!(r.sim.builder_prompts().len(), 1);
 }

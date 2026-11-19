@@ -259,7 +259,10 @@ impl Supervisor {
                 continue;
             }
             let Some(factory) = self.kinds.get(&row.kind) else {
-                eprintln!("quaqua daemon: no kind '{}' for workflow {}", row.kind, row.id);
+                eprintln!(
+                    "quaqua daemon: no kind '{}' for workflow {}",
+                    row.kind, row.id
+                );
                 continue;
             };
             match factory(&row.id, None) {

@@ -117,7 +117,8 @@ fn field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
 
 /// Levels of a `Verified: <level> <sha>` line that count as a pass. Any other
 /// level (verifier-failed, verifier-blocked, inconclusive, unknown) does not.
-pub(crate) const PASSING_LEVELS: [&str; 3] = ["unit-test-verified", "type-check-only", "review-clean"];
+pub(crate) const PASSING_LEVELS: [&str; 3] =
+    ["unit-test-verified", "type-check-only", "review-clean"];
 
 /// The `Verified:` line a brief asks for, with the levels that pass spelled out.
 pub(crate) fn verified_line_ask() -> String {
@@ -286,10 +287,14 @@ impl Activity for WorkerActivities {
             ActivityRequest::Herdr(HerdrRequest::Prompt { name, task }) => {
                 Ok(ActivityResult::Herdr(
                     match crate::herdr::prompt_landed(self.herdr.as_ref(), name, task).0 {
-                        crate::herdr::Landing::Landed => HerdrResult::Prompted { name: name.clone() },
+                        crate::herdr::Landing::Landed => {
+                            HerdrResult::Prompted { name: name.clone() }
+                        }
                         crate::herdr::Landing::Blocked => HerdrResult::PromptFailed {
                             name: name.clone(),
-                            cause: format!("{name} is blocked on a question; the prompt did not land"),
+                            cause: format!(
+                                "{name} is blocked on a question; the prompt did not land"
+                            ),
                         },
                         crate::herdr::Landing::NotLanded(cause) => HerdrResult::PromptFailed {
                             name: name.clone(),
@@ -779,6 +784,9 @@ mod tests {
             prompt_through(h.clone()),
             HerdrResult::Prompted { name: "w1".into() }
         );
-        assert_eq!(h.keys(), vec![("w1".to_string(), vec!["enter".to_string()])]);
+        assert_eq!(
+            h.keys(),
+            vec![("w1".to_string(), vec!["enter".to_string()])]
+        );
     }
 }
