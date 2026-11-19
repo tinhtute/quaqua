@@ -1054,7 +1054,7 @@ fn write_targets(base: &str, a: &[String]) -> Vec<String> {
     let in_place = |x: &String| {
         x == "--in-place"
             || x.starts_with("--in-place=")
-            || (x.starts_with('-') && !x.starts_with("--") && x.contains('i'))
+            || (x.starts_with('-') && !x.starts_with("--") && x.contains(['i', 'I']))
     };
     match base {
         "tee" | "mv" | "truncate" | "rm" | "unlink" | "shred" => plain().collect(),
@@ -1136,10 +1136,9 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
     let short = |a: &str, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
     match base {
         _ if READ_ONLY.contains(&base) => true,
-        "jq" | "nl" | "cut" | "uniq" | "tac" => true,
-        "sed" => !args
-            .iter()
-            .any(|a| short(a, 'i') || a == "--in-place" || a.starts_with("--in-place=")),
+        "jq" | "nl" | "cut" | "tac" => true,
+        "uniq" => uniq_reads(args),
+        "sed" => sed_reads(args),
         "sort" => !args
             .iter()
             .any(|a| short(a, 'o') || a == "--output" || a.starts_with("--output=")),
@@ -1151,11 +1150,18 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
         "git" => {
             let mut it = args.iter();
             let mut sub = None;
+            // `-c k=v` can name a program (`diff.external`, `core.pager`).
+            let mut config = false;
             while let Some(a) = it.next() {
                 match a.as_str() {
-                    "-C" | "-c" => {
+                    "-C" => {
                         it.next();
                     }
+                    "-c" => {
+                        config = true;
+                        it.next();
+                    }
+                    x if x.starts_with("--config-env") => config = true,
                     x if x.starts_with('-') => {}
                     x => {
                         sub = Some(x);
@@ -1163,11 +1169,216 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
                     }
                 }
             }
-            sub.is_some_and(|s| GIT_READ.contains(&s))
-                && !args.iter().any(|a| a.starts_with("--output"))
+            // `git grep -O<cmd>` / `--open-files-in-pager=<cmd>` runs the command
+            // (every `--o…` spelling, abbreviations included, fails closed).
+            let runs_pager = sub == Some("grep")
+                && args.iter().any(|a| {
+                    (a.starts_with("--o") && a != "--only-matching")
+                        || (a.starts_with('-') && !a.starts_with("--") && a.contains('O'))
+                });
+            // `--output=<file>`, abbreviations included (`--out=f`).
+            let writes_file = args.iter().any(|a| {
+                let name = a.split('=').next().unwrap_or(a);
+                name.len() >= 4 && "--output".starts_with(name) || a.starts_with("--output")
+            });
+            sub.is_some_and(|s| GIT_READ.contains(&s)) && !config && !runs_pager && !writes_file
         }
         _ => false,
     }
+}
+
+/// `uniq [OPTION]… [INPUT [OUTPUT]]`: the second operand is the file it
+/// writes, so it reads only with at most one operand. A long option it cannot
+/// place (an abbreviation of one that takes a value) fails closed.
+fn uniq_reads(args: &[String]) -> bool {
+    const VALUED: [&str; 3] = ["--skip-fields", "--skip-chars", "--check-chars"];
+    let mut operands = 0;
+    let mut done = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if done || a == "-" || !a.starts_with('-') {
+            operands += 1;
+        } else if a == "--" {
+            done = true;
+        } else if a.starts_with("--") {
+            if VALUED.contains(&a) {
+                it.next();
+            } else if !a.contains('=') && VALUED.iter().any(|v| v.starts_with(a)) {
+                return false;
+            }
+        } else if a.ends_with(['f', 's', 'w']) {
+            // `-f N`, `-s N`, `-w N` (the value is the next word)
+            it.next();
+        }
+    }
+    operands <= 1
+}
+
+/// `sed` reads unless a flag or a command of its script writes or runs a
+/// program: `-i`/`-I`/`--in-place` (abbreviations too), `-f` (a script file we
+/// cannot see), a `w`/`W`/`e` command, an `s///w` or `s///e` flag. The script
+/// is parsed against an allow-list of commands; anything it does not
+/// recognise is a writer, and it must pass whether or not `[...]` hides a
+/// delimiter (GNU and BSD disagree).
+fn sed_reads(args: &[String]) -> bool {
+    let opt = |name: &str, full: &str| !name.is_empty() && full.starts_with(name);
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut first_operand: Option<&str> = None;
+    let mut have_e = false;
+    let mut done = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if done || a == "-" || !a.starts_with('-') {
+            first_operand.get_or_insert(a);
+        } else if a == "--" {
+            done = true;
+        } else if let Some(long) = a.strip_prefix("--") {
+            let (name, val) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if opt(name, "in-place") || opt(name, "file") {
+                return false;
+            }
+            if opt(name, "expression") {
+                have_e = true;
+                match val.or_else(|| it.next().map(String::as_str)) {
+                    Some(v) => scripts.push(v),
+                    None => return false,
+                }
+            } else if opt(name, "line-length") && val.is_none() {
+                it.next();
+            }
+        } else {
+            let cl = &a[1..];
+            for (k, c) in cl.char_indices() {
+                match c {
+                    'i' | 'I' | 'f' => return false,
+                    'e' => {
+                        have_e = true;
+                        let rest = &cl[k + 1..];
+                        match if rest.is_empty() {
+                            it.next().map(String::as_str)
+                        } else {
+                            Some(rest)
+                        } {
+                            Some(v) => scripts.push(v),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    'l' => {
+                        if cl[k + 1..].is_empty() {
+                            it.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !have_e {
+        match first_operand {
+            Some(s) => scripts.push(s),
+            None => return false,
+        }
+    }
+    scripts
+        .iter()
+        .all(|s| sed_script_reads(s, false) && sed_script_reads(s, true))
+}
+
+/// True when every command of the sed script `s` is on the read-only list.
+fn sed_script_reads(s: &str, brackets: bool) -> bool {
+    let c: Vec<char> = s.chars().collect();
+    let n = c.len();
+    // `i` is the opening delimiter; the index just past the closing one.
+    let skip = |i: usize| -> Option<usize> {
+        let d = *c.get(i)?;
+        if d == '\\' || d == '\n' {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < n {
+            match c[j] {
+                '\\' => j += 2,
+                x if x == d => return Some(j + 1),
+                '[' if brackets => {
+                    j += 1;
+                    if c.get(j) == Some(&'^') {
+                        j += 1;
+                    }
+                    if c.get(j) == Some(&']') {
+                        j += 1;
+                    }
+                    while j < n && c[j] != ']' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                _ => j += 1,
+            }
+        }
+        None
+    };
+    let eol = |mut j: usize| {
+        while j < n && c[j] != '\n' {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < n {
+        match c[i] {
+            ' ' | '\t' | '\n' | ';' | '{' | '}' | '!' | ',' | '~' | '+' | '$' => i += 1,
+            x if x.is_ascii_digit() => i += 1,
+            '#' => i = eol(i),
+            '/' | '\\' => {
+                let start = if c[i] == '\\' { i + 1 } else { i };
+                let Some(j) = skip(start) else { return false };
+                i = j;
+                while i < n && matches!(c[i], 'I' | 'M') {
+                    i += 1;
+                }
+            }
+            'p' | 'P' | 'd' | 'D' | 'q' | 'Q' | 'n' | 'N' | 'g' | 'G' | 'h' | 'H' | 'x' | 'l'
+            | '=' | 'z' | 'F' => i += 1,
+            's' | 'y' => {
+                let subst = c[i] == 's';
+                let Some(j) = skip(i + 1).and_then(|j| skip(j - 1)) else {
+                    return false;
+                };
+                i = j;
+                while i < n && !matches!(c[i], ';' | '\n' | '}' | ' ' | '\t') {
+                    // `w` and `e` write or run; anything unknown fails closed.
+                    if !subst
+                        || !(matches!(c[i], 'g' | 'p' | 'i' | 'I' | 'm' | 'M')
+                            || c[i].is_ascii_digit())
+                    {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            // text and file names run to the end of the line (`a\` continues)
+            'a' | 'i' | 'c' | 'r' | 'R' => {
+                i = eol(i);
+                while i > 0 && i < n && c[i - 1] == '\\' {
+                    i = eol(i + 1);
+                }
+            }
+            'b' | 't' | 'T' | ':' => {
+                while i < n && !matches!(c[i], ';' | '\n') {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Any other command naming the daemon's `qq.db`, bar the read-only tools.

@@ -22,9 +22,27 @@
 set -uo pipefail
 
 bin=${QUAQUA_BIN:-quaqua}
+stdin=$(cat)
+tool=$(grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$stdin" | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/')
+why="not found"
 if command -v "$bin" >/dev/null 2>&1; then
-  # The hook JSON stays on stdin; `quaqua gate` blocks (exit 2) on empty or unparseable input.
-  exec "$bin" gate
+  # A binary from before the Write/Edit gate answers every non-Bash tool with the
+  # pane-spawn block, which would lock a worker out of every file. Ask it about a
+  # Write to a path no policy protects: a binary that knows the tool allows it
+  # (exit 0), an older one blocks (exit 2). That is a behaviour probe, not a
+  # parse of its message. An old binary falls through to the text rules below.
+  stale=''
+  case $tool in
+  Write | Edit | MultiEdit | NotebookEdit)
+    "$bin" gate >/dev/null 2>&1 <<<'{"tool_name":"Write","tool_input":{"file_path":"/dev/null/qq-gate-probe"},"cwd":"/"}' ||
+      stale=1
+    ;;
+  esac
+  if [[ -z $stale ]]; then
+    # The hook JSON stays on stdin; `quaqua gate` blocks (exit 2) on empty or unparseable input.
+    exec "$bin" gate <<<"$stdin"
+  fi
+  why="predates the Write/Edit gate"
 fi
 
 # The fallback guarded list mirrors `guarded_pair`, `check_git`, `check_gh`,
@@ -59,9 +77,7 @@ live_tools="(^|[^a-zA-Z0-9_.-])(tee|mv|cp|dd|install|truncate|rm|unlink|shred|ln
 live_sed="(^|[^a-zA-Z0-9_.-])sed[[:space:]][^\"|;&]*(-[a-zA-Z]*i|--in-place)[^\"|;&]*$live_names"
 grant_door='(^|[^a-zA-Z0-9_.-])(socat|nc|ncat|netcat|curl|python[0-9.]*|node|ruby|perl|php|deno|bun|lua)[[:space:]]'
 
-stdin=$(cat)
 hit=''
-tool=$(grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$stdin" | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/')
 case $tool in
 mcp__*)
   # The same three regexes as MCP_OUTWARD in src/authority/gate.rs.
@@ -105,10 +121,10 @@ Write | Edit | MultiEdit | NotebookEdit)
 esac
 
 if [[ -n $hit ]]; then
-  echo "quaqua gate: '$bin' not found — fallback match on $hit (fail-closed)" >&2
-  echo "blocked: '$bin' is missing and '$hit' cannot be cleared by the fallback — install quaqua or set QUAQUA_BIN, then retry — rules/_all/fanout-agent-grid.md, AGENTS.md rule 3" >&2
+  echo "quaqua gate: '$bin' $why — fallback match on $hit (fail-closed)" >&2
+  echo "blocked: '$bin' $why and '$hit' cannot be cleared by the fallback — install or rebuild quaqua or set QUAQUA_BIN, then retry — rules/_all/fanout-agent-grid.md, AGENTS.md rule 3" >&2
   exit 2
 fi
 
-echo "quaqua gate: '$bin' not found — install quaqua or set QUAQUA_BIN; only pane/tab/workspace spawn+move+close+input, push, merge, the approval list, outward MCP tools and instruction-file writes are blocked meanwhile" >&2
+echo "quaqua gate: '$bin' $why — install or rebuild quaqua or set QUAQUA_BIN; only pane/tab/workspace spawn+move+close+input, push, merge, the approval list, outward MCP tools and instruction-file writes are blocked meanwhile" >&2
 exit 0
