@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+use super::situation;
+
 /// Total size of the block, in Unicode chars, headers included.
 pub const BUDGET: usize = 8000;
 
@@ -28,7 +30,15 @@ struct Section {
 
 impl Section {
     fn render(&self) -> String {
-        format!("## {} — {}\n{}\n", self.title, self.path, self.body.trim())
+        let fill = situation::fill_of(self.path, &self.body)
+            .map(|f| format!(" {}", f.header()))
+            .unwrap_or_default();
+        format!(
+            "## {} — {}{fill}\n{}\n",
+            self.title,
+            self.path,
+            self.body.trim()
+        )
     }
 }
 
@@ -49,28 +59,43 @@ fn load(root: &Path) -> Vec<Section> {
 }
 
 /// The block for the workspace at `root`; empty when no source file exists.
-/// Over budget, the INDEX becomes a pointer; the other sections are never cut,
-/// and an overrun they cause alone is stated on the last line.
+/// Capped sections carry a fill header. The block ends with the computed
+/// `## Now` section. Over budget, the INDEX becomes a pointer; the other
+/// sections are never cut, and an overrun they cause alone is stated before
+/// the Now section.
 pub fn render_standing(root: &Path) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    render_standing_at(root, now_ms)
+}
+
+fn render_standing_at(root: &Path, now_ms: u64) -> String {
     let sections = load(root);
     if sections.is_empty() {
         return String::new();
     }
     let size = |s: &str| s.chars().count();
+    let now = situation::render_block(&situation::compute(root, now_ms));
     let head = format!("{HEADER} (rendered at session start from the files named in each header; these outrank the global persona)\n\n");
     let mut parts: Vec<String> = sections.iter().map(Section::render).collect();
-    if size(&head) + parts.iter().map(|p| size(p) + 1).sum::<usize>() > BUDGET {
+    let total = |parts: &[String]| {
+        size(&head) + parts.iter().map(|p| size(p) + 1).sum::<usize>() + size(&now)
+    };
+    if total(&parts) > BUDGET {
         if let Some(i) = sections.iter().position(|s| s.path == INDEX) {
             parts[i] = format!("## {} — {INDEX}\nread {INDEX}\n", sections[i].title);
         }
     }
     let mut out = format!("{head}{}", parts.join("\n"));
-    let n = size(&out);
+    let n = size(&out) + 1 + size(&now);
     if n > BUDGET {
         out.push_str(&format!(
             "\n(standing block {n} chars, over the {BUDGET} budget: shorten identity.md, SOUL.md, USER.md or memory/rules.md)\n"
         ));
     }
+    out.push('\n');
+    out.push_str(&now);
     out
 }
 
@@ -139,7 +164,7 @@ mod tests {
 
     #[test]
     fn over_budget_swaps_index_for_pointer() {
-        let big = "x".repeat(BUDGET - 300);
+        let big = "x".repeat(BUDGET - 400); // the Now section takes its share
         let d = ws(
             "t6",
             &[
@@ -164,5 +189,55 @@ mod tests {
         let d = ws("t8", &[("SOUL.md", &"s".repeat(BUDGET + 10))]);
         let out = render_standing(d.root());
         assert!(out.contains("over the 8000 budget"));
+    }
+
+    #[test]
+    fn capped_sections_carry_a_fill_header_and_now_comes_last() {
+        let d = ws(
+            "t9",
+            &[
+                ("memory/rules.md", &"é".repeat(1100)),
+                ("USER.md", "# Tinh\nUSR"),
+                ("SOUL.md", "SOUL"),
+                ("projects/INDEX.md", "IDX"),
+            ],
+        );
+        let out = render_standing_at(d.root(), 0);
+        assert!(
+            out.contains("## rules — memory/rules.md [50% · 1100/2200 chars]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("## owner — USER.md [0% · 10/1375 chars]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("## persona — SOUL.md\n"),
+            "uncapped: no header"
+        );
+        let now = out.find("## Now (computed)").unwrap();
+        assert!(now > out.find("IDX").unwrap(), "Now follows the INDEX");
+        assert!(!out[now + 1..].contains("\n## "));
+    }
+
+    #[test]
+    fn now_section_counts_toward_the_budget() {
+        // Rules alone fit; rules + a full Now section do not, so the INDEX yields.
+        let reports: Vec<(String, &str)> = (0..20)
+            .map(|i| (format!("reports/audit-{i:02}.md"), "x"))
+            .collect();
+        let mut files: Vec<(&str, &str)> = reports.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+        let big = "x".repeat(BUDGET - 1000);
+        files.push(("memory/rules.md", &big));
+        let idx = "i".repeat(300);
+        files.push(("projects/INDEX.md", &idx));
+        let d = ws("t10", &files);
+        let out = render_standing_at(d.root(), 0);
+        assert!(
+            out.contains("read projects/INDEX.md"),
+            "{}",
+            out.chars().count()
+        );
+        assert!(out.chars().count() <= BUDGET, "{}", out.chars().count());
     }
 }
