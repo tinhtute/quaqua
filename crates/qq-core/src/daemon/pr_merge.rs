@@ -35,10 +35,13 @@ const FENCE_PREFIXES: &[&str] = &[
     "crates/qq-core/src/daemon/",
     "crates/qq-core/templates/workspace/scripts/hooks/",
     "crates/qq-core/templates/workspace/.claude/",
+    ".github/",
+    "crates/qq-core/src/db/sql/",
 ];
 const FENCE_FILES: &[&str] = &[
     ".claude/settings.json",
     "crates/qq-core/templates/workspace/AGENTS.md",
+    "crates/qq-core/src/driver/claude.rs",
 ];
 
 /// True when `path` (repo-relative, as `gh pr diff --name-only` prints it)

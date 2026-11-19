@@ -31,10 +31,10 @@ fi
 # `check_sqlite` and `check_herdr` in src/authority/gate.rs, the one predicate;
 # change them together.
 guarded='(pane[[:space:]]+(split|move|close|send-keys|send-text|run)|tab[[:space:]]+(create|close)|workspace[[:space:]]+(create|close)|agent[[:space:]]+start)'
-outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[[:space:]]+pr[[:space:]]+merge|gh.*[[:space:]]api.*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*[aA][lL][iI][aA][sS]\.[^[:space:]]*[[:space:]].*push|git.*[[:space:]]-c[[:space:]]*[\\"'"'"']*[aA][lL][iI][aA][sS]\.[^[:space:]]*push)'
+outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[^"|;&]*[[:space:]]pr[[:space:]]+merge|gh.*[[:space:]]api.*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*[aA][lL][iI][aA][sS]\.[^[:space:]]*[[:space:]].*push|git.*[[:space:]]-c[[:space:]]*[\\"'"'"']*[aA][lL][iI][aA][sS]\.[^[:space:]]*push)'
 
 # T3 approval list: branch delete, trunk rename/force-move, tag, release, history rewrite.
-listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[[:space:]]+release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMf][a-zA-Z]*|--move|--force)[[:space:]].*(main|master))'
+listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[^"|;&]*[[:space:]]release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMf][a-zA-Z]*|--move|--force)[[:space:]].*(main|master))'
 mcp_outward=(
   '^mcp__plugin_tinyfish_tinyfish__(run_deep_research(_async)?|run_web_automation(_async)?|create_dataset|populate_dataset|top_up_wallet)$'
   '^mcp__claude_ai_Claude_Data__share_(connector|live_queries)$'
@@ -63,7 +63,7 @@ mcp__*)
 Write | Edit | MultiEdit | NotebookEdit)
   # Only the live instruction files; the content is never scanned. The binary
   # tells the live workspace copy from a template; the fallback cannot.
-  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"([^"]*/)?(AGENTS|SOUL|identity)\.md"' <<<"$stdin" &&
+  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"([^"]*/)?(AGENTS|SOUL|identity|USER)\.md"' <<<"$stdin" &&
     hit='write to an instruction file'
   ;;
 *)
@@ -78,6 +78,11 @@ Write | Edit | MultiEdit | NotebookEdit)
   # `.open` and `ATTACH` reopen a database read-write, past -readonly.
   if grep -Eq 'sqlite3.*qq\.db' <<<"$stdin" &&
     { ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin" || grep -Eiq '\.open|\battach\b' <<<"$stdin"; }; then
+    hit="${hit:+$hit and }qq.db write"
+  fi
+  # Any write to or naming of the daemon's qq.db: a removal/copy/edit tool or an
+  # interpreter that names it, or a redirect onto it.
+  if grep -Eq '(rm|mv|cp|tee|sed|truncate|dd|install|unlink|shred|python[0-9.]*|node|ruby|perl|php)[[:space:]][^"|;&]*qq\.db|>[[:space:]]*[^[:space:]";&|]*qq\.db' <<<"$stdin"; then
     hit="${hit:+$hit and }qq.db write"
   fi
   grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"
