@@ -50,6 +50,8 @@ const ASK_BYPASS: &str = "approval list: a push or merge door by another name";
 const ASK_INPUT: &str = "approval list: pane input or a grid_role token";
 const ASK_DB: &str = "approval list: runs/qq.db belongs to the daemon";
 const ASK_FILE: &str = "approval list: the CoS's live instruction files";
+const ASK_GRANT: &str = "approval list: a grant, tier or lane write needs anh iu's consent";
+const ASK_MEMORY: &str = "the CoS's memory files (USER.md, memory/rules.md)";
 const ASK_MCP: &str = "approval list: an MCP tool that sends, publishes or spends";
 
 /// MCP tool names that send, publish or spend (docs/research/hermes-cos-memory/
@@ -84,17 +86,47 @@ pub enum Verdict {
 
 /// An approval-list hit: a fixed action, or a branch delete whose class
 /// (merged or not) is read from git only once the caller is known to be the CoS.
+/// `BranchDelete` carries the remote of a push delete (None: a local branch).
 #[derive(Debug)]
 enum Pending {
     Act(Action),
-    BranchDelete(String),
+    BranchDelete(String, Option<String>),
 }
 
-/// What a scan found: the first hard block, and every approval-list hit.
+/// The repo a command acts on, as far as the scanner can tell: the hook's cwd,
+/// a literal `git -C <dir>` path, or unknown (`cd`, `--git-dir`, `GIT_DIR=`,
+/// `gh -R`, a path with a variable): unknown is judged at `Tier::High`.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum Target {
+    #[default]
+    Here,
+    Dir(String),
+    Unknown,
+}
+
+#[derive(Debug)]
+struct Hit {
+    p: Pending,
+    reason: &'static str,
+    target: Target,
+}
+
+/// A path a Bash command writes, resolved against the CoS workspace later.
+/// `loose`: a `cd` the scanner could not follow came first, so a protected
+/// basename counts wherever it sits.
+#[derive(Debug)]
+struct PathHit {
+    path: String,
+    loose: bool,
+}
+
+/// What a scan found: the first hard block, every approval-list hit and every
+/// path a Bash command writes.
 #[derive(Debug, Default)]
 struct Found {
     block: Option<&'static str>,
-    listed: Vec<(Pending, &'static str)>,
+    listed: Vec<Hit>,
+    paths: Vec<PathHit>,
 }
 
 impl Found {
@@ -105,24 +137,40 @@ impl Found {
     fn block(m: &'static str) -> Self {
         Found {
             block: Some(m),
-            listed: Vec::new(),
+            ..Self::default()
         }
     }
 
     fn act(a: Action, reason: &'static str) -> Self {
-        Found {
-            block: None,
-            listed: vec![(Pending::Act(a), reason)],
-        }
+        let mut f = Self::default();
+        f.listed.push(Hit {
+            p: Pending::Act(a),
+            reason,
+            target: Target::Here,
+        });
+        f
     }
 
     fn is_pass(&self) -> bool {
-        self.block.is_none() && self.listed.is_empty()
+        self.block.is_none() && self.listed.is_empty() && self.paths.is_empty()
     }
 
     fn absorb(&mut self, o: Found) {
         self.block = self.block.or(o.block);
         self.listed.extend(o.listed);
+        self.paths.extend(o.paths);
+    }
+
+    /// Point every hit that still acts on the cwd at `t`.
+    fn retarget(mut self, t: &Target) -> Self {
+        if *t != Target::Here {
+            for h in &mut self.listed {
+                if h.target == Target::Here {
+                    h.target = t.clone();
+                }
+            }
+        }
+        self
     }
 }
 
@@ -172,7 +220,7 @@ fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
                 .filter(|p| !p.is_empty());
             match (path, env) {
                 (None, _) => return Verdict::Block(PANE_MESSAGE),
-                (Some(p), Some(env)) => edit_found(env, p, cwd.as_deref()),
+                (Some(p), Some(env)) => edit_found(env, p, cwd.as_deref(), false),
                 // No workspace to resolve against: treat as a hit and deny.
                 (Some(_), None) => Found::act(Action::InstructionFile, ASK_FILE),
             }
@@ -180,6 +228,17 @@ fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
         (_, None | Some("Bash")) => return Verdict::Block(PANE_MESSAGE),
         _ => return Verdict::Allow,
     };
+    let mut found = found;
+    for h in std::mem::take(&mut found.paths) {
+        found.absorb(match env {
+            Some(env) => edit_found(env, &h.path, cwd.as_deref(), h.loose),
+            // No workspace to resolve against: a protected basename is a hit.
+            None => match protected_kind(&h.path) {
+                Some(_) => Found::act(Action::InstructionFile, ASK_FILE),
+                None => Found::pass(),
+            },
+        });
+    }
     judge(
         found,
         &|| env.map_or(Caller::Unknown, |e| caller::lookup(&e.runs_dir)),
@@ -207,32 +266,87 @@ fn judge(
         Caller::Other(_) => return Verdict::Block(NOT_COS_MESSAGE),
         Caller::Unknown => return Verdict::Block(NO_CALLER_MESSAGE),
     }
-    let dir = cwd.unwrap_or(Path::new("."));
-    let ctx = runs_dir.map_or(Tier::High, |r| tier::effective_context_tier(r, dir, true));
+    let here = cwd.unwrap_or(Path::new("."));
     let mut ask = None;
-    for (p, reason) in f.listed {
-        let action = match p {
+    for h in f.listed {
+        // The tier is the target repo's, not the hook cwd's; no target, no
+        // runs dir or an unreadable path is high.
+        let (dir, ctx) = match (&h.target, runs_dir) {
+            (Target::Here, Some(r)) => (
+                here.to_path_buf(),
+                tier::effective_context_tier(r, here, true),
+            ),
+            (Target::Dir(d), Some(r)) => match target_dir(d, here) {
+                Some(p) => {
+                    let c = tier::effective_context_tier(r, &p, true);
+                    (p, c)
+                }
+                None => (here.to_path_buf(), Tier::High),
+            },
+            _ => (here.to_path_buf(), Tier::High),
+        };
+        let action = match h.p {
             Pending::Act(a) => a,
-            Pending::BranchDelete(b) => tier::branch_delete_action(dir, &b),
+            Pending::BranchDelete(b, remote) => {
+                if h.target == Target::Unknown {
+                    Action::BranchDeleteUnmerged
+                } else {
+                    tier::branch_delete_class(&dir, &b, remote.as_deref())
+                }
+            }
         };
         match tier::decide(true, action, ctx, ctx) {
             Decision::Deny => return Verdict::Block(TIER_DENY_MESSAGE),
-            Decision::Ask => ask = Some(reason),
+            Decision::Ask => ask = Some(h.reason),
             Decision::Allow => {}
         }
     }
     ask.map_or(Verdict::Allow, Verdict::Ask)
 }
 
+/// `~` and `$HOME` at the start of a path.
+fn expand_home(p: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match p {
+        "~" | "$HOME" => home,
+        _ => match p.strip_prefix("~/").or_else(|| p.strip_prefix("$HOME/")) {
+            Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
+            _ => p.to_string(),
+        },
+    }
+}
+
+/// A literal `-C` directory as a path, or None when it holds a variable, a
+/// glob or a substitution.
+fn target_dir(d: &str, here: &Path) -> Option<PathBuf> {
+    let d = expand_home(d);
+    if d.is_empty() || d.contains(['$', '`', '*', '?', '~']) {
+        return None;
+    }
+    let p = PathBuf::from(d);
+    Some(if p.is_relative() { here.join(p) } else { p })
+}
+
+/// Which protected workspace file a basename names (the live instruction
+/// files, or the CoS's memory files).
+fn protected_kind(file: &str) -> Option<Action> {
+    match file.rsplit('/').next().unwrap_or(file) {
+        "AGENTS.md" | "SOUL.md" | "identity.md" => Some(Action::InstructionFile),
+        "USER.md" | "rules.md" => Some(Action::MemoryFile),
+        _ => None,
+    }
+}
+
 /// A Write/Edit to the live AGENTS.md, SOUL.md or identity.md: the path is
 /// resolved (cwd, `..`, symlinks) and compared under the CoS workspace root, so
 /// a template or a repo AGENTS.md with the same basename is not a hit.
-fn edit_found(env: &Env, file: &str, cwd: Option<&Path>) -> Found {
+fn edit_found(env: &Env, file: &str, cwd: Option<&Path>, loose: bool) -> Found {
     let Some(root) = env.runs_dir.parent() else {
         return Found::act(Action::InstructionFile, ASK_FILE);
     };
     let root = resolve(root);
-    let mut p = PathBuf::from(file);
+    let file = expand_home(file);
+    let mut p = PathBuf::from(&file);
     if p.is_relative() {
         p = cwd
             .map_or_else(
@@ -242,11 +356,19 @@ fn edit_found(env: &Env, file: &str, cwd: Option<&Path>) -> Found {
             .join(p);
     }
     let p = resolve(&p);
-    let live = ["AGENTS.md", "SOUL.md", "identity.md"]
+    if ["AGENTS.md", "SOUL.md", "identity.md"]
         .iter()
-        .any(|n| p == root.join(n));
-    if live {
+        .any(|n| p == root.join(n))
+    {
         Found::act(Action::InstructionFile, ASK_FILE)
+    } else if p == root.join("USER.md") || p == root.join("memory").join("rules.md") {
+        Found::act(Action::MemoryFile, ASK_MEMORY)
+    } else if loose {
+        match protected_kind(&file) {
+            Some(Action::MemoryFile) => Found::act(Action::MemoryFile, ASK_MEMORY),
+            Some(a) => Found::act(a, ASK_FILE),
+            None => Found::pass(),
+        }
     } else {
         Found::pass()
     }
@@ -301,6 +423,56 @@ fn scan(command: &str) -> Found {
     for seg in &segs {
         f.absorb(check_words(seg));
     }
+    // Redirect targets are dropped by the tokenizer: read them off the text.
+    for t in redirect_targets(command) {
+        if t.rsplit('/').next() == Some("qq.db") {
+            f.absorb(Found::act(Action::DbWrite, ASK_DB));
+        }
+        f.paths.push(PathHit {
+            path: t,
+            loose: false,
+        });
+    }
+    // A raw RPC door (socket client, interpreter) naming a grant verb.
+    let lower = command.to_ascii_lowercase();
+    if GRANT_VERBS.iter().any(|v| lower.contains(v))
+        && segs.iter().any(|s| {
+            s.iter()
+                .any(|w| rpc_tool(w.rsplit('/').next().unwrap_or(w)))
+        })
+    {
+        f.absorb(Found::act(Action::GrantWrite, ASK_GRANT));
+    }
+    // A `cd` moves what the command acts on: its hits are judged at high, and
+    // a relative write path is read against the last literal `cd` target.
+    let mut cd: Option<Option<String>> = None;
+    for seg in &segs {
+        let Some(i) = seg.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+            continue;
+        };
+        let base = seg[i].rsplit('/').next().unwrap_or(&seg[i]);
+        if matches!(base, "cd" | "pushd" | "popd" | "chdir") {
+            let arg = seg[i + 1..].iter().find(|x| !x.starts_with('-'));
+            cd = Some(match (base, arg) {
+                ("cd" | "pushd" | "chdir", Some(a)) if !a.contains(['$', '`', '*', '?']) => {
+                    Some(expand_home(a))
+                }
+                _ => None,
+            });
+        }
+    }
+    if let Some(dir) = cd {
+        f = f.retarget(&Target::Unknown);
+        for h in &mut f.paths {
+            match &dir {
+                Some(d) if !h.path.starts_with('/') && !h.path.starts_with('~') => {
+                    h.path = format!("{d}/{}", h.path);
+                }
+                None => h.loose = true,
+                _ => {}
+            }
+        }
+    }
     // A shell that reads its script from stdin (`| bash`, `bash -s`, a
     // here-string or heredoc) hides the script from the tokenizer: block when
     // the command text names a push.
@@ -308,6 +480,92 @@ fn scan(command: &str) -> Found {
         f.absorb(Found::block(PUSH_MESSAGE));
     }
     f
+}
+
+const GRANT_VERBS: [&str; 3] = ["grant.full", "grant.tier", "grant.lane"];
+
+/// Programs that can speak to the daemon's socket without `quaqua`.
+fn rpc_tool(base: &str) -> bool {
+    matches!(base, "socat" | "nc" | "ncat" | "netcat" | "curl" | "quaqua") || is_interp(base)
+}
+
+fn is_interp(base: &str) -> bool {
+    [
+        "python", "node", "ruby", "perl", "php", "deno", "bun", "lua",
+    ]
+    .iter()
+    .any(|p| base.starts_with(p))
+}
+
+/// The words after each unquoted `>` redirect (`>`, `>>`, `>|`, `&>`, `N>`),
+/// quotes stripped; fd duplications (`>&2`, `>&-`) and `>(…)` are not files.
+fn redirect_targets(cmd: &str) -> Vec<String> {
+    let c: Vec<char> = cmd.chars().collect();
+    let mut out = Vec::new();
+    let (mut i, mut q) = (0, '\0');
+    while i < c.len() {
+        let ch = c[i];
+        i += 1;
+        if q != '\0' {
+            if ch == q {
+                q = '\0';
+            } else if ch == '\\' && q == '"' {
+                i += 1;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => q = ch,
+            '\\' => i += 1,
+            '>' => {
+                while i < c.len() && matches!(c[i], '>' | '|') {
+                    i += 1;
+                }
+                if i < c.len() && c[i] == '&' {
+                    if c.get(i + 1)
+                        .is_some_and(|d| d.is_ascii_digit() || *d == '-')
+                    {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+                while i < c.len() && c[i].is_whitespace() {
+                    i += 1;
+                }
+                if c.get(i) == Some(&'(') {
+                    continue;
+                }
+                let mut w = String::new();
+                let mut wq = '\0';
+                while i < c.len() {
+                    let d = c[i];
+                    if wq != '\0' {
+                        if d == wq {
+                            wq = '\0';
+                        } else {
+                            w.push(d);
+                        }
+                    } else if d == '\'' || d == '"' {
+                        wq = d;
+                    } else if d == '\\' && i + 1 < c.len() {
+                        i += 1;
+                        w.push(c[i]);
+                    } else if d.is_whitespace() || ";|&<>()".contains(d) {
+                        break;
+                    } else {
+                        w.push(d);
+                    }
+                    i += 1;
+                }
+                if !w.is_empty() {
+                    out.push(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn mentions_push(text: &str) -> bool {
@@ -418,16 +676,37 @@ fn input_pair(a: &str, b: &str) -> bool {
     a == "pane" && matches!(b, "send-keys" | "send-text" | "run")
 }
 
+/// `GIT_DIR=…`, `GH_REPO=…` and friends retarget the command that follows.
+fn retargets(w: &str) -> bool {
+    ["GIT_DIR=", "GIT_WORK_TREE=", "GIT_COMMON_DIR=", "GH_REPO="]
+        .iter()
+        .any(|p| w.starts_with(p))
+}
+
 fn check_words(w: &[String]) -> Found {
     let Some(i) = w.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
         return Found::pass();
     };
+    let t = if w[..i].iter().any(|x| retargets(x)) {
+        Target::Unknown
+    } else {
+        Target::Here
+    };
+    check_cmd(w, i).retarget(&t)
+}
+
+fn check_cmd(w: &[String], i: usize) -> Found {
     let base = w[i].rsplit('/').next().unwrap_or(&w[i]);
     let a = &w[i + 1..];
     match base {
         "herdr" => check_herdr(a),
         "git" => check_git(a),
         "gh" => check_gh(a),
+        "quaqua" => {
+            let mut f = check_quaqua(a);
+            f.absorb(names_db(base, a));
+            f
+        }
         "sqlite3" => check_sqlite(a),
         b if is_shell(b) => check_shell(a),
         "busybox" if a.first().is_some_and(|x| is_shell(x)) => check_shell(&a[1..]),
@@ -435,7 +714,61 @@ fn check_words(w: &[String]) -> Found {
         "find" => check_find(a),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
         | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
-        b => names_db(b, a),
+        b => {
+            let mut f = names_db(b, a);
+            f.paths.extend(
+                write_targets(b, a)
+                    .into_iter()
+                    .map(|path| PathHit { path, loose: false }),
+            );
+            f
+        }
+    }
+}
+
+/// `quaqua … call grant.full|tier|lane`: anh iu's consent, never silent. A verb
+/// the scanner cannot read (`call "$V"`) counts too.
+fn check_quaqua(a: &[String]) -> Found {
+    let names_grant = a.iter().any(|x| {
+        let l = x.to_ascii_lowercase();
+        GRANT_VERBS.iter().any(|v| l.contains(v))
+    });
+    let opaque = a
+        .windows(2)
+        .any(|w| w[0] == "call" && w[1].contains(['$', '`']));
+    if names_grant || opaque {
+        Found::act(Action::GrantWrite, ASK_GRANT)
+    } else {
+        Found::pass()
+    }
+}
+
+/// The paths a file-writing tool changes, as far as its words say.
+fn write_targets(base: &str, a: &[String]) -> Vec<String> {
+    let plain = || a.iter().filter(|x| !x.starts_with('-')).cloned();
+    let in_place = |x: &String| {
+        x == "--in-place"
+            || x.starts_with("--in-place=")
+            || (x.starts_with('-') && !x.starts_with("--") && x.contains('i'))
+    };
+    match base {
+        "tee" | "mv" | "truncate" | "rm" | "unlink" | "shred" => plain().collect(),
+        "sed" if a.iter().any(in_place) => plain().collect(),
+        "cp" | "install" => {
+            let mut v: Vec<String> = plain().last().into_iter().collect();
+            v.extend(a.windows(2).filter(|w| w[0] == "-t").map(|w| w[1].clone()));
+            v.extend(
+                a.iter()
+                    .filter_map(|x| x.strip_prefix("--target-directory="))
+                    .map(String::from),
+            );
+            v
+        }
+        "dd" => a
+            .iter()
+            .filter_map(|x| x.strip_prefix("of=").map(String::from))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -473,7 +806,8 @@ fn names_db(base: &str, a: &[String]) -> Found {
         "hexdump",
         "od",
     ];
-    let names = a.iter().any(|x| x.rsplit('/').next() == Some("qq.db"));
+    let names = a.iter().any(|x| x.rsplit('/').next() == Some("qq.db"))
+        || (is_interp(base) && a.iter().any(|x| x.contains("qq.db")));
     if names && !READ_ONLY.contains(&base) {
         Found::act(Action::DbWrite, ASK_DB)
     } else {
@@ -645,6 +979,15 @@ fn targets_trunk(x: &str) -> bool {
 /// blocks); a ref/contents write or a hidden query is a push by another name:
 /// blocked when it lands on main/master, else on the approval list.
 fn check_gh(a: &[String]) -> Found {
+    // `-R/--repo` names another repo than the cwd's.
+    let other = a.iter().any(|x| {
+        x == "-R" || x.starts_with("--repo") || (x.starts_with("-R") && !x.starts_with("--"))
+    });
+    let t = if other { Target::Unknown } else { Target::Here };
+    check_gh_cmd(a).retarget(&t)
+}
+
+fn check_gh_cmd(a: &[String]) -> Found {
     let pr = a.iter().position(|x| x == "pr");
     if pr.is_some_and(|p| a[p + 1..].iter().any(|x| x == "merge")) {
         return Found::block(MERGE_MESSAGE);
@@ -720,6 +1063,26 @@ fn check_herdr(a: &[String]) -> Found {
 /// `git [global options] <verb> …`: a push is blocked (a pure branch delete is
 /// on the approval list), `--help` aside.
 fn check_git(a: &[String]) -> Found {
+    let mut target = Target::Here;
+    let f = check_git_at(a, &mut target);
+    f.retarget(&target)
+}
+
+/// `-C a -C b` chain; a path the scanner cannot read is unknown.
+fn chain_dir(prev: &Target, d: Option<&String>) -> Target {
+    let Some(d) = d.filter(|d| !d.is_empty() && !d.contains(['$', '`', '*', '?'])) else {
+        return Target::Unknown;
+    };
+    match prev {
+        Target::Unknown => Target::Unknown,
+        Target::Dir(p) if !d.starts_with('/') && !d.starts_with('~') => {
+            Target::Dir(format!("{p}/{d}"))
+        }
+        _ => Target::Dir(d.clone()),
+    }
+}
+
+fn check_git_at(a: &[String], target: &mut Target) -> Found {
     let mut i = 0;
     while i < a.len() {
         let w = a[i].as_str();
@@ -737,6 +1100,7 @@ fn check_git(a: &[String]) -> Found {
             }
             i += if w == "-c" { 2 } else { 1 };
         } else if w == "-C" {
+            *target = chain_dir(target, a.get(i + 1));
             i += 2;
         } else if w == "--help" || w == "-h" {
             return Found::pass();
@@ -744,7 +1108,13 @@ fn check_git(a: &[String]) -> Found {
             w,
             "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
         ) {
+            if w != "--namespace" && w != "--exec-path" {
+                *target = Target::Unknown;
+            }
             i += 2;
+        } else if w.starts_with("--git-dir=") || w.starts_with("--work-tree=") {
+            *target = Target::Unknown;
+            i += 1;
         } else if w.starts_with('-') {
             i += 1;
         } else {
@@ -775,7 +1145,10 @@ fn check_git(a: &[String]) -> Found {
             }
             match push_deletes(rest) {
                 Some(names) if names.iter().any(|n| is_trunk(n)) => Found::block(BRANCH_MESSAGE),
-                Some(names) if !names.is_empty() => delete_hits(names),
+                Some(names) if !names.is_empty() => {
+                    let remote = rest.iter().find(|x| !x.starts_with('-')).cloned();
+                    delete_hits(names, remote)
+                }
                 _ => Found::block(PUSH_MESSAGE),
             }
         }
@@ -783,10 +1156,14 @@ fn check_git(a: &[String]) -> Found {
     }
 }
 
-fn delete_hits(names: Vec<String>) -> Found {
+fn delete_hits(names: Vec<String>, remote: Option<String>) -> Found {
     let mut f = Found::pass();
     for n in names {
-        f.listed.push((Pending::BranchDelete(n), ASK_BRANCH_DELETE));
+        f.listed.push(Hit {
+            p: Pending::BranchDelete(n, remote.clone()),
+            reason: ASK_BRANCH_DELETE,
+            target: Target::Here,
+        });
     }
     f
 }
@@ -852,11 +1229,12 @@ fn check_git_branch(a: &[String]) -> Found {
         if names.iter().any(|n| is_trunk(n)) {
             return Found::block(BRANCH_MESSAGE);
         }
-        return delete_hits(names.iter().map(|n| n.to_string()).collect());
+        return delete_hits(names.iter().map(|n| n.to_string()).collect(), None);
     }
     let moves = long("--move") || short('m') || short('M');
+    let copies = long("--copy") || short('c') || short('C');
     let forces = long("--force") || short('f');
-    if (moves && names.iter().any(|n| is_trunk(n)))
+    if ((moves || copies) && names.iter().any(|n| is_trunk(n)))
         || (forces && names.first().is_some_and(|n| is_trunk(n)))
     {
         return Found::act(Action::TrunkMove, ASK_TRUNK_MOVE);
@@ -865,38 +1243,46 @@ fn check_git_branch(a: &[String]) -> Found {
 }
 
 /// `git tag` that creates, moves or deletes a tag; listing and reading are free.
+/// A list flag (`-l`, `-n`, `-v`, `--contains`, `--points-at`, `--merged`)
+/// makes a bare word a pattern; `--sort`, `--format` and friends do not, so
+/// `git tag --sort=refname v9` still creates `v9`.
 fn check_git_tag(a: &[String]) -> Found {
-    let reads = a.iter().any(|x| {
-        matches!(
-            x.as_str(),
-            "-l" | "--list"
-                | "-v"
-                | "--verify"
-                | "--contains"
-                | "--no-contains"
-                | "--points-at"
-                | "--merged"
-                | "--no-merged"
-        ) || x.starts_with("-n")
-            || x.starts_with("--sort")
-            || x.starts_with("--format")
-    });
-    let writes = a.iter().any(|x| {
-        !x.starts_with('-')
-            || matches!(
-                x.as_str(),
-                "-a" | "-s"
-                    | "-f"
-                    | "-d"
-                    | "-m"
-                    | "-u"
-                    | "--delete"
-                    | "--annotate"
-                    | "--sign"
-                    | "--force"
-            )
-    });
-    if writes && !reads {
+    let (mut list, mut write, mut positional) = (false, false, false);
+    let mut k = 0;
+    while k < a.len() {
+        let x = a[k].as_str();
+        k += 1;
+        if let Some(long) = x.strip_prefix("--") {
+            let (name, joined) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            match name {
+                "list" | "verify" | "contains" | "no-contains" | "points-at" | "merged"
+                | "no-merged" => list = true,
+                "delete" | "annotate" | "sign" | "force" | "message" | "file" | "local-user" => {
+                    write = true
+                }
+                "sort" | "format" if !joined => k += 1,
+                _ => {}
+            }
+        } else if x.len() > 1 && x.starts_with('-') {
+            for c in x[1..].chars() {
+                match c {
+                    'l' | 'v' => list = true,
+                    'n' => {
+                        list = true;
+                        break;
+                    }
+                    'a' | 's' | 'd' | 'f' | 'm' | 'u' | 'F' => write = true,
+                    _ => {}
+                }
+            }
+        } else {
+            positional = true;
+        }
+    }
+    if write || (positional && !list) {
         Found::act(Action::Tag, ASK_TAG)
     } else {
         Found::pass()
@@ -914,6 +1300,7 @@ fn wrapper(base: &str, a: &[String]) -> Found {
     };
     let mut k = 0;
     let mut duration_pending = base == "timeout";
+    let mut moved = false;
     while k < a.len() {
         if let Some(f) = single_letter_flag(&a[k]) {
             if value_flags.contains(&format!(" {f} ")) {
@@ -937,6 +1324,7 @@ fn wrapper(base: &str, a: &[String]) -> Found {
             }
         }
         if a[k].starts_with('-') || is_assignment(&a[k]) {
+            moved |= retargets(&a[k]);
             k += 1;
             continue;
         }
@@ -945,7 +1333,8 @@ fn wrapper(base: &str, a: &[String]) -> Found {
             k += 1;
             continue;
         }
-        return check_words(&a[k..]);
+        let t = if moved { Target::Unknown } else { Target::Here };
+        return check_words(&a[k..]).retarget(&t);
     }
     Found::pass()
 }

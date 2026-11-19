@@ -29,6 +29,10 @@ pub enum Action {
     DbWrite,
     PaneInput,
     InstructionFile,
+    /// `quaqua call grant.*`: anh iu's consent, asked at every tier (R14).
+    GrantWrite,
+    /// USER.md and memory/rules.md: the CoS's alone, no per-write ask (R4).
+    MemoryFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +51,7 @@ pub fn action_tier(a: Action) -> Option<Tier> {
         BranchDeleteUnmerged | MergeRequest | Tag | Release | DeleteData => Some(Tier::Medium),
         HistoryRewrite => Some(Tier::High),
         Floor | PushMain | ForcePush | TrunkMove | Bypass | DbWrite | PaneInput
-        | InstructionFile => None,
+        | InstructionFile | GrantWrite | MemoryFile => None,
     }
 }
 
@@ -64,8 +68,8 @@ pub fn decide(cos: bool, action: Action, repo: Tier, lane: Tier) -> Decision {
     }
     match action {
         PushMain | ForcePush => Decision::Deny,
-        Floor | TrunkMove | Bypass | DbWrite | InstructionFile => Decision::Ask,
-        PaneInput => Decision::Allow,
+        Floor | TrunkMove | Bypass | DbWrite | InstructionFile | GrantWrite => Decision::Ask,
+        PaneInput | MemoryFile => Decision::Allow,
         _ => {
             let tier = repo
                 .max(lane)
@@ -205,12 +209,6 @@ pub fn effective_context_tier(runs_dir: &Path, dir: &Path, caller_is_cos: bool) 
     apply_grant(runs_dir, dir, caller_is_cos, base)
 }
 
-/// Class of a delete of `branch`: `remote` names the remote when the delete is
-/// a push delete (judged on that remote-tracking ref), else the local branch.
-pub fn branch_delete_class(cwd: &Path, branch: &str, _remote: Option<&str>) -> Action {
-    branch_delete_action(cwd, branch)
-}
-
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     std::process::Command::new("git")
         .arg("-C")
@@ -223,12 +221,20 @@ fn git_ok(cwd: &Path, args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// A branch already merged into the remote default is a low-tier delete; any
-/// other (unmerged, unknown, git failing) is medium. `git merge-base
-/// --is-ancestor <branch> <remote default>`.
+/// A local branch already merged into the remote default is a low-tier delete;
+/// any other (unmerged, unknown, git failing) is medium.
 pub fn branch_delete_action(cwd: &Path, branch: &str) -> Action {
-    if branch.is_empty() || branch.starts_with('-') {
-        return Action::BranchDeleteUnmerged;
+    branch_delete_class(cwd, branch, None)
+}
+
+/// Class of a delete of `branch`, judged on the ref the delete removes: the
+/// remote-tracking ref `refs/remotes/<remote>/<branch>` for a push delete, else
+/// the local branch. Merged means `git merge-base --is-ancestor <tip> <remote
+/// default>`; a missing ref, a missing default or git failing is unmerged.
+pub fn branch_delete_class(cwd: &Path, branch: &str, remote: Option<&str>) -> Action {
+    let unmerged = Action::BranchDeleteUnmerged;
+    if branch.is_empty() || branch.starts_with('-') || remote.is_some_and(|r| r.starts_with('-')) {
+        return unmerged;
     }
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -246,18 +252,17 @@ pub fn branch_delete_action(cwd: &Path, branch: &str) -> Action {
             .to_string(),
     };
     if default.is_empty() {
-        return Action::BranchDeleteUnmerged;
+        return unmerged;
     }
-    let tip = [
-        format!("refs/heads/{branch}"),
-        format!("refs/remotes/origin/{branch}"),
-    ]
-    .into_iter()
-    .find(|r| git_ok(cwd, &["rev-parse", "--verify", "--quiet", r]));
-    match tip {
-        Some(t) if git_ok(cwd, &["merge-base", "--is-ancestor", &t, &default]) => {
-            Action::BranchDeleteMerged
-        }
-        _ => Action::BranchDeleteUnmerged,
+    let tip = match remote {
+        Some(r) => format!("refs/remotes/{r}/{branch}"),
+        None => format!("refs/heads/{branch}"),
+    };
+    if git_ok(cwd, &["rev-parse", "--verify", "--quiet", &tip])
+        && git_ok(cwd, &["merge-base", "--is-ancestor", &tip, &default])
+    {
+        Action::BranchDeleteMerged
+    } else {
+        unmerged
     }
 }

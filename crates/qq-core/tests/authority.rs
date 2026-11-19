@@ -1416,7 +1416,6 @@ mod caller_gate {
                 root.join("crates/qq-core/templates/workspace/AGENTS.md"),
                 root.join("projects/x/AGENTS.md"),
                 root.join("runs/AGENTS.md"),
-                root.join("USER.md"),
                 root.join("notes.md"),
                 std::path::PathBuf::from("/tmp/elsewhere/SOUL.md"),
             ] {

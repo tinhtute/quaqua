@@ -303,7 +303,7 @@ fn ask_tier_tag_create_spellings_with_options() {
     for cmd in [
         "git tag --sort=refname v9",
         "git tag --sort refname v9",
-        "git tag --format=%(refname) v9",
+        "git tag --format='%(refname)' v9",
         "git tag --no-sort v9",
         "git tag -i v9",
         "git tag --color=never v9",
@@ -330,17 +330,19 @@ fn ask_tier_tag_create_spellings_with_options() {
 
 #[test]
 fn ask_tier_branch_copy_onto_trunk() {
-    let r = rig("gf-copy", Who::Cos);
-    for cmd in [
-        "git branch -C feat main",
-        "git branch -c feat master",
-        "git branch --copy feat main",
-        "git branch -fc feat main",
-    ] {
-        assert!(ask(&r.bash(cmd)), "{cmd}");
-    }
-    for ok in ["git branch -C feat feat2", "git branch -c feat feat2"] {
-        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    {
+        let r = rig("gf-copy", Who::Cos);
+        for cmd in [
+            "git branch -C feat main",
+            "git branch -c feat master",
+            "git branch --copy feat main",
+            "git branch -fc feat main",
+        ] {
+            assert!(ask(&r.bash(cmd)), "{cmd}");
+        }
+        for ok in ["git branch -C feat feat2", "git branch -c feat feat2"] {
+            assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+        }
     }
     let w = rig("gf-copy-w", Who::Worker);
     assert!(block(&w.bash("git branch -C feat main")));
