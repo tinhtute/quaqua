@@ -144,22 +144,26 @@ pub fn pre_decision(input: &str) -> Option<Value> {
     let tool = doc.get("tool_name")?.as_str()?;
     let tool_input = doc.get("tool_input")?;
     let path = Path::new(tool_input.get("file_path")?.as_str()?);
-    let target = target_for(path)?;
+    let (rel, capped) = match target_for(path) {
+        Some(t) => (t.rel, true),
+        None => (standing_rel(path)?, false),
+    };
     let current = std::fs::read_to_string(path).unwrap_or_default();
     // An edit we cannot simulate (stale `old_string`) is one Claude Code
     // rejects on its own: nothing is written, so there is nothing to gate.
     let next = simulate(tool, tool_input, &current)?;
-    let mut violations = check_text(target.rel, &next);
-    // Strict scan, on what this edit adds: a line already in the file must not
-    // lock every later edit out of it.
-    let before = threat::scan(&current, Scope::Strict);
-    for id in threat::scan(&next, Scope::Strict) {
-        if !before.contains(&id) {
-            violations.push(Violation {
-                file: target.rel.to_string(),
-                problem: Problem::Threat(id),
-            });
-        }
+    let mut violations = if capped {
+        check_text(rel, &next)
+    } else {
+        Vec::new()
+    };
+    // Strict scan of the lines this edit adds: a line already in the file must
+    // not lock every later edit out of it, nor excuse a second payload.
+    for id in threat::scan(&threat::added_lines(&current, &next), Scope::Strict) {
+        violations.push(Violation {
+            file: rel.to_string(),
+            problem: Problem::Threat(id),
+        });
     }
     if violations.is_empty() {
         return None;
@@ -249,6 +253,17 @@ fn target_for(path: &Path) -> Option<&'static Target> {
         }
     }
     None
+}
+
+/// The standing files without a cap: threat-scanned on write, not capped.
+const UNCAPPED_STANDING: &[&str] = &["SOUL.md", "identity.md", "projects/INDEX.md"];
+
+/// The uncapped standing file `path` names, if it sits in a workspace.
+fn standing_rel(path: &Path) -> Option<&'static str> {
+    let rel = UNCAPPED_STANDING.iter().find(|r| path.ends_with(r))?;
+    let depth = Path::new(rel).components().count();
+    let ws = path.ancestors().nth(depth)?;
+    (ws.join("AGENTS.md").is_file() || ws.join(".quaqua").is_dir()).then_some(*rel)
 }
 
 /// The workspace `cwd` sits in: the nearest ancestor that carries `AGENTS.md`
