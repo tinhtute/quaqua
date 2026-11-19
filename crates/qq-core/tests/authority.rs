@@ -1408,7 +1408,8 @@ mod caller_gate {
     #[test]
     fn instruction_file_gate_only_the_live_paths() {
         // Same basename elsewhere (a template, a repo AGENTS.md, a worktree) is
-        // engine code workers edit under review; other live files are free.
+        // engine code workers edit under review; other live files are free (USER.md and
+        // memory/rules.md are the exception: see tests/memory_write.rs).
         for who in [Who::Worker, Who::Cos] {
             let r = rig("ifg-scope", who);
             let root = r.ws.root();

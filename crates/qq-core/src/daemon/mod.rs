@@ -8,6 +8,7 @@
 
 pub mod caller;
 pub mod grant;
+pub mod memory_write;
 pub mod pr_merge;
 pub mod store;
 pub mod supervisor;
@@ -300,6 +301,7 @@ impl Daemon {
         caller::register(self);
         pr_merge::register(self);
         grant::register(self);
+        memory_write::register(self);
         let add = |d: &mut Daemon, name: &str, h: Handler| {
             d.verbs.insert(name.to_string(), h);
         };

@@ -1,9 +1,26 @@
 // A stand-in for the engine, with only the surfaces the mod touches. Tests drive
 // the mod through these, never through its internals.
 
-export function fakeEngine({ root = '/ws', files = {}, stamps = {}, gate = null, scan = null, fork = null, failWrite = false } = {}) {
-  const calls = { process: [], writes: [], forks: [] }
+export function fakeEngine({ root = '/ws', files = {}, stamps = {}, verb = null, scan = null, fork = null, failWrite = false, caller = 'cos', cap = null } = {}) {
+  const calls = { process: [], writes: [], forks: [], verbWrites: [] }
   const store = {}
+
+  // A stand-in for the daemon's `memory.write` verb: cos only, drift guard,
+  // an optional cap on each final text, then the files land.
+  const daemonVerb = ({ files: asked }) => {
+    const refuse = why => ({ exitCode: 1, stdout: '', stderr: `quaqua: refused: ${why}\n` })
+    if (caller !== 'cos') return refuse(`${caller}: only cos writes memory`)
+    for (const [rel, { before, after }] of Object.entries(asked)) {
+      const path = `${root}/${rel}`
+      if ((files[path] ?? '') !== before) return refuse(`${rel}: changed outside since you loaded it`)
+      if (cap !== null && [...after].length > cap) return refuse(`${rel}: ${[...after].length} chars > ${cap} cap`)
+    }
+    for (const [rel, { after }] of Object.entries(asked)) {
+      files[`${root}/${rel}`] = after
+      calls.verbWrites.push(rel)
+    }
+    return { exitCode: 0, stdout: JSON.stringify({ caller, written: Object.keys(asked) }), stderr: '' }
+  }
 
   const engine = {
     plugin: { name: 'cos-memory', root: '/mod' },
@@ -45,8 +62,11 @@ export function fakeEngine({ root = '/ws', files = {}, stamps = {}, gate = null,
             }
           )
         }
-        if (gate instanceof Error) throw gate
-        return gate ?? { exitCode: 0, stdout: '', stderr: '' }
+        if (argv[1] === 'call' && argv[2] === 'memory.write') {
+          if (verb instanceof Error) throw verb
+          return verb ?? daemonVerb(JSON.parse(argv[3]))
+        }
+        return { exitCode: 127, stdout: '', stderr: `unexpected command ${argv.join(' ')}` }
       },
     },
     store: {
@@ -63,6 +83,7 @@ export function fakeEngine({ root = '/ws', files = {}, stamps = {}, gate = null,
       fork: async request => {
         calls.forks.push(request)
         if (fork instanceof Error) throw fork
+        if (typeof fork === 'function') return fork()
         return fork ?? { isAnswered: false, reason: 'nothing to fork' }
       },
     },
@@ -98,19 +119,10 @@ export async function settle(ms = 20) {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
 
-/** The JSON `quaqua memory hook pre` prints when it refuses a write. */
+/** What `quaqua call memory.write` prints on stderr when the daemon refuses. */
 export function denyVerdict(reason) {
-  return {
-    exitCode: 0,
-    stdout: JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: reason,
-      },
-    }),
-    stderr: '',
-  }
+  return { exitCode: 1, stdout: '', stderr: `quaqua: refused: ${reason}\n` }
 }
 
-export const allowVerdict = { exitCode: 0, stdout: '', stderr: '' }
+/** Leaves the fake daemon's own judgement in charge. */
+export const allowVerdict = null

@@ -31,8 +31,6 @@ pub enum Action {
     InstructionFile,
     /// `quaqua call grant.*`: anh iu's consent, asked at every tier (R14).
     GrantWrite,
-    /// USER.md and memory/rules.md: the CoS's alone, no per-write ask (R4).
-    MemoryFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +49,7 @@ pub fn action_tier(a: Action) -> Option<Tier> {
         BranchDeleteUnmerged | MergeRequest | Tag | Release | DeleteData => Some(Tier::Medium),
         HistoryRewrite => Some(Tier::High),
         Floor | PushMain | ForcePush | TrunkMove | Bypass | DbWrite | PaneInput
-        | InstructionFile | GrantWrite | MemoryFile => None,
+        | InstructionFile | GrantWrite => None,
     }
 }
 
@@ -69,7 +67,7 @@ pub fn decide(cos: bool, action: Action, repo: Tier, lane: Tier) -> Decision {
     match action {
         PushMain | ForcePush => Decision::Deny,
         Floor | TrunkMove | Bypass | DbWrite | InstructionFile | GrantWrite => Decision::Ask,
-        PaneInput | MemoryFile => Decision::Allow,
+        PaneInput => Decision::Allow,
         _ => {
             let tier = repo
                 .max(lane)

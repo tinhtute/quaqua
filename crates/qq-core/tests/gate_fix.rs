@@ -510,7 +510,6 @@ fn memory_path_gate_other_paths_and_reads_are_free() {
     );
     for ok in [
         format!("cat {root}/USER.md"),
-        format!("cp {root}/memory/rules.md /tmp/x"),
         format!("echo x > {root}/memory/notes.md"),
     ] {
         assert_eq!(r.bash(&ok), GateVerdict::Allow, "{ok}");
