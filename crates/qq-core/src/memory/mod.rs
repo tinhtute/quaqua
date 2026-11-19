@@ -5,6 +5,7 @@
 mod caps;
 mod drift;
 mod inbox;
+pub mod journal;
 mod situation;
 mod standing;
 pub mod threat;

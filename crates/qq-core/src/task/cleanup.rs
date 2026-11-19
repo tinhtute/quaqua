@@ -623,7 +623,16 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
                 now_ms(),
             )
             .map_err(rpc_err)?;
-            Ok(json!({ "cleaned": name }))
+            let sha = git(&repo, &["rev-parse", "--short", &format!("quaqua/{name}")])
+                .unwrap_or_else(|_| "-".into());
+            let today = crate::memory::journal::today();
+            let j = crate::memory::journal::cleanup(&rd, &repo, name, &sha, &today);
+            Ok(json!({
+                "cleaned": name,
+                "journal": j.line,
+                "raw": j.raw,
+                "journal_skipped": j.skipped,
+            }))
         }),
     )?;
 
