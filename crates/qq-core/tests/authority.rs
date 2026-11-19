@@ -633,6 +633,8 @@ const TRIPWIRES: &[Tripwire] = &[
         ],
         &[
             "herdr agent send-keys worker enter",
+            "herdr agent prompt worker hi",
+            "quaqua worker prompt --resume worker",
             "herdr pane read p",
             "herdr pane list",
         ],

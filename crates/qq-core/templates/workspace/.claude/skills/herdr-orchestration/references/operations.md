@@ -21,7 +21,7 @@ herdr agent list
 herdr pane close <pane_id>
 ```
 
-`prompt --wait` may return idle before the reply renders: wait/read again and verify the report, not merely the lifecycle state. Long output not visible → ask once for a file and its path. Read `recovery.md` before sending any input after a failure. A pending provider/stream error may require `pane send-text` followed by `pane send-keys ... Enter`; never treat this as permission to blindly repeat a task.
+`prompt --wait` may return idle before the reply renders: wait/read again and verify the report, not merely the lifecycle state. Long output not visible → ask once for a file and its path. Read `recovery.md` before sending any input after a failure. A pending provider/stream error may need a key-only `herdr agent send-keys <name> enter`; free text cannot reach a blocked agent (`pane send-*` is gated), so escalate per `recovery.md`. Never treat this as permission to blindly repeat a task.
 
 ## Panes, tabs, and layout
 

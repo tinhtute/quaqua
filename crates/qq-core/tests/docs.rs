@@ -395,3 +395,31 @@ fn workspace_docs_name_no_removed_features() {
         );
     }
 }
+
+/// The gate blocks `herdr pane send-keys|send-text|run` for every caller, so no
+/// shipped document may tell anyone to use them.
+#[test]
+fn workspace_docs_name_no_blocked_pane_input() {
+    let mut hits = Vec::new();
+    for p in all_files() {
+        let text = std::fs::read_to_string(&p).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let w: Vec<&str> = line
+                .split(|c: char| c.is_whitespace() || "`\"'()".contains(c))
+                .filter(|t| !t.is_empty())
+                .collect();
+            if w.windows(3).any(|t| {
+                t[0] == "herdr"
+                    && t[1] == "pane"
+                    && matches!(t[2], "send-keys" | "send-text" | "run")
+            }) {
+                hits.push(format!("{}:{}", rel(&p), n + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "blocked herdr pane input named:\n{}",
+        hits.join("\n")
+    );
+}

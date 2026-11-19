@@ -77,4 +77,4 @@ Routing and model settings live in `models.md`; configuration is authoritative i
 
 Use the `herdr-orchestration` skill for command syntax, routing, recovery, and cleanup. Never use native subagents; the Agent tool is denied (`.claude/settings.json:3`).
 
-- Raw `git push`, `gh` merges, and herdr pane spawn/move/close are blocked by the PreToolUse gate (`crates/qq-core/src/authority/gate.rs`: `check` :56, `guarded_pair` :161, `check_gh` :222); go through `quaqua`.
+- Raw `git push`, `gh` merges, and herdr pane spawn/move/close/input are blocked by the PreToolUse gate (`crates/qq-core/src/authority/gate.rs`: `check` :65, `guarded_pair` :170, `check_gh` :352); go through `quaqua`.
