@@ -12,7 +12,7 @@ Always look first: `herdr agent get <name>` then `herdr agent read <name> --sour
 
 Watchdog exits 2–5: read the pane, act only within the brief's authority, then `quaqua worker prompt --resume <name>` keeps waiting without a fresh task prompt or clock. Text still sitting unsubmitted → `herdr agent send-keys <name> enter`, then resume. A still-working worker needs another wait, not another task.
 
-For a provider/stream error (`agent_blocked`), inspect the UI first. If the one safe recovery input cannot use `agent prompt`, use `herdr pane send-text <pane_id> "<message>"` followed by `herdr pane send-keys <pane_id> Enter`, then wait. Still stuck → escalate, never loop retries.
+For a provider/stream error (`agent_blocked`), inspect the UI first. Raw `herdr pane` input verbs are blocked by the gate for every caller, CoS included. `agent prompt` is rejected while the agent is `blocked`, and `herdr agent` has no `send-text`, so free text cannot reach a blocked agent: use `herdr agent send-keys <name> <key>` for a key-only fix (e.g. `enter`), otherwise escalate to anh iu with the pane read. Still stuck → escalate, never loop retries.
 
 Long answer not visible in read → ask the worker to publish a file atomically and reply with the path.
 

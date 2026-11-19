@@ -16,10 +16,8 @@ use qq_core::testkit::TestWorkspace;
 use rusqlite::{params, Connection};
 
 fn template() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/team.toml");
-    std::fs::read_to_string(p)
-        .expect("read template team.toml")
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
+    std::fs::read_to_string(p).expect("read template team.toml")
 }
 
 /// A database seeded from the shipped team.toml, with projects 1 and 2.
@@ -528,4 +526,267 @@ fn unknown_caller_refusal_records_attempted_target() {
             ("ghost", "orchestration", "merge"),
         ]
     );
+}
+
+// U3 gate tripwires: (name, must block, must allow). The same table drives the
+// binary verdict and the shell fallback, so the two stay in step.
+type Tripwire = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+const TRIPWIRES: &[Tripwire] = &[
+    (
+        "alias push",
+        &[
+            "git config alias.p push",
+            "git config --global alias.p push",
+            "git config --local alias.ship 'push origin main'",
+            "git config alias.p '!git push'",
+            "git -C repo config --add alias.p push",
+            "git config alias.p \"!f() { git push origin main; }; f\"",
+            "git config ALIAS.p push",
+            "git -c ALIAS.p=push status",
+        ],
+        &[
+            "git config alias.st status",
+            "git config user.name x",
+            "git config --get alias.p",
+            "git config ALIAS.st status",
+        ],
+    ),
+    (
+        "gh api ref and contents writes",
+        &[
+            "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api --method PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api --method=PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api -XPATCH repos/o/r/git/refs/heads/main",
+            "gh api repos/o/r/git/refs/heads/main -X PATCH -f sha=abc",
+            "gh api -X patch repos/o/r/git/refs/heads/main",
+            "gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA==",
+            "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/main -f sha=abc",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main",
+            "gh api -X 'DELETE' repos/o/r/git/refs/heads/main",
+            "gh api -X \"PATCH\" repos/o/r/git/refs/heads/main",
+            "gh api -X=DELETE repos/o/r/git/refs/heads/main",
+            "gh api --method='DELETE' repos/o/r/git/refs/heads/main",
+            "gh api --method \"PUT\" repos/o/r/contents/README.md",
+            "gh api -X GET -X DELETE repos/o/r/git/refs/heads/main",
+            "gh api --method GET --method PUT repos/o/r/contents/a.txt -f message=m",
+            "gh api --method=GET --method=PATCH repos/o/r/git/refs/heads/main",
+            "gh api -X GET -XPATCH repos/o/r/git/refs/heads/main",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main -p -XGET",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main --jq -XGET",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main -H -XGET",
+            "gh api -X DELETE -X GET repos/o/r/git/refs/heads/main",
+            "gh api repos/o/r/git/refs -p -XGET -f sha=x",
+            "gh api -p -XGET -f sha=x repos/o/r/git/refs",
+            "gh api --jq -XGET -F ref=x repos/o/r/git/refs",
+            "gh api -H -XGET repos/o/r/merges -f base=main -f head=x",
+            "gh api -H -XGET repos/o/r/git/refs/heads/main --input body.json",
+            "gh api repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
+        ],
+        &[
+            "gh api repos/o/r/git/refs/heads/main",
+            "gh api -X GET repos/o/r/git/refs/heads/main",
+            "gh api --method GET repos/o/r/contents/README.md",
+            "gh api -X GET repos/o/r/git/refs/heads/main -p foo",
+            "gh api repos/o/r/contents/README.md --jq .content",
+            "gh api repos/o/r/contents/README.md -q .content -H 'Accept: x'",
+            "gh api repos/o/r/contents/README.md",
+            "gh api -X POST repos/o/r/issues/1/comments -f body=x",
+        ],
+    ),
+    (
+        "graphql enablePullRequestAutoMerge",
+        &[
+            "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+            "gh api graphql -f query=\"mutation { enablePullRequestAutoMerge(input:{pullRequestId:\\\"x\\\"}) { clientMutationId } }\"",
+            "gh api graphql -f query=\"mutation { mergePullRequest(input:{pullRequestId:\\\"x\\\"}) { clientMutationId } }\"",
+            "gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+        ],
+        &[
+            "gh api graphql -f query='{ viewer { login } }'",
+            "gh api graphql -f query=\"{ viewer { login } }\"",
+        ],
+    ),
+    (
+        "graphql query from a file",
+        &[
+            "gh api graphql -F query=@auto.graphql",
+            "gh api graphql -Fquery=@auto.graphql",
+            "gh api graphql --field query=@auto.graphql",
+            "gh api graphql --field=query=@auto.graphql",
+        ],
+        &[],
+    ),
+    (
+        "herdr pane input",
+        &[
+            "herdr pane send-keys w1:p1 enter",
+            "herdr pane send-text w1:p1 'hello'",
+            "herdr pane run w1:p1 'rm -rf x'",
+            "herdr --session x pane send-keys p enter",
+            "echo hi && herdr pane run p ls",
+        ],
+        &[
+            "herdr agent send-keys worker enter",
+            "herdr agent prompt worker hi",
+            "quaqua worker prompt --resume worker",
+            "herdr pane read p",
+            "herdr pane list",
+        ],
+    ),
+    (
+        "grid_role metadata",
+        &[
+            "herdr pane report-metadata p --source s --token grid_role=cos",
+            "herdr pane report-metadata p --source s --token=grid_role=cos",
+            "herdr pane report-metadata p --token grid_role=worker --source s",
+        ],
+        &["herdr pane report-metadata p --source s --token role=x --display-agent Foo"],
+    ),
+    (
+        "sqlite3 on qq.db",
+        &[
+            "sqlite3 runs/qq.db 'delete from tasks'",
+            "sqlite3 ~/quaqua/runs/qq.db \"update agents set kind='cos'\"",
+            "sqlite3 runs/qq.db < fix.sql",
+            "cat fix.sql | sqlite3 runs/qq.db",
+            "sqlite3 -cmd '.timeout 5' runs/qq.db 'insert into t values (1)'",
+            "sqlite3 -readonly :memory: \".open runs/qq.db\" \"delete from tasks\"",
+            "sqlite3 -readonly :memory: \"ATTACH 'runs/qq.db' AS q\" \"delete from q.tasks\"",
+            "sqlite3 --readonly :memory: \"attach 'runs/qq.db' as q\" \"delete from q.tasks\"",
+        ],
+        &[
+            "sqlite3 -readonly runs/qq.db 'select 1'",
+            "sqlite3 --readonly runs/qq.db 'select 1'",
+            "sqlite3 -readonly ~/quaqua/runs/qq.db < q.sql",
+            "sqlite3 other.db 'select 1'",
+            "sqlite3 -readonly runs/qq.db 'select attached_at from t'",
+        ],
+    ),
+    (
+        "delete main or master",
+        &[
+            "git branch -D main",
+            "git branch -D master",
+            "git branch -d main",
+            "git branch --delete --force main",
+            "git branch -d -f master",
+            "git branch -df main",
+            "git -C repo branch -D main",
+            "git branch -D feat main",
+            "git branch -D refs/heads/main",
+            "git branch main -D",
+            "git branch master -d",
+            "git branch main --delete",
+            "git branch refs/heads/main -D",
+        ],
+        &[
+            "git branch -D feat",
+            "git branch --list main",
+            "git branch main",
+            "git branch -a",
+            "git branch -D feat/main-x",
+            "git branch main && ls -d x",
+        ],
+    ),
+];
+
+fn tripwire(name: &str) -> &'static Tripwire {
+    TRIPWIRES.iter().find(|t| t.0 == name).unwrap()
+}
+
+/// One test per behaviour: the binary verdict, then the shell fallback.
+fn assert_tripwire(name: &str) {
+    let (_, blocked, allowed) = tripwire(name);
+    for cmd in *blocked {
+        assert_eq!(gate_exit(cmd), 2, "{name}: must block: {cmd}");
+        assert_eq!(fallback_exit(cmd), 2, "{name}: fallback must block: {cmd}");
+    }
+    for cmd in *allowed {
+        assert_eq!(gate_exit(cmd), 0, "{name}: must allow: {cmd}");
+        assert_eq!(fallback_exit(cmd), 0, "{name}: fallback must allow: {cmd}");
+    }
+}
+
+#[test]
+fn gate_blocks_alias_push() {
+    assert_tripwire("alias push");
+}
+
+#[test]
+fn gate_blocks_gh_api_ref_and_contents_writes() {
+    assert_tripwire("gh api ref and contents writes");
+}
+
+#[test]
+fn gate_blocks_graphql_auto_merge() {
+    assert_tripwire("graphql enablePullRequestAutoMerge");
+}
+
+#[test]
+fn gate_blocks_graphql_query_from_file() {
+    assert_tripwire("graphql query from a file");
+}
+
+#[test]
+fn gate_blocks_herdr_pane_input() {
+    assert_tripwire("herdr pane input");
+    // The fallback is a superset and cannot tell `--help`; the binary can.
+    assert_eq!(gate_exit("herdr pane send-keys --help"), 0);
+}
+
+#[test]
+fn gate_any_non_get_method_blocks() {
+    // gh keeps the last -X/--method, but `-p -XGET` smuggles a GET token after a
+    // DELETE: any explicit non-GET method blocks, whatever the order.
+    assert_eq!(
+        gate_exit("gh api -X DELETE -X GET repos/o/r/git/refs/heads/main"),
+        2
+    );
+    assert_eq!(gate_exit("gh api -X GET -X PUT repos/o/r/pulls/1/merge"), 2);
+    assert_eq!(gate_exit("gh api -X PUT -X GET repos/o/r/pulls/1/merge"), 2);
+    // Every explicit method GET stays a read.
+    assert_eq!(gate_exit("gh api -X GET -XGET repos/o/r/pulls/1/merge"), 0);
+}
+
+#[test]
+fn gate_blocks_grid_role_metadata() {
+    assert_tripwire("grid_role metadata");
+}
+
+#[test]
+fn gate_blocks_qq_db_writes() {
+    assert_tripwire("sqlite3 on qq.db");
+}
+
+#[test]
+fn gate_blocks_main_or_master_delete() {
+    assert_tripwire("delete main or master");
+}
+
+fn fallback_exit(cmd: &str) -> i32 {
+    use std::io::Write;
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/workspace/scripts/hooks/herdr-gate.sh");
+    let json = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .env("QUAQUA_BIN", "qq-binary-that-does-not-exist")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.to_string().as_bytes())
+        .unwrap();
+    child.wait().unwrap().code().unwrap()
 }
