@@ -1,11 +1,11 @@
 // The periodic review fork (R12). `$.model.fork` cannot restrict its toolset
 // (ModelForkRequest is `{ prompt, effort? }`), so the restriction is enforced
 // here: the fork is asked for a JSON array of memory operations and told to
-// call no tools, and only operations matching that schema are applied. Every
-// applied operation goes through the same engine gate as the tools.
+// call no tools, and only operations matching that schema are applied. One reply
+// is one all-or-nothing batch checked on the final state, like `memory_batch`.
 
 import { FILES } from './memory-gate.js'
-import { apply } from './tools.js'
+import { applyBatch } from './tools.js'
 
 export const REVIEW_PROMPT = `Review this session for memory worth keeping.
 
@@ -51,7 +51,8 @@ export function accepted(ops) {
 }
 
 /**
- * Run one review and apply what it asks for.
+ * Run one review and apply what it asks for as one batch: a refusal writes
+ * nothing.
  *
  * @returns `{ reviewed, applied, reason? }` — `reviewed: false` means the fork
  *   did not answer or its reply held no array, and the caller must not reset
@@ -72,13 +73,11 @@ export async function runReview($, { root }) {
   const ops = parseOps(result.text)
   if (ops === null) return { reviewed: false, applied: 0, reason: 'reply held no array' }
 
-  let applied = 0
-  const refused = []
-  for (const op of accepted(ops)) {
-    const out = await apply($, { root, op: op.op, file: op.file, input: op })
-    if ('result' in out) applied += 1
-    else refused.push(out.deny)
-  }
+  const batch = accepted(ops)
+  if (batch.length === 0) return { reviewed: true, applied: 0, refused: [] }
+  const out = await applyBatch($, { root, ops: batch })
+  const applied = 'result' in out ? batch.length : 0
+  const refused = 'result' in out ? [] : [out.deny]
 
   return { reviewed: true, applied, refused }
 }

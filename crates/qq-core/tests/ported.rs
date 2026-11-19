@@ -451,6 +451,11 @@ fn standing_block_of_the_shipped_template() {
         start.contains("## persona — SOUL.md") && start.contains("## projects — projects/INDEX.md")
     );
     assert!(!start.contains("USER.md"), "the seed USER.md is skipped");
+    let now_at = start.find("## Now (computed)").expect("Now section");
+    assert!(
+        !start[now_at + 1..].contains("\n## ") && start[now_at..].chars().count() <= 600,
+        "Now is the last section and within its cap: {start}"
+    );
     let clear = hook_context(memory::session_start(
         root,
         &input("clear", json!({})),
@@ -490,7 +495,10 @@ fn standing_block_of_the_shipped_template() {
         &format!("{{\"text\": \"{}\"}}\n", memory::STANDING_HEADER),
     );
     let with = input("resume", json!({"transcript_path": t}));
-    assert!(memory::session_start(root, &with, &pane, None).is_none());
+    assert!(
+        memory::session_start(root, &with, &pane, None).is_none(),
+        "a resume keeps the frozen block: no second copy, edited or not"
+    );
     write(&t, "{\"text\": \"old engine session\"}\n");
     let got = hook_context(memory::session_start(root, &with, &pane, None));
     assert!(got.contains("prefix 🍑"));

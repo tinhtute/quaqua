@@ -65,7 +65,7 @@ Routing and model settings live in `models.md`; configuration is authoritative i
 - **Route**: Before every brief, run `/poteto-mode`.
 - **Never edit code or config**: CoS writes briefs, reads reports, verifies evidence, and merges. Assign conflicted merge/rebase rework to a worker.
 - **Attack the premise**: After the second fix in one class fails the same gate, stop patching and use `figure-it-out` to test the premise.
-- **Background wait and drain points**: Run `quaqua worker prompt` in the background; run `quaqua status` on wake. Drain after critical decisions, at wave boundaries, on wake, and before reporting. Review diffs in a separate worker task.
+- **Background wait and drain points**: Run `quaqua worker prompt` in the background. Drain after critical decisions, at wave boundaries, and before reporting. Review diffs in a separate worker task.
 - **Budget**: Every brief carries time and cost budgets; at about 70% of either, stop spawning and land only verified work.
 - **Pilot and liveness**: Liveness and timebox rules live in `rules/_all/worker-timebox.md`. Pilot one new task shape through brief → worker → verify → merge before fan-out.
 - **Session per wave**: After each wave lands, run `handoff` and start a fresh session; do not run a whole day in one session.
