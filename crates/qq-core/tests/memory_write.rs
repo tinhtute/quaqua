@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use qq_core::authority::{gate_evaluate_in, GateVerdict};
+use qq_core::cli::Env;
 use qq_core::daemon::{Config, Daemon, DaemonHandle};
 use qq_core::herdr::{FakeHerdr, HerdrClient, Verb};
 use qq_core::identity::peer::HerdrPeers;
@@ -112,6 +114,23 @@ impl Rig {
 
     fn read(&self, rel: &str) -> Option<String> {
         std::fs::read_to_string(self.root().join(rel)).ok()
+    }
+
+    fn gate(&self, tool: &str, input: Value) -> GateVerdict {
+        let hook = json!({"tool_name": tool, "tool_input": input, "cwd": self.root()});
+        let env = Env {
+            runs_dir: self.ws.runs_dir(),
+        };
+        gate_evaluate_in(&env, &hook.to_string())
+    }
+
+    fn gate_bash(&self, cmd: &str) -> GateVerdict {
+        self.gate("Bash", json!({ "command": cmd }))
+    }
+
+    fn gate_file(&self, tool: &str, rel: &str) -> GateVerdict {
+        let p = self.root().join(rel);
+        self.gate(tool, json!({ "file_path": p }))
     }
 
     fn journal(&self) -> i64 {
@@ -313,4 +332,67 @@ fn memory_journal_is_append_only() {
         .is_err());
     assert!(conn.execute("DELETE FROM memory_journal", []).is_err());
     assert_eq!(r.journal(), 1);
+}
+
+// ---- the PreToolUse path deny (last commit) ----
+
+fn blocked(v: &GateVerdict) -> bool {
+    matches!(v, GateVerdict::Block(_))
+}
+
+#[test]
+fn memory_write_owner_worker_direct_write_denied() {
+    let r = rig("mw-gate-lead", Who::Lead);
+    for rel in ["USER.md", "memory/rules.md"] {
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let v = r.gate_file(tool, rel);
+            assert!(blocked(&v), "{tool} {rel}: {v:?}");
+        }
+    }
+    let abs = r.root().join("USER.md");
+    let bad = [
+        "echo x >> USER.md".to_string(),
+        "echo x > memory/rules.md".to_string(),
+        format!("echo x >{}", abs.display()),
+        "sed -i s/a/b/ memory/rules.md".to_string(),
+        "printf x | tee USER.md".to_string(),
+        "cp /tmp/x USER.md".to_string(),
+        "bash -c 'echo x >> USER.md'".to_string(),
+        "cd memory && echo x > ../USER.md".to_string(),
+    ];
+    for cmd in &bad {
+        let v = r.gate_bash(cmd);
+        assert!(blocked(&v), "{cmd}: {v:?}");
+    }
+}
+
+#[test]
+fn memory_write_owner_worker_reads_and_other_files_pass() {
+    let r = rig("mw-gate-reads", Who::Lead);
+    for cmd in [
+        "cat USER.md",
+        "grep rule memory/rules.md",
+        "wc -c memory/rules.md",
+        "echo x >> notes.md",
+    ] {
+        assert_eq!(r.gate_bash(cmd), GateVerdict::Allow, "{cmd}");
+    }
+    // Engine copies under the repo are code workers edit under review.
+    for rel in ["notes.md", "templates/seed/USER.md", "docs/memory/rules.md"] {
+        assert_eq!(r.gate_file("Write", rel), GateVerdict::Allow, "{rel}");
+    }
+}
+
+#[test]
+fn memory_write_owner_cos_direct_write_is_not_denied() {
+    let r = rig("mw-gate-cos", Who::Cos);
+    assert_eq!(r.gate_file("Write", "USER.md"), GateVerdict::Allow);
+    assert_eq!(r.gate_bash("echo x >> memory/rules.md"), GateVerdict::Allow);
+}
+
+#[test]
+fn memory_write_owner_unidentified_direct_write_denied() {
+    let r = rig("mw-gate-anon", Who::Nobody);
+    assert!(blocked(&r.gate_file("Write", "USER.md")));
+    assert!(blocked(&r.gate_bash("echo x >> USER.md")));
 }
