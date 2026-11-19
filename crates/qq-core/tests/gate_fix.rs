@@ -985,6 +985,8 @@ fn gate_fix2_m3_call_through_command_substitution() {
     ] {
         assert!(ask(&r.bash_in(&r.a, cmd)), "{cmd}");
     }
+    // One rig at a time: TestWorkspace holds a global lock for its lifetime.
+    drop(r);
     let w = rig("gf2-m3-sub-w", Who::Worker);
     assert!(block(&w.bash("quaqua call \"$(cat /tmp/v)\" '{}'")));
 }
@@ -1022,6 +1024,7 @@ fn gate_fix2_m3_mail_body_naming_a_grant_is_free() {
         assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
     }
     // The real verb, and the xargs placeholder, still ask.
+    drop(r);
     let c = rig("gf2-m3-mail-cos", Who::Cos);
     assert!(ask(&c.bash("printf grant.full | xargs -I{} quaqua call {}")));
     assert!(ask(&c.bash("quaqua call grant.full '{}' --note 'x'")));

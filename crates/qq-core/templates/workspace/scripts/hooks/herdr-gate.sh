@@ -34,7 +34,7 @@ guarded='(pane[[:space:]]+(split|move|close|send-keys|send-text|run)|tab[[:space
 outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[^"|;&]*[[:space:]]pr[[:space:]]+merge|gh.*[[:space:]]api.*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*[aA][lL][iI][aA][sS]\.[^[:space:]]*[[:space:]].*push|git.*[[:space:]]-c[[:space:]]*[\\"'"'"']*[aA][lL][iI][aA][sS]\.[^[:space:]]*push)'
 
 # T3 approval list: branch delete, trunk rename/force-move, tag, release, history rewrite.
-listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[^"|;&]*[[:space:]]release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMf][a-zA-Z]*|--move|--force)[[:space:]].*(main|master))'
+listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|--(sort|format)(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)[[:space:]]+[^-[:space:]"\\]|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[^"|;&]*[[:space:]]release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMfcC][a-zA-Z]*|--move|--copy|--force)[[:space:]].*(main|master))'
 mcp_outward=(
   '^mcp__plugin_tinyfish_tinyfish__(run_deep_research(_async)?|run_web_automation(_async)?|create_dataset|populate_dataset|top_up_wallet)$'
   '^mcp__claude_ai_Claude_Data__share_(connector|live_queries)$'
@@ -49,6 +49,15 @@ trunk_pre='[[:space:]"'"'"'/]'
 trunk_name="$trunk_pre(main|master)([^a-zA-Z0-9_-]|\$)"
 # the delete flag may follow the name (`git branch main -D`)
 trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|master)([^a-zA-Z0-9_;|&-][^;|&]*)?$trunk_flag)"
+
+# Bash writes to the live instruction and memory files (the binary resolves the
+# workspace root; the fallback matches the basename, a superset), and a grant
+# verb sent through a raw socket client or inline interpreter code.
+live_names='((AGENTS|SOUL|identity|USER)\.md|memory/rules\.md)([^a-zA-Z0-9_.-]|$)'
+live_redirect=">[[:space:]]*[^[:space:]\";&|]*$live_names"
+live_tools="(tee|mv|cp|dd|install|truncate|rm|unlink|shred|ln|rsync|python[0-9.]*|node|ruby|perl|php)[[:space:]][^\"|;&]*$live_names"
+live_sed="sed[[:space:]][^\"|;&]*(-[a-zA-Z]*i|--in-place)[^\"|;&]*$live_names"
+grant_door='(^|[^a-zA-Z0-9_.-])(socat|nc|ncat|netcat|curl|quaqua|python[0-9.]*|node|ruby|perl|php|deno|bun|lua)([^a-zA-Z0-9_-]|$)'
 
 stdin=$(cat)
 hit=''
@@ -84,6 +93,12 @@ Write | Edit | MultiEdit | NotebookEdit)
   # interpreter that names it, or a redirect onto it.
   if grep -Eq '(rm|mv|cp|tee|sed|truncate|dd|install|unlink|shred|python[0-9.]*|node|ruby|perl|php)[[:space:]][^"|;&]*qq\.db|>[[:space:]]*[^[:space:]";&|]*qq\.db' <<<"$stdin"; then
     hit="${hit:+$hit and }qq.db write"
+  fi
+  if grep -Eq "$live_redirect|$live_tools|$live_sed" <<<"$stdin"; then
+    hit="${hit:+$hit and }instruction or memory file write"
+  fi
+  if grep -Eq 'grant\.(full|tier|lane)' <<<"$stdin" && grep -Eq "$grant_door" <<<"$stdin"; then
+    hit="${hit:+$hit and }grant verb"
   fi
   grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"
   ;;

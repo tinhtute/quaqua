@@ -139,6 +139,9 @@ struct Found {
     block: Option<&'static str>,
     listed: Vec<Hit>,
     paths: Vec<PathHit>,
+    /// A `cd`-like word, a `GIT_DIR=`-style assignment or a chdir flag was seen
+    /// (in a nested script too): the command may act on another directory.
+    moved: bool,
 }
 
 impl Found {
@@ -181,6 +184,15 @@ impl Found {
         self.block = self.block.or(o.block);
         self.listed.extend(o.listed);
         self.paths.extend(o.paths);
+        self.moved |= o.moved;
+    }
+
+    /// Point every hit at `t`, a `Dir` one included.
+    fn force_target(mut self, t: &Target) -> Self {
+        for h in &mut self.listed {
+            h.target = t.clone();
+        }
+        self
     }
 
     /// Point every hit that still acts on the cwd at `t`.
@@ -422,14 +434,36 @@ fn is_memory_file(root: &Path, resolved: &Path) -> bool {
         .any(|t| resolved == root.join(t.rel))
 }
 
-/// True when the word `w` (a path as the shell sees it, relative to `cwd`)
-/// names one of the memory files, or is `key=<path>` (`dd of=`, `--output=`).
-/// A leading `~`, `$HOME`, `${HOME}` is expanded; `$PWD` is each `dirs` entry.
-/// Cheap name test first: only a word ending in one of the two file names is
-/// resolved.
-fn names_memory_file(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
-    if !(w.ends_with("USER.md") || w.ends_with("rules.md")) {
-        return false;
+/// Which live file a Bash word names: a memory file (denied to everyone) or an
+/// instruction file (the CoS asks, the rest are denied).
+#[derive(Clone, Copy, PartialEq)]
+enum Live {
+    Memory,
+    Instruction,
+}
+
+fn live_kind(root: &Path, resolved: &Path) -> Option<Live> {
+    if ["AGENTS.md", "SOUL.md", "identity.md"]
+        .iter()
+        .any(|n| resolved == root.join(n))
+    {
+        Some(Live::Instruction)
+    } else if is_memory_file(root, resolved) {
+        Some(Live::Memory)
+    } else {
+        None
+    }
+}
+
+/// What the word `w` (a path as the shell sees it, relative to `cwd`) names
+/// among the live memory and instruction files, or is `key=<path>` (`dd of=`,
+/// `--output=`). A leading `~`, `$HOME`, `${HOME}` is expanded; `$PWD` is each
+/// `dirs` entry. Cheap name test first: only a word ending in one of the five
+/// file names is resolved. A memory hit wins over an instruction hit.
+fn names_live_file(root: &Path, dirs: &[PathBuf], w: &str) -> Option<Live> {
+    const NAMES: [&str; 5] = ["USER.md", "rules.md", "AGENTS.md", "SOUL.md", "identity.md"];
+    if !NAMES.iter().any(|n| w.ends_with(n)) {
+        return None;
     }
     let value = match w.split_once('=') {
         Some((k, v))
@@ -441,31 +475,39 @@ fn names_memory_file(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
         }
         _ => None,
     };
-    [Some(w), value]
+    let kinds = [Some(w), value]
         .into_iter()
         .flatten()
-        .any(|w| names_one(root, dirs, w))
+        .filter_map(|w| names_one(root, dirs, w));
+    kinds.fold(None, |acc, k| match (acc, k) {
+        (Some(Live::Memory), _) | (_, Live::Memory) => Some(Live::Memory),
+        _ => Some(Live::Instruction),
+    })
 }
 
-fn names_one(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
+fn names_one(root: &Path, dirs: &[PathBuf], w: &str) -> Option<Live> {
+    let kind = |p: &Path| live_kind(root, &resolve(p));
     if let Some(rest) = w
         .strip_prefix("$PWD/")
         .or_else(|| w.strip_prefix("${PWD}/"))
     {
         return dirs
             .iter()
-            .any(|d| is_memory_file(root, &resolve(&d.join(rest))));
+            .filter_map(|d| kind(&d.join(rest)))
+            .max_by_key(|k| *k == Live::Memory);
     }
     let p = PathBuf::from(expand_home(w));
     if p.is_absolute() {
-        return is_memory_file(root, &resolve(&p));
+        return kind(&p);
     }
     dirs.iter()
-        .any(|d| is_memory_file(root, &resolve(&d.join(&p))))
+        .filter_map(|d| kind(&d.join(&p)))
+        .max_by_key(|k| *k == Live::Memory)
 }
 
-/// The directories a relative path in `cmd` may be read from: the hook's cwd
-/// and every `cd`/`pushd` target named in the command (one level deep).
+/// The directories a relative path in `cmd` may be read from: the hook's cwd,
+/// every `cd`/`pushd` target named in the command (one level deep) and every
+/// `-C`, `-D` or `--chdir` directory of any command (`git -C d`, `env -C d`).
 fn command_dirs(cmd: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
     let base = cwd.map_or_else(
         || std::env::current_dir().unwrap_or_default(),
@@ -478,25 +520,46 @@ fn command_dirs(cmd: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
                 dirs.push(base.join(t));
             }
         }
+        let mut cur = base.clone();
+        for (k, w) in seg.iter().enumerate() {
+            let d = match w.as_str() {
+                "-C" | "-D" | "--chdir" => seg.get(k + 1).map(String::as_str),
+                x => x.strip_prefix("--chdir="),
+            };
+            if let Some(d) = d.filter(|d| !d.contains(['$', '`'])) {
+                cur = cur.join(expand_home(d));
+                dirs.push(cur.clone());
+            }
+        }
     }
     dirs
 }
 
-/// A Bash command that writes one of the memory files: a redirect onto it, or
-/// a command that is not read-only naming it (`sed -i`, `tee`, `cp`, a shell
-/// `-c` string, …). A tripwire like the rest of the gate: a script that builds
-/// the path at run time gets past it.
+/// Commands whose last plain word is the file they write; the earlier words are
+/// only read.
+fn copy_like(base: &str) -> bool {
+    matches!(base, "cp" | "rsync" | "install" | "ln" | "scp")
+}
+
+/// A Bash command that writes one of the memory or instruction files: a
+/// redirect onto it, or a command that is not read-only naming it (`sed -i`,
+/// `tee`, `cp`, `perl -pi`, a shell `-c` string, …). A tripwire like the rest of
+/// the gate: a script that builds the path at run time gets past it. A memory
+/// hit is denied to everyone; an instruction hit asks the CoS. The source of a
+/// copy (`cp AGENTS.md /tmp/x`) is a read.
 fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
     let Some(root) = env.runs_dir.parent() else {
         return Found::pass();
     };
     let root = resolve(root);
     let dirs = command_dirs(cmd, cwd);
-    if redirect_targets(cmd)
-        .iter()
-        .any(|t| names_memory_file(&root, &dirs, t))
-    {
-        return Found::cos_only(ASK_MEMORY);
+    let mut instruction = false;
+    for t in redirect_targets(cmd) {
+        match names_live_file(&root, &dirs, &t) {
+            Some(Live::Memory) => return Found::cos_only(ASK_MEMORY),
+            Some(Live::Instruction) => instruction = true,
+            None => {}
+        }
     }
     for seg in tokenize(cmd) {
         let Some(i) = seg.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
@@ -506,27 +569,45 @@ fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
         if read_only_cmd(base, &seg[i + 1..]) {
             continue;
         }
+        let args = &seg[i + 1..];
+        let last_plain = args.iter().rposition(|x| !x.starts_with('-'));
         // An interpreter or awk program names its target inside a quoted
         // string (`open('USER.md','a')`): test the pieces between the quotes.
         let embedded = is_interp(base) || matches!(base, "awk" | "gawk" | "mawk");
-        for w in &seg[i + 1..] {
-            if names_memory_file(&root, &dirs, w)
-                || (embedded
-                    && w.split(|c: char| c.is_whitespace() || "'\"(),;{}[]".contains(c))
-                        .any(|p| names_memory_file(&root, &dirs, p)))
-            {
-                return Found::cos_only(ASK_MEMORY);
+        for (j, w) in args.iter().enumerate() {
+            let mut kind = names_live_file(&root, &dirs, w);
+            if embedded && kind != Some(Live::Memory) {
+                for p in w.split(|c: char| c.is_whitespace() || "'\"(),;{}[]".contains(c)) {
+                    match names_live_file(&root, &dirs, p) {
+                        Some(Live::Memory) => kind = Some(Live::Memory),
+                        Some(Live::Instruction) => kind = kind.or(Some(Live::Instruction)),
+                        None => {}
+                    }
+                }
+            }
+            let dest = Some(j) == last_plain
+                || (j > 0 && args[j - 1] == "-t")
+                || w.starts_with("--target-directory=");
+            match kind {
+                Some(Live::Memory) => return Found::cos_only(ASK_MEMORY),
+                Some(Live::Instruction) if !copy_like(base) || dest => instruction = true,
+                _ => {}
             }
             // A nested script (`bash -c '…'`, `eval '…'`).
             if depth < 3 && w.contains(char::is_whitespace) {
                 let inner = bash_memory(env, w, cwd, depth + 1);
-                if !inner.is_pass() {
+                if inner.listed.iter().any(|h| matches!(h.p, Pending::CosOnly)) {
                     return inner;
                 }
+                instruction |= !inner.is_pass();
             }
         }
     }
-    Found::pass()
+    if instruction {
+        Found::act(Action::InstructionFile, ASK_FILE)
+    } else {
+        Found::pass()
+    }
 }
 
 /// Lexical `.`/`..` removal, then symlinks resolved on the longest existing prefix.
@@ -588,21 +669,38 @@ fn scan(command: &str) -> Found {
             loose: false,
         });
     }
-    // A raw RPC door (socket client, interpreter) naming a grant verb.
+    // A raw RPC door naming a grant verb: a socket client with the verb anywhere
+    // in the command text (it may arrive on a pipe), or an interpreter with
+    // inline code that names it. `quaqua call` is read at its verb position.
     let lower = command.to_ascii_lowercase();
-    if GRANT_VERBS.iter().any(|v| lower.contains(v))
-        && segs.iter().any(|s| {
-            s.iter()
-                .any(|w| rpc_tool(w.rsplit('/').next().unwrap_or(w)))
-        })
-    {
+    let names_verb = |t: &str| GRANT_VERBS.iter().any(|v| t.contains(v));
+    if segs.iter().any(|s| {
+        let Some(i) = s.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+            return false;
+        };
+        let base = s[i].rsplit('/').next().unwrap_or(&s[i]);
+        match base {
+            "socat" | "nc" | "ncat" | "netcat" | "curl" => names_verb(&lower),
+            b if is_interp(b) => {
+                s[i + 1..].iter().any(|x| inline_code_flag(x))
+                    && s[i + 1..]
+                        .iter()
+                        .any(|x| names_verb(&x.to_ascii_lowercase()))
+            }
+            _ => false,
+        }
+    }) {
         f.absorb(Found::act(Action::GrantWrite, ASK_GRANT));
     }
-    // A `cd` moves what the command acts on: its hits are judged at high, and
-    // a relative write path is read against the last literal `cd` target.
-    let mut cd: Option<Option<String>> = None;
+    // Anything that may change the directory or hide the command word (`cd`,
+    // `builtin cd`, `eval cd`, `$X`, `GIT_DIR=`) makes every hit unknown, which
+    // is judged at high. A literal `cd` target still reads relative write paths.
+    let mut cd: Option<Option<String>> = f.moved.then_some(None);
     for seg in &segs {
         let Some(i) = seg.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+            if seg.iter().any(|x| retargets(x)) {
+                cd = Some(None);
+            }
             continue;
         };
         let base = seg[i].rsplit('/').next().unwrap_or(&seg[i]);
@@ -615,18 +713,18 @@ fn scan(command: &str) -> Found {
                 _ => None,
             });
         }
+        // A cd-like word that is not the command word itself, a retargeting
+        // assignment or a command word built at run time.
+        if seg[i + 1..].iter().any(|x| cd_word(x))
+            || seg.iter().any(|x| retargets(x))
+            || base.contains(['$', '`'])
+        {
+            cd = Some(None);
+        }
     }
-    // The one common spelling is read: a single leading `cd <literal> && ...`
-    // with no other separator, so every `Here` hit follows the cd target.
-    let is_cd = |s: &Vec<String>| s.first().is_some_and(|w| w == "cd");
-    let lone = segs.iter().filter(|s| is_cd(s)).count() == 1
-        && segs.first().is_some_and(is_cd)
-        && !command.contains([';', '|', '(', '`'])
-        && !command.contains("$(");
-    if let (Some(Some(d)), true) = (&cd, lone) {
-        f = f.retarget(&Target::Dir(d.clone()));
-    } else if cd.is_some() {
-        f = f.retarget(&Target::Unknown);
+    if cd.is_some() {
+        f.moved = true;
+        f = f.force_target(&Target::Unknown);
     }
     if let Some(dir) = cd {
         for h in &mut f.paths {
@@ -650,9 +748,22 @@ fn scan(command: &str) -> Found {
 
 const GRANT_VERBS: [&str; 3] = ["grant.full", "grant.tier", "grant.lane"];
 
-/// Programs that can speak to the daemon's socket without `quaqua`.
-fn rpc_tool(base: &str) -> bool {
-    matches!(base, "socat" | "nc" | "ncat" | "netcat" | "curl" | "quaqua") || is_interp(base)
+/// `cd`, `pushd`, `popd` or `chdir`, however the word is spelled as a path.
+fn cd_word(w: &str) -> bool {
+    matches!(
+        w.rsplit('/').next().unwrap_or(w),
+        "cd" | "pushd" | "popd" | "chdir"
+    )
+}
+
+/// An interpreter flag that carries the program text (`-c`, `-e`, `-r`, `--eval`).
+fn inline_code_flag(w: &str) -> bool {
+    matches!(w, "--eval" | "--print" | "--exec")
+        || (w.starts_with('-')
+            && !w.starts_with("--")
+            && w[1..]
+                .chars()
+                .any(|c| matches!(c, 'c' | 'e' | 'E' | 'r' | 'p')))
 }
 
 fn is_interp(base: &str) -> bool {
@@ -882,6 +993,10 @@ fn check_cmd(w: &[String], i: usize) -> Found {
         | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
         b => {
             let mut f = names_db(b, a);
+            // A command word built at run time (`$Q call …`) may be `quaqua`.
+            if b.contains(['$', '`']) {
+                f.absorb(check_quaqua(a));
+            }
             f.paths.extend(
                 write_targets(b, a)
                     .into_iter()
@@ -892,16 +1007,26 @@ fn check_cmd(w: &[String], i: usize) -> Found {
     }
 }
 
-/// `quaqua … call grant.full|tier|lane`: anh iu's consent, never silent. A verb
-/// the scanner cannot read (`call "$V"`) counts too.
+/// `quaqua … call grant.full|tier|lane`: anh iu's consent, never silent. Only
+/// the verb position counts: a word after `call` that is a grant verb, or a verb
+/// the scanner cannot read (missing, `"$V"`, a `{}` placeholder).
 fn check_quaqua(a: &[String]) -> Found {
-    let names_grant = a.iter().any(|x| {
-        let l = x.to_ascii_lowercase();
-        GRANT_VERBS.iter().any(|v| l.contains(v))
-    });
-    let opaque = a
-        .windows(2)
-        .any(|w| w[0] == "call" && w[1].contains(['$', '`']));
+    let Some(c) = a.iter().position(|x| x == "call") else {
+        return Found::pass();
+    };
+    let after = &a[c + 1..];
+    let readable = |x: &String| {
+        !x.is_empty()
+            && x.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let opaque = after
+        .iter()
+        .find(|x| !x.starts_with('-'))
+        .is_none_or(|x| !readable(x));
+    let names_grant = after
+        .iter()
+        .any(|x| GRANT_VERBS.contains(&x.to_ascii_lowercase().as_str()));
     if names_grant || opaque {
         Found::act(Action::GrantWrite, ASK_GRANT)
     } else {
@@ -970,6 +1095,8 @@ const READ_ONLY: &[&str] = &[
     "xxd",
     "hexdump",
     "od",
+    "bat",
+    "batcat",
 ];
 
 /// Read-only git subcommands.
@@ -1514,7 +1641,25 @@ fn check_git_tag(a: &[String]) -> Found {
     }
 }
 
+/// How many `--long VALUE` forks one wrapper command may open before it asks.
+const WRAP_FORKS: u8 = 6;
+
 fn wrapper(base: &str, a: &[String]) -> Found {
+    wrap(base, a, 0, base == "timeout", false, 0)
+}
+
+/// The command a wrapper runs. An unknown `--long` followed by a plain word may
+/// take that word as its value or not: both readings are checked and the
+/// strictest kept, so no table of value-taking options has to stay complete.
+/// `env -C`, `--chdir`, `sudo -D` move the command to another directory.
+fn wrap(
+    base: &str,
+    a: &[String],
+    mut k: usize,
+    mut duration_pending: bool,
+    mut moved: bool,
+    forks: u8,
+) -> Found {
     let value_flags: &str = match base {
         "sudo" => " u g h p C T U R t D ",
         "env" => " u C S ",
@@ -1523,12 +1668,17 @@ fn wrapper(base: &str, a: &[String]) -> Found {
         "xargs" => " I n L P s d E a ",
         _ => " ",
     };
-    let mut k = 0;
-    let mut duration_pending = base == "timeout";
-    let mut moved = false;
+    let chdir_short = match base {
+        "env" => 'C',
+        "sudo" => 'D',
+        _ => '\0',
+    };
+    let mut other_reading = Found::pass();
+    let mut main = Found::pass();
     while k < a.len() {
         if let Some(f) = single_letter_flag(&a[k]) {
             if value_flags.contains(&format!(" {f} ")) {
+                moved |= f == chdir_short;
                 // `env -S 'cmd args'`: the value is a command line.
                 if base == "env" && f == 'S' {
                     if let Some(p) = a.get(k + 1) {
@@ -1548,8 +1698,28 @@ fn wrapper(base: &str, a: &[String]) -> Found {
                 return f;
             }
         }
+        if a[k] == "--split-string" {
+            if let Some(p) = a.get(k + 1) {
+                let f = scan(p);
+                if !f.is_pass() {
+                    return f;
+                }
+            }
+        }
         if a[k].starts_with('-') || is_assignment(&a[k]) {
-            moved |= retargets(&a[k]);
+            moved |= retargets(&a[k])
+                || a[k] == "--chdir"
+                || a[k].starts_with("--chdir=")
+                || (chdir_short != '\0'
+                    && !a[k].starts_with("--")
+                    && a[k].starts_with(&format!("-{chdir_short}")));
+            let long_alone = a[k].len() > 2 && a[k].starts_with("--") && !a[k].contains('=');
+            if long_alone && a.get(k + 1).is_some_and(|n| !n.starts_with('-')) {
+                if forks >= WRAP_FORKS {
+                    return Found::act(Action::Bypass, ASK_BYPASS);
+                }
+                other_reading.absorb(wrap(base, a, k + 2, duration_pending, moved, forks + 1));
+            }
             k += 1;
             continue;
         }
@@ -1559,9 +1729,11 @@ fn wrapper(base: &str, a: &[String]) -> Found {
             continue;
         }
         let t = if moved { Target::Unknown } else { Target::Here };
-        return check_words(&a[k..]).retarget(&t);
+        main = check_words(&a[k..]).retarget(&t);
+        break;
     }
-    Found::pass()
+    main.absorb(other_reading);
+    main
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
