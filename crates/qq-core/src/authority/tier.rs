@@ -205,6 +205,12 @@ pub fn effective_context_tier(runs_dir: &Path, dir: &Path, caller_is_cos: bool) 
     apply_grant(runs_dir, dir, caller_is_cos, base)
 }
 
+/// Class of a delete of `branch`: `remote` names the remote when the delete is
+/// a push delete (judged on that remote-tracking ref), else the local branch.
+pub fn branch_delete_class(cwd: &Path, branch: &str, _remote: Option<&str>) -> Action {
+    branch_delete_action(cwd, branch)
+}
+
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     std::process::Command::new("git")
         .arg("-C")
