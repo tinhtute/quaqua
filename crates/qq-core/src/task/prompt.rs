@@ -989,6 +989,25 @@ fn send_brief(
     }
 }
 
+/// Moves a previous `<name>.md` to `<name>.<mtime-epoch>.md` (never clobbering
+/// an earlier archive) so a wait can only end on a report written after this
+/// prompt. Returns the archive path, or `None` when there was nothing to move.
+fn archive_report(runs: &Path, name: &str) -> Option<PathBuf> {
+    let report = runs.join(format!("{name}.md"));
+    let mtime = std::fs::metadata(&report).ok()?.modified().ok()?;
+    let ts = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut dest = runs.join(format!("{name}.{ts}.md"));
+    let mut n = 1;
+    while dest.exists() {
+        dest = runs.join(format!("{name}.{ts}-{n}.md"));
+        n += 1;
+    }
+    std::fs::rename(&report, &dest).ok().map(|_| dest)
+}
+
 /// The worktree and harness shape of an open agent, from the database.
 fn lookup(runs: &Path, name: &str) -> (Option<PathBuf>, Option<Shape>) {
     let Ok(c) = crate::db::open(&runs.join(crate::db::path::DB_FILE)) else {
@@ -1076,7 +1095,17 @@ pub fn prompt_run(
         ] {
             let _ = std::fs::remove_file(side(runs, name, ext));
         }
-        send_brief(herdr, runs, name, &compose_prompt_body(name, text))?;
+        let archived = archive_report(runs, name);
+        if let Err(e) = send_brief(herdr, runs, name, &compose_prompt_body(name, text)) {
+            // the brief never ran: put the previous report back where it was
+            if let Some(a) = archived {
+                let report = runs.join(format!("{name}.md"));
+                if !report.exists() {
+                    let _ = std::fs::rename(a, report);
+                }
+            }
+            return Err(e);
+        }
     }
     if let Some(sec) = extend {
         let cur = read_u64(&budget_f)

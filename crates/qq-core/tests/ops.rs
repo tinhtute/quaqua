@@ -1561,3 +1561,46 @@ fn lead_cleanup_closes_only_the_recorded_pane() {
         .unwrap();
     assert_eq!(ended, Some(9));
 }
+
+#[test]
+fn prompt_archives_the_previous_report_and_waits_for_a_new_one() {
+    let (runs, _c) = seeded("stale");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    let tuning = Tuning {
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+    };
+    let old = "Outcome: COMPLETE\n\n## Blockers\nold-round\n\n## Lessons\nnone\n";
+    let new = "Outcome: COMPLETE\n\n## Blockers\nnew-round\n\n## Lessons\nnone\n";
+    let report = runs.join("w.md");
+    std::fs::write(&report, old).unwrap();
+
+    // the worker answers only at t=20, after the prompt went out
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now >= 20 {
+                std::fs::write(&report, new).unwrap();
+            }
+        }),
+    };
+    let args: Vec<String> = ["w", BRIEF].iter().map(|s| s.to_string()).collect();
+    prompt::prompt_run(&h, &clock, &runs, &args, &tuning).unwrap();
+
+    assert!(clock.now_sec() >= 20, "returned on the stale report");
+    assert_eq!(std::fs::read_to_string(&report).unwrap(), new);
+    let archived: Vec<_> = std::fs::read_dir(&runs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("w.") && n.ends_with(".md") && n != "w.md")
+        .collect();
+    assert_eq!(archived.len(), 1, "{archived:?}");
+    assert_eq!(
+        std::fs::read_to_string(runs.join(&archived[0])).unwrap(),
+        old
+    );
+}
