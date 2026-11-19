@@ -9,12 +9,12 @@ const ENGINE_REASON = "memory/rules.md is 2400 chars, over the 2200 cap (AGENTS.
 test('an engine refusal is the tool error, verbatim, and nothing is written', async () => {
   const { $, calls, files } = fakeEngine({
     files: { '/ws/memory/rules.md': 'old\n' },
-    gate: denyVerdict(ENGINE_REASON),
+    verb: denyVerdict(ENGINE_REASON),
   })
 
   const out = await runTool($, 'memory_add', { file: 'memory/rules.md', text: 'new rule' })
 
-  assert.deepEqual(out, { deny: `${ENGINE_REASON}\n\n--- current memory/rules.md (4 chars) ---\nold\n` })
+  assert.deepEqual(out, { deny: `refused: ${ENGINE_REASON}\n\n--- current memory/rules.md (4 chars) ---\nold\n` })
   assert.equal(files['/ws/memory/rules.md'], 'old\n')
   assert.equal(calls.writes.length, 0)
 })
@@ -22,7 +22,7 @@ test('an engine refusal is the tool error, verbatim, and nothing is written', as
 test('an allowed write lands and reports the file it touched', async () => {
   const { $, files } = fakeEngine({
     files: { '/ws/memory/rules.md': 'old\n' },
-    gate: allowVerdict,
+    verb: allowVerdict,
   })
 
   const out = await runTool($, 'memory_add', { file: 'memory/rules.md', text: 'new rule' })
@@ -31,25 +31,23 @@ test('an allowed write lands and reports the file it touched', async () => {
   assert.equal(files['/ws/memory/rules.md'], 'old\nnew rule\n')
 })
 
-test('the gate is asked about the absolute path and the whole result', async () => {
-  const { $, calls } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, gate: allowVerdict })
+test('the daemon verb is asked with what was loaded and the whole result', async () => {
+  const { $, calls } = fakeEngine({ files: { '/ws/USER.md': 'a\n' } })
 
   await runTool($, 'memory_replace', { file: 'USER.md', old_text: 'a', new_text: 'b' })
 
   assert.equal(calls.process.length, 1)
   const [call] = calls.process
-  assert.deepEqual(call.argv, ['quaqua', 'memory', 'hook', 'pre'])
+  assert.deepEqual(call.argv.slice(0, 3), ['quaqua', 'call', 'memory.write'])
   assert.equal(call.init.cwd, '/ws')
-  assert.deepEqual(JSON.parse(call.init.stdin), {
-    tool_name: 'Write',
-    tool_input: { file_path: '/ws/USER.md', content: 'b\n' },
-  })
+  assert.deepEqual(JSON.parse(call.argv[3]), { files: { 'USER.md': { before: 'a\n', after: 'b\n' } } })
+  assert.equal(calls.writes.length, 0, 'the mod never writes the file itself')
 })
 
-test('a gate that cannot run is a refusal, not a silent allow', async () => {
+test('a daemon that cannot be reached is a refusal, not a silent allow', async () => {
   const { $, calls } = fakeEngine({
     files: { '/ws/memory/rules.md': '' },
-    gate: Object.assign(new Error('spawn quaqua ENOENT'), { code: 'ENOENT' }),
+    verb: Object.assign(new Error('spawn quaqua ENOENT'), { code: 'ENOENT' }),
   })
 
   const out = await runTool($, 'memory_add', { file: 'memory/rules.md', text: 'x' })
@@ -58,22 +56,22 @@ test('a gate that cannot run is a refusal, not a silent allow', async () => {
   assert.equal(calls.writes.length, 0)
 })
 
-test('a gate that exits non-zero is a refusal', async () => {
+test('a verb that exits non-zero without a reason is a refusal', async () => {
   const { $, calls } = fakeEngine({
     files: { '/ws/memory/rules.md': '' },
-    gate: { exitCode: 2, stdout: '', stderr: 'boom' },
+    verb: { exitCode: 2, stdout: '', stderr: '' },
   })
 
   const out = await runTool($, 'memory_add', { file: 'memory/rules.md', text: 'x' })
 
-  assert.match(out.deny, /failed \(exit 2\).*boom/s)
+  assert.match(out.deny, /failed \(exit 2\)/)
   assert.equal(calls.writes.length, 0)
 })
 
 test('a verdict that cannot be parsed is a refusal', async () => {
   const { $, calls } = fakeEngine({
     files: { '/ws/memory/rules.md': '' },
-    gate: { exitCode: 0, stdout: 'not json', stderr: '' },
+    verb: { exitCode: 0, stdout: 'not json', stderr: '' },
   })
 
   const out = await runTool($, 'memory_add', { file: 'memory/rules.md', text: 'x' })
@@ -83,7 +81,7 @@ test('a verdict that cannot be parsed is a refusal', async () => {
 })
 
 test('a file outside the capped pair is refused without asking the engine', async () => {
-  const { $, calls } = fakeEngine({ gate: allowVerdict })
+  const { $, calls } = fakeEngine({ verb: allowVerdict })
 
   const out = await runTool($, 'memory_add', { file: 'memory/corrections.md', text: 'x' })
 
@@ -93,7 +91,7 @@ test('a file outside the capped pair is refused without asking the engine', asyn
 })
 
 test('memory_replace refuses an old_text that is not there', async () => {
-  const { $, calls } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, gate: allowVerdict })
+  const { $, calls } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, verb: allowVerdict })
 
   const out = await runTool($, 'memory_replace', { file: 'USER.md', old_text: 'zzz', new_text: 'b' })
 
@@ -105,7 +103,7 @@ test('memory_replace refuses an old_text that is not there', async () => {
 test('memory_remove drops every line holding the text', async () => {
   const { $, files } = fakeEngine({
     files: { '/ws/memory/rules.md': 'keep\nstale rule\nkeep too\nstale again\n' },
-    gate: allowVerdict,
+    verb: allowVerdict,
   })
 
   const out = await runTool($, 'memory_remove', { file: 'memory/rules.md', text: 'stale' })
@@ -115,7 +113,7 @@ test('memory_remove drops every line holding the text', async () => {
 })
 
 test('memory_replace writes new_text literally, dollar patterns included', async () => {
-  const { $, files } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, gate: allowVerdict })
+  const { $, files } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, verb: allowVerdict })
 
   const out = await runTool($, 'memory_replace', {
     file: 'USER.md',
@@ -128,35 +126,16 @@ test('memory_replace writes new_text literally, dollar patterns included', async
 })
 
 test('an unknown tool name is refused', async () => {
-  const { $ } = fakeEngine({ gate: allowVerdict })
+  const { $ } = fakeEngine({ verb: allowVerdict })
   const out = await runTool($, 'memory_drop', { file: 'USER.md', text: 'x' })
   assert.match(out.deny, /unknown tool/)
 })
 
-// A gate that judges the content like the engine: over 20 chars is over the cap.
-function capGate($) {
-  const run = $.process.run
-  $.process.run = async (argv, init) => {
-    await run(argv, init)
-    const { content } = JSON.parse(init.stdin).tool_input
-    if ([...content].length <= 20) return { exitCode: 0, stdout: '', stderr: '' }
-    const reason = `${[...content].length} chars > 20 cap`
-    return {
-      exitCode: 0,
-      stdout: JSON.stringify({
-        hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: reason },
-      }),
-      stderr: '',
-    }
-  }
-  return $
-}
-
 test('a batch is checked on the final state: a drop that makes room lets the add land', async () => {
   const { $, files, calls } = fakeEngine({
     files: { '/ws/memory/rules.md': 'aaaaaaaaaaaaaaaa\nstale\n' },
+    cap: 20,
   })
-  capGate($)
 
   const out = await runTool($, 'memory_batch', {
     ops: [
@@ -173,8 +152,8 @@ test('a batch is checked on the final state: a drop that makes room lets the add
 test('a batch over the cap writes nothing, in any file, and returns current content', async () => {
   const { $, files, calls } = fakeEngine({
     files: { '/ws/memory/rules.md': 'keep\n', '/ws/USER.md': 'user\n' },
+    cap: 20,
   })
-  capGate($)
 
   const out = await runTool($, 'memory_batch', {
     ops: [
@@ -191,7 +170,7 @@ test('a batch over the cap writes nothing, in any file, and returns current cont
 })
 
 test('a batch with an op that cannot apply writes nothing', async () => {
-  const { $, calls } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, gate: allowVerdict })
+  const { $, calls } = fakeEngine({ files: { '/ws/USER.md': 'a\n' }, verb: allowVerdict })
 
   const out = await runTool($, 'memory_batch', {
     ops: [
@@ -209,7 +188,7 @@ test('a batch with an op that cannot apply writes nothing', async () => {
 test('a batch with a secret verdict is refused as a whole', async () => {
   const { $, calls } = fakeEngine({
     files: { '/ws/USER.md': 'a\n' },
-    gate: denyVerdict('USER.md contains a token'),
+    verb: denyVerdict('USER.md contains a token'),
   })
 
   const out = await runTool($, 'memory_batch', { ops: [{ op: 'add', file: 'USER.md', text: 'k' }] })
@@ -218,30 +197,8 @@ test('a batch with a secret verdict is refused as a whole', async () => {
   assert.equal(calls.writes.length, 0)
 })
 
-test('a batch write that fails halfway restores the earlier file', async () => {
-  const { $, files } = fakeEngine({
-    files: { '/ws/memory/rules.md': 'r\n', '/ws/USER.md': 'u\n' },
-    gate: allowVerdict,
-  })
-  const write = $.fs.write
-  $.fs.write = async (path, text) => {
-    if (path.endsWith('USER.md') && text !== 'u\n') throw new Error('EACCES')
-    return write(path, text)
-  }
-
-  const out = await runTool($, 'memory_batch', {
-    ops: [
-      { op: 'add', file: 'memory/rules.md', text: 'x' },
-      { op: 'add', file: 'USER.md', text: 'y' },
-    ],
-  })
-
-  assert.match(out.deny, /write failed, nothing kept/)
-  assert.equal(files['/ws/memory/rules.md'], 'r\n')
-})
-
 test('an empty or foreign-file batch is refused', async () => {
-  const { $, calls } = fakeEngine({ gate: allowVerdict })
+  const { $, calls } = fakeEngine({ verb: allowVerdict })
   assert.match((await runTool($, 'memory_batch', { ops: [] })).deny, /empty/)
   const out = await runTool($, 'memory_batch', { ops: [{ op: 'add', file: 'SOUL.md', text: 'x' }] })
   assert.match(out.deny, /not a capped memory file/)
@@ -251,8 +208,8 @@ test('an empty or foreign-file batch is refused', async () => {
 test('a single refused write also returns the file as it stands', async () => {
   const { $ } = fakeEngine({
     files: { '/ws/USER.md': 'mine\n' },
-    gate: denyVerdict('over cap'),
+    verb: denyVerdict('over cap'),
   })
   const out = await runTool($, 'memory_add', { file: 'USER.md', text: 'x' })
-  assert.equal(out.deny, 'over cap\n\n--- current USER.md (5 chars) ---\nmine\n')
+  assert.equal(out.deny, 'refused: over cap\n\n--- current USER.md (5 chars) ---\nmine\n')
 })

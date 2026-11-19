@@ -2,10 +2,21 @@
 // (ModelForkRequest is `{ prompt, effort? }`), so the restriction is enforced
 // here: the fork is asked for a JSON array of memory operations and told to
 // call no tools, and only operations matching that schema are applied. One reply
-// is one all-or-nothing batch checked on the final state, like `memory_batch`.
+// is one all-or-nothing batch checked on the final state, like `memory_batch`,
+// and it goes through the daemon verb `memory.write` like every other write. The
+// drift baseline is the files as they stood when the fork started: an outside edit
+// during the fork refuses the batch.
 
 import { FILES } from './memory-gate.js'
 import { applyBatch } from './tools.js'
+
+async function readOrEmpty($, path) {
+  try {
+    return String(await $.fs.read(path))
+  } catch {
+    return ''
+  }
+}
 
 export const REVIEW_PROMPT = `Review this session for memory worth keeping.
 
@@ -59,6 +70,9 @@ export function accepted(ops) {
  *   its counters.
  */
 export async function runReview($, { root }) {
+  const loaded = {}
+  for (const file of FILES) loaded[file] = await readOrEmpty($, `${root}/${file}`)
+
   let result
   try {
     result = await $.model.fork({ prompt: REVIEW_PROMPT, effort: 'low' })
@@ -75,7 +89,7 @@ export async function runReview($, { root }) {
 
   const batch = accepted(ops)
   if (batch.length === 0) return { reviewed: true, applied: 0, refused: [] }
-  const out = await applyBatch($, { root, ops: batch })
+  const out = await applyBatch($, { root, ops: batch, loaded })
   const applied = 'result' in out ? batch.length : 0
   const refused = 'result' in out ? [] : [out.deny]
 
