@@ -4,6 +4,7 @@
 
 mod caps;
 mod drift;
+mod fence;
 mod inbox;
 mod situation;
 mod standing;
