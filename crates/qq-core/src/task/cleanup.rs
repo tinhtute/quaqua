@@ -137,16 +137,19 @@ fn release_pane(
     name: &str,
     lead: bool,
 ) -> Result<Released, OpsError> {
-    let recorded: Option<String> = conn
+    let (recorded, row_ended): (Option<String>, bool) = conn
         .query_row(
-            "SELECT pane_id FROM agent WHERE name = ?1 ORDER BY id DESC LIMIT 1",
+            "SELECT pane_id, ended_ms IS NOT NULL FROM agent WHERE name = ?1 \
+             ORDER BY id DESC LIMIT 1",
             [name],
-            |r| r.get(0),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(other)?
-        .flatten()
-        .filter(|p: &String| !p.is_empty());
+        .unwrap_or((None, false));
+    // An ended row's id is the stalest in the DB and herdr may have reused
+    // it: only herdr's live answer is trusted for it.
+    let recorded = recorded.filter(|p| !p.is_empty() && !row_ended);
     let mut lookup_failed = false;
     let mut from_herdr = None;
     if let Some(h) = live {
@@ -166,6 +169,7 @@ fn release_pane(
             _ => lookup_failed = true,
         }
     }
+    let from_live = from_herdr.is_some();
     let Some(pane) = from_herdr.or(recorded) else {
         return Ok(Released {
             unverified: lookup_failed.then(|| "pane unknown (herdr lookup failed)".to_string()),
@@ -195,6 +199,19 @@ fn release_pane(
                 ..Released::default()
             }
         }
+        // herdr says this is the agent's pane and the scope refuses it: ours
+        // but not closed. A recorded id that names such a pane is just a
+        // wrong record (a CoS pane): left alone, silently.
+        Some(p) if from_live => Released {
+            unverified: Some(format!(
+                "pane {} (out of scope: owner {}, farm {}, role {})",
+                p.id,
+                p.owner.as_deref().unwrap_or("-"),
+                p.farm.as_deref().unwrap_or("-"),
+                p.role.as_deref().unwrap_or("-")
+            )),
+            ..Released::default()
+        },
         Some(_) => Released::default(),
         None if lookup_failed => Released {
             unverified: Some(format!(
