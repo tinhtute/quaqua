@@ -62,8 +62,7 @@ Routing and model settings live in `models.md`; configuration is authoritative i
 
 ## Coordinator Rules
 
-- **Route**: Before every brief, run `/poteto-mode`.
-- **Never edit code or config**: CoS writes briefs, reads reports, verifies evidence, and merges. Assign conflicted merge/rebase rework to a worker.
+- **Never edit code or config**: CoS writes briefs, reads reports, verifies evidence, and merges. Assign conflicted merge/rebase rework to a worker. The memory hook (`quaqua memory hook pre`) asks before a CoS `Write`, `Edit`, `MultiEdit` or `NotebookEdit` under `crates/`, `tests/`, `.github/` or any git worktree.
 - **Attack the premise**: After the second fix in one class fails the same gate, stop patching and use `figure-it-out` to test the premise.
 - **Background wait and drain points**: Run `quaqua worker prompt` in the background. Drain after critical decisions, at wave boundaries, and before reporting. Review diffs in a separate worker task.
 - **Budget**: Every brief carries time and cost budgets; at about 70% of either, stop spawning and land only verified work.
