@@ -50,6 +50,29 @@ const ASK_BYPASS: &str = "approval list: a push or merge door by another name";
 const ASK_INPUT: &str = "approval list: pane input or a grid_role token";
 const ASK_DB: &str = "approval list: runs/qq.db belongs to the daemon";
 const ASK_FILE: &str = "approval list: the CoS's live instruction files";
+const ASK_MCP: &str = "approval list: an MCP tool that sends, publishes or spends";
+
+/// MCP tool names that send, publish or spend (docs/research/hermes-cos-memory/
+/// mcp-outward-tools.md). `driver/claude.rs` and the template settings carry
+/// the same regexes as PreToolUse matchers; `tests/hook_routes.rs` keeps them
+/// in step.
+const MCP_OUTWARD: [&str; 3] = [
+    r"^mcp__plugin_tinyfish_tinyfish__(run_deep_research(_async)?|run_web_automation(_async)?|create_dataset|populate_dataset|top_up_wallet)$",
+    r"^mcp__claude_ai_Claude_Data__share_(connector|live_queries)$",
+    r"^mcp__claude_ai_(Asana|Atlassian|Box|Canva|Gmail|Google_Calendar|Google_Docs|Google_Drive|Google_Sheets|Google_Slides|Higgsfield|HubSpot|Intercom|Linear|Notion|Slack|monday_com)__.*(send|post|reply|publish|share|invite|comment|message|upload|generate)",
+];
+
+fn outward_mcp(tool: &str) -> bool {
+    static RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    RES.get_or_init(|| {
+        MCP_OUTWARD
+            .iter()
+            .map(|r| regex::Regex::new(r).expect("MCP_OUTWARD regex"))
+            .collect()
+    })
+    .iter()
+    .any(|r| r.is_match(tool))
+}
 
 /// What the gate decided. `Ask` prompts the person; `Block` refuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +156,8 @@ fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
     let cwd = v.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from);
     let tool = v.get("tool_name").and_then(|t| t.as_str());
     let found = match (input.and_then(|t| t.get("command")), tool) {
+        // Spend, publish and send outward are the floor: ask at every tier.
+        (_, Some(t)) if outward_mcp(t) => Found::act(Action::Floor, ASK_MCP),
         (Some(c), _) if c.is_string() => {
             let cmd = c.as_str().unwrap_or_default();
             if cmd.trim().is_empty() {

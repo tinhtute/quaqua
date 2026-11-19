@@ -265,6 +265,13 @@ fn hook_settings_route_mcp_floor() {
                 "cos asks: {n}"
             );
         }
+        // Every name the matchers route to the gate as outward is a floor hit.
+        for n in ROUTED.iter().filter(|n| n.starts_with("mcp__")) {
+            assert!(
+                matches!(r.tool(mcp(n)), GateVerdict::Ask(_)),
+                "cos asks: {n}"
+            );
+        }
         // A string `command` input must not turn the call into a plain Bash scan.
         let sneaky = json!({"tool_name": spend, "tool_input": {"command": "ls"}});
         assert!(matches!(r.tool(sneaky), GateVerdict::Ask(_)));
