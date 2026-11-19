@@ -64,10 +64,12 @@ guarded command. Provable readers (below) are exempt, so `echo git push` and
   `sort -ruoX`, `rg --pre=tee`, `bat --pager=…` all fall out of the table).
 - Readers that have no such flag in any implementation (`cat ls stat head tail wc
   du hexdump od strings checksum tools cmp realpath readlink basename dirname nl
-  cut tac jq echo printf test [`) stay on the list unconditionally. Each was
-  checked against the GNU and BSD man pages for an output-file, an exec or a
-  program-text option. This is the one place the design still relies on a claim
-  about a tool; the held-out tests name USER.md through each of them.
+  cut tac jq echo printf test [`) stay on the list unconditionally. This is the
+  one place the design still relies on a claim about a tool, made from the
+  documented GNU and BSD (macOS) option lists, not re-verified against man pages
+  on every platform. The tests name live files through `cat ls head wc grep
+  hexdump od` and the armed readers; a writing flag found on an inert reader
+  moves that reader to an exact table.
 - Dropped from the list: `xxd` (the second operand is the output; the operand
   count is not provable once `-r`, `-p`, `-i` and `-s` change it), `less` and
   `more` (`-o`, `--log-file`, `+cmd`, `!cmd`). A pager has no use in a hook-run
@@ -86,12 +88,30 @@ are unchanged.
 
 ## Hook fallback (`herdr-gate.sh`)
 
-The fallback is a text scan that only adds blocks when the binary is missing or
-stale; it never allows something the binary refuses, because the binary runs
-whenever it exists. It has no wrapper parser to widen: its regexes use
-`git[^"]*[[:space:]]push`, which already matches a push after any wrapper words.
-Findings 1, 3, 4 and 10 are binary-path holes, so the script is left unchanged
-unless the held-out run shows a fallback miss that the structure above can close.
+The fallback only adds blocks: it runs when the binary is missing or stale, and
+`exec`s the binary otherwise, so it can never allow what the binary refuses. It
+has no wrapper parser to widen: its regexes use `git[^"]*[[:space:]]push`, which
+matches a push after any wrapper words, quoted or not. Measured: all 48
+push/herdr probes of the gate_fix4 tests (review-3 and held-out) exit 2 through
+`herdr-gate.sh` with `QUAQUA_BIN` unset to a missing binary; the same probes exit
+0 on the cdd727d binary in 40 of 48. The script is unchanged. Known and
+pre-existing: the fallback's live-file writer list is a tool list (`tee mv cp …`),
+so reader-writers such as `xxd in USER.md` are only caught by the binary.
+
+## Results
+
+- Red (5dddbd1, f3f0f7d): 7 of 8 gate_fix4 tests fail on the unchanged gate;
+  the ordinary-commands guard passes. Of the 48 push/herdr probes, 40 exit 0
+  (allowed) on the cdd727d binary; on the fix build, 0.
+- Mutation check: removing the letters `E` (sudo), `C` (env), digits (nice),
+  `v` (timeout) and `t` (xargs) from the tables leaves every block and ask test
+  green; only the free-path guard fails (`xargs -tn 1 echo git push` becomes a
+  block). A missing table entry costs a false ask, never a hole.
+- Replay (4,934 CoS commands): ALLOW 4,718→4,717, BLOCK 174→175, ASK 42→42.
+  One move, ALLOW→BLOCK, a false block: a shell function `g` that feeds the
+  string `herdr pane split …` to the hook through `jq`, with the herdr text as
+  a quoted argument of an unlisted command. ALLOW→ASK: 0. False moves
+  1 of 4,934 (0.02%).
 
 ## Rejected alternatives
 

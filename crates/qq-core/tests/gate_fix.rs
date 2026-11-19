@@ -1471,7 +1471,7 @@ fn gate_fix4_heldout_tier_escapes_ask() {
             format!("sudo -nkD {b} git tag v1"),
             format!("env -iC {b} gh release create v1"),
             format!("direnv exec {b} git tag v1"),
-            format!("lockf /tmp/l git tag v1"),
+            "lockf /tmp/l git tag v1".to_string(),
             format!("chroot {b} git tag v1"),
         ]
     });
