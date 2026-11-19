@@ -755,7 +755,7 @@ fn write_targets(base: &str, a: &[String]) -> Vec<String> {
         "tee" | "mv" | "truncate" | "rm" | "unlink" | "shred" => plain().collect(),
         "sed" if a.iter().any(in_place) => plain().collect(),
         "cp" | "install" => {
-            let mut v: Vec<String> = plain().last().into_iter().collect();
+            let mut v: Vec<String> = plain().next_back().into_iter().collect();
             v.extend(a.windows(2).filter(|w| w[0] == "-t").map(|w| w[1].clone()));
             v.extend(
                 a.iter()
