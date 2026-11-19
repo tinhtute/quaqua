@@ -133,7 +133,11 @@ fn down_marker(env: &Env, session: Option<&str>) -> Option<PathBuf> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    ok.then(|| env.runs_dir.join(".sessions").join(format!("{id}.inbox-down")))
+    ok.then(|| {
+        env.runs_dir
+            .join(".sessions")
+            .join(format!("{id}.inbox-down"))
+    })
 }
 
 /// The hook output when the daemon did not answer: the "daemon down" line the

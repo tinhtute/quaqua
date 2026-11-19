@@ -22,8 +22,11 @@ fn start(ws: &TestWorkspace) -> DaemonHandle {
         [],
     )
     .unwrap();
-    conn.execute("INSERT INTO project (slug, created_ms) VALUES ('p1', 0)", [])
-        .unwrap();
+    conn.execute(
+        "INSERT INTO project (slug, created_ms) VALUES ('p1', 0)",
+        [],
+    )
+    .unwrap();
     for (name, role) in [("lead", "lead"), ("peer-a", "peer")] {
         conn.execute(
             "INSERT INTO agent (name, role, project_id, started_ms) VALUES (?1, ?2, 1, 1)",
@@ -40,7 +43,10 @@ fn start(ws: &TestWorkspace) -> DaemonHandle {
 }
 
 fn send(ws: &TestWorkspace, kind: &str, body: &str) {
-    let mut req = Request::new("mail.send", json!({"to": "peer-a", "body": body, "kind": kind}));
+    let mut req = Request::new(
+        "mail.send",
+        json!({"to": "peer-a", "body": body, "kind": kind}),
+    );
     req.caller = Some("lead".into());
     rpc::call(&rpc::socket_path(&ws.runs_dir()), &req)
         .expect("transport")
@@ -65,7 +71,9 @@ fn context(out: &str) -> String {
 #[test]
 fn inbox_daemon_down_state_mail_shows_in_digest() {
     let ws = TestWorkspace::new("inbox-down-state");
-    let env = Env { runs_dir: ws.runs_dir() };
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
     let daemon = start(&ws);
     send(&ws, "state", "lead-1 stalled");
     let out = context(&hook(&env, &["--session", "s1"]));
@@ -77,7 +85,9 @@ fn inbox_daemon_down_state_mail_shows_in_digest() {
 #[test]
 fn inbox_daemon_down_no_change_is_empty() {
     let ws = TestWorkspace::new("inbox-down-quiet");
-    let env = Env { runs_dir: ws.runs_dir() };
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
     let daemon = start(&ws);
     assert_eq!(hook(&env, &["--session", "s1"]), "");
     assert_eq!(hook(&env, &["--session", "s1"]), "");
@@ -87,7 +97,9 @@ fn inbox_daemon_down_no_change_is_empty() {
 #[test]
 fn inbox_daemon_down_prints_one_line_once_per_session() {
     let ws = TestWorkspace::new("inbox-down-once");
-    let env = Env { runs_dir: ws.runs_dir() };
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
     let daemon = start(&ws);
     assert_eq!(hook(&env, &["--session", "s1"]), "");
     daemon.stop().unwrap();
@@ -97,13 +109,23 @@ fn inbox_daemon_down_prints_one_line_once_per_session() {
     assert!(first.contains("daemon down"), "{first}");
     assert_eq!(hook(&env, &["--session", "s1"]), "", "once per session");
     let other = context(&hook(&env, &["--session", "s2"]));
-    assert!(other.contains("daemon down"), "another session hears it once: {other}");
+    assert!(
+        other.contains("daemon down"),
+        "another session hears it once: {other}"
+    );
 
     // Stop-time never blocks on a dead daemon.
     let stop = memory::inbox_as(
         &env,
         Some("peer-a".into()),
-        &args(&["--for", "peer-a", "--format", "hook-stop", "--session", "s3"]),
+        &args(&[
+            "--for",
+            "peer-a",
+            "--format",
+            "hook-stop",
+            "--session",
+            "s3",
+        ]),
     )
     .unwrap();
     assert_eq!(stop, "");
