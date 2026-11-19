@@ -203,7 +203,12 @@ fn memory_fix_cos_fence_denies_direct_memory_file_writes() {
         }
     }
     // relative and `..` spellings resolve against the payload cwd
-    for rel in ["USER.md", "memory/rules.md", "projects/../USER.md", "nope/../memory/rules.md"] {
+    for rel in [
+        "USER.md",
+        "memory/rules.md",
+        "projects/../USER.md",
+        "nope/../memory/rules.md",
+    ] {
         let r = memory::pre_decision(&call("Edit", &f.ws, Path::new(rel)));
         assert_eq!(decision(&r), Some("deny"), "{rel}");
     }
@@ -214,10 +219,18 @@ fn memory_fix_cos_fence_denies_direct_memory_file_writes() {
     assert_eq!(decision(&memory::pre_decision(&nb)), Some("deny"));
     // other workspace files stay free; so do the engine copies, and workers
     for p in [f.ws.join("memory/notes.md"), f.ws.join("projects/USER.md")] {
-        assert_eq!(decision(&memory::pre_decision(&call("Write", &f.ws, &p))), None, "{p:?}");
+        assert_eq!(
+            decision(&memory::pre_decision(&call("Write", &f.ws, &p))),
+            None,
+            "{p:?}"
+        );
     }
     assert_eq!(
-        decision(&memory::pre_decision(&call("Write", &f.wt, &f.ws.join("USER.md")))),
+        decision(&memory::pre_decision(&call(
+            "Write",
+            &f.wt,
+            &f.ws.join("USER.md")
+        ))),
         None,
         "a worker is the gate's, not the fence's"
     );

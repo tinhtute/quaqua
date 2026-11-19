@@ -421,7 +421,10 @@ fn memory_fix_cos_direct_write_denied_with_tool_hint() {
         assert!(names_tools(&v), "{cmd}: {v:?}");
     }
     // other files and reads stay free for the CoS
-    assert_eq!(r.gate_file("Write", "memory/2026-11-19.md"), GateVerdict::Allow);
+    assert_eq!(
+        r.gate_file("Write", "memory/2026-11-19.md"),
+        GateVerdict::Allow
+    );
     assert_eq!(r.gate_bash("cat USER.md"), GateVerdict::Allow);
 }
 

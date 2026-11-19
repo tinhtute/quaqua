@@ -34,6 +34,8 @@ struct Change {
     path: PathBuf,
     before: String,
     after: String,
+    /// The file was on disk when the call began: a rollback restores it, else removes it.
+    existed: bool,
 }
 
 /// The files of the call, validated: only a capped target, only strings.
@@ -59,6 +61,7 @@ fn parse(root: &Path, args: &Value) -> Result<Vec<Change>, RpcError> {
         out.push(Change {
             rel: t.rel,
             path: root.join(t.rel),
+            existed: root.join(t.rel).exists(),
             before: text("before")?,
             after: text("after")?,
         });
@@ -92,6 +95,15 @@ fn put(path: &Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("md.tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Puts a file back as it was before the call: its old text, or gone.
+fn restore(c: &Change) {
+    if c.existed {
+        let _ = put(&c.path, &c.before);
+    } else {
+        let _ = std::fs::remove_file(&c.path);
+    }
 }
 
 fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
@@ -137,7 +149,7 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     for c in &changes {
         if let Err(e) = put(&c.path, &c.after) {
             for d in done {
-                let _ = put(&d.path, &d.before);
+                restore(d);
             }
             return Err(internal_err(format!("write failed, nothing kept: {e}")));
         }
@@ -145,7 +157,7 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     }
     if let Err(e) = tx.commit() {
         for d in done {
-            let _ = put(&d.path, &d.before);
+            restore(d);
         }
         return Err(internal_err(e));
     }

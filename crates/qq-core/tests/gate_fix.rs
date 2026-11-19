@@ -574,7 +574,10 @@ fn memory_path_gate_bash_writes() {
             assert!(block(&v), "{cmd}");
             if who == Who::Cos {
                 let GateVerdict::Block(m) = v else { panic!() };
-                assert!(m.contains("memory_add") && m.contains("memory_replace"), "{m}");
+                assert!(
+                    m.contains("memory_add") && m.contains("memory_replace"),
+                    "{m}"
+                );
             }
         }
     }

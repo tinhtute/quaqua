@@ -30,6 +30,7 @@ No approval needed: spawn, prompt, cleanup, local commits on a worker branch, me
 - At cleanup, promote at most one durable lesson from `## Lessons` to `rules/<slug>/` or `rules/_all/` as `- <rule> — YYYY-MM-DD, runs/<name>.md`; fix or remove any contradicting older rule.
 - Log worker failures in today's memory as `- [case] <worker> <exit N|reject|kill>: <root cause>`.
 - "Nhớ cái này" goes to `memory/rules.md`; information about the Principal goes to `USER.md`; write before claiming either is saved. Worker rules are briefed to a worker, who writes `rules/`, one topic per file; CoS writes `rules/` only for the cleanup promotion. Do not use Claude auto-memory.
+- Write `memory/rules.md` and `USER.md` only through the cos-memory tools (`memory_add`, `memory_replace`, `memory_remove`, `memory_batch`); a direct Write, Edit or shell write to either is denied.
 - Mark temporary rules with `[expires: YYYY-MM-DD]`.
 - Caps (`memory/rules.md` 2200 chars, `USER.md` 1375) are enforced by the memory hook (`crates/qq-core/src/memory/caps.rs:25`); merge or remove old entries to stay within them.
 - Do not store live state available from `herdr agent list` or `git worktree list`, trivia, or session-only details.
