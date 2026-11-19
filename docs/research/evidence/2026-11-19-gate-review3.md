@@ -4,7 +4,7 @@ Reviewer: suhuynh-gate3 (read-only). Base: `quaqua/hermes3-integ` at 6be07e6.
 Earlier reviews: `2026-11-19-gate-rereview.md` (N1–N3, P1, m-new-1..3) and
 `2026-11-19-t9-memfix-review.md` (T9 majors and minors).
 
-**Summary.** Most named items are fixed: N1, N2, the old-binary hook, push case
+**Summary.** Most named items are fixed: N1, N2, m-new-2, the old-binary hook, push case
 variants, and the m-new-3 false hits. The fail-closed rules add about 10 false
 asks across 4,934 CoS commands (0.2%). The hook probe adds about 4 ms per Write.
 Neither opens a new hole. Three majors remain:
@@ -50,9 +50,9 @@ tests/qq-test.sh memory_path_gate hook_settings_route
 | N3 env-chdir / GIT_DIR | FIXED for the named forms | `env -C`, `--chdir=`, `--chdir`, `sudo -D`, `export GIT_DIR`, `declare -x`, `typeset -x`, `export GH_REPO` → ASK. Residual: clustered `env -iC {B} git tag v1` and `sudo -nD {B} git tag v1` → ALLOW (finding 1). |
 | P1 wrapper flags skip hard blocks | PARTLY FIXED | All 6 named long-option spellings → rc=2. Clustered short flags still give rc=0 on base and branch alike (finding 1). |
 | m-new-1 memory/instruction writers | FIXED for the named spellings | Worker BLOCK for: ln -sf, rsync, perl -pi, python open, git checkout --, tar -C, unzip, git restore, patch, and case variants (agents.md, user.md, Memory/Rules.md). Reads stay free: cat, cp out, diff, grep, wc, less, head, git diff. Residual: directory-destination copies (finding 5). |
-| m-new-2 fallback parity | PARTLY FIXED | Without a binary, the fallback blocks Write/Edit/NotebookEdit on USER/AGENTS/rules. Fallback misses: `gh pr -R o/B merge 5` and `gh pr --repo=o/B merge 5` → fb rc=0 (finding 7); `agents.md` case variant and symlink paths (finding 9). |
+| m-new-2 fallback parity | FIXED for the named cases | All six cases named in the re-review give bin=2 and fb=2 through `herdr-gate.sh`, with `QUAQUA_BIN=/nonexistent-qq` for the fallback: `git branch -C feat main`, `git tag --sort=refname v9`, `echo x >` AGENTS.md / USER.md, `>>` memory/rules.md, `sed -i … SOUL.md`, and the socat `grant.full` call. New drift: `gh pr -R o/B merge 5` and `gh pr --repo=o/B merge 5` give fb=0 (finding 7). The fallback's Write arm misses case-variant and symlink paths (finding 9). |
 | m-new-3 grant tripwire false hits | FIXED | Mail body, `git commit -m`, `python --verb`, `node --test` → ALLOW. `"$(cat …)"` call and `$Q call` → ASK. Residual: shell-on-stdin (finding 6). |
-| T9 push to remote default | NOT FIXED | Three push3 setups push to the remote default `trunk`; all three end `ALLOWED {"branch":"trunk","pushed":true}` and the origin's trunk moves (finding 2). |
+| T9 push to remote default | PARTLY FIXED | The plain cases are refused, and these tests are green: `cos_push_door_remote_default_refused_without_local_head`, `…_after_set_head_delete`, `…_via_second_remote`, `cos_push_door_unreadable_remote_refused`. Bypass: when the push URL differs from the fetch URL, three probe_push3 setups still push to the remote default `trunk`. All three end `ALLOWED {"branch":"trunk","pushed":true}` and the origin's trunk moves (finding 2). |
 | T9 read-path writers | PARTLY FIXED | Named spellings (`sed w`/`I`, `uniq` output, `git grep -O`) → rc=2. The sed allow-list parser fails closed on most forms. All 21 legit sed reads, uniq reads and git reads give rc=0. New holes: finding 3. |
 | T9 old-binary hook | FIXED | An e723967 binary fails the Write probe, so the hook falls back. Ordinary Write rc=0. USER/AGENTS/rules Write and NotebookEdit rc=2. `/nonexistent-qq` gives the same results. |
 | T9 push case variants | FIXED | `cos_push_door_case_variants_refused` is green; `same_branch` lowercases both sides. |
@@ -89,7 +89,7 @@ The only change is 12 commands moving from ALLOW to ASK, all under `approval lis
 
 That is 9–10 false asks in 4,934 commands (about 0.2%): acceptable, but listed as finding 8.
 
-A replay with no daemon gives 34 ALLOW-to-block changes. All of them are "the daemon did not identify the caller". That is the intended fail-closed behaviour with no daemon, not a CoS ask.
+A replay of the release binaries with no daemon (b94e630 build, sha f4db346a…, against the branch build) moves the same 12 commands, and nothing else. The replay rig grants only `repo-a`, so the base-to-branch change is what matters here, not the absolute ASK counts. In #540 the ask may come from its `for … AGENTS.md; do diff` loop rather than from `init --update`; I did not isolate which, so the count stays a 9–10 range.
 
 ## Findings
 
@@ -141,7 +141,7 @@ A replay with no daemon gives 34 ALLOW-to-block changes. All of them are "the da
     - `echo 'quaqua call grant.full' \| bash` → ALLOW.
     - `… \| sh -s` → ALLOW.
 - [minor] **`gh` repo flag after the subcommand group.**
-  - `gate.rs:1572` matches `release create` only as adjacent words. On the branch binary, `gh release -R o/B create v1` and `gh release --repo o/B create v1` give rc=0, while `gh release create v1` gives rc=2. Base b94e630 had no release rule, so this new rule is incomplete.
+  - `gate.rs:1572` matches `release create` only as adjacent words. On the branch binary, `gh release -R o/B create v1` and `gh release --repo o/B create v1` give rc=0, while `gh release create v1` gives rc=2. This is pre-existing: b94e630 has the same adjacent-word rule, and both spellings give rc=0 there too.
   - The fallback (`templates/workspace/scripts/hooks/herdr-gate.sh:52`) misses `gh pr -R o/B merge 5` and `gh pr --repo=o/B merge 5` (fb rc=0); the binary blocks both.
 - [minor] **Over-blocks from fail-closed name matching.**
   - Code: `gate.rs:64` (`ASK_FILE`).
@@ -150,13 +150,16 @@ A replay with no daemon gives 34 ALLOW-to-block changes. All of them are "the da
   - CoS `git -C WS add USER.md` is still BLOCK; the T9 minor is still open.
 - [trivial] **Fallback Write misses case variants and symlinks.** `herdr-gate.sh:91` matches basenames exactly. With a stale or missing binary, Write to `WS/agents.md`, or to a symlink pointing at USER.md, gives rc=0 (APFS is case-insensitive). The branch binary blocks both.
 - [trivial] **`Write runs/qq.db`** gives rc=0 on the branch binary and in the fallback. Pre-existing.
+  - Code: `herdr-gate.sh:91`; the Write arm in `gate.rs` (`names_live_file`, `gate.rs:465`) does not cover `qq.db`.
+  - Probe: `hk.py`, Write to `WS/runs/qq.db`.
 - [trivial] **`sort -oUSER.md`** (attached form) gives rc=0. `gate.rs:1142` checks only a detached `-o`. Pre-existing.
 
 The fail-closed rules and the hook probe add no new allow path. The new holes
 above sit in parser corners (clustered flags, sed continuation) and in
 read-list entries, not in the both-readings fork itself. The gate probes in
-findings 1 and 3 also give rc=0 on b94e630. That includes the sed `r\` form,
-because base allowed sed `w` outright. These holes were not introduced in this
+findings 1, 3, 5 and 7 also give rc=0 on a verified b94e630 build (sha
+f4db346a…). That includes the sed `r\` form, because base allowed sed `w`
+outright. These holes were not introduced in this
 round; this round left them open.
 
 Verdict: 11 findings
