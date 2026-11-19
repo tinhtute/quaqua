@@ -571,6 +571,169 @@ fn lead_cleanup_removes_the_lead_worktree_or_names_it() {
     assert!(ended(&conn, "proj-lead"));
 }
 
+fn lead_fixture(
+    tag: &str,
+    herdr: &FakeHerdr,
+) -> (std::path::PathBuf, Connection, std::path::PathBuf, String) {
+    let (dir, conn, repo, _wt, _pane) = worker_fixture(tag, herdr);
+    let p = project_with_repo(&conn, "proj", &repo);
+    add_agent(&conn, "proj-lead", "lead", "ni", Some(p));
+    let mine = herdr.seed_pane(
+        "repo-workers",
+        Some("claude"),
+        &[("grid_role", "lead"), ("grid_farm", "f1")],
+    );
+    set_pane(&conn, "proj-lead", &mine);
+    (dir, conn, repo, mine)
+}
+
+#[test]
+fn lead_cleanup_closes_its_own_lead_pane() {
+    let herdr = FakeHerdr::new();
+    let f = foreign(&herdr);
+    let (_d, conn, _repo, mine) = lead_fixture("lead-own-pane", &herdr);
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(!herdr.has_pane(&mine), "the Lead's own pane is closed");
+    assert!(ended(&conn, "proj-lead"));
+    survive(&herdr, &f);
+}
+
+#[test]
+fn lead_cleanup_closes_a_moved_lead_pane_by_live_lookup() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn, _repo, mine) = lead_fixture("lead-live", &herdr);
+    herdr
+        .agent_start("proj-lead", "ni", &mine, 1000, &[])
+        .unwrap();
+    set_pane(&conn, "proj-lead", "p999");
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead_live(&conn, &panes, &herdr, &scope_f1(), "proj", 9).unwrap();
+    assert!(!herdr.has_pane(&mine) && ended(&conn, "proj-lead"));
+}
+
+#[test]
+fn cleanup_refuses_to_claim_cleaned_when_herdr_lookup_fails_and_the_record_is_stale() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-lookup", &herdr);
+    herdr.agent_start("w1", "pi", &pane, 1000, &[]).unwrap();
+    set_pane(&conn, "w1", "p999");
+    herdr.set_fault(qq_core::herdr::Verb::Get, std::io::ErrorKind::TimedOut);
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    let r = cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5);
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.contains("pane"))),
+        "{r:?}"
+    );
+    assert!(!ended(&conn, "w1") && herdr.has_pane(&pane));
+}
+
+#[test]
+fn cleanup_falls_back_to_the_recorded_pane_when_herdr_lost_the_agent() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-lost", &herdr);
+    // herdr has no agent `w1` (agent_not_found); the record is right
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_f1(), &t, 5).unwrap();
+    assert!(!herdr.has_pane(&pane) && ended(&conn, "w1"));
+}
+
+#[test]
+fn lead_cleanup_rerun_removes_the_worktree_an_older_cleanup_left() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, _mine) = lead_fixture("lead-rerun", &herdr);
+    let lwt = dir.join(".wt").join("proj-lead");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    conn.execute("UPDATE agent SET ended_ms = 3 WHERE name = 'proj-lead'", [])
+        .unwrap(); // an older cleanup ended the row and left the worktree
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(!lwt.exists(), "the rerun finishes the job");
+    // a repeat converges
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 10).unwrap();
+}
+
+#[test]
+fn lead_cleanup_of_an_unknown_project_is_an_error() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn) = seeded("lead-unknown");
+    let r = cleanup::cleanup_lead(&conn, &HerdrPanes(&herdr), &scope_f1(), "nope", 9);
+    assert!(r.is_err(), "{r:?}");
+}
+
+#[test]
+fn lead_cleanup_finds_a_worktree_registered_outside_the_convention_path() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, _mine) = lead_fixture("lead-elsewhere", &herdr);
+    let lwt = dir.join("elsewhere");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9).unwrap();
+    assert!(!lwt.exists());
+    assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains("elsewhere"));
+}
+
+#[test]
+fn lead_cleanup_names_a_dirty_worktree_and_releases_nothing() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, mine) = lead_fixture("lead-dirty", &herdr);
+    let lwt = dir.join(".wt").join("proj-lead");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "quaqua/proj-lead",
+            &lwt.to_string_lossy(),
+        ],
+    );
+    std::fs::write(lwt.join("scratch.txt"), "x").unwrap();
+    let panes = HerdrPanes(&herdr);
+    let r = cleanup::cleanup_lead(&conn, &panes, &scope_f1(), "proj", 9);
+    assert_eq!(r, Err(OpsError::Dirty(vec!["scratch.txt".into()])));
+    assert!(lwt.exists() && herdr.has_pane(&mine) && !ended(&conn, "proj-lead"));
+}
+
+#[test]
+fn cleanup_with_the_repo_gone_names_the_worktree_that_remains() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, pane) = worker_fixture("cleanup-norepo", &herdr);
+    let gone = dir.join("repo-moved");
+    std::fs::rename(&repo, &gone).unwrap();
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, true);
+    let r = cleanup::cleanup_worker(&conn, &panes, &scope_f1(), &t, 5);
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.starts_with("worktree "))),
+        "{r:?}"
+    );
+    assert!(!herdr.has_pane(&pane) && !ended(&conn, "w1"));
+}
+
 #[test]
 fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     let (_dir, conn) = seeded("stop");
