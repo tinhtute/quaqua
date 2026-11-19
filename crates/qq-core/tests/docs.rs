@@ -25,6 +25,7 @@ const ACCEPTED_FLAGS: &[(&str, &str)] = &[
     ("status", "--metrics"),
     ("inbox", "--for"),
     ("inbox", "--format"),
+    ("inbox", "--session"),
     ("transcripts", "--last"),
     ("transcripts", "--session"),
     ("worker", "--check-brief"),
