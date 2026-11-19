@@ -57,6 +57,12 @@ fn seed(conn: &mut rusqlite::Connection) {
     let team = std::fs::read_to_string(template)
         .unwrap();
     config::seed(conn, &team).expect("seed");
+    // A pipeline start needs a named caller that may merge: the CoS.
+    conn.execute(
+        "INSERT OR IGNORE INTO agent (name, role, started_ms) VALUES ('cos', 'cos', 1)",
+        [],
+    )
+    .unwrap();
 }
 
 struct Fixture {
@@ -1016,6 +1022,10 @@ fn daemon_with(
 }
 
 fn verb_call(ws: &TestWorkspace, args: Value) -> rpc::Response {
+    verb_call_as(ws, "cos", args)
+}
+
+fn verb_call_anon(ws: &TestWorkspace, args: Value) -> rpc::Response {
     rpc::call(
         &rpc::socket_path(&ws.runs_dir()),
         &Request::new("pipeline", args),
@@ -1081,7 +1091,7 @@ fn pipeline_verb_enforces_cross_harness_review_and_converges() {
     assert_eq!(again.result["running"], json!(true));
     assert_eq!(herdr.prompts().len(), 1, "the repeat prompts nobody again");
     let agents: i64 = conn
-        .query_row("SELECT count(*) FROM agent", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM agent WHERE name != 'cos'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(agents, 1, "one builder, no second spawn");
 
@@ -1246,7 +1256,7 @@ fn pipeline_start_refuses_a_protected_integ() {
 fn pipeline_start_without_a_caller_fails_closed() {
     let (ws, fx, herdr, anchor, daemon) = pipeline_rig("pstart-anon");
     let args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
-    assert_eq!(refused(verb_call(&ws, args)), "refused");
+    assert_eq!(refused(verb_call_anon(&ws, args)), "refused");
     assert!(herdr.prompts().is_empty(), "a refusal starts nothing");
     daemon.stop().unwrap();
 }

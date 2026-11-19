@@ -488,22 +488,23 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             )),
             authority::Decision::Allowed => Ok(()),
         };
-        if let Some(caller) = req.caller.as_deref() {
-            denied(
-                authority::check_orchestration(
-                    &conn,
-                    caller,
-                    authority::Op::Merge,
-                    authority::Fence::Fenced,
-                )
-                .map_err(|e| internal(e.0))?,
-            )?;
-        }
+        let Some(caller) = req.caller.as_deref() else {
+            return Err(RpcError::new("refused", "a pipeline needs an identified caller"));
+        };
+        denied(
+            authority::check_orchestration(
+                &conn,
+                caller,
+                authority::Op::Merge,
+                authority::Fence::Fenced,
+            )
+            .map_err(|e| internal(e.0))?,
+        )?;
         if merge::protected_integ(Path::new(&input.repo), &input.integ) {
             denied(
                 authority::refuse(
                     &conn,
-                    req.caller.as_deref().unwrap_or("cos"),
+                    caller,
                     "pipeline",
                     &input.integ,
                     "integ is the repo's main or default branch",
