@@ -317,21 +317,14 @@ pub(crate) fn protected_integ(repo: &Path, integ: &str) -> bool {
     let remotes: Vec<String> = git(repo, &["remote"])
         .map(|o| stdout(&o).lines().map(String::from).collect())
         .unwrap_or_default();
-    let remotes = if remotes.is_empty() {
-        vec!["origin".to_string()]
-    } else {
-        remotes
-    };
+    let remotes = if remotes.is_empty() { vec!["origin".to_string()] } else { remotes };
     remotes
         .iter()
         .any(|m| crate::authority::push::protected_branch(&r, m, integ))
 }
 
 fn refused(r: &crate::authority::Refusal) -> RpcError {
-    RpcError::new(
-        "refused",
-        format!("{} -> {}: {}", r.caller, r.target, r.reason),
-    )
+    RpcError::new("refused", format!("{} -> {}: {}", r.caller, r.target, r.reason))
 }
 
 /// The `merge {repo, integ, entries:[{branch, sha?}]}` verb. The caller must
@@ -355,8 +348,8 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
         let Some(caller) = req.caller.as_deref() else {
             return Err(RpcError::new("refused", "merge needs an identified caller"));
         };
-        if let Decision::Refused(d) = check_orchestration(&conn, caller, Op::Merge, Fence::Fenced)
-            .map_err(|e| internal(&e))?
+        if let Decision::Refused(d) =
+            check_orchestration(&conn, caller, Op::Merge, Fence::Fenced).map_err(|e| internal(&e))?
         {
             return Err(refused(&d));
         }

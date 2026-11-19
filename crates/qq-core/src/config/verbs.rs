@@ -29,10 +29,7 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
         help: "list kinds with harness, model, use_for and avoid",
         run: roster_cmd,
     })?;
-    daemon.register_verb(
-        "config",
-        Box::new(|ctx, req| serve(ctx, req, exec_config, true)),
-    )?;
+    daemon.register_verb("config", Box::new(|ctx, req| serve(ctx, req, exec_config, true)))?;
     daemon.register_verb(
         "roster",
         Box::new(|ctx, req| serve(ctx, req, |c, _| exec_roster(c), false)),
@@ -59,10 +56,7 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
         .map_err(|e| RpcError::new("internal", e.to_string()))?;
     if guarded && !matches!(argv.first().map(String::as_str), Some("get" | "validate")) {
         let Some(caller) = req.caller.as_deref() else {
-            return Err(RpcError::new(
-                "refused",
-                "a config write needs an identified caller",
-            ));
+            return Err(RpcError::new("refused", "a config write needs an identified caller"));
         };
         let d = crate::authority::check_orchestration(
             &conn,
@@ -665,10 +659,7 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
         .and_then(|v| v.as_table())
         .map(|t| t.keys().cloned().collect())
         .unwrap_or_default();
-    super::write_harnesses(
-        &tx,
-        p.harnesses.iter().filter(|(n, _)| declared.contains(n)),
-    )?;
+    super::write_harnesses(&tx, p.harnesses.iter().filter(|(n, _)| declared.contains(n)))?;
     let named: Vec<String> = doc
         .get("kinds")
         .and_then(|v| v.as_table())

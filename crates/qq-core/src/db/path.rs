@@ -129,10 +129,7 @@ fn normalize(p: &Path) -> PathBuf {
     if let Ok(c) = p.canonicalize() {
         return c;
     }
-    match (
-        p.parent().and_then(|d| d.canonicalize().ok()),
-        p.file_name(),
-    ) {
+    match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
         (Some(dir), Some(name)) => dir.join(name),
         _ => p.to_path_buf(),
     }
@@ -165,8 +162,7 @@ pub fn default_runs_dir() -> PathBuf {
     }
     let runs = workspace_root().join("runs");
     if is_test_environment()
-        && (live_db_open_refused(&runs.join(DB_FILE))
-            || live_db_open_refused(&runs.join(OLD_DB_FILE)))
+        && (live_db_open_refused(&runs.join(DB_FILE)) || live_db_open_refused(&runs.join(OLD_DB_FILE)))
     {
         let dir = std::env::temp_dir().join(format!("qq-test-runs-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

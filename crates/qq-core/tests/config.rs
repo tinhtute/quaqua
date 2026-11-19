@@ -10,7 +10,8 @@ use rusqlite::Connection;
 use std::sync::Arc;
 
 fn template() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/team.toml");
     std::fs::read_to_string(p).expect("read template team.toml")
 }
 
@@ -61,7 +62,10 @@ fn unknown_harness_rejected() {
     assert_eq!(count(&conn, "kind"), 0);
 
     // A valid harness is accepted by the same call.
-    assert_eq!(config::seed(&mut conn, &template()).unwrap(), Seeded::Fresh);
+    assert_eq!(
+        config::seed(&mut conn, &template()).unwrap(),
+        Seeded::Fresh
+    );
 
     // The daily verbs refuse the same names and change nothing.
     let env = Env {
@@ -552,21 +556,9 @@ fn harness_declared_in_toml_imports_and_validates() {
     let spec = t.harness.spec.expect("stored spec");
     assert_eq!((spec.herdr_kind.as_str(), spec.args.len()), ("kimi", 2));
     // a stored harness stays usable by later sets and a bare validate
-    assert_eq!(
-        run(&[
-            "config",
-            "set",
-            "kind.k2",
-            r#"{"harness":"kimi","model":"m2"}"#
-        ]),
-        0
-    );
+    assert_eq!(run(&["config", "set", "kind.k2", r#"{"harness":"kimi","model":"m2"}"#]), 0);
     assert_eq!(run(&["config", "validate"]), 0);
-    assert_eq!(
-        run(&["config", "set", "kind.k2.effort", "high"]),
-        1,
-        "not in efforts"
-    );
+    assert_eq!(run(&["config", "set", "kind.k2.effort", "high"]), 1, "not in efforts");
 
     // refused before anything is written
     let refused = |name: &str, body: String| {
@@ -580,23 +572,14 @@ fn harness_declared_in_toml_imports_and_validates() {
     refused("upper.toml", decl("Kimi"));
     refused("nomodel.toml", decl("x").replace("{model}", "m"));
     refused("badph.toml", decl("x").replace("{model}", "{model}{nope}"));
-    refused(
-        "prompt.toml",
-        decl("x").replace("{model}", "{model}{prompt}"),
-    );
+    refused("prompt.toml", decl("x").replace("{model}", "{model}{prompt}"));
     refused(
         "ctrlc.toml",
         decl("x").replace("args =", "stop_keys = [\"ctrl+c\"]\nargs ="),
     );
-    refused(
-        "shape.toml",
-        decl("x").replace("args =", "error_shape = \"zzz\"\nargs ="),
-    );
+    refused("shape.toml", decl("x").replace("args =", "error_shape = \"zzz\"\nargs ="));
     // neither native nor declared: unknown
-    let ghost = file(
-        "ghost.toml",
-        "[kinds.g]\nharness = \"nope\"\nmodel = \"m\"\n",
-    );
+    let ghost = file("ghost.toml", "[kinds.g]\nharness = \"nope\"\nmodel = \"m\"\n");
     assert_eq!(run(&["config", "validate", &ghost]), 1);
     daemon.stop().unwrap();
 }

@@ -52,8 +52,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 /// The seeded team: `ni` builds on claude, `sude` reviews on pi.
 fn seed(conn: &mut rusqlite::Connection) {
-    let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
-    let team = std::fs::read_to_string(template).unwrap();
+    let template =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
+    let team = std::fs::read_to_string(template)
+        .unwrap();
     config::seed(conn, &team).expect("seed");
     // A pipeline start needs a named caller that may merge: the CoS.
     conn.execute(
@@ -835,11 +837,7 @@ fn no_changes_after_an_earlier_commit_keeps_that_candidate_for_review() {
     r.approve();
     assert_eq!(r.sim.saw("prompt t1-b"), 2);
     r.answer("Outcome: NO_CHANGES\n");
-    assert_eq!(
-        r.sim.saw("spawn t1-r1 sude"),
-        1,
-        "the committed tip is reviewed"
-    );
+    assert_eq!(r.sim.saw("spawn t1-r1 sude"), 1, "the committed tip is reviewed");
     assert!(r.sim.prompt_text("t1-r1", 0).contains(&first));
     let done = merged(r.answer(clean()));
     assert_eq!(done.status, "merged");
@@ -1093,9 +1091,7 @@ fn pipeline_verb_enforces_cross_harness_review_and_converges() {
     assert_eq!(again.result["running"], json!(true));
     assert_eq!(herdr.prompts().len(), 1, "the repeat prompts nobody again");
     let agents: i64 = conn
-        .query_row("SELECT count(*) FROM agent WHERE name != 'cos'", [], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT count(*) FROM agent WHERE name != 'cos'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(agents, 1, "one builder, no second spawn");
 
@@ -1180,10 +1176,7 @@ fn merge_run_refuses_a_protected_integ_for_every_caller() {
     let r = merge::run(&merge::Request {
         repo: fx.repo.clone(),
         integ: "main".into(),
-        entries: vec![Entry {
-            branch: "t1".into(),
-            sha: Some(tip),
-        }],
+        entries: vec![Entry { branch: "t1".into(), sha: Some(tip) }],
         check: None,
     });
     assert!(matches!(r, Err(MergeError::Operational(_))), "{r:?}");
@@ -1191,15 +1184,7 @@ fn merge_run_refuses_a_protected_integ_for_every_caller() {
 }
 
 /// A pipeline verb daemon with a Peer `p1` and a Lead `l1` of project 1.
-fn pipeline_rig(
-    tag: &str,
-) -> (
-    TestWorkspace,
-    Fixture,
-    Arc<FakeHerdr>,
-    String,
-    qq_core::daemon::DaemonHandle,
-) {
+fn pipeline_rig(tag: &str) -> (TestWorkspace, Fixture, Arc<FakeHerdr>, String, qq_core::daemon::DaemonHandle) {
     let ws = TestWorkspace::new(tag);
     let fx = Fixture::new(tag);
     let mut conn = db::open(&ws.db_path()).expect("open qq db");
@@ -1234,10 +1219,7 @@ fn pipeline_start_refuses_a_peer_and_journals_it() {
     let conn = db::open(&ws.db_path()).unwrap();
     let rows = qq_core::authority::refusals(&conn).unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(
-        (rows[0].caller.as_str(), rows[0].edge.as_str()),
-        ("p1", "orchestration")
-    );
+    assert_eq!((rows[0].caller.as_str(), rows[0].edge.as_str()), ("p1", "orchestration"));
     // A Lead still starts the same flow.
     let ok = verb_call_as(&ws, "l1", args);
     assert!(ok.ok, "{:?}", ok.error);
@@ -1253,11 +1235,7 @@ fn pipeline_start_by_a_refused_caller_never_runs_its_check() {
     assert_eq!(refused(verb_call_as(&ws, "p1", args)), "refused");
     let n: i64 = db::open(&ws.db_path())
         .unwrap()
-        .query_row(
-            "SELECT count(*) FROM agent WHERE name LIKE '%t1%'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT count(*) FROM agent WHERE name LIKE '%t1%'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 0, "no builder spawned for the refused flow");
     assert!(herdr.prompts().is_empty() && !marker.exists());

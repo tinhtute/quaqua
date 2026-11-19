@@ -20,8 +20,10 @@ use serde_json::{json, Value};
 const SHA: &str = "0123abc4567def890123abc4567def890123abcd";
 
 fn template() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
-    std::fs::read_to_string(p).expect("read template team.toml")
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/team.toml");
+    std::fs::read_to_string(p)
+        .expect("read template team.toml")
 }
 
 /// A seeded workspace with one project and one task.

@@ -957,7 +957,10 @@ impl Tuning {
 
 /// The brief plus the report instruction, as the old binary composed it.
 pub fn compose_prompt_body(name: &str, task: &str) -> String {
-    format!("{task}. {}", super::report_contract::report_ask(name))
+    format!(
+        "{task}. {}",
+        super::report_contract::report_ask(name)
+    )
 }
 
 /// Sends the brief through herdr and checks it reached the turn. A stalled

@@ -647,13 +647,7 @@ impl Workflow for PipelineFlow {
                             }
                             _ => "the reviewer could not be spawned".into(),
                         };
-                        block(
-                            s,
-                            Stage::SpawnReview,
-                            BlockKind::Restart,
-                            BLOCK_UNFINISHED,
-                            why,
-                        )
+                        block(s, Stage::SpawnReview, BlockKind::Restart, BLOCK_UNFINISHED, why)
                     }
                     ("read", ActivityResult::ReportFile(ReportFileResult::Content(text))) => {
                         self.on_report(s, &text)

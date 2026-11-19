@@ -16,10 +16,7 @@ pub enum DbError {
     /// The path is a live database and the process is in test mode.
     LiveDb(PathBuf),
     /// The file was written by a newer schema than this build knows.
-    TooNew {
-        found: u32,
-        known: u32,
-    },
+    TooNew { found: u32, known: u32 },
 }
 
 impl std::fmt::Display for DbError {
