@@ -1300,3 +1300,288 @@ fn gate_fix3_b_a_binary_with_the_write_gate_keeps_its_verdict() {
         );
     }
 }
+
+// ---- gate allowlist (sude-gateallow): known spellings are the fast path ----
+//
+// Review 3 findings 1, 3, 4, 10, then a held-out set no review listed. The
+// held-out cases are the test of the premise "the gate can enumerate the unsafe
+// spellings": they must pass with no case-by-case additions.
+
+/// Hard blocks (push, pane spawn) end BLOCK for every role, like their siblings.
+#[test]
+fn gate_fix4_review3_clustered_wrapper_flags_block() {
+    gf2_blocks(
+        "gf4-r3-wrap",
+        &[
+            "env -iC /tmp git push origin feat",
+            "env -iu FOO git push origin feat",
+            "sudo -Eu root git push origin feat",
+            "sudo -nu root git push origin feat",
+            "xargs -tn 1 git push origin feat",
+            "timeout -vs KILL 5 git push origin feat",
+            "env -iS 'git push origin feat'",
+            "sudo -Eu root herdr pane split p1",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix4_review3_unlisted_wrappers_block() {
+    gf2_blocks(
+        "gf4-r3-unl",
+        &[
+            "caffeinate -i git push origin feat",
+            "script -q /dev/null git push origin feat",
+            "doas -u root git push origin feat",
+            "unbuffer git push origin feat",
+            "flock /tmp/l git push origin feat",
+            "watch -n 5 git push origin feat",
+            "parallel -j1 git push origin ::: feat",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix4_review3_clustered_flags_keep_the_tier() {
+    gf2_asks("gf4-r3-tier", true, |r| {
+        let b = r.b.display();
+        vec![
+            format!("env -iC {b} git tag v1"),
+            format!("sudo -nD {b} git tag v1"),
+        ]
+    });
+}
+
+/// Writers through a reader on `f`, as the command names it.
+fn gf4_reader_writers(f: &str) -> Vec<String> {
+    vec![
+        // review 3, finding 3 and 10
+        format!("sed -n 'r /dev/null\\\nw {f}' in.txt"),
+        format!("xxd in.txt {f}"),
+        format!("xxd -r in.hex {f}"),
+        format!("rg --pre tee x {f}"),
+        format!("bat --pager='tee {f}' x"),
+        format!("sort -o{f} in.txt"),
+        // held-out: not listed by any review
+        format!("sed -n 'R /dev/null\\\nW {f}' in.txt"),
+        format!("sed -n '1{{r /dev/null\\\nw {f}\n}}' in.txt"),
+        format!("xxd -p -r in.hex {f}"),
+        format!("xxd -ps in.txt {f}"),
+        format!("xxd -i in.txt {f}"),
+        format!("rg -n --pre=tee x {f}"),
+        format!("rg --pre-glob '*' --pre=tee x {f}"),
+        format!("bat --paging=always --pager 'tee {f}' x"),
+        format!("batcat -P --pager='tee {f}' x"),
+        format!("less -o{f} in.txt"),
+        format!("less --log-file={f} in.txt"),
+        format!("sort -ruo{f} in.txt"),
+        format!("sort --compress-program 'tee {f}' in.txt"),
+        format!("awk '{{print | \"tee {f}\"}}' in.txt"),
+        format!("awk 'END{{printf \"x\" | \"tee {f}\"}}' in.txt"),
+        format!("awk '{{ \"tee {f}\" | getline }}' in.txt"),
+        format!("gawk -iinplace '{{print}}' {f}"),
+    ]
+}
+
+#[test]
+fn gate_fix4_readers_that_write_memory_files_block_every_role() {
+    for who in [Who::Worker, Who::Cos, Who::Down] {
+        let r = rig("gf4-rd-mem", who);
+        for name in ["USER.md", "memory/rules.md"] {
+            let abs = r.root().join(name).display().to_string();
+            for cmd in gf4_reader_writers(&abs) {
+                assert!(block(&r.bash(&cmd)), "{who:?} absolute: {cmd}");
+            }
+            for cmd in gf4_reader_writers(name) {
+                assert!(block(&r.bash_in(r.root(), &cmd)), "{who:?} relative: {cmd}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_fix4_readers_that_write_instruction_files_ask_cos_deny_workers() {
+    for who in [Who::Worker, Who::Cos] {
+        let r = rig("gf4-rd-ins", who);
+        for name in ["AGENTS.md", "SOUL.md"] {
+            let abs = r.root().join(name).display().to_string();
+            for cmd in gf4_reader_writers(&abs) {
+                let v = r.bash(&cmd);
+                if who == Who::Cos {
+                    assert!(ask(&v), "cos must ask: {cmd}");
+                } else {
+                    assert!(block(&v), "worker must be denied: {cmd}");
+                }
+            }
+        }
+    }
+}
+
+/// Held-out: other clustered flags and other wrappers, no review listed them.
+#[test]
+fn gate_fix4_heldout_wrappers_block() {
+    gf2_blocks(
+        "gf4-ho-wrap",
+        &[
+            "env -0iu FOO git push origin feat",
+            "env -vi -u FOO git push origin feat",
+            "sudo -HEu root git push origin feat",
+            "sudo -nkH -g wheel git push origin feat",
+            "xargs -rtn1 git push origin feat",
+            "xargs -0rI{} git push origin feat",
+            "timeout -pvk 3 9 git push origin feat",
+            "nice -n5 git push origin feat",
+            "nice -5 git push origin feat",
+            "ionice -tc3 git push origin feat",
+            "stdbuf -oL -eL git push origin feat",
+            "env -iC /tmp herdr workspace create",
+            "sudo -HEu root herdr pane close p1",
+            "ssh host git push origin feat",
+            "chroot / git push origin feat",
+            "lockf /tmp/l git push origin feat",
+            "runuser -u x git push origin feat",
+            "systemd-run --user git push origin feat",
+            "nsenter -t 1 git push origin feat",
+            "unshare -r git push origin feat",
+            "proxychains4 -q git push origin feat",
+            "direnv exec . git push origin feat",
+            "mise exec -- git push origin feat",
+            "op run -- git push origin feat",
+            "lockf /tmp/l herdr pane split p1",
+            "direnv exec . herdr pane close p1",
+            "watch -n1 'git push origin feat'",
+            "flock -n /tmp/l -c 'git push origin feat'",
+            "script -qc 'git push origin feat' /dev/null",
+            "ssh host 'git push origin feat'",
+            "tmux new-session -d 'git push origin feat'",
+            "su -c 'git push origin feat' root",
+            "sg wheel -c 'git push origin feat'",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix4_heldout_tier_escapes_ask() {
+    gf2_asks("gf4-ho-tier", true, |r| {
+        let b = r.b.display();
+        vec![
+            format!("env -vC {b} git tag v1"),
+            format!("env -0C {b} git tag v1"),
+            format!("sudo -HD {b} git tag v1"),
+            format!("sudo -nkD {b} git tag v1"),
+            format!("env -iC {b} gh release create v1"),
+            format!("direnv exec {b} git tag v1"),
+            "lockf /tmp/l git tag v1".to_string(),
+            format!("chroot {b} git tag v1"),
+        ]
+    });
+}
+
+/// The strict path must not make ordinary work ask or block.
+#[test]
+fn gate_fix4_ordinary_commands_stay_free() {
+    let r = rig("gf4-free", Who::Worker);
+    for name in ["USER.md", "memory/rules.md", "AGENTS.md"] {
+        let f = r.root().join(name).display().to_string();
+        for ok in [
+            format!("rg -n foo {f}"),
+            format!("rg -il foo -g '*.md' {f}"),
+            format!("bat -n {f}"),
+            format!("bat --style=plain --paging=never {f}"),
+            format!("sort -u {f}"),
+            format!("sort -k2,2 -t, -r {f}"),
+            format!("diff -u /tmp/a {f}"),
+            format!("awk '{{print $1}}' {f}"),
+            format!("awk -F: '{{print $2}}' {f}"),
+            format!("sed -n '/a/{{p;q}}' {f}"),
+            format!("cat {f}"),
+            format!("ls -la {f}"),
+            format!("head -5 {f}"),
+            format!("wc -l {f}"),
+            format!("grep -rn foo {f}"),
+            format!("hexdump -C {f}"),
+        ] {
+            assert_eq!(r.bash(&ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+    for ok in [
+        "env -i ls",
+        "env -iu FOO ls -la",
+        "sudo -n git status",
+        "sudo -Eu root ls",
+        "timeout -vs KILL 5 git log",
+        "xargs -tn 1 echo git push",
+        "echo git push",
+        "printf 'git push\\n'",
+        "grep -rn git push docs",
+        "rg -n 'git push' docs",
+        "ssh host ls",
+        "caffeinate -i sleep 1",
+        "flock /tmp/l ls",
+        "watch -n 5 ls",
+        "nice -n5 cargo build",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
+
+/// A worker never gets a tag through a wrapper either (predicate (a): ASK for
+/// the CoS, BLOCK for a worker).
+#[test]
+fn gate_fix4_tier_escapes_through_wrappers_block_workers() {
+    for who in [Who::Worker, Who::Down] {
+        let r = rig("gf4-tier-w", who);
+        let b = r.b.display();
+        for cmd in [
+            format!("env -iC {b} git tag v1"),
+            format!("sudo -nD {b} git tag v1"),
+            format!("env -vC {b} git tag v1"),
+            format!("sudo -nkD {b} git tag v1"),
+            format!("direnv exec {b} git tag v1"),
+            format!("chroot {b} git tag v1"),
+        ] {
+            assert!(block(&r.bash_in(&r.a, &cmd)), "{who:?}: {cmd}");
+        }
+    }
+}
+
+/// An option the wrapper table does not know must not switch off the checks the
+/// ordinary command path runs (db writes, `names_db`).
+#[test]
+fn gate_fix4_unknown_wrapper_flag_keeps_the_db_checks() {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig("gf4-unk-db", who);
+        for cmd in [
+            "env -Z rm runs/qq.db",
+            "nohup --x v tee runs/qq.db",
+            "env -Z mv x runs/qq.db",
+            "sudo --zz truncate -s0 runs/qq.db",
+        ] {
+            let v = r.bash(cmd);
+            if who == Who::Cos {
+                assert!(ask(&v), "cos must ask: {cmd}");
+            } else {
+                assert!(block(&v), "non-cos must deny: {cmd}");
+            }
+        }
+    }
+}
+
+/// A command line glued to a flag (`--command=…`, `-qc'…'`) or sitting in the
+/// command-word slot is scanned like any other quoted command line.
+#[test]
+fn gate_fix4_glued_and_slot_command_lines_block() {
+    gf2_blocks(
+        "gf4-glued",
+        &[
+            "script --command='git push origin feat' /dev/null",
+            "su --command='git push origin feat' root",
+            "script -qc'git push origin feat' /dev/null",
+            "sudo -s 'git push origin feat'",
+            "env -S'git push origin feat'",
+            "su -c'herdr pane split p1' root",
+            "script --command='herdr workspace create' /dev/null",
+            "sudo -s 'herdr pane close p1'",
+        ],
+    );
+}

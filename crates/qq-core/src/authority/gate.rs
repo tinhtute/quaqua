@@ -51,8 +51,6 @@ const MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written o
 const COS_MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written only through the cos-memory tools (memory_add, memory_replace, memory_remove), never directly";
 const TIER_DENY_MESSAGE: &str = "blocked: pushing to main and force-pushing are anh iu's call";
 
-const WRAP_MESSAGE: &str =
-    "blocked: too many wrapper options to read the command; run the command without the wrapper";
 const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
 const ASK_TRUNK_MOVE: &str = "approval list: rename or force-move main/master";
 const ASK_TAG: &str = "approval list: git tag";
@@ -578,6 +576,17 @@ fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
         let embedded = is_interp(base) || matches!(base, "awk" | "gawk" | "mawk");
         for (j, w) in args.iter().enumerate() {
             let mut kind = names_live_file(&root, &dirs, w);
+            // `-oFILE`, `-ruoFILE`: the value is glued to the flag cluster.
+            if kind.is_none() && w.starts_with('-') && !w.starts_with("--") {
+                kind = w
+                    .char_indices()
+                    .skip(2)
+                    .filter_map(|(k, _)| names_live_file(&root, &dirs, &w[k..]))
+                    .fold(None, |acc, k| match (acc, k) {
+                        (Some(Live::Memory), _) | (_, Live::Memory) => Some(Live::Memory),
+                        _ => Some(Live::Instruction),
+                    });
+            }
             if embedded && kind != Some(Live::Memory) {
                 for p in w.split(|c: char| c.is_whitespace() || "'\"(),;{}[]".contains(c)) {
                     match names_live_file(&root, &dirs, p) {
@@ -656,10 +665,17 @@ pub fn check(command: &str) -> Verdict {
 
 /// Every simple command in `command`, nested ones included.
 fn scan(command: &str) -> Found {
+    scan_with(command, true)
+}
+
+/// [`scan`]. `deep` is false for a quoted word that merely might be a command
+/// line (an argument of an unlisted command): its command word must itself be a
+/// known command, so prose that mentions `git push` is not read as one.
+fn scan_with(command: &str, deep: bool) -> Found {
     let segs = tokenize(command);
     let mut f = Found::pass();
     for seg in &segs {
-        f.absorb(check_words(seg));
+        f.absorb(check_words_in(seg, deep));
     }
     // Redirect targets are dropped by the tokenizer: read them off the text.
     for t in redirect_targets(command) {
@@ -938,14 +954,6 @@ fn is_c_flag(w: &str) -> bool {
         && w[1..w.len() - 1].chars().all(|c| c.is_ascii_lowercase())
 }
 
-fn single_letter_flag(w: &str) -> Option<char> {
-    let mut c = w.chars();
-    match (c.next(), c.next(), c.next()) {
-        (Some('-'), Some(f), None) if f.is_ascii_alphabetic() => Some(f),
-        _ => None,
-    }
-}
-
 fn guarded_pair(a: &str, b: &str) -> bool {
     matches!(
         (a, b),
@@ -973,6 +981,10 @@ fn retargets(w: &str) -> bool {
 }
 
 fn check_words(w: &[String]) -> Found {
+    check_words_in(w, true)
+}
+
+fn check_words_in(w: &[String], deep: bool) -> Found {
     let Some(i) = w.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
         return Found::pass();
     };
@@ -981,10 +993,10 @@ fn check_words(w: &[String]) -> Found {
     } else {
         Target::Here
     };
-    check_cmd(w, i).retarget(&t)
+    check_cmd(w, i, deep).retarget(&t)
 }
 
-fn check_cmd(w: &[String], i: usize) -> Found {
+fn check_cmd(w: &[String], i: usize, deep: bool) -> Found {
     let base = w[i].rsplit('/').next().unwrap_or(&w[i]);
     let a = &w[i + 1..];
     match base {
@@ -1010,6 +1022,16 @@ fn check_cmd(w: &[String], i: usize) -> Found {
             // A command word built at run time (`$Q call …`) may be `quaqua`.
             if b.contains(['$', '`']) {
                 f.absorb(check_quaqua(a));
+            }
+            // Not a provable reader and not a wrapper the gate has a table for:
+            // it may run any of its words as a command (`caffeinate`, `doas`,
+            // `watch`, `ssh host …`). Check them all, at an unknown target.
+            if deep && !read_only_cmd(b, a) {
+                f.absorb(scan_suffixes(a, 0));
+                // The command word may itself be a command line (`sudo -s 'git push'`).
+                let mut g = spaced_word(&w[i]);
+                g.moved |= !g.is_pass();
+                f.absorb(g.force_target(&Target::Unknown));
             }
             f.paths.extend(
                 write_targets(b, a)
@@ -1077,28 +1099,26 @@ fn write_targets(base: &str, a: &[String]) -> Vec<String> {
     }
 }
 
-/// Commands that only read their file arguments.
+/// Commands that only read their file arguments, whatever flags they get: none
+/// of them has an output file, a program or a pager option in any
+/// implementation. Everything else that reads must pass [`read_only_cmd`]'s
+/// exact flag tables.
 const READ_ONLY: &[&str] = &[
     "cat",
     "ls",
     "stat",
-    "file",
     "head",
     "tail",
     "wc",
     "du",
-    "less",
-    "more",
     "md5sum",
     "sha1sum",
     "sha256sum",
     "shasum",
     "strings",
     "grep",
-    "rg",
     "echo",
     "printf",
-    "diff",
     "cmp",
     "test",
     "[",
@@ -1106,11 +1126,8 @@ const READ_ONLY: &[&str] = &[
     "readlink",
     "basename",
     "dirname",
-    "xxd",
     "hexdump",
     "od",
-    "bat",
-    "batcat",
 ];
 
 /// Read-only git subcommands.
@@ -1133,20 +1150,61 @@ const GIT_READ: &[&str] = &[
 /// list, plus the tools that read unless a flag or program makes them write
 /// (`sed -i`, `sort -o`, awk `print >`, `git diff --output=`).
 fn read_only_cmd(base: &str, args: &[String]) -> bool {
-    let short = |a: &str, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
     match base {
         _ if READ_ONLY.contains(&base) => true,
         "jq" | "nl" | "cut" | "tac" => true,
         "uniq" => uniq_reads(args),
         "sed" => sed_reads(args),
-        "sort" => !args
-            .iter()
-            .any(|a| short(a, 'o') || a == "--output" || a.starts_with("--output=")),
-        "awk" | "gawk" | "mawk" => !args.iter().any(|a| {
-            (a.contains('>') && a.contains("print"))
-                || a.contains("system(")
-                || a.contains("inplace")
-        }),
+        "awk" | "gawk" | "mawk" => awk_reads(args),
+        // Exact tables: a flag or letter that is not listed is not a read.
+        "sort" => flags_ok(
+            args,
+            "bcCdfghiMmnrRsuVz",
+            "kStT",
+            "reverse numeric-sort general-numeric-sort human-numeric-sort ignore-case \
+             ignore-leading-blanks ignore-nonprinting dictionary-order unique stable merge \
+             check month-sort random-sort version-sort zero-terminated",
+            "key field-separator buffer-size temporary-directory parallel batch-size",
+        ),
+        "rg" => flags_ok(
+            args,
+            "aiInNsSvwxcHlLoqUuFPpVb0.",
+            "efgmtTABCMjdrE",
+            "hidden no-ignore no-ignore-vcs no-ignore-parent files files-with-matches \
+             files-without-match count count-matches line-number no-line-number ignore-case \
+             smart-case case-sensitive fixed-strings word-regexp line-regexp invert-match \
+             only-matching quiet no-heading heading with-filename no-filename json column \
+             no-messages follow text multiline unrestricted pcre2 stats vimgrep trim null \
+             sort-files binary no-binary no-config",
+            "glob iglob type type-not max-depth max-count max-filesize context after-context \
+             before-context color regexp file replace threads encoding sort sortr max-columns",
+        ),
+        "bat" | "batcat" => flags_ok(
+            args,
+            "nApPufds",
+            "lrHm",
+            "plain number show-all diff no-config unbuffered force-colorization squeeze-blank",
+            "language style color theme line-range highlight-line paging decorations wrap tabs \
+             terminal-width map-syntax",
+        ),
+        "diff" => flags_ok(
+            args,
+            "abBcdeEfHiNnpqrsTtuwyZ",
+            "CUDFILWxXS",
+            "brief unified context recursive new-file text ignore-case ignore-all-space \
+             ignore-space-change ignore-blank-lines side-by-side report-identical-files minimal \
+             speed-large-files strip-trailing-cr expand-tabs initial-tab ed normal \
+             suppress-common-lines show-c-function color",
+            "unified context label width exclude ignore-matching-lines tabsize",
+        ),
+        "file" => flags_ok(
+            args,
+            "bcdhiIkLnNprsvzZ",
+            "fmeFP",
+            "brief mime mime-type mime-encoding dereference no-dereference keep-going \
+             special-files uncompress",
+            "files-from magic-file separator",
+        ),
         "git" => {
             let mut it = args.iter();
             let mut sub = None;
@@ -1185,6 +1243,76 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// True when every flag in `args` is in the exact tables: `no` and `val` are
+/// the short letters that take no value / a value (the rest of the cluster, or
+/// the next word), `lno` and `lval` the space-separated long names. A letter or
+/// long name that is not listed (an abbreviation included) is not a read.
+fn flags_ok(args: &[String], no: &str, val: &str, lno: &str, lval: &str) -> bool {
+    let has = |list: &str, n: &str| list.split_whitespace().any(|x| x == n);
+    let mut it = args.iter();
+    let mut done = false;
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if done || a == "-" || !a.starts_with('-') {
+            continue;
+        }
+        if a == "--" {
+            done = true;
+        } else if let Some(l) = a.strip_prefix("--") {
+            let (n, eq) = l.split_once('=').map_or((l, false), |(n, _)| (n, true));
+            if has(lval, n) {
+                if !eq {
+                    it.next();
+                }
+            } else if !has(lno, n) {
+                return false;
+            }
+        } else {
+            let cl = &a[1..];
+            for (k, c) in cl.char_indices() {
+                if no.contains(c) {
+                    continue;
+                }
+                if val.contains(c) {
+                    if cl[k + c.len_utf8()..].is_empty() {
+                        it.next();
+                    }
+                    break;
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `awk` reads when its flags are only `-F`, `-v` and `--`, and its program
+/// text has no way to write or run anything: no `>`, `|`, `system`, `getline`
+/// or `@` (a gawk extension). A program in a file (`-f`) is not read-only.
+fn awk_reads(args: &[String]) -> bool {
+    let mut it = args.iter();
+    let mut done = false;
+    let mut program = false;
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if done || a == "-" || !a.starts_with('-') {
+            if !program {
+                program = true;
+                if a.contains(['>', '|', '@']) || a.contains("system") || a.contains("getline") {
+                    return false;
+                }
+            }
+        } else if a == "--" {
+            done = true;
+        } else if a == "-F" || a == "-v" {
+            it.next();
+        } else if !(a.starts_with("-F") || a.starts_with("-v")) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `uniq [OPTION]… [INPUT [OUTPUT]]`: the second operand is the file it
@@ -1364,12 +1492,15 @@ fn sed_script_reads(s: &str, brackets: bool) -> bool {
                 }
             }
             // text and file names run to the end of the line (`a\` continues)
-            'a' | 'i' | 'c' | 'r' | 'R' => {
+            'a' | 'i' | 'c' => {
                 i = eol(i);
                 while i > 0 && i < n && c[i - 1] == '\\' {
                     i = eol(i + 1);
                 }
             }
+            // A file name ends at the newline, whatever precedes it: a
+            // backslash there must not hide the next line's `w`.
+            'r' | 'R' => i = eol(i),
             'b' | 't' | 'T' | ':' => {
                 while i < n && !matches!(c[i], ';' | '\n') {
                     i += 1;
@@ -1385,7 +1516,7 @@ fn sed_script_reads(s: &str, brackets: bool) -> bool {
 fn names_db(base: &str, a: &[String]) -> Found {
     let names = a.iter().any(|x| x.rsplit('/').next() == Some("qq.db"))
         || (is_interp(base) && a.iter().any(|x| x.contains("qq.db")));
-    if names && !READ_ONLY.contains(&base) {
+    if names && !read_only_cmd(base, a) {
         Found::act(Action::DbWrite, ASK_DB)
     } else {
         Found::pass()
@@ -1866,107 +1997,254 @@ fn check_git_tag(a: &[String]) -> Found {
     }
 }
 
-/// How many `--flag VALUE` forks one wrapper command may open before it blocks.
-const WRAP_FORKS: u8 = 6;
-
-fn wrapper(base: &str, a: &[String]) -> Found {
-    wrap(
-        base,
-        a,
-        0,
-        matches!(base, "timeout" | "chrt" | "taskset"),
-        false,
-        0,
-    )
+/// The exact spellings of one wrapper's leading options.
+struct WrapTable {
+    /// Short letters that take no value / a value (the rest of the cluster, or
+    /// the next word) / an optional value (only the rest of the cluster).
+    no: &'static str,
+    val: &'static str,
+    opt: &'static str,
+    /// Long names (space separated) that take no value / a value.
+    lno: &'static str,
+    lval: &'static str,
+    /// Short letters and long names that move the command to another directory.
+    chdir: &'static str,
+    lchdir: &'static str,
 }
 
-/// The command a wrapper runs. An unknown flag followed by a plain word may
-/// take that word as its value or not: both readings are checked and the
-/// strictest kept, so no table of value-taking options has to stay complete.
-/// `env -C`, `--chdir`, `sudo -D` move the command to another directory.
-fn wrap(
-    base: &str,
-    a: &[String],
-    mut k: usize,
-    mut duration_pending: bool,
-    mut moved: bool,
-    forks: u8,
-) -> Found {
-    let value_flags: &str = match base {
-        "sudo" => " u g h p C T U R t D ",
-        "env" => " u C S ",
-        "nice" => " n ",
-        "timeout" => " s k ",
-        "xargs" => " I n L P s d E a ",
-        _ => " ",
+fn wrap_table(base: &str) -> WrapTable {
+    let t = |no, val, opt, lno, lval, chdir, lchdir| WrapTable {
+        no,
+        val,
+        opt,
+        lno,
+        lval,
+        chdir,
+        lchdir,
     };
-    let chdir_short = match base {
-        "env" => 'C',
-        "sudo" => 'D',
-        _ => '\0',
-    };
-    let mut other_reading = Found::pass();
-    let mut main = Found::pass();
+    match base {
+        "sudo" => t(
+            "ABbEeHiKklnPSsVvN",
+            "ughpCTURtDrc",
+            "",
+            "askpass background bell preserve-env login non-interactive reset-timestamp stdin \
+             shell validate version remove-timestamp list set-home edit",
+            "user group host prompt close-from command-timeout other-user chroot chdir role type",
+            "DR",
+            "chdir chroot",
+        ),
+        "env" => t(
+            "i0v",
+            "uCSPa",
+            "",
+            "ignore-environment null debug list-signal-handling",
+            "unset chdir split-string argv0 block-signal default-signal ignore-signal",
+            "C",
+            "chdir",
+        ),
+        "nice" => t("0123456789", "n", "", "", "adjustment", "", ""),
+        "timeout" => t(
+            "fpv",
+            "sk",
+            "",
+            "foreground preserve-status verbose",
+            "signal kill-after",
+            "",
+            "",
+        ),
+        "xargs" => t(
+            "0prtxoh",
+            "InLPsdEaJRS",
+            "iel",
+            "null no-run-if-empty verbose interactive exit open-tty show-limits replace eof",
+            "max-args max-lines max-procs max-chars delimiter arg-file",
+            "",
+            "",
+        ),
+        "chrt" => t(
+            "bfiomrRv",
+            "",
+            "",
+            "batch fifo idle other rr reset-on-fork",
+            "",
+            "",
+            "",
+        ),
+        "ionice" => t(
+            "t",
+            "cnpPu",
+            "",
+            "ignore",
+            "class classdata pid pgid uid",
+            "",
+            "",
+        ),
+        "taskset" => t("cp", "", "", "cpu-list pid", "", "", ""),
+        "stdbuf" => t("", "ioe", "", "", "input output error", "", ""),
+        "time" => t(
+            "apvV",
+            "fo",
+            "",
+            "append portability verbose",
+            "format output",
+            "",
+            "",
+        ),
+        "command" => t("pvV", "", "", "", "", "", ""),
+        "exec" => t("cl", "a", "", "", "", "", ""),
+        "setsid" => t("cfwV", "", "", "ctty fork wait", "", "", ""),
+        _ => t("", "", "", "", "", "", ""),
+    }
+}
+
+/// The command a wrapper runs. A wrapper's leading options are skipped only when
+/// every token is in its exact table (a short cluster is read letter by letter).
+/// The first token that is not makes the command word unknown, and then every
+/// later word is checked as a command ([`scan_suffixes`]): no table of
+/// value-taking options has to stay complete. `env -C`, `--chdir`, `sudo -D`
+/// move the command to another directory.
+fn wrapper(base: &str, a: &[String]) -> Found {
+    let t = wrap_table(base);
+    let listed = |l: &str, n: &str| l.split_whitespace().any(|x| x == n);
+    let mut duration_pending = matches!(base, "timeout" | "chrt" | "taskset");
+    let (mut k, mut moved, mut ended) = (0, false, false);
+    // An option the table does not know: any later word may be the command.
+    let unknown = |k: usize| scan_suffixes(a, k + 1);
     while k < a.len() {
-        if let Some(f) = single_letter_flag(&a[k]) {
-            if value_flags.contains(&format!(" {f} ")) {
-                moved |= f == chdir_short;
+        let tok = a[k].as_str();
+        if !ended && tok == "--" {
+            ended = true;
+            k += 1;
+        } else if !ended && tok.starts_with("--") {
+            let (name, eq) = tok[2..]
+                .split_once('=')
+                .map_or((&tok[2..], None), |(n, v)| (n, Some(v)));
+            let takes = listed(t.lval, name);
+            if !takes && !listed(t.lno, name) {
+                return unknown(k);
+            }
+            moved |= listed(t.lchdir, name);
+            if name == "split-string" {
+                if let Some(v) = eq.or_else(|| a.get(k + 1).map(String::as_str)) {
+                    let f = scan(v);
+                    if !f.is_pass() {
+                        return f;
+                    }
+                }
+            }
+            k += if takes && eq.is_none() { 2 } else { 1 };
+        } else if !ended && tok == "-" && base == "env" {
+            k += 1;
+        } else if !ended && tok.starts_with('-') && tok.len() > 1 {
+            let mut next_taken = false;
+            for (p, c) in tok.char_indices().skip(1) {
+                if t.no.contains(c) {
+                    continue;
+                }
+                if !t.val.contains(c) && !t.opt.contains(c) {
+                    return unknown(k);
+                }
+                moved |= t.chdir.contains(c);
+                let rest = &tok[p + c.len_utf8()..];
+                let value = if !rest.is_empty() {
+                    Some(rest)
+                } else if t.val.contains(c) {
+                    next_taken = true;
+                    a.get(k + 1).map(String::as_str)
+                } else {
+                    None
+                };
                 // `env -S 'cmd args'`: the value is a command line.
-                if base == "env" && f == 'S' {
-                    if let Some(p) = a.get(k + 1) {
-                        let f = scan(p);
+                if base == "env" && c == 'S' {
+                    if let Some(v) = value {
+                        let f = scan(v);
                         if !f.is_pass() {
                             return f;
                         }
                     }
                 }
-                k += 2;
-                continue;
+                break;
             }
-        }
-        if let Some(p) = a[k].strip_prefix("--split-string=") {
-            let f = scan(p);
-            if !f.is_pass() {
-                return f;
-            }
-        }
-        if a[k] == "--split-string" {
-            if let Some(p) = a.get(k + 1) {
-                let f = scan(p);
-                if !f.is_pass() {
-                    return f;
-                }
-            }
-        }
-        if a[k].starts_with('-') || is_assignment(&a[k]) {
-            moved |= retargets(&a[k])
-                || a[k] == "--chdir"
-                || a[k].starts_with("--chdir=")
-                || (chdir_short != '\0'
-                    && !a[k].starts_with("--")
-                    && a[k].starts_with(&format!("-{chdir_short}")));
-            let long_alone = (a[k].len() > 2 && a[k].starts_with("--") && !a[k].contains('='))
-                || single_letter_flag(&a[k]).is_some();
-            if long_alone && a.get(k + 1).is_some_and(|n| !n.starts_with('-')) {
-                if forks >= WRAP_FORKS {
-                    return Found::block(WRAP_MESSAGE);
-                }
-                other_reading.absorb(wrap(base, a, k + 2, duration_pending, moved, forks + 1));
-            }
+            k += 1 + usize::from(next_taken);
+        } else if is_assignment(tok) {
+            moved |= retargets(tok);
             k += 1;
-            continue;
-        }
-        if duration_pending {
+        } else if duration_pending {
             duration_pending = false;
             k += 1;
-            continue;
+        } else {
+            let target = if moved { Target::Unknown } else { Target::Here };
+            return check_words(&a[k..]).retarget(&target);
         }
-        let t = if moved { Target::Unknown } else { Target::Here };
-        main = check_words(&a[k..]).retarget(&t);
-        break;
     }
-    main.absorb(other_reading);
-    main
+    Found::pass()
+}
+
+/// The command word is unknown (an unlisted command, or a wrapper option the
+/// table does not list): any word from `from` on may start the command that
+/// runs. Each suffix is read as a command if it opens with a known command word,
+/// and each word that holds a space as a command line whose own command word
+/// must be known (prose is not a command). The hits are judged at an unknown
+/// target. Wrappers inside are not followed: their own words are suffixes here.
+fn scan_suffixes(a: &[String], from: usize) -> Found {
+    let mut f = Found::pass();
+    for j in from..a.len() {
+        f.absorb(check_flat(&a[j..]));
+        f.absorb(spaced_word(&a[j]));
+    }
+    f.moved |= !f.is_pass();
+    f.force_target(&Target::Unknown)
+}
+
+/// A word that holds a command line: the word itself, and for an option the text
+/// after `=` and after each cluster letter (`--command='git push'`,
+/// `-qc'git push'`). The command word of the line must be known.
+fn spaced_word(x: &str) -> Found {
+    let mut f = Found::pass();
+    if !x.contains(char::is_whitespace) {
+        return f;
+    }
+    f.absorb(scan_with(x, false));
+    if x.starts_with('-') {
+        if let Some((_, v)) = x.split_once('=') {
+            f.absorb(scan_with(v, false));
+        }
+        if !x.starts_with("--") {
+            for (p, c) in x.char_indices().skip(1) {
+                f.absorb(scan_with(&x[p + c.len_utf8()..], false));
+            }
+        }
+    }
+    f
+}
+
+/// One suffix as a command through the ordinary path, shallow: a wrapper word
+/// passes (its own words are suffixes of the same scan), and no suffix scan runs
+/// inside (that would be exponential in the word count). Every other check of
+/// [`check_cmd`] (db writes, path writers, grants) still applies.
+fn check_flat(w: &[String]) -> Found {
+    let base = w[0].rsplit('/').next().unwrap_or(&w[0]);
+    if matches!(
+        base,
+        "sudo"
+            | "env"
+            | "command"
+            | "exec"
+            | "nice"
+            | "time"
+            | "nohup"
+            | "setsid"
+            | "stdbuf"
+            | "xargs"
+            | "builtin"
+            | "chrt"
+            | "ionice"
+            | "taskset"
+            | "timeout"
+    ) {
+        return Found::pass();
+    }
+    check_cmd(w, 0, false)
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
