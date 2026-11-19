@@ -150,3 +150,16 @@ cdd727d and on the fix build. Report ALLOW→ASK and ALLOW→BLOCK, each move
 classified as a real write or a false ask. Target: false asks at most 0.5% of
 commands (about 24). Not met means reporting the number and the cause, not
 loosening the gate.
+
+## Round 3: git's own option, config and env surface (review 4 finding B)
+
+The allowlist premise now covers git itself (`gate.rs`, `check_git_at`).
+
+- **Global options.** An exact table (`GIT_NOVAL`, `GIT_VAL`, `GIT_GLUED`). A value-taking option consumes its value (`--attr-source HEAD`, `--super-prefix x`); an option not in the table makes the call unknown: ask for the CoS, block for workers, and a hard block when a `push` word follows.
+- **`-c` / `--config-env`.** Keys outside a short safe list (`user.name`, `user.email`, `commit.gpgsign`, `tag.gpgsign`, `core.quotepath`, `core.abbrev`, `core.autocrlf`, `init.defaultBranch`, `color.ui`, `safe.directory`, `protocol.version`, `gc.auto`, `advice.*`) are unknown. A plain alias (`alias.st=status`) stays free; `!…` aliases and aliases naming a push do not. `--config-env` values are env var names, so any alias key there is unknown.
+- **Env.** `NAME=v` and `NAME+=v` words anywhere in a command (`export` and bare assignments included). `GIT_CONFIG_KEY_n` and `GIT_CONFIG_PARAMETERS` keys are checked like `-c`; `GIT_CONFIG`/`_GLOBAL`/`_SYSTEM` and `GIT_EXEC_PATH` ask unless empty or `/dev/null`. Program-valued env (`GIT_EXTERNAL_DIFF`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_SSH(_COMMAND)`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_PROXY_COMMAND`, `EDITOR`, `VISUAL`, `PAGER`, `SSH_ASKPASS`) is free only for exact plain values (`true`, `:`, `cat`, `less`, `vim`, `ssh`, `code --wait`, …); anything else asks, and a command line in it is scanned, so a push there is a hard deny. `git --exec-path=<dir>` is unknown too.
+- **`git config`.** A write (two positionals, no `--get*`/`--unset`/`--list`; the values of `-f`/`--file`/`-t`/`--type`/`--blob` are skipped) of a key outside the safe list asks. A literal push in the value of a non-alias key is a hard deny. Reads and safe keys (`user.name`, `pull.rebase`, …) stay free.
+- **Exec verbs.** `rebase`, `bisect`, `submodule`, `fetch`, `pull`, `ls-remote`, `clone`, `difftool`, `mergetool`, `remote` run the suffix scan on their words (`rebase -x '…'`, `bisect run …`, `submodule foreach '…'`, `--upload-pack=…`), top-level only (`deep`), so the scan cannot nest.
+- **Corpus measure (4,934 CoS commands).** git globals: `-C` ×395; `-c`: `user.name` ×1 (plus `user.email`); env: `GIT_CONFIG_GLOBAL=/dev/null` ×11, `GIT_EDITOR=true` ×2.
+- **Replay, base 9e5c7b6 vs fix.** ALLOW 4,717 / ASK 42 / BLOCK 175 on both; no command moved.
+- **Not covered.** Config already stored in the repo (a stored alias or `core.fsmonitor`), a script path in a program env or option (its content is not read), and unknown subcommands outside the exec-verb list, which still pass.
