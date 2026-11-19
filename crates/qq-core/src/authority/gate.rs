@@ -13,12 +13,14 @@
 //!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
 //!   AGENTS.md, SOUL.md and identity.md. Only a hit asks the daemon who is
 //!   calling (`caller.lookup`); only the CoS gets past `deny`, and the tier
-//!   table (`tier.rs`) says allow or ask. No daemon answer is `deny`.
+//!   table (`tier.rs`) says allow or ask. No daemon answer is `deny`. A branch
+//!   delete is classed live against the remote default: merged is low, unmerged
+//!   is high and asks at every tier, a full grant for the repo the only exception.
 //! - The two memory files (R4), `USER.md` and `memory/rules.md` of the live
 //!   workspace: a Write/Edit to either, or a Bash command that writes one (a
-//!   redirect onto it, or a non-read-only command naming it), asks the daemon
-//!   who is calling. Only the CoS passes, with no ask; every other caller, and
-//!   no daemon answer, is `deny`. The one writer is the daemon verb
+//!   redirect onto it, or a non-read-only command naming it), is `deny` for
+//!   every caller, the CoS included (its message names the cos-memory tools);
+//!   no daemon answer is `deny` too. The one writer is the daemon verb
 //!   `memory.write`, which is also the only door that journals.
 //! - Everything else is allowed, with no daemon call.
 //!
@@ -46,6 +48,7 @@ const NOT_COS_MESSAGE: &str =
     "blocked: this needs the CoS's approval; report to the CoS, who asks anh iu";
 const NO_CALLER_MESSAGE: &str = "blocked: the quaqua daemon did not identify the caller (daemon down or unmapped peer); start the daemon, or report to the CoS";
 const MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written only by the CoS, through the daemon's memory.write verb (the cos-memory tools); report what to remember to the CoS";
+const COS_MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written only through the cos-memory tools (memory_add, memory_replace, memory_remove), never directly";
 const TIER_DENY_MESSAGE: &str = "blocked: pushing to main and force-pushing are anh iu's call";
 
 const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
@@ -286,6 +289,7 @@ fn judge(
     }
     let memory = f.listed.iter().any(|h| matches!(h.p, Pending::CosOnly));
     match who() {
+        Caller::Cos if memory => return Verdict::Block(COS_MEMORY_MESSAGE),
         Caller::Cos => {}
         Caller::Other(_) if memory => return Verdict::Block(MEMORY_MESSAGE),
         Caller::Other(_) => return Verdict::Block(NOT_COS_MESSAGE),
@@ -296,19 +300,20 @@ fn judge(
     for h in f.listed {
         // The tier is the target repo's, not the hook cwd's; no target, no
         // runs dir or an unreadable path is high.
-        let (dir, ctx) = match (&h.target, runs_dir) {
+        let (dir, ctx, known) = match (&h.target, runs_dir) {
             (Target::Here, Some(r)) => (
                 here.to_path_buf(),
                 tier::effective_context_tier(r, here, true),
+                true,
             ),
             (Target::Dir(d), Some(r)) => match target_dir(d, here) {
                 Some(p) => {
                     let c = tier::effective_context_tier(r, &p, true);
-                    (p, c)
+                    (p, c, true)
                 }
-                None => (here.to_path_buf(), Tier::High),
+                None => (here.to_path_buf(), Tier::High, false),
             },
-            _ => (here.to_path_buf(), Tier::High),
+            _ => (here.to_path_buf(), Tier::High, false),
         };
         let action = match h.p {
             Pending::Act(a) => a,
@@ -321,6 +326,14 @@ fn judge(
             }
             Pending::CosOnly => continue,
         };
+        // A full grant is the one exception to "unmerged asks at every tier",
+        // and only for a target the scanner could read.
+        if action == Action::BranchDeleteUnmerged
+            && known
+            && runs_dir.is_some_and(|r| tier::grant_full(r, &dir))
+        {
+            continue;
+        }
         match tier::decide(true, action, ctx, ctx) {
             Decision::Deny => return Verdict::Block(TIER_DENY_MESSAGE),
             Decision::Ask => ask = Some(h.reason),
@@ -330,12 +343,16 @@ fn judge(
     ask.map_or(Verdict::Allow, Verdict::Ask)
 }
 
-/// `~` and `$HOME` at the start of a path.
+/// `~`, `$HOME` and `${HOME}` at the start of a path.
 fn expand_home(p: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match p {
-        "~" | "$HOME" => home,
-        _ => match p.strip_prefix("~/").or_else(|| p.strip_prefix("$HOME/")) {
+        "~" | "$HOME" | "${HOME}" => home,
+        _ => match p
+            .strip_prefix("~/")
+            .or_else(|| p.strip_prefix("$HOME/"))
+            .or_else(|| p.strip_prefix("${HOME}/"))
+        {
             Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
             _ => p.to_string(),
         },
@@ -397,19 +414,49 @@ fn edit_found(env: &Env, file: &str, cwd: Option<&Path>, loose: bool) -> Found {
     }
 }
 
-/// The two files `memory.write` owns, under the resolved workspace `root`.
+/// The two files `memory.write` owns, under the resolved workspace `root`:
+/// the one list is [`crate::memory::TARGETS`], which `memory/fence.rs` reads too.
 fn is_memory_file(root: &Path, resolved: &Path) -> bool {
-    resolved == root.join("USER.md") || resolved == root.join("memory/rules.md")
+    crate::memory::TARGETS
+        .iter()
+        .any(|t| resolved == root.join(t.rel))
 }
 
 /// True when the word `w` (a path as the shell sees it, relative to `cwd`)
-/// names one of the memory files. Cheap name test first: only a word ending
-/// in one of the two file names is resolved.
+/// names one of the memory files, or is `key=<path>` (`dd of=`, `--output=`).
+/// A leading `~`, `$HOME`, `${HOME}` is expanded; `$PWD` is each `dirs` entry.
+/// Cheap name test first: only a word ending in one of the two file names is
+/// resolved.
 fn names_memory_file(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
     if !(w.ends_with("USER.md") || w.ends_with("rules.md")) {
         return false;
     }
-    let p = PathBuf::from(w);
+    let value = match w.split_once('=') {
+        Some((k, v))
+            if !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c)) =>
+        {
+            Some(v)
+        }
+        _ => None,
+    };
+    [Some(w), value]
+        .into_iter()
+        .flatten()
+        .any(|w| names_one(root, dirs, w))
+}
+
+fn names_one(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
+    if let Some(rest) = w
+        .strip_prefix("$PWD/")
+        .or_else(|| w.strip_prefix("${PWD}/"))
+    {
+        return dirs
+            .iter()
+            .any(|d| is_memory_file(root, &resolve(&d.join(rest))));
+    }
+    let p = PathBuf::from(expand_home(w));
     if p.is_absolute() {
         return is_memory_file(root, &resolve(&p));
     }
@@ -456,11 +503,18 @@ fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
             continue;
         };
         let base = seg[i].rsplit('/').next().unwrap_or(&seg[i]);
-        if READ_ONLY.contains(&base) {
+        if read_only_cmd(base, &seg[i + 1..]) {
             continue;
         }
+        // An interpreter or awk program names its target inside a quoted
+        // string (`open('USER.md','a')`): test the pieces between the quotes.
+        let embedded = is_interp(base) || matches!(base, "awk" | "gawk" | "mawk");
         for w in &seg[i + 1..] {
-            if names_memory_file(&root, &dirs, w) {
+            if names_memory_file(&root, &dirs, w)
+                || (embedded
+                    && w.split(|c: char| c.is_whitespace() || "'\"(),;{}[]".contains(c))
+                        .any(|p| names_memory_file(&root, &dirs, p)))
+            {
                 return Found::cos_only(ASK_MEMORY);
             }
             // A nested script (`bash -c '…'`, `eval '…'`).
@@ -917,6 +971,63 @@ const READ_ONLY: &[&str] = &[
     "hexdump",
     "od",
 ];
+
+/// Read-only git subcommands.
+const GIT_READ: &[&str] = &[
+    "diff",
+    "log",
+    "show",
+    "blame",
+    "grep",
+    "status",
+    "ls-files",
+    "cat-file",
+    "shortlog",
+    "rev-parse",
+    "reflog",
+    "describe",
+];
+
+/// True when `base args…` only reads its file arguments: the [`READ_ONLY`]
+/// list, plus the tools that read unless a flag or program makes them write
+/// (`sed -i`, `sort -o`, awk `print >`, `git diff --output=`).
+fn read_only_cmd(base: &str, args: &[String]) -> bool {
+    let short = |a: &str, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
+    match base {
+        _ if READ_ONLY.contains(&base) => true,
+        "jq" | "nl" | "cut" | "uniq" | "tac" => true,
+        "sed" => !args
+            .iter()
+            .any(|a| short(a, 'i') || a == "--in-place" || a.starts_with("--in-place=")),
+        "sort" => !args
+            .iter()
+            .any(|a| short(a, 'o') || a == "--output" || a.starts_with("--output=")),
+        "awk" | "gawk" | "mawk" => !args.iter().any(|a| {
+            (a.contains('>') && a.contains("print"))
+                || a.contains("system(")
+                || a.contains("inplace")
+        }),
+        "git" => {
+            let mut it = args.iter();
+            let mut sub = None;
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-C" | "-c" => {
+                        it.next();
+                    }
+                    x if x.starts_with('-') => {}
+                    x => {
+                        sub = Some(x);
+                        break;
+                    }
+                }
+            }
+            sub.is_some_and(|s| GIT_READ.contains(&s))
+                && !args.iter().any(|a| a.starts_with("--output"))
+        }
+        _ => false,
+    }
+}
 
 /// Any other command naming the daemon's `qq.db`, bar the read-only tools.
 fn names_db(base: &str, a: &[String]) -> Found {

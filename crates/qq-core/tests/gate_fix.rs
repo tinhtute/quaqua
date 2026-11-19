@@ -285,26 +285,112 @@ fn ask_tier_branch_delete_class_follows_the_deleted_ref() {
 }
 
 #[test]
-fn ask_tier_branch_delete_unmerged_is_medium_and_still_cos_alone_at_low() {
+fn branch_delete_class_unmerged_is_high_and_asks_at_every_tier() {
     use tier::{Decision, Tier};
     assert_eq!(
         tier::action_tier(Action::BranchDeleteUnmerged),
-        Some(Tier::Medium)
+        Some(Tier::High)
     );
     assert_eq!(
         tier::action_tier(Action::BranchDeleteMerged),
         Some(Tier::Low)
     );
-    for t in [Tier::Low, Tier::Medium] {
+    for t in [Tier::Low, Tier::Medium, Tier::High] {
         assert_eq!(
             tier::decide(true, Action::BranchDeleteUnmerged, t, t),
-            Decision::Allow
+            Decision::Ask,
+            "unmerged at {t:?}"
+        );
+        assert_eq!(
+            tier::decide(true, Action::BranchDeleteMerged, t, Tier::Low),
+            if t == Tier::High {
+                Decision::Ask
+            } else {
+                Decision::Allow
+            },
+            "merged at {t:?}"
         );
     }
-    assert_eq!(
-        tier::decide(true, Action::BranchDeleteUnmerged, Tier::High, Tier::High),
-        Decision::Ask
-    );
+}
+
+impl Rig {
+    fn set_tier(&self, repo: &Path, t: &str) {
+        let c = qq_core::db::open(&self.ws.db_path()).unwrap();
+        for (table, col) in [("repo_tier", "repo"), ("plan_lane", "lane")] {
+            c.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {table} ({col}, tier, set_ms, set_by) VALUES (?1, ?2, 1, 'cos')"
+                ),
+                params![tier::repo_key(repo), t],
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// A repo with `origin/main` at one commit, branch `merged` on it and branch
+/// `feat` one commit ahead.
+fn repo_with_branches(dir: &Path) {
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "a"]);
+    git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(dir, &["branch", "merged"]);
+    git(dir, &["checkout", "-q", "-b", "feat"]);
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "b"]);
+    git(dir, &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn branch_delete_class_gate_unmerged_asks_at_every_tier_merged_follows_tier() {
+    let r = rig("gf-bdc", Who::Cos);
+    repo_with_branches(&r.b);
+    for t in ["low", "medium", "high"] {
+        r.set_tier(&r.b, t);
+        assert!(ask(&r.bash("git branch -D feat")), "unmerged local at {t}");
+        assert!(ask(&r.bash("git branch -d feat")), "unmerged -d at {t}");
+        let merged = r.bash("git branch -d merged");
+        if t == "high" {
+            assert!(ask(&merged), "merged at high");
+        } else {
+            assert_eq!(merged, GateVerdict::Allow, "merged at {t}");
+        }
+    }
+}
+
+#[test]
+fn branch_delete_class_gate_merge_base_is_checked_live() {
+    let r = rig("gf-bdc-live", Who::Cos);
+    repo_with_branches(&r.b);
+    r.set_tier(&r.b, "low");
+    assert!(ask(&r.bash("git branch -D feat")));
+    // feat lands on origin/main: the same command is now a merged delete.
+    git(&r.b, &["update-ref", "refs/remotes/origin/main", "feat"]);
+    assert_eq!(r.bash("git branch -D feat"), GateVerdict::Allow);
+    // and moving origin/main back makes it unmerged again.
+    git(&r.b, &["update-ref", "refs/remotes/origin/main", "merged"]);
+    assert!(ask(&r.bash("git branch -D feat")));
+}
+
+#[test]
+fn branch_delete_class_gate_full_grant_is_the_only_exception() {
+    let r = rig("gf-bdc-grant", Who::Cos);
+    repo_with_branches(&r.a);
+    // repo A holds the full grant: an unmerged delete passes alone.
+    assert_eq!(r.bash_in(&r.a, "git branch -D feat"), GateVerdict::Allow);
+    assert_eq!(r.bash_in(&r.a, "git branch -D merged"), GateVerdict::Allow);
+    // aimed at B from A's cwd the grant does not follow.
+    let b = r.b.display();
+    repo_with_branches(&r.b);
+    assert!(ask(&r.bash_in(&r.a, &format!("git -C {b} branch -D feat"))));
+    // an unreadable target is unmerged and not granted
+    assert!(ask(&r.bash_in(&r.a, "git -C '$X' branch -D feat")));
+}
+
+#[test]
+fn branch_delete_class_gate_non_cos_still_denied() {
+    let r = rig("gf-bdc-worker", Who::Worker);
+    repo_with_branches(&r.a);
+    assert!(block(&r.bash_in(&r.a, "git branch -D feat")));
+    assert!(block(&r.bash_in(&r.a, "git branch -d merged")));
 }
 
 // ---- m2: parse misses ----
@@ -459,10 +545,12 @@ fn memory_path_gate_write_edit_deny_non_cos_allow_cos() {
         for p in [r.root().join("USER.md"), r.root().join("memory/rules.md")] {
             for tool in ["Write", "Edit", "MultiEdit"] {
                 let v = r.edit(tool, &p);
+                assert!(block(&v), "{tool} {p:?}");
                 if who == Who::Cos {
-                    assert_eq!(v, GateVerdict::Allow, "cos {tool} {p:?}");
-                } else {
-                    assert!(block(&v), "non-cos {tool} {p:?}");
+                    let GateVerdict::Block(m) = v else { panic!() };
+                    for t in ["memory_add", "memory_replace", "memory_remove"] {
+                        assert!(m.contains(t), "cos message names {t}: {m}");
+                    }
                 }
             }
         }
@@ -483,10 +571,13 @@ fn memory_path_gate_bash_writes() {
             format!("cd {root}/memory && echo x >> rules.md"),
         ] {
             let v = r.bash(&cmd);
+            assert!(block(&v), "{cmd}");
             if who == Who::Cos {
-                assert_eq!(v, GateVerdict::Allow, "cos: {cmd}");
-            } else {
-                assert!(block(&v), "worker: {cmd}");
+                let GateVerdict::Block(m) = v else { panic!() };
+                assert!(
+                    m.contains("memory_add") && m.contains("memory_replace"),
+                    "{m}"
+                );
             }
         }
     }

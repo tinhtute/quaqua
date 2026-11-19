@@ -63,7 +63,7 @@ mcp__*)
 Write | Edit | MultiEdit | NotebookEdit)
   # Only the live instruction files; the content is never scanned. The binary
   # tells the live workspace copy from a template; the fallback cannot.
-  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"([^"]*/)?(AGENTS|SOUL|identity|USER)\.md"' <<<"$stdin" &&
+  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"(([^"]*/)?(AGENTS|SOUL|identity|USER)\.md|([^"]*/)?memory/rules\.md)"' <<<"$stdin" &&
     hit='write to an instruction file'
   ;;
 *)

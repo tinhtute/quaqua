@@ -46,8 +46,10 @@ pub fn action_tier(a: Action) -> Option<Tier> {
     use Action::*;
     match a {
         PushNonMain | OpenPr | BranchDeleteMerged => Some(Tier::Low),
-        BranchDeleteUnmerged | MergeRequest | Tag | Release | DeleteData => Some(Tier::Medium),
-        HistoryRewrite => Some(Tier::High),
+        MergeRequest | Tag | Release | DeleteData => Some(Tier::Medium),
+        // Unmerged work cannot be got back: the CoS asks at every tier. Only a
+        // full grant for the repo lets it through (the gate checks that).
+        HistoryRewrite | BranchDeleteUnmerged => Some(Tier::High),
         Floor | PushMain | ForcePush | TrunkMove | Bypass | DbWrite | PaneInput
         | InstructionFile | GrantWrite => None,
     }
@@ -220,7 +222,7 @@ fn git_ok(cwd: &Path, args: &[&str]) -> bool {
 }
 
 /// A local branch already merged into the remote default is a low-tier delete;
-/// any other (unmerged, unknown, git failing) is medium.
+/// any other (unmerged, unknown, git failing) is high: the CoS asks.
 pub fn branch_delete_action(cwd: &Path, branch: &str) -> Action {
     branch_delete_class(cwd, branch, None)
 }
