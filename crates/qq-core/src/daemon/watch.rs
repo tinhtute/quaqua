@@ -130,6 +130,12 @@ pub const STALL_SEC: f64 = 600.0;
 const SWEEP_MS: u64 = 2_000;
 /// A fresh agent that herdr does not know yet is not "exited" before this.
 const SPAWN_GRACE_MS: u64 = 30_000;
+/// A missing agent is exited only after it stays missing this long and its row
+/// is still open: cleanup closes the pane before it closes the row.
+/// The setting `notify.exit_debounce_sec` overrides it.
+pub const EXIT_DEBOUNCE_SEC: f64 = 30.0;
+/// Floor for `notify.sweep_ms`, so a bad setting cannot spin the sweeper.
+const SWEEP_MIN_MS: u64 = 10;
 
 struct Seen {
     status: String,
@@ -143,21 +149,32 @@ fn number_setting(ctx: &Ctx, key: &str) -> Option<f64> {
         .ok()
         .flatten()
         .and_then(|v| v.as_f64())
-        .filter(|v| *v >= 0.0)
+        .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 fn stall_after(ctx: &Ctx) -> Duration {
     let secs = std::env::var("QQ_STALL_SEC")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v >= 0.0)
+        .filter(|v| v.is_finite() && *v >= 0.0)
         .or_else(|| number_setting(ctx, "notify.stall_sec"))
         .unwrap_or(STALL_SEC);
-    Duration::from_secs_f64(secs)
+    secs_or(secs, STALL_SEC)
+}
+
+/// `secs` as a Duration; a value too large for one falls back to `default`.
+fn secs_or(secs: f64, default: f64) -> Duration {
+    Duration::try_from_secs_f64(secs).unwrap_or_else(|_| Duration::from_secs_f64(default))
+}
+
+fn exit_debounce(ctx: &Ctx) -> Duration {
+    let secs = number_setting(ctx, "notify.exit_debounce_sec").unwrap_or(EXIT_DEBOUNCE_SEC);
+    secs_or(secs, EXIT_DEBOUNCE_SEC)
 }
 
 fn sweep_every(ctx: &Ctx) -> Duration {
-    Duration::from_millis(number_setting(ctx, "notify.sweep_ms").map_or(SWEEP_MS, |v| v as u64))
+    let ms = number_setting(ctx, "notify.sweep_ms").map_or(SWEEP_MS, |v| v as u64);
+    Duration::from_millis(ms.max(SWEEP_MIN_MS))
 }
 
 /// `(name, role, started_ms)` of every open Lead and Peer.
@@ -196,24 +213,31 @@ fn now_ms() -> u64 {
 
 /// Polls every open Lead and Peer in herdr and mails the CoS once per move
 /// into stalled (`working` with no status change for [`STALL_SEC`]), blocked,
-/// done or exited. idle and working flips are silent. An agent whose row
-/// cleanup closed is dropped without a word; only a vanished agent with an open
-/// row is exited. Any status change is progress and re-arms the stall clock.
+/// done or exited. idle and working flips are silent. Task workers are Peer
+/// rows, so Leads and Peers cover every engine-spawned agent. An agent that
+/// vanishes is exited only if it stays missing for [`EXIT_DEBOUNCE_SEC`] and
+/// its row is still open then; cleanup closes the pane first and the row
+/// later, so a cleaned-up agent is dropped without a word. Any status change is
+/// progress and re-arms the stall clock.
 ///
 /// Polls, with no blocking wait, so a stop is seen within one nap. Holds the
-/// daemon only weakly. Memory is in-process: a restart mails a standing
-/// blocked or done again once.
+/// daemon only weakly. Memory is in-process and exited is not deduped by agent
+/// id: a daemon restart mails a standing blocked or done, and an agent still
+/// missing with an open row, again once.
 pub fn state_sweeper(ctx: Weak<Ctx>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut seen: HashMap<String, Seen> = HashMap::new();
         let mut gone: HashSet<String> = HashSet::new();
+        let mut missing: HashMap<String, Instant> = HashMap::new();
         while !stop.load(Ordering::SeqCst) {
             let Some(ctx) = ctx.upgrade() else { return };
-            let (stall, every) = (stall_after(&ctx), sweep_every(&ctx));
+            let (stall, every, debounce) =
+                (stall_after(&ctx), sweep_every(&ctx), exit_debounce(&ctx));
             let open = open_agents(&ctx);
             let names: HashSet<&str> = open.iter().map(|(n, _, _)| n.as_str()).collect();
             seen.retain(|n, _| names.contains(n.as_str()));
             gone.retain(|n| names.contains(n.as_str()));
+            missing.retain(|n, _| names.contains(n.as_str()));
             for (name, role, started) in &open {
                 if stop.load(Ordering::SeqCst) {
                     return;
@@ -229,7 +253,12 @@ pub fn state_sweeper(ctx: Weak<Ctx>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
                     }
                     let fresh = !seen.contains_key(name)
                         && now_ms().saturating_sub(*started) < SPAWN_GRACE_MS;
-                    if !fresh && is_open(&ctx, name) {
+                    if fresh {
+                        continue;
+                    }
+                    let since = *missing.entry(name.clone()).or_insert_with(Instant::now);
+                    if since.elapsed() >= debounce && is_open(&ctx, name) {
+                        missing.remove(name);
                         gone.insert(name.clone());
                         seen.remove(name);
                         bus::state_mail(&ctx, name, role, AgentState::Exited, "");
@@ -240,6 +269,7 @@ pub fn state_sweeper(ctx: Weak<Ctx>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
                     continue;
                 };
                 gone.remove(name);
+                missing.remove(name);
                 let entry = seen.get_mut(name).filter(|e| e.status == status);
                 match entry {
                     Some(e) => {

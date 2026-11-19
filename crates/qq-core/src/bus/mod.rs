@@ -183,7 +183,7 @@ fn send(bus: &Bus, ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
 }
 
 /// A mail the daemon itself sends: no caller, so no edge check.
-pub fn daemon_mail(
+pub(crate) fn daemon_mail(
     ctx: &Ctx,
     to: &str,
     kind: &str,
