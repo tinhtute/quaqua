@@ -425,23 +425,33 @@ fn cos_push_door_multiple_pushurls_each_checked() {
     assert!(!has_ref(&origin, "feat"));
 }
 
-/// A URL that git rewrites again (chained `insteadOf`) is unproven: the URL
-/// checked would not be the one pushed to.
+/// Chained `insteadOf` (alias -> origin, origin -> decoy): `get-url --push`
+/// says origin, but `ls-remote -- origin` would read the decoy. A URL git
+/// would rewrite a second time is unproven, so the push refuses.
 #[test]
 fn cos_push_door_chained_insteadof_refused() {
     let r = rig("cpd-chain", Who::Cos);
     let (work, origin) = repo_with_trunk_remote(&r);
     let decoy = decoy_bare(&r, &work, "decoy.git", "decoy", true);
+    let alias = r.ws.root().join("alias.git");
     git(
         &work,
-        &["config", "remote.origin.pushurl", decoy.to_str().unwrap()],
+        &["config", "remote.origin.url", alias.to_str().unwrap()],
     );
     git(
         &work,
         &[
             "config",
-            &format!("url.{}.pushInsteadOf", origin.display()),
-            decoy.to_str().unwrap(),
+            &format!("url.{}.insteadOf", origin.display()),
+            alias.to_str().unwrap(),
+        ],
+    );
+    git(
+        &work,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", decoy.display()),
+            origin.to_str().unwrap(),
         ],
     );
     let before = rev(&origin, "refs/heads/trunk");
