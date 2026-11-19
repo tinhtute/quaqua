@@ -40,7 +40,7 @@ trunk_flag='([[:space:]]-[a-zA-Z]*[dD][a-zA-Z]*|--delete)'
 trunk_pre='[[:space:]"'"'"'/]'
 trunk_name="$trunk_pre(main|master)([^a-zA-Z0-9_-]|\$)"
 # the delete flag may follow the name (`git branch main -D`)
-trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|master)([^a-zA-Z0-9_-].*)?$trunk_flag)"
+trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|master)([^a-zA-Z0-9_;|&-][^;|&]*)?$trunk_flag)"
 
 stdin=$(cat)
 hit=''
@@ -53,7 +53,7 @@ fi
 grep -Eq 'herdr.*report-metadata.*grid_role=' <<<"$stdin" && hit="${hit:+$hit and }grid_role token"
 # `.open` and `ATTACH` reopen a database read-write, past -readonly.
 if grep -Eq 'sqlite3.*qq\.db' <<<"$stdin" &&
-  { ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin" || grep -Eiq '\.open|attach' <<<"$stdin"; }; then
+  { ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin" || grep -Eiq '\.open|\battach\b' <<<"$stdin"; }; then
   hit="${hit:+$hit and }qq.db write"
 fi
 grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"

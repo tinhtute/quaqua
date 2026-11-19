@@ -237,7 +237,9 @@ fn check_sqlite(a: &[String]) -> Verdict {
     // `.open` and `ATTACH` reopen a database read-write, past `-readonly`.
     let reopens = a.iter().any(|x| {
         let x = x.to_ascii_lowercase();
-        x.contains(".open") || x.contains("attach")
+        x.contains(".open")
+            || x.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|t| t == "attach")
     });
     if (!readonly || reopens) && a.iter().any(|x| x.contains("qq.db")) {
         return Verdict::Block(DB_MESSAGE);
@@ -245,10 +247,10 @@ fn check_sqlite(a: &[String]) -> Verdict {
     Verdict::Allow
 }
 
-/// The HTTP method `gh api` is given: an explicit one (`-X M`, `-XM`,
-/// `--method M`, `--method=M`, upper-cased), else `POST` when any field flag is
-/// present (gh's own default), else `GET`.
-fn gh_api_method(a: &[String]) -> String {
+/// The explicit method of `gh api` (`-X M`, `-XM`, `--method M`, `--method=M`,
+/// upper-cased). gh keeps the LAST one (pflag), so the last one wins here too.
+fn last_method(a: &[String]) -> Option<String> {
+    let mut method = None;
     for (k, x) in a.iter().enumerate() {
         let v = if matches!(x.as_str(), "-X" | "--method") {
             a.get(k + 1).map(String::as_str)
@@ -260,8 +262,17 @@ fn gh_api_method(a: &[String]) -> String {
             None
         };
         if let Some(v) = v {
-            return v.to_ascii_uppercase();
+            method = Some(v.to_ascii_uppercase());
         }
+    }
+    method
+}
+
+/// The HTTP method `gh api` is given: the explicit one, else `POST` when any
+/// field flag is present (gh's own default), else `GET`.
+fn gh_api_method(a: &[String]) -> String {
+    if let Some(m) = last_method(a) {
+        return m;
     }
     let field = a.iter().any(|x| {
         matches!(
@@ -286,9 +297,7 @@ fn check_gh(a: &[String]) -> Verdict {
             let path = x.split('?').next().unwrap_or(x).trim_end_matches('/');
             !x.starts_with('-') && (path.ends_with("/merge") || path.ends_with("/merges"))
         });
-        let explicit_get = a.windows(2).any(|w| {
-            matches!(w[0].as_str(), "-X" | "--method") && w[1].eq_ignore_ascii_case("GET")
-        }) || a.iter().any(|x| x.eq_ignore_ascii_case("-XGET"));
+        let explicit_get = last_method(a).is_some_and(|m| m == "GET");
         if (merge_path && !explicit_get)
             || a.iter()
                 .any(|x| x.contains("mergePullRequest") || x.contains("enablePullRequestAutoMerge"))
