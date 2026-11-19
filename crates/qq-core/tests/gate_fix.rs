@@ -1253,7 +1253,11 @@ fn gate_fix3_b_old_binary_keeps_write_and_edit_on_ordinary_files() {
             "/tmp/ws/memory/notes.md",
             "/tmp/ws/src/main.rs",
         ] {
-            assert_eq!(hook_exit_with(&bin, tool, json!({ key: p })), 0, "{tool} {p}");
+            assert_eq!(
+                hook_exit_with(&bin, tool, json!({ key: p })),
+                0,
+                "{tool} {p}"
+            );
         }
     }
 }
@@ -1269,7 +1273,11 @@ fn gate_fix3_b_old_binary_still_protects_memory_and_instruction_files() {
             "/tmp/ws/SOUL.md",
             "/tmp/ws/identity.md",
         ] {
-            assert_eq!(hook_exit_with(&bin, tool, json!({ key: p })), 2, "{tool} {p}");
+            assert_eq!(
+                hook_exit_with(&bin, tool, json!({ key: p })),
+                2,
+                "{tool} {p}"
+            );
         }
     }
 }
@@ -1277,7 +1285,10 @@ fn gate_fix3_b_old_binary_still_protects_memory_and_instruction_files() {
 #[test]
 fn gate_fix3_b_old_binary_bash_still_goes_to_the_binary() {
     let bin = stub_bin("old-bash", OLD_BIN);
-    assert_eq!(hook_exit_with(&bin, "Bash", json!({"command": "echo hi"})), 2);
+    assert_eq!(
+        hook_exit_with(&bin, "Bash", json!({"command": "echo hi"})),
+        2
+    );
 }
 
 #[test]

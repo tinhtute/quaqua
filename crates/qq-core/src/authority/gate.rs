@@ -676,6 +676,7 @@ fn scan_with(command: &str, deep: bool) -> Found {
     let mut f = Found::pass();
     for seg in &segs {
         f.absorb(check_words_in(seg, deep));
+        f.absorb(git_env_words(seg));
     }
     // Redirect targets are dropped by the tokenizer: read them off the text.
     for t in redirect_targets(command) {
@@ -1790,41 +1791,228 @@ fn chain_dir(prev: &Target, d: Option<&String>) -> Target {
     }
 }
 
+/// git's global options: an exact table, like the wrapper tables. `NOVAL` take
+/// no value; `VAL` take one (`--opt v` or `--opt=v`); `--exec-path` and
+/// `--list-cmds` only take it glued.
+const GIT_NOVAL: &[&str] = &[
+    "-v",
+    "--version",
+    "-p",
+    "--paginate",
+    "-P",
+    "--no-pager",
+    "--no-replace-objects",
+    "--no-lazy-fetch",
+    "--no-optional-locks",
+    "--no-advice",
+    "--bare",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--html-path",
+    "--man-path",
+    "--info-path",
+    "--exec-path",
+];
+const GIT_VAL: &[&str] = &[
+    "-C",
+    "-c",
+    "--config-env",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--attr-source",
+];
+const GIT_GLUED: &[&str] = &["--exec-path", "--list-cmds"];
+
+/// `-c` / `--config-env` keys that are plain values, never a program or an
+/// alias. Any other key makes the call unknown.
+fn safe_git_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    k.starts_with("advice.")
+        || matches!(
+            k.as_str(),
+            "user.name"
+                | "user.email"
+                | "commit.gpgsign"
+                | "tag.gpgsign"
+                | "core.quotepath"
+                | "core.abbrev"
+                | "core.autocrlf"
+                | "init.defaultbranch"
+                | "color.ui"
+                | "safe.directory"
+                | "protocol.version"
+                | "gc.auto"
+        )
+}
+
+/// A config key whose value names a program or a file of more config.
+fn program_git_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    matches!(
+        k.as_str(),
+        "core.fsmonitor"
+            | "core.sshcommand"
+            | "core.pager"
+            | "core.editor"
+            | "core.hookspath"
+            | "core.askpass"
+            | "core.gitproxy"
+            | "core.alternaterefscommand"
+            | "sequence.editor"
+            | "diff.external"
+            | "uploadpack.packobjectshook"
+            | "include.path"
+    ) || k.starts_with("pager.")
+        || k.starts_with("includeif.")
+        || [
+            ".textconv",
+            ".clean",
+            ".smudge",
+            ".process",
+            ".driver",
+            ".cmd",
+            ".command",
+            ".helper",
+            ".program",
+            ".path",
+            ".sshcommand",
+        ]
+        .iter()
+        .any(|x| k.ends_with(x))
+}
+
+fn names_push_token(v: &str) -> bool {
+    v.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .any(|t| t == "push")
+}
+
+/// The call is one the fast path cannot read: ask (workers block). A push word
+/// anywhere after `from` is a hard deny.
+fn unknown_git(a: &[String], from: usize) -> Found {
+    if a.get(from..)
+        .unwrap_or_default()
+        .iter()
+        .any(|x| names_push_token(x))
+    {
+        Found::block(PUSH_MESSAGE)
+    } else {
+        Found::act(Action::Bypass, ASK_BYPASS)
+    }
+}
+
+/// One `-c k=v` / `--config-env k=ENV` word names a key outside the safe list.
+/// A plain alias (`alias.st=status`) stays free; a shell alias (`!…`) or one
+/// naming a push does not.
+/// `from_env`: the value is an environment variable's name, unreadable here.
+fn git_config_unsafe(cfg: &str, from_env: bool) -> bool {
+    let (key, val) = cfg.split_once('=').unwrap_or((cfg, ""));
+    if !from_env && strip_alias(key).is_some() {
+        return val.starts_with('!') || names_push_token(val);
+    }
+    !safe_git_key(key)
+}
+
+/// Assignment words that carry git config or name a program git will run
+/// (`GIT_CONFIG_*`, `GIT_EXTERNAL_DIFF`, `GIT_EDITOR`, `EDITOR`, …): an alias or
+/// program the gate cannot read. Plain values (`GIT_CONFIG_GLOBAL=/dev/null`,
+/// `GIT_EDITOR=true`) stay free.
+fn git_env_words(seg: &[String]) -> Found {
+    let mut f = Found::pass();
+    for w in seg.iter().filter(|w| is_assignment(w)) {
+        let (name, v) = w.split_once('=').unwrap_or((w, ""));
+        let name = name.to_ascii_uppercase();
+        let unsafe_cfg = if name.starts_with("GIT_CONFIG_KEY_") {
+            !safe_git_key(v)
+        } else if name == "GIT_CONFIG_PARAMETERS" {
+            v.replace('\'', "")
+                .split_whitespace()
+                .any(|kv| !safe_git_key(kv.split_once('=').map_or(kv, |x| x.0)))
+        } else if matches!(
+            name.as_str(),
+            "GIT_CONFIG" | "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM"
+        ) {
+            !(v.is_empty() || v == "/dev/null")
+        } else if matches!(
+            name.as_str(),
+            "GIT_EXTERNAL_DIFF"
+                | "GIT_EDITOR"
+                | "GIT_SEQUENCE_EDITOR"
+                | "GIT_SSH"
+                | "GIT_SSH_COMMAND"
+                | "GIT_PAGER"
+                | "GIT_ASKPASS"
+                | "GIT_PROXY_COMMAND"
+                | "GIT_EXEC_PATH"
+                | "EDITOR"
+                | "VISUAL"
+                | "PAGER"
+                | "SSH_ASKPASS"
+        ) {
+            // A program: its command line is read like any other, and a word
+            // `push` in it, or a path the scanner cannot read, is an ask.
+            let g = if v.contains(char::is_whitespace) || v.contains(';') {
+                scan_with(v, false)
+            } else {
+                Found::pass()
+            };
+            let hit = names_push_token(v) || name == "GIT_EXEC_PATH" && !v.is_empty();
+            f.absorb(g);
+            hit
+        } else {
+            false
+        };
+        if unsafe_cfg {
+            f.absorb(Found::act(Action::Bypass, ASK_BYPASS));
+        }
+    }
+    f
+}
+
 fn check_git_at(a: &[String], target: &mut Target) -> Found {
     let mut i = 0;
     while i < a.len() {
         let w = a[i].as_str();
-        if w == "-c" || (w.starts_with("-c") && w.len() > 2) {
+        let (name, glued) = match w.split_once('=') {
+            Some((n, _)) if n.starts_with("--") => (n, true),
+            _ => (w, false),
+        };
+        if w == "-c" || (w.starts_with("-c") && w.len() > 2 && !w.starts_with("--")) {
             let cfg = if w == "-c" { a.get(i + 1) } else { Some(&a[i]) };
-            let cfg = cfg.map(|c| c.trim_start_matches("-c")).unwrap_or("");
-            if let Some(rest) = strip_alias(cfg) {
-                let body = rest.split_once('=').map_or("", |x| x.1);
-                if body
-                    .split_whitespace()
-                    .any(|t| t.trim_start_matches('!') == "push")
-                {
-                    return Found::act(Action::Bypass, ASK_BYPASS);
-                }
+            let cfg = cfg.map(|c| c.strip_prefix("-c").unwrap_or(c)).unwrap_or("");
+            let next = i + if w == "-c" { 2 } else { 1 };
+            if git_config_unsafe(cfg, false) {
+                return unknown_git(a, next);
             }
-            i += if w == "-c" { 2 } else { 1 };
+            i = next;
+        } else if name == "--config-env" {
+            let cfg = if glued {
+                w.split_once('=').map(|x| x.1)
+            } else {
+                a.get(i + 1).map(String::as_str)
+            };
+            let next = i + if glued { 1 } else { 2 };
+            if git_config_unsafe(cfg.unwrap_or(""), true) {
+                return unknown_git(a, next);
+            }
+            i = next;
         } else if w == "-C" {
             *target = chain_dir(target, a.get(i + 1));
             i += 2;
         } else if w == "--help" || w == "-h" {
             return Found::pass();
-        } else if matches!(
-            w,
-            "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
-        ) {
-            if w != "--namespace" && w != "--exec-path" {
+        } else if GIT_VAL.contains(&name) {
+            if matches!(name, "--git-dir" | "--work-tree") {
                 *target = Target::Unknown;
             }
-            i += 2;
-        } else if w.starts_with("--git-dir=") || w.starts_with("--work-tree=") {
-            *target = Target::Unknown;
+            i += if glued { 1 } else { 2 };
+        } else if GIT_NOVAL.contains(&w) || (glued && GIT_GLUED.contains(&name)) {
             i += 1;
         } else if w.starts_with('-') {
-            i += 1;
+            return unknown_git(a, i + 1);
         } else {
             break;
         }
@@ -1904,15 +2092,34 @@ fn strip_alias(s: &str) -> Option<&str> {
     head.eq_ignore_ascii_case("alias.").then_some(rest)
 }
 
-/// `git config … alias.<x> <value naming push>`: a push by another name.
+/// `git config … alias.<x> <value naming push>`: a push by another name; and
+/// setting a program-valued key (`core.fsmonitor`, `diff.external`, …).
 fn check_git_config(a: &[String]) -> Found {
+    let mut p: Vec<&str> = a
+        .iter()
+        .map(String::as_str)
+        .filter(|x| !x.starts_with('-'))
+        .collect();
+    let reads = a.iter().any(|x| {
+        x.starts_with("--get")
+            || x.starts_with("--unset")
+            || matches!(x.as_str(), "-l" | "--list" | "-e" | "--edit")
+    });
+    if p.first().is_some_and(|x| *x == "set") {
+        p.remove(0);
+    } else if p
+        .first()
+        .is_some_and(|x| matches!(*x, "get" | "list" | "unset" | "edit"))
+    {
+        return Found::pass();
+    }
+    if !reads && p.len() >= 2 && program_git_key(p[0]) {
+        return Found::act(Action::Bypass, ASK_BYPASS);
+    }
     let Some(k) = a.iter().position(|x| strip_alias(x).is_some()) else {
         return Found::pass();
     };
-    let names_push = a[k + 1..].iter().any(|v| {
-        v.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-            .any(|t| t == "push")
-    });
+    let names_push = a[k + 1..].iter().any(|v| names_push_token(v));
     if names_push {
         Found::act(Action::Bypass, ASK_BYPASS)
     } else {
