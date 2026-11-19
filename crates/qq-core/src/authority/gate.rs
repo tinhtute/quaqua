@@ -14,6 +14,12 @@
 //!   AGENTS.md, SOUL.md and identity.md. Only a hit asks the daemon who is
 //!   calling (`caller.lookup`); only the CoS gets past `deny`, and the tier
 //!   table (`tier.rs`) says allow or ask. No daemon answer is `deny`.
+//! - The two memory files (R4), `USER.md` and `memory/rules.md` of the live
+//!   workspace: a Write/Edit to either, or a Bash command that writes one (a
+//!   redirect onto it, or a non-read-only command naming it), asks the daemon
+//!   who is calling. Only the CoS passes, with no ask; every other caller, and
+//!   no daemon answer, is `deny`. The one writer is the daemon verb
+//!   `memory.write`, which is also the only door that journals.
 //! - Everything else is allowed, with no daemon call.
 //!
 //! A tripwire, not a fence: a same-uid process can still route around it. It
@@ -39,6 +45,7 @@ const BRANCH_MESSAGE: &str = "blocked: deleting main or master is anh iu's call,
 const NOT_COS_MESSAGE: &str =
     "blocked: this needs the CoS's approval; report to the CoS, who asks anh iu";
 const NO_CALLER_MESSAGE: &str = "blocked: the quaqua daemon did not identify the caller (daemon down or unmapped peer); start the daemon, or report to the CoS";
+const MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written only by the CoS, through the daemon's memory.write verb (the cos-memory tools); report what to remember to the CoS";
 const TIER_DENY_MESSAGE: &str = "blocked: pushing to main and force-pushing are anh iu's call";
 
 const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
@@ -50,6 +57,7 @@ const ASK_BYPASS: &str = "approval list: a push or merge door by another name";
 const ASK_INPUT: &str = "approval list: pane input or a grid_role token";
 const ASK_DB: &str = "approval list: runs/qq.db belongs to the daemon";
 const ASK_FILE: &str = "approval list: the CoS's live instruction files";
+const ASK_MEMORY: &str = "the CoS's memory files";
 const ASK_MCP: &str = "approval list: an MCP tool that sends, publishes or spends";
 
 /// MCP tool names that send, publish or spend (docs/research/hermes-cos-memory/
@@ -88,6 +96,8 @@ pub enum Verdict {
 enum Pending {
     Act(Action),
     BranchDelete(String),
+    /// Only the CoS may do it, and the CoS needs no approval for it: no tier.
+    CosOnly,
 }
 
 /// What a scan found: the first hard block, and every approval-list hit.
@@ -113,6 +123,13 @@ impl Found {
         Found {
             block: None,
             listed: vec![(Pending::Act(a), reason)],
+        }
+    }
+
+    fn cos_only(reason: &'static str) -> Self {
+        Found {
+            block: None,
+            listed: vec![(Pending::CosOnly, reason)],
         }
     }
 
@@ -163,7 +180,11 @@ fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
             if cmd.trim().is_empty() {
                 return Verdict::Block(PANE_MESSAGE);
             }
-            scan(cmd)
+            let mut f = scan(cmd);
+            if let Some(env) = env {
+                f.absorb(bash_memory(env, cmd, cwd.as_deref(), 0));
+            }
+            f
         }
         (_, Some("Write" | "Edit" | "MultiEdit" | "NotebookEdit")) => {
             let path = input
@@ -202,8 +223,10 @@ fn judge(
     if f.listed.is_empty() {
         return Verdict::Allow;
     }
+    let memory = f.listed.iter().any(|(p, _)| matches!(p, Pending::CosOnly));
     match who() {
         Caller::Cos => {}
+        Caller::Other(_) if memory => return Verdict::Block(MEMORY_MESSAGE),
         Caller::Other(_) => return Verdict::Block(NOT_COS_MESSAGE),
         Caller::Unknown => return Verdict::Block(NO_CALLER_MESSAGE),
     }
@@ -214,6 +237,7 @@ fn judge(
         let action = match p {
             Pending::Act(a) => a,
             Pending::BranchDelete(b) => tier::branch_delete_action(dir, &b),
+            Pending::CosOnly => continue,
         };
         match tier::decide(true, action, ctx, ctx) {
             Decision::Deny => return Verdict::Block(TIER_DENY_MESSAGE),
@@ -247,9 +271,106 @@ fn edit_found(env: &Env, file: &str, cwd: Option<&Path>) -> Found {
         .any(|n| p == root.join(n));
     if live {
         Found::act(Action::InstructionFile, ASK_FILE)
+    } else if is_memory_file(&root, &p) {
+        Found::cos_only(ASK_MEMORY)
     } else {
         Found::pass()
     }
+}
+
+/// The two files `memory.write` owns, under the resolved workspace `root`.
+fn is_memory_file(root: &Path, resolved: &Path) -> bool {
+    resolved == root.join("USER.md") || resolved == root.join("memory/rules.md")
+}
+
+/// True when the word `w` (a path as the shell sees it, relative to `cwd`)
+/// names one of the memory files. Cheap name test first: only a word ending
+/// in one of the two file names is resolved.
+fn names_memory_file(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
+    if !(w.ends_with("USER.md") || w.ends_with("rules.md")) {
+        return false;
+    }
+    let p = PathBuf::from(w);
+    if p.is_absolute() {
+        return is_memory_file(root, &resolve(&p));
+    }
+    dirs.iter()
+        .any(|d| is_memory_file(root, &resolve(&d.join(&p))))
+}
+
+/// The directories a relative path in `cmd` may be read from: the hook's cwd
+/// and every `cd`/`pushd` target named in the command (one level deep).
+fn command_dirs(cmd: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
+    let base = cwd.map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        Path::to_path_buf,
+    );
+    let mut dirs = vec![base.clone()];
+    for seg in tokenize(cmd) {
+        if matches!(seg.first().map(String::as_str), Some("cd" | "pushd")) {
+            if let Some(t) = seg[1..].iter().find(|x| !x.starts_with('-')) {
+                dirs.push(base.join(t));
+            }
+        }
+    }
+    dirs
+}
+
+/// Targets of `>` and `>>` redirects in `cmd`. The tokenizer drops redirect
+/// targets, so the raw text is read for them.
+fn redirect_targets(cmd: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"(?:>>?|>\|)\s*(?:'([^']*)'|"([^"]*)"|([^\s;|&<>()'"]+))"#)
+            .expect("redirect regex")
+    });
+    re.captures_iter(cmd)
+        .filter_map(|c| {
+            (1..=3)
+                .find_map(|i| c.get(i))
+                .map(|m| m.as_str().to_string())
+        })
+        .collect()
+}
+
+/// A Bash command that writes one of the memory files: a redirect onto it, or
+/// a command that is not read-only naming it (`sed -i`, `tee`, `cp`, a shell
+/// `-c` string, …). A tripwire like the rest of the gate: a script that builds
+/// the path at run time gets past it.
+fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
+    let Some(root) = env.runs_dir.parent() else {
+        return Found::pass();
+    };
+    let root = resolve(root);
+    let dirs = command_dirs(cmd, cwd);
+    if redirect_targets(cmd)
+        .iter()
+        .any(|t| names_memory_file(&root, &dirs, t))
+    {
+        return Found::cos_only(ASK_MEMORY);
+    }
+    for seg in tokenize(cmd) {
+        let Some(i) = seg.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+            continue;
+        };
+        let base = seg[i].rsplit('/').next().unwrap_or(&seg[i]);
+        if READ_ONLY.contains(&base) {
+            continue;
+        }
+        for w in &seg[i + 1..] {
+            if names_memory_file(&root, &dirs, w) {
+                return Found::cos_only(ASK_MEMORY);
+            }
+            // A nested script (`bash -c '…'`, `eval '…'`).
+            if depth < 3 && w.contains(char::is_whitespace) {
+                let inner = bash_memory(env, w, cwd, depth + 1);
+                if !inner.is_pass() {
+                    return inner;
+                }
+            }
+        }
+    }
+    Found::pass()
 }
 
 /// Lexical `.`/`..` removal, then symlinks resolved on the longest existing prefix.
@@ -439,40 +560,42 @@ fn check_words(w: &[String]) -> Found {
     }
 }
 
+/// Commands that only read their file arguments.
+const READ_ONLY: &[&str] = &[
+    "cat",
+    "ls",
+    "stat",
+    "file",
+    "head",
+    "tail",
+    "wc",
+    "du",
+    "less",
+    "more",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "shasum",
+    "strings",
+    "grep",
+    "rg",
+    "echo",
+    "printf",
+    "diff",
+    "cmp",
+    "test",
+    "[",
+    "realpath",
+    "readlink",
+    "basename",
+    "dirname",
+    "xxd",
+    "hexdump",
+    "od",
+];
+
 /// Any other command naming the daemon's `qq.db`, bar the read-only tools.
 fn names_db(base: &str, a: &[String]) -> Found {
-    const READ_ONLY: &[&str] = &[
-        "cat",
-        "ls",
-        "stat",
-        "file",
-        "head",
-        "tail",
-        "wc",
-        "du",
-        "less",
-        "more",
-        "md5sum",
-        "sha1sum",
-        "sha256sum",
-        "shasum",
-        "strings",
-        "grep",
-        "rg",
-        "echo",
-        "printf",
-        "diff",
-        "cmp",
-        "test",
-        "[",
-        "realpath",
-        "readlink",
-        "basename",
-        "dirname",
-        "xxd",
-        "hexdump",
-        "od",
-    ];
     let names = a.iter().any(|x| x.rsplit('/').next() == Some("qq.db"));
     if names && !READ_ONLY.contains(&base) {
         Found::act(Action::DbWrite, ASK_DB)
