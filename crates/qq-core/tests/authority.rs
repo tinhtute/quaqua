@@ -529,3 +529,173 @@ fn unknown_caller_refusal_records_attempted_target() {
         ]
     );
 }
+
+// U3 gate tripwires: (name, must block, must allow). The same table drives the
+// binary verdict and the shell fallback, so the two stay in step.
+type Tripwire = (&'static str, &'static [&'static str], &'static [&'static str]);
+
+const TRIPWIRES: &[Tripwire] = &[
+    (
+        "alias push",
+        &[
+            "git config alias.p push",
+            "git config --global alias.p push",
+            "git config --local alias.ship 'push origin main'",
+            "git config alias.p '!git push'",
+            "git -C repo config --add alias.p push",
+            "git config alias.p \"!f() { git push origin main; }; f\"",
+        ],
+        &[
+            "git config alias.st status",
+            "git config user.name x",
+            "git config --get alias.p",
+        ],
+    ),
+    (
+        "gh api ref and contents writes",
+        &[
+            "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api --method PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api --method=PATCH repos/o/r/git/refs/heads/main -f sha=abc",
+            "gh api -XPATCH repos/o/r/git/refs/heads/main",
+            "gh api repos/o/r/git/refs/heads/main -X PATCH -f sha=abc",
+            "gh api -X patch repos/o/r/git/refs/heads/main",
+            "gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA==",
+            "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/main -f sha=abc",
+            "gh api -X DELETE repos/o/r/git/refs/heads/main",
+            "gh api repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
+        ],
+        &[
+            "gh api repos/o/r/git/refs/heads/main",
+            "gh api -X GET repos/o/r/git/refs/heads/main",
+            "gh api --method GET repos/o/r/contents/README.md",
+            "gh api repos/o/r/contents/README.md",
+            "gh api -X POST repos/o/r/issues/1/comments -f body=x",
+        ],
+    ),
+    (
+        "graphql enablePullRequestAutoMerge",
+        &[
+            "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+        ],
+        &["gh api graphql -f query='{ viewer { login } }'"],
+    ),
+    (
+        "graphql query from a file",
+        &[
+            "gh api graphql -F query=@auto.graphql",
+            "gh api graphql -Fquery=@auto.graphql",
+            "gh api graphql --field query=@auto.graphql",
+            "gh api graphql --field=query=@auto.graphql",
+        ],
+        &[],
+    ),
+    (
+        "herdr pane input",
+        &[
+            "herdr pane send-keys w1:p1 enter",
+            "herdr pane send-text w1:p1 'hello'",
+            "herdr pane run w1:p1 'rm -rf x'",
+            "herdr --session x pane send-keys p enter",
+            "echo hi && herdr pane run p ls",
+        ],
+        &[
+            "herdr agent send-keys worker enter",
+            "herdr pane send-keys --help",
+            "herdr pane read p",
+            "herdr pane list",
+        ],
+    ),
+    (
+        "grid_role metadata",
+        &[
+            "herdr pane report-metadata p --source s --token grid_role=cos",
+            "herdr pane report-metadata p --source s --token=grid_role=cos",
+            "herdr pane report-metadata p --token grid_role=worker --source s",
+        ],
+        &["herdr pane report-metadata p --source s --token role=x --display-agent Foo"],
+    ),
+    (
+        "sqlite3 on qq.db",
+        &[
+            "sqlite3 runs/qq.db 'delete from tasks'",
+            "sqlite3 ~/quaqua/runs/qq.db \"update agents set kind='cos'\"",
+            "sqlite3 runs/qq.db < fix.sql",
+            "cat fix.sql | sqlite3 runs/qq.db",
+            "sqlite3 -cmd '.timeout 5' runs/qq.db 'insert into t values (1)'",
+        ],
+        &[
+            "sqlite3 -readonly runs/qq.db 'select 1'",
+            "sqlite3 --readonly runs/qq.db 'select 1'",
+            "sqlite3 -readonly ~/quaqua/runs/qq.db < q.sql",
+            "sqlite3 other.db 'select 1'",
+        ],
+    ),
+    (
+        "delete main or master",
+        &[
+            "git branch -D main",
+            "git branch -D master",
+            "git branch -d main",
+            "git branch --delete --force main",
+            "git branch -d -f master",
+            "git branch -df main",
+            "git -C repo branch -D main",
+            "git branch -D feat main",
+            "git branch -D refs/heads/main",
+        ],
+        &[
+            "git branch -D feat",
+            "git branch --list main",
+            "git branch main",
+            "git branch -a",
+            "git branch -D feat/main-x",
+        ],
+    ),
+];
+
+#[test]
+fn gate_blocks_u3_tripwires() {
+    for (name, blocked, allowed) in TRIPWIRES {
+        for cmd in *blocked {
+            assert_eq!(gate_exit(cmd), 2, "{name}: must block: {cmd}");
+        }
+        for cmd in *allowed {
+            assert_eq!(gate_exit(cmd), 0, "{name}: must allow: {cmd}");
+        }
+    }
+}
+
+fn fallback_exit(cmd: &str) -> i32 {
+    use std::io::Write;
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/workspace/scripts/hooks/herdr-gate.sh");
+    let json = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .env("QUAQUA_BIN", "qq-binary-that-does-not-exist")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.to_string().as_bytes())
+        .unwrap();
+    child.wait().unwrap().code().unwrap()
+}
+
+#[test]
+fn gate_fallback_blocks_u3_tripwires_without_the_binary() {
+    for (name, blocked, allowed) in TRIPWIRES {
+        for cmd in *blocked {
+            assert_eq!(fallback_exit(cmd), 2, "{name}: fallback must block: {cmd}");
+        }
+        for cmd in *allowed {
+            assert_eq!(fallback_exit(cmd), 0, "{name}: fallback must allow: {cmd}");
+        }
+    }
+}
