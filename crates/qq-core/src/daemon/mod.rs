@@ -295,6 +295,7 @@ impl Daemon {
     }
 
     fn register_builtin(&mut self) {
+        caller::register(self);
         let add = |d: &mut Daemon, name: &str, h: Handler| {
             d.verbs.insert(name.to_string(), h);
         };

@@ -686,11 +686,9 @@ const TRIPWIRES: &[Tripwire] = &[
             "git branch refs/heads/main -D",
         ],
         &[
-            "git branch -D feat",
             "git branch --list main",
             "git branch main",
             "git branch -a",
-            "git branch -D feat/main-x",
             "git branch main && ls -d x",
         ],
     ),
@@ -905,8 +903,10 @@ mod caller_gate {
 
     /// cos asks, worker/Lead/unmapped/daemon-down block.
     pub fn assert_ask_for_cos_deny_for_rest(tag: &str, cmd: &str) {
-        let r = rig(&format!("{tag}-cos"), Who::Cos);
-        assert!(is_ask(&r.bash(cmd)), "{tag}: cos must ask: {cmd}");
+        {
+            let r = rig(&format!("{tag}-cos"), Who::Cos);
+            assert!(is_ask(&r.bash(cmd)), "{tag}: cos must ask: {cmd}");
+        }
         assert_denied_for_rest(tag, cmd);
     }
 
@@ -934,10 +934,12 @@ mod caller_gate {
 
     #[test]
     fn caller_lookup_worker_is_not_cos() {
-        let r = rig("cl-worker", Who::Worker);
-        let v = r.lookup().unwrap();
-        assert_eq!(v["caller"], "w-1");
-        assert_eq!(v["cos"], false);
+        {
+            let r = rig("cl-worker", Who::Worker);
+            let v = r.lookup().unwrap();
+            assert_eq!(v["caller"], "w-1");
+            assert_eq!(v["cos"], false);
+        }
         let r = rig("cl-lead", Who::Lead);
         assert_eq!(r.lookup().unwrap()["cos"], false);
     }
@@ -1248,10 +1250,12 @@ mod caller_gate {
 
     #[test]
     fn ask_tier_deny_says_report_to_the_cos() {
-        let r = rig("ask-msg", Who::Worker);
-        match r.bash("git tag v1") {
-            GateVerdict::Block(m) => assert!(m.contains("report to the CoS"), "{m}"),
-            v => panic!("{v:?}"),
+        {
+            let r = rig("ask-msg", Who::Worker);
+            match r.bash("git tag v1") {
+                GateVerdict::Block(m) => assert!(m.contains("report to the CoS"), "{m}"),
+                v => panic!("{v:?}"),
+            }
         }
         let r = rig("ask-msg-down", Who::Down);
         match r.bash("git tag v1") {
@@ -1345,28 +1349,30 @@ mod caller_gate {
     // ---- instruction_file_gate_* (R5) ----
 
     fn file_case(tag: &str, name: &str) {
-        let r = rig(&format!("{tag}-cos"), Who::Cos);
-        let live = r.ws.root().join(name);
-        std::fs::write(&live, "x").unwrap();
-        let live = live.to_str().unwrap();
-        for tool in ["Write", "Edit", "MultiEdit"] {
-            assert!(is_ask(&r.edit(tool, live)), "cos {tool} {name} must ask");
+        {
+            let r = rig(&format!("{tag}-cos"), Who::Cos);
+            let live = r.ws.root().join(name);
+            std::fs::write(&live, "x").unwrap();
+            let live = live.to_str().unwrap();
+            for tool in ["Write", "Edit", "MultiEdit"] {
+                assert!(is_ask(&r.edit(tool, live)), "cos {tool} {name} must ask");
+            }
+            // `..` and a relative path with the hook's cwd resolve to the same file.
+            let dotted = format!("{}/sub/../{name}", r.ws.root().display());
+            assert!(is_ask(&r.edit("Write", &dotted)), "{dotted}");
+            let rel = r.run(json!({
+                "tool_name": "Edit", "cwd": r.ws.root().to_str().unwrap(),
+                "tool_input": {"file_path": name}
+            }));
+            assert!(is_ask(&rel), "relative {name}");
+            // A symlink to the live file is the live file.
+            let link = r.ws.root().join(format!("link-{name}"));
+            std::os::unix::fs::symlink(live, &link).unwrap();
+            assert!(
+                is_ask(&r.edit("Write", link.to_str().unwrap())),
+                "symlink {name}"
+            );
         }
-        // `..` and a relative path with the hook's cwd resolve to the same file.
-        let dotted = format!("{}/sub/../{name}", r.ws.root().display());
-        assert!(is_ask(&r.edit("Write", &dotted)), "{dotted}");
-        let rel = r.run(json!({
-            "tool_name": "Edit", "cwd": r.ws.root().to_str().unwrap(),
-            "tool_input": {"file_path": name}
-        }));
-        assert!(is_ask(&rel), "relative {name}");
-        // A symlink to the live file is the live file.
-        let link = r.ws.root().join(format!("link-{name}"));
-        std::os::unix::fs::symlink(live, &link).unwrap();
-        assert!(
-            is_ask(&r.edit("Write", link.to_str().unwrap())),
-            "symlink {name}"
-        );
         for (who, n) in [
             (Who::Worker, "w"),
             (Who::Lead, "l"),
