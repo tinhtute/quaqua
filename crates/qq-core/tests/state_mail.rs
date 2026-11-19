@@ -341,8 +341,7 @@ fn deliver_trace(tag: &str, reply: Reply) -> Vec<(String, String, String)> {
         .expect("rpc transport")
         .into_result()
         .expect("mail.send");
-    let mail = settled_mail(&f, 2);
-    mail
+    settled_mail(&f, 2)
 }
 
 #[test]
