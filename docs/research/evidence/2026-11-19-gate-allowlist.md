@@ -41,8 +41,12 @@ exactly known spelling; every other shape takes the fail-closed path.
   token that is not (an unknown flag, an unknown letter in a cluster) makes the
   command word unknown.
 - Unknown command word means: every suffix of the remaining words is checked as
-  a command (a superset of every reading of which word is the command), every
-  word that holds a space is scanned as a command line, and the target is
+  a command through the ordinary path, shallow (`check_cmd`, no nested suffix
+  scan; a wrapper word passes, its words are suffixes of the same scan), so the
+  db, path-writer and grant checks still run (a superset of every reading of which word is the command), every
+  word that holds a space is scanned as a command line (for an option
+  also the text after `=` and after each cluster letter: `--command='…'`,
+  `-qc'…'`; and the command word itself: `sudo -s '…'`), and the target is
   unknown (high tier). This replaces the both-readings fork and the six-fork cap:
   one linear scan covers all readings, so no table of value-taking options has to
   stay complete, and no fork budget can be exhausted.
@@ -59,8 +63,11 @@ guarded command. Provable readers (below) are exempt, so `echo git push` and
 ### 3. READ_ONLY
 
 - Readers that have a flag or program that can write or execute (`sed sort uniq
-  awk rg bat diff file git`) carry an exact flag table or a grammar; any flag or
-  operand shape outside it means not read-only (`sort -oUSER.md`,
+  awk rg bat diff file git`) carry a flag table or a grammar. `sort rg bat diff
+  file awk` are exact: any flag or operand shape outside the table means not
+  read-only. `sed` and `uniq` keep their own parsers and `git` its subcommand
+  list; they are not exact tables, and an unknown flag on them is not refused
+  by this change (`sort -oUSER.md`,
   `sort -ruoX`, `rg --pre=tee`, `bat --pager=…` all fall out of the table).
 - Readers that have no such flag in any implementation (`cat ls stat head tail wc
   du hexdump od strings checksum tools cmp realpath readlink basename dirname nl
@@ -100,8 +107,8 @@ so reader-writers such as `xxd in USER.md` are only caught by the binary.
 
 ## Results
 
-- Red (5dddbd1, f3f0f7d): 7 of 8 gate_fix4 tests fail on the unchanged gate;
-  the ordinary-commands guard passes. Of the 48 push/herdr probes, 40 exit 0
+- Red (5dddbd1, f3f0f7d): 7 of 8 gate_fix4 tests fail at 5dddbd1; at f3f0f7d 8
+  of 9 (the worker-tier test joins); the ordinary-commands guard passes. Of the 48 push/herdr probes, 40 exit 0
   (allowed) on the cdd727d binary; on the fix build, 0.
 - Mutation check: removing the letters `E` (sudo), `C` (env), digits (nice),
   `v` (timeout) and `t` (xargs) from the tables leaves every block and ask test
@@ -112,6 +119,12 @@ so reader-writers such as `xxd in USER.md` are only caught by the binary.
   string `herdr pane split …` to the hook through `jq`, with the herdr text as
   a quoted argument of an unlisted command. ALLOW→ASK: 0. False moves
   1 of 4,934 (0.02%).
+
+- Second round (167575b red, 7588352 fix), after review of the first fix: the
+  first `check_flat` was a second dispatch table without the default arm's db,
+  path-writer and grant checks, so `env -Z rm runs/qq.db` went from block (base)
+  to allow. Now `check_flat` runs `check_cmd` shallow. Both red tests fail at
+  167575b and pass at 7588352; the replay is unchanged (one move, #166).
 
 ## Rejected alternatives
 
