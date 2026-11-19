@@ -15,6 +15,8 @@ use rusqlite::Connection;
 /// settings, so no case waits for the 600 s default.
 const STALL_SEC: f64 = 0.4;
 const SWEEP_MS: u64 = 20;
+/// How long an agent must stay missing before it counts as exited.
+const EXIT_DEBOUNCE_SEC: f64 = 0.6;
 
 struct Farm {
     ws: TestWorkspace,
@@ -36,6 +38,7 @@ fn farm(tag: &str, agents: &[(&str, &str)]) -> Farm {
         for (key, val) in [
             ("notify.stall_sec", STALL_SEC.to_string()),
             ("notify.sweep_ms", SWEEP_MS.to_string()),
+            ("notify.exit_debounce_sec", EXIT_DEBOUNCE_SEC.to_string()),
         ] {
             conn.execute(
                 "INSERT OR REPLACE INTO setting (key, value_json) VALUES (?1, ?2)",
@@ -188,4 +191,35 @@ fn state_mail_idle_working_flips_are_silent() {
 
     assert!(cos_mail(&f.ws).is_empty());
     assert!(f.herdr.notifications().is_empty());
+}
+
+/// Cleanup closes the pane first and the row after the worktree is gone, so a
+/// sweep in between sees a missing agent with an open row.
+#[test]
+fn state_mail_exit_before_the_row_closes_is_silent() {
+    let f = farm("state-cleanup-race", &[("sude-r", "peer")]);
+    f.herdr.remove("sude-r");
+    std::thread::sleep(Duration::from_millis(100));
+    db(&f.ws)
+        .execute("UPDATE agent SET ended_ms = 2 WHERE name = 'sude-r'", [])
+        .unwrap();
+
+    std::thread::sleep(Duration::from_secs_f64(EXIT_DEBOUNCE_SEC * 2.0));
+
+    assert!(cos_mail(&f.ws).is_empty());
+    assert!(f.herdr.notifications().is_empty());
+}
+
+#[test]
+fn state_mail_huge_stall_setting_does_not_kill_the_sweeper() {
+    let f = farm("state-huge", &[("sude-h", "peer")]);
+    db(&f.ws)
+        .execute(
+            "INSERT OR REPLACE INTO setting (key, value_json) VALUES ('notify.stall_sec', '1e308')",
+            [],
+        )
+        .unwrap();
+    f.herdr.remove("sude-h");
+
+    wait_for("the exited mail", || !cos_mail(&f.ws).is_empty());
 }
