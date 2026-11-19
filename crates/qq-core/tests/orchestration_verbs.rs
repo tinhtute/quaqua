@@ -520,7 +520,7 @@ fn push_pushurl_flip_race_never_moves_default() {
         std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let u = if n % 2 == 0 { &d } else { &o };
+                let u = if n.is_multiple_of(2) { &d } else { &o };
                 let _ = Command::new("git")
                     .arg("-C")
                     .arg(&work)

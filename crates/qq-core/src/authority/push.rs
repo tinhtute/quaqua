@@ -230,22 +230,24 @@ fn url_default(repo: &str, url: &str) -> RemoteDefault {
         })
 }
 
-/// Asks every URL `git push <remote>` will push to (`ls-remote --symref`, not
-/// the fetch URL) for its default branch. Any unproven URL makes the whole
-/// answer [`Unknown`](RemoteDefault::Unknown).
-pub(crate) fn remote_default(repo: &str, remote: &str) -> RemoteDefault {
+/// Resolves the URLs `git push <remote>` goes to, once, and asks each of them
+/// (`ls-remote --symref`, not the fetch URL) for its default branch. Any
+/// unproven URL makes the answer [`Unknown`](RemoteDefault::Unknown). The URLs
+/// come back with the answer so the caller pushes to exactly what was checked
+/// ([`push_checked`]); they are empty when the answer is `Unknown`.
+pub(crate) fn resolve_remote(repo: &str, remote: &str) -> (Vec<String>, RemoteDefault) {
     let Some(urls) = push_urls(repo, remote) else {
-        return RemoteDefault::Unknown;
+        return (Vec::new(), RemoteDefault::Unknown);
     };
     let (mut branches, mut empty) = (Vec::<String>::new(), 0);
     for u in &urls {
         match url_default(repo, u) {
-            RemoteDefault::Unknown => return RemoteDefault::Unknown,
+            RemoteDefault::Unknown => return (Vec::new(), RemoteDefault::Unknown),
             RemoteDefault::Empty => empty += 1,
             RemoteDefault::Branches(b) => branches.extend(b),
         }
     }
-    match (branches.is_empty(), empty) {
+    let default = match (branches.is_empty(), empty) {
         (true, _) => RemoteDefault::Empty,
         (false, 0) => {
             branches.sort();
@@ -253,7 +255,100 @@ pub(crate) fn remote_default(repo: &str, remote: &str) -> RemoteDefault {
             RemoteDefault::Branches(branches)
         }
         (false, _) => RemoteDefault::Unknown,
+    };
+    (urls, default)
+}
+
+/// Pushes `refs/heads/<branch>` to exactly the `urls` that were checked, as a
+/// plain non-forcing `git push -- <url> <refspec>`. The push runs from a
+/// scratch bare repo with an empty config (the work repo's objects through
+/// `alternates`, the branch tip pinned once), so no `insteadOf`, `pushurl`,
+/// `remote.<name>.*` or `url.*` change made after the check can send it
+/// anywhere else. The URLs are used as given, relative to `repo` as when they
+/// were read. First failure stops, as `git push <remote>` does.
+pub(crate) fn push_checked(repo: &str, urls: &[String], branch: &str) -> Result<(), String> {
+    let out = |args: &[&str]| {
+        git(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let tip = out(&[
+        "rev-parse",
+        "--verify",
+        "-q",
+        &format!("refs/heads/{branch}^{{commit}}"),
+    ])
+    .ok_or_else(|| format!("branch {branch} does not exist"))?;
+    let objects = out(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ])
+    .ok_or("cannot find the repo's object store")?;
+    let scratch = std::env::temp_dir().join(format!(
+        "qq-push-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let result = push_from_scratch(repo, &scratch, &objects, &tip, urls, branch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+fn push_from_scratch(
+    repo: &str,
+    scratch: &std::path::Path,
+    objects: &str,
+    tip: &str,
+    urls: &[String],
+    branch: &str,
+) -> Result<(), String> {
+    let s = scratch.to_string_lossy().into_owned();
+    let run = |mut c: Proc| -> Result<(), String> {
+        let o = c.output().map_err(|e| e.to_string())?;
+        o.status
+            .success()
+            .then_some(())
+            .ok_or_else(|| String::from_utf8_lossy(&o.stderr).trim().to_string())
+    };
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    run({
+        let mut c = git(&s);
+        c.args(["init", "-q", "--bare"]);
+        c
+    })?;
+    std::fs::write(
+        scratch.join("objects/info/alternates"),
+        format!("{objects}\n"),
+    )
+    .map_err(|e| e.to_string())?;
+    run({
+        let mut c = git(&s);
+        c.args(["update-ref", &format!("refs/heads/{branch}"), tip]);
+        c
+    })?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    for u in urls {
+        run({
+            let mut c = Proc::new("git");
+            c.arg("--git-dir")
+                .arg(scratch)
+                .current_dir(repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["push", "--", u, &refspec]);
+            c
+        })?;
     }
+    Ok(())
 }
 
 fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
@@ -318,26 +413,20 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
             if !configured_remote(repo, remote) {
                 return deny("remote is not configured in the repo", remote);
             }
+            // Resolve the push URLs once; the push goes to these URLs, not to
+            // the remote name, so a config flip after this read changes nothing.
+            // An empty remote has no readable default (its unborn HEAD is
+            // invisible), so it is refused like an unproven one.
+            let (urls, default) = resolve_remote(repo, remote);
             if protected_branch(repo, remote, branch)
-                || match remote_default(repo, remote) {
+                || match default {
                     RemoteDefault::Branches(d) => d.iter().any(|d| same_branch(d, branch)),
-                    RemoteDefault::Empty => false,
-                    RemoteDefault::Unknown => true,
+                    RemoteDefault::Empty | RemoteDefault::Unknown => true,
                 }
             {
                 return deny("branch is the repo's main or default branch", branch);
             }
-            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-            let out = git(repo)
-                .args(["push", "--", remote, &refspec])
-                .output()
-                .map_err(internal)?;
-            if !out.status.success() {
-                return Err(RpcError::new(
-                    "push_failed",
-                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                ));
-            }
+            push_checked(repo, &urls, branch).map_err(|e| RpcError::new("push_failed", e))?;
             Ok(json!({ "pushed": true, "remote": remote, "branch": branch }))
         }),
     )

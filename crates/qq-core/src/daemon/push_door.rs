@@ -3,7 +3,8 @@
 //! the request); `main`, `master`, the remote default branch and any forcing
 //! form stay refused; the push is classified with `authority::tier`
 //! (`PushNonMain`, judged in the repo's effective context tier) and runs as
-//! a plain `git push <remote> refs/heads/<b>:refs/heads/<b>` argv, no force.
+//! a plain, non-forcing `git push -- <url> refs/heads/<b>:refs/heads/<b>` to the
+//! URLs that were checked (`push_checked`), never to the remote name.
 //! The fenced-Lead `push` verb is unchanged.
 
 use std::path::Path;
@@ -12,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::{caller, Ctx, Daemon};
 use crate::authority::push::{
-    configured_remote, git, plain_branch, protected_branch, remote_default, same_branch,
+    configured_remote, plain_branch, protected_branch, push_checked, resolve_remote, same_branch,
     RemoteDefault,
 };
 use crate::authority::tier::{self, Action, Decision};
@@ -92,7 +93,8 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     // where the push lands. Anything unproven refuses (fail closed): a failed,
     // timed-out or unstable read, and an empty remote (its unborn HEAD is
     // invisible, so a first push needs the owner).
-    match remote_default(repo, remote) {
+    let (urls, default) = resolve_remote(repo, remote);
+    match default {
         RemoteDefault::Unknown | RemoteDefault::Empty => {
             return Err(refused(
                 ctx,
@@ -124,17 +126,7 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             &format!("tier {base:?} does not allow the CoS to push alone"),
         ));
     }
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    let out = git(repo)
-        .args(["push", "--", remote, &refspec])
-        .output()
-        .map_err(|e| RpcError::new("push_failed", e.to_string()))?;
-    if !out.status.success() {
-        return Err(RpcError::new(
-            "push_failed",
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ));
-    }
+    push_checked(repo, &urls, branch).map_err(|e| RpcError::new("push_failed", e))?;
     Ok(json!({ "pushed": true, "remote": remote, "branch": branch }))
 }
 

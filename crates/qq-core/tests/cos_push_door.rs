@@ -482,7 +482,7 @@ fn flip_race(r: &Rig, work: &Path, origin: &Path, key: &str, a: &str, b: &str) {
         std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let v = if n % 2 == 0 { &a } else { &b };
+                let v = if n.is_multiple_of(2) { &a } else { &b };
                 let _ = Command::new("git")
                     .arg("-C")
                     .arg(&work)
