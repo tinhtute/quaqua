@@ -199,6 +199,86 @@ pub fn check_brief(
     })
 }
 
+/// `Playbook: prototype` is the pilot/spike playbook; the budget the worker
+/// actually gets (`budget_sec`: brief line, env override or default) may not
+/// exceed `limit_sec` (`timers.pilot_budget`). `None` limit: nothing to compare.
+pub fn check_pilot_budget(
+    text: &str,
+    budget_sec: u64,
+    limit_sec: Option<u64>,
+) -> Result<(), String> {
+    let Some(limit) = limit_sec else {
+        return Ok(());
+    };
+    let pilot = at_col1(header_block(text), "Playbook:")
+        .and_then(|p| p.split([',', ';', ' ']).next())
+        == Some("prototype");
+    if pilot && budget_sec > limit {
+        return Err(format!(
+            "Playbook 'prototype' time budget {} exceeds timers.pilot_budget {}",
+            fmt_sec(budget_sec),
+            fmt_sec(limit)
+        ));
+    }
+    Ok(())
+}
+
+fn fmt_sec(s: u64) -> String {
+    if s.is_multiple_of(60) {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// `"30m"`, `"2h"`, `"90s"` (or a bare number of seconds) as seconds.
+fn parse_duration_sec(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (n, mult) = match s.chars().last()? {
+        'h' => (&s[..s.len() - 1], 3600),
+        'm' => (&s[..s.len() - 1], 60),
+        's' => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    n.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// `timers.pilot_budget` from the config database (team.toml only seeds it).
+pub fn pilot_budget_sec(runs: &Path) -> Option<u64> {
+    let c = crate::db::open(&runs.join(crate::db::path::DB_FILE)).ok()?;
+    let v = crate::config::setting(&c, "timers.pilot_budget").ok()??;
+    parse_duration_sec(v.as_str()?)
+}
+
+const PANE_TAIL_LINES: u32 = 40;
+
+/// The pane tail block the CoS reads after exit 3, 4, 5, 7 or 8: one
+/// `WATCHDOG pane tail <name>` header, then the last lines or one line why not.
+/// The pane comes from herdr, else (a dead core) from the agent record.
+pub fn pane_tail_block(herdr: &dyn HerdrClient, runs: &Path, name: &str) -> String {
+    let head = format!("WATCHDOG pane tail {name}");
+    let pane = agent_state(herdr, name).1.or_else(|| {
+        let c = crate::db::open(&runs.join(crate::db::path::DB_FILE)).ok()?;
+        c.query_row(
+            "SELECT pane_id FROM agent WHERE name = ?1 ORDER BY started_ms DESC LIMIT 1",
+            [name],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()?
+    });
+    let Some(pane) = pane else {
+        return format!("{head}\npane read failed: no pane known for '{name}'");
+    };
+    match herdr.pane_read(&pane, PANE_TAIL_LINES) {
+        Ok(r) if r.ok => format!("{head}\n{}", r.body.trim_end()),
+        Ok(r) => format!(
+            "{head}\npane read failed: {}",
+            r.error_code().unwrap_or_else(|| "herdr error".into())
+        ),
+        Err(e) => format!("{head}\npane read failed: {e}"),
+    }
+}
+
 /// What the wait observed at one poll.
 #[derive(Debug, Clone, Default)]
 pub struct Observed {
@@ -1090,6 +1170,8 @@ pub fn prompt_run(
             .and_then(|v| v.parse().ok());
         let ok = check_brief(text, env_budget, playbooks_dir(runs).as_deref())
             .map_err(|e| CliError::new(1, e))?;
+        check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(runs))
+            .map_err(|e| CliError::new(1, e))?;
         for w in &ok.warnings {
             eprintln!("{w}");
         }
@@ -1142,10 +1224,22 @@ pub fn prompt_run(
     };
     match wait(herdr, clock, &cfg) {
         Exit::ReportReady => Ok(report.display().to_string()),
-        e => Err(CliError::new(
-            e.code(),
-            format!("WATCHDOG exit={} | name={name}", e.code()),
-        )),
+        e => {
+            if matches!(
+                e,
+                Exit::Stalled
+                    | Exit::BudgetExceeded
+                    | Exit::Blocked
+                    | Exit::ProviderError
+                    | Exit::CoreDied
+            ) {
+                eprintln!("{}", pane_tail_block(herdr, runs, name));
+            }
+            Err(CliError::new(
+                e.code(),
+                format!("WATCHDOG exit={} | name={name}", e.code()),
+            ))
+        }
     }
 }
 
@@ -1161,6 +1255,8 @@ fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
                     .ok()
                     .and_then(|v| v.parse().ok());
                 let ok = check_brief(text, env_budget, playbooks_dir(&env.runs_dir).as_deref())
+                    .map_err(|e| CliError::new(1, e))?;
+                check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(&env.runs_dir))
                     .map_err(|e| CliError::new(1, e))?;
                 let mut out = ok.warnings.join("\n");
                 if !out.is_empty() {
