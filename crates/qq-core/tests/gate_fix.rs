@@ -1804,3 +1804,82 @@ fn gate_fix5_ordinary_git_stays_free_round_two() {
         assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
     }
 }
+
+// ---- review 5, finding 1: a flag's value must never count as a read flag ----
+
+/// `git config` is classified from the parsed arguments: the value taken by
+/// `--comment`/`-f`/... is not a flag, so a write dressed with a read-looking
+/// value keeps the verdict of its plain form.
+#[test]
+fn gate_fix5_config_flag_value_is_not_a_read_flag() {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig(&format!("gf5-cfgval-{}", who as u8), who);
+        let pairs = [
+            (
+                "git config alias.ship '!git push origin HEAD:main'",
+                "git config --comment --unset alias.ship '!git push origin HEAD:main'",
+            ),
+            (
+                "git config alias.ship '!git push origin HEAD:main'",
+                "git config --comment=--unset alias.ship '!git push origin HEAD:main'",
+            ),
+            (
+                "git config core.fsmonitor 'git push origin HEAD:main;:'",
+                "git config --comment --get core.fsmonitor 'git push origin HEAD:main;:'",
+            ),
+            (
+                "git config core.fsmonitor 'git push origin HEAD:main;:'",
+                "git config --comment=--get core.fsmonitor 'git push origin HEAD:main;:'",
+            ),
+            (
+                "git config remote.origin.pushurl /tmp/decoy.git",
+                "git config --comment --get remote.origin.pushurl /tmp/decoy.git",
+            ),
+            (
+                "git config remote.origin.pushurl /tmp/decoy.git",
+                "git config --comment=--get remote.origin.pushurl /tmp/decoy.git",
+            ),
+            (
+                "git config remote.origin.pushurl /tmp/decoy.git",
+                "git config --file --get remote.origin.pushurl /tmp/decoy.git",
+            ),
+            (
+                "git config remote.origin.pushurl /tmp/decoy.git",
+                "git config --default --list remote.origin.pushurl /tmp/decoy.git",
+            ),
+            (
+                "git config remote.origin.pushurl /tmp/decoy.git",
+                "git config -t --get remote.origin.pushurl /tmp/decoy.git",
+            ),
+        ];
+        for (plain, dressed) in pairs {
+            let (p, d) = (r.bash(plain), r.bash(dressed));
+            assert_eq!(d, p, "{who:?}: {dressed} must match {plain}");
+            if who == Who::Cos {
+                assert!(ask(&d) || block(&d), "cos must ask or block: {dressed}");
+            } else {
+                assert!(block(&d), "{who:?} must block: {dressed}");
+            }
+            if dressed.contains("fsmonitor") {
+                assert!(block(&d), "{who:?} must block: {dressed}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_fix5_config_ordinary_reads_stay_free_round_three() {
+    let r = rig("gf5-cfgread", Who::Down);
+    for ok in [
+        "git config --get user.name",
+        "git config -l",
+        "git config --list",
+        "git config --get-regexp alias",
+        "git config --get core.fsmonitor 'git push origin HEAD:main;:'",
+        "git config --comment note --get user.name",
+        "git config --file .git/config --get user.name",
+        "git config --unset alias.ship",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
