@@ -62,6 +62,37 @@ pub fn pr_tier(repo: Tier, lane: Tier, files: &[String]) -> Tier {
     }
 }
 
+/// Every path a unified diff names in its headers: both sides of a rename or
+/// copy, the old and new side of each file. Over-matching only fails closed.
+pub fn diff_paths(diff: &str) -> Vec<String> {
+    const HEADERS: &[&str] = &[
+        "diff --git ",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+        "--- ",
+        "+++ ",
+    ];
+    let mut out = Vec::new();
+    for line in diff.lines() {
+        let Some(rest) = HEADERS.iter().find_map(|h| line.strip_prefix(h)) else {
+            continue;
+        };
+        out.push(rest.to_string());
+        for tok in rest.split_whitespace() {
+            let t = tok.trim_matches('"');
+            out.push(
+                t.strip_prefix("a/")
+                    .or(t.strip_prefix("b/"))
+                    .unwrap_or(t)
+                    .to_string(),
+            );
+        }
+    }
+    out
+}
+
 struct Hooks {
     gh: PathBuf,
     repo: Tier,
@@ -94,7 +125,7 @@ fn bad(why: impl Into<String>) -> RpcError {
 
 /// A refusal, journaled like every other authority refusal.
 fn deny(ctx: &Ctx, req: &Request, target: &str, why: &str) -> RpcError {
-    let who = req.caller.as_deref().unwrap_or("unknown");
+    let who = caller::identified(req).unwrap_or("unknown");
     let _ = ctx
         .store
         .with_conn(|c| crate::authority::refuse(c, who, VERB, target, why));
@@ -119,6 +150,13 @@ fn ok_stdout(o: std::io::Result<Output>) -> Option<String> {
 /// the latest snapshot holds a clean review of a sha that is at or past the
 /// gate (a sha still under review is not yet reviewed).
 fn reviewed(ctx: &Ctx, workflow: &str) -> Option<(String, String)> {
+    let rows = ctx.store.workflows().ok()?;
+    if !rows
+        .iter()
+        .any(|w| w.id == workflow && w.kind == crate::task::pipeline::KIND)
+    {
+        return None;
+    }
     let snap = ctx.store.journal().load_latest_snapshot(workflow).ok()??;
     let v: Value = serde_json::from_str(&snap.state_json).ok()?;
     let at_gate = match v.get("stage").and_then(Value::as_str)? {
@@ -198,27 +236,15 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             ),
         }
     };
-    // A high base needs no diff to refuse; otherwise an unreadable diff is high.
-    let tier = if base_repo.max(base_lane) >= Tier::High {
-        Tier::High
-    } else {
-        match ok_stdout(gh(&program, &repo, &["pr", "diff", &pr, "--name-only"])) {
-            Some(out) => {
-                let files: Vec<String> = out.lines().map(String::from).collect();
-                pr_tier(base_repo, base_lane, &files)
-            }
-            None => Tier::High,
-        }
-    };
-    if tier::decide(true, Action::MergeRequest, tier, base_lane) != Decision::Allow {
+    // A high base needs no diff to refuse.
+    if base_repo.max(base_lane) >= Tier::High {
         return Err(deny(
             ctx,
             req,
             &target,
-            &format!("tier {tier:?} does not allow the CoS to merge alone"),
+            "tier High does not allow the CoS to merge alone",
         ));
     }
-
     let head = ok_stdout(gh(
         &program,
         &repo,
@@ -234,6 +260,24 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     ));
     if !head.is_some_and(|h| h.eq_ignore_ascii_case(&sha)) {
         return Err(deny(ctx, req, &target, "PR head is not the reviewed sha"));
+    }
+    // The whole diff, not `--name-only`: the old side of a rename is a path too.
+    // An unreadable diff is high.
+    let tier = match ok_stdout(gh(
+        &program,
+        &repo,
+        &["pr", "diff", &pr, "--color", "never"],
+    )) {
+        Some(out) => pr_tier(base_repo, base_lane, &diff_paths(&out)),
+        None => Tier::High,
+    };
+    if tier::decide(true, Action::MergeRequest, tier, base_lane) != Decision::Allow {
+        return Err(deny(
+            ctx,
+            req,
+            &target,
+            &format!("tier {tier:?} does not allow the CoS to merge alone"),
+        ));
     }
     if !checks_green(&program, &repo, &pr) {
         return Err(deny(ctx, req, &target, "checks are not green on the sha"));

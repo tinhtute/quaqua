@@ -645,6 +645,13 @@ mod pr_merge_door {
         });
         conn(&r)
             .execute(
+                "INSERT INTO workflow (id, kind, state, started_ms, updated_ms) \
+                 VALUES ('wf-1', 'pipeline', 'running', 1, 1)",
+                [],
+            )
+            .unwrap();
+        conn(&r)
+            .execute(
                 "INSERT INTO snapshots (workflow_id, seq, state_json) VALUES ('wf-1', 1, ?1)",
                 params![state.to_string()],
             )
