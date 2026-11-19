@@ -62,6 +62,35 @@ fn at_col1<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+/// The body of `key`: its own line plus the lines after it up to the next
+/// header (a line that starts with an uppercase letter at column 1).
+fn field_body(text: &str, key: &str) -> Option<String> {
+    let mut lines = text.lines().skip_while(|l| !l.starts_with(key));
+    let mut body = lines.next()?[key.len()..].to_string();
+    for l in lines.take_while(|l| !l.starts_with(|c: char| c.is_ascii_uppercase())) {
+        body.push('\n');
+        body.push_str(l);
+    }
+    Some(body)
+}
+
+/// First line holding an absolute `/home/<user>` or `/Users/<user>` path
+/// (1-based line number, trimmed line). A path under `/tmp/` or a relative
+/// path that merely contains `/home/` is not one: the match must start a path.
+fn home_path_line(text: &str) -> Option<(usize, &str)> {
+    let path_char = |c: char| c.is_alphanumeric() || "._-/~".contains(c);
+    text.lines().enumerate().find_map(|(i, l)| {
+        let hit = ["/home/", "/Users/"].iter().any(|root| {
+            l.match_indices(root).any(|(at, _)| {
+                let starts_path = !l[..at].chars().next_back().is_some_and(path_char);
+                let user = l[at + root.len()..].chars().next();
+                starts_path && user.is_some_and(|c| c.is_alphanumeric() || "._-".contains(c))
+            })
+        });
+        hit.then_some((i + 1, l.trim()))
+    })
+}
+
 fn header_block(text: &str) -> &str {
     text.split("\n\n").next().unwrap_or("")
 }
@@ -111,7 +140,39 @@ pub fn check_brief(
             return Err(format!("brief has no '{key}' line"));
         }
     }
+    for key in ["Time budget:", "Cost budget:"] {
+        if at_col1(text, key).is_none() {
+            return Err(format!("brief has no '{key}' line"));
+        }
+    }
+    if let Some((n, line)) = home_path_line(text) {
+        return Err(format!(
+            "brief line {n} holds an absolute home path (use worktree-relative paths): {line}"
+        ));
+    }
     let mut warnings = Vec::new();
+    for key in ["Unknowns:", "Evidence:"] {
+        if at_col1(text, key).is_none() {
+            warnings.push(format!("warning: brief has no '{key}' line"));
+        }
+    }
+    if !field_body(text, "Hard constraints:").is_some_and(|b| {
+        b.split('`')
+            .skip(1)
+            .step_by(2)
+            .any(|c| c.to_lowercase().contains("test"))
+    }) {
+        warnings.push(
+            "warning: 'Hard constraints:' names no test command or filter (e.g. `<cmd> <filter>`)"
+                .into(),
+        );
+    }
+    if text.contains("pgrep -f") {
+        warnings.push(
+            "warning: brief uses 'pgrep -f' (it matches its own shell; wait on a pid or file)"
+                .into(),
+        );
+    }
     match at_col1(head, "Playbook:") {
         None => warnings.push("warning: brief has no 'Playbook:' header".into()),
         Some("none") => warnings.push("warning: 'Playbook: none' needs a reason".into()),
@@ -1049,10 +1110,7 @@ impl Tuning {
 
 /// The brief plus the report instruction, as the old binary composed it.
 pub fn compose_prompt_body(name: &str, task: &str) -> String {
-    format!(
-        "{task}. {}",
-        super::report_contract::report_ask(name)
-    )
+    format!("{task}. {}", super::report_contract::report_ask(name))
 }
 
 /// Sends the brief through herdr and checks it reached the turn. A stalled

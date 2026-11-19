@@ -21,7 +21,7 @@ use qq_core::task::worker_flow::place_pane;
 use rusqlite::Connection;
 
 const BRIEF: &str = "Topology: solo — one unit\nPlaybook: feature\nContext: none, test\n\
-Goal: g\nHard constraints: h\nCurrent design (open to challenge): d\n\
+Goal: g\nHard constraints: h; `tests/qq-test.sh foo`\nCurrent design (open to challenge): d\n\
 Unknowns: u\nEvidence: e\nTime budget: 15 min\nCost budget: $2\n";
 
 fn seeded(tag: &str) -> (std::path::PathBuf, Connection) {
@@ -92,9 +92,6 @@ fn prompt_check_brief_and_resume() {
         prompt::check_brief(BRIEF, Some(60), None).unwrap().source,
         "env"
     );
-    let no_time = BRIEF.replace("Time budget: 15 min\n", "");
-    let d = prompt::check_brief(&no_time, None, None).unwrap();
-    assert_eq!((d.budget_sec, d.source), (2700, "default"));
     // rejected briefs
     for bad in [
         BRIEF.replace("Topology: solo — one unit\n", ""),
@@ -102,6 +99,8 @@ fn prompt_check_brief_and_resume() {
         format!("{BRIEF}Must fix: urgent\n"),
         format!("{BRIEF}Review rounds: 0\n"),
         BRIEF.replace("15 min", "soon"),
+        BRIEF.replace("Time budget: 15 min\n", ""),
+        BRIEF.replace("Cost budget: $2\n", ""),
     ] {
         assert!(prompt::check_brief(&bad, None, None).is_err(), "{bad}");
     }
@@ -1755,16 +1754,98 @@ fn pilot_budget_judges_the_effective_budget_not_the_brief_line() {
     let proto = BRIEF.replace("Playbook: feature", "Playbook: prototype");
     let no_line = proto.replace("Time budget: 15 min\n", "");
     assert!(!no_line.contains("Time budget:"));
-    // no line: the default (45 min) is what the worker gets
-    let ok = prompt::check_brief(&no_line, None, None).unwrap();
-    assert_eq!(ok.budget_sec, 2700);
-    assert!(prompt::check_pilot_budget(&no_line, ok.budget_sec, limit).is_err());
+    // no line: the brief is rejected before the pilot cap is asked
+    assert!(prompt::check_brief(&no_line, None, None).is_err());
     // an env override above the cap beats a brief line under it
     let ok = prompt::check_brief(&proto, Some(3600), None).unwrap();
     assert_eq!(ok.budget_sec, 3600);
     assert!(prompt::check_pilot_budget(&proto, ok.budget_sec, limit).is_err());
     // an env override under the cap passes
-    assert!(prompt::check_pilot_budget(&no_line, 600, limit).is_ok());
+    assert!(prompt::check_pilot_budget(&proto, 600, limit).is_ok());
+}
+
+#[test]
+fn check_brief_requires_both_budget_lines() {
+    for key in ["Time budget: 15 min\n", "Cost budget: $2\n"] {
+        let e = prompt::check_brief(&BRIEF.replace(key, ""), None, None).unwrap_err();
+        assert!(e.contains(key.split(':').next().unwrap()), "{e}");
+    }
+}
+
+#[test]
+fn check_brief_rejects_an_absolute_home_path_and_names_the_line() {
+    // built at runtime: the repo's pre-commit hook rejects literal home paths
+    let (home, users) = (format!("/{}/", "home"), format!("/{}/", "Users"));
+    for p in [
+        format!("{home}bob/x"),
+        format!("{users}bob/x"),
+        format!("see ({home}bob/), ok"),
+    ] {
+        let b = BRIEF.replace("Goal: g\n", &format!("Goal: g\nContext2: {p}\n"));
+        let e = prompt::check_brief(&b, None, None).unwrap_err();
+        assert!(e.contains("line 5") && e.contains(&p), "{e}");
+    }
+    // /tmp, a placeholder and a relative path that contains it are fine
+    for p in [
+        format!("/tmp{home}bob/x"),
+        format!("{home}<user>/x"),
+        format!("crates{home}bob/x"),
+        "/tmp/a".to_string(),
+    ] {
+        let b = BRIEF.replace("Goal: g\n", &format!("Goal: g {p}\n"));
+        assert!(prompt::check_brief(&b, None, None).is_ok(), "{p}");
+    }
+}
+
+#[test]
+fn check_brief_warns_on_missing_unknowns_and_evidence() {
+    for key in ["Unknowns: u\n", "Evidence: e\n"] {
+        let w = prompt::check_brief(&BRIEF.replace(key, ""), None, None).unwrap();
+        let name = key.split(':').next().unwrap();
+        assert!(
+            w.warnings.iter().any(|m| m.contains(name)),
+            "{:?}",
+            w.warnings
+        );
+    }
+}
+
+#[test]
+fn check_brief_warns_when_hard_constraints_name_no_test_command() {
+    let bare = BRIEF.replace("; `tests/qq-test.sh foo`", "; run the tests");
+    let w = prompt::check_brief(&bare, None, None).unwrap();
+    assert!(
+        w.warnings.iter().any(|m| m.contains("Hard constraints")),
+        "{:?}",
+        w.warnings
+    );
+    // a bullet list under the header counts
+    let list = BRIEF.replace(
+        "Hard constraints: h; `tests/qq-test.sh foo`\n",
+        "Hard constraints:\n- own x\n- `cargo test foo`\n",
+    );
+    assert!(prompt::check_brief(&list, None, None)
+        .unwrap()
+        .warnings
+        .is_empty());
+    // a test command after the next header does not count
+    let late = BRIEF.replace("; `tests/qq-test.sh foo`", "");
+    let late = late.replace("Unknowns: u", "Unknowns: u `cargo test x`");
+    assert!(!prompt::check_brief(&late, None, None)
+        .unwrap()
+        .warnings
+        .is_empty());
+}
+
+#[test]
+fn check_brief_warns_on_pgrep_f() {
+    let b = BRIEF.replace("Goal: g", "Goal: g, wait with `pgrep -f foo`");
+    let w = prompt::check_brief(&b, None, None).unwrap();
+    assert!(
+        w.warnings.iter().any(|m| m.contains("pgrep -f")),
+        "{:?}",
+        w.warnings
+    );
 }
 
 #[test]
