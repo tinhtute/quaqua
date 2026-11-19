@@ -7,7 +7,7 @@ Topology: <solo|lead — why; see rules/_all/lead-gate.md>
 Playbook: <name from `quaqua playbook list`, or `none, <reason>` for a trivial one-command unit>
 Context: <files / PR pointers; when this unit depends on another, that unit's report pasted in full>
 Goal: <what must be true at the end>
-Hard constraints: <non-negotiables: owned and forbidden paths, hard limits; targeted tests only (`<cmd> <filter>`), foreground, no `pgrep -f` wait loops, `--slow` is the Lead's gate>
+Hard constraints: <non-negotiables: owned and forbidden paths, hard limits; targeted tests only (`<cmd> <filter>`), foreground, no `pgrep -f` wait loops; the full workspace check is the Lead's merge gate (`merge.check`, default `cargo check --workspace --locked`)>
 Current design (open to challenge): <the approach as it stands>
 Unknowns: <what is not known yet + how to verify it>
 Evidence: <checkable lines: the exact verify command (one filter per run) and its real output, files, decisions>

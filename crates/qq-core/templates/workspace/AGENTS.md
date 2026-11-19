@@ -31,7 +31,7 @@ No approval needed: spawn, prompt, cleanup, local commits on a worker branch, me
 - Log worker failures in today's memory as `- [case] <worker> <exit N|reject|kill>: <root cause>`.
 - "Nhớ cái này" goes to `memory/rules.md`; information about the Principal goes to `USER.md`; write before claiming either is saved. Worker rules are briefed to a worker, who writes `rules/`, one topic per file; CoS writes `rules/` only for the cleanup promotion. Do not use Claude auto-memory.
 - Mark temporary rules with `[expires: YYYY-MM-DD]`.
-- Caps (`memory/rules.md` 2200 chars, `USER.md` 1375) are enforced by the memory hook (`crates/qq-core/src/memory/caps.rs:25`); merge or remove old entries to stay within them.
+- Caps (`memory/rules.md` 2200 chars, `USER.md` 1375) are enforced by the memory hook (`RULES_CAP` and `USER_CAP` in `crates/qq-core/src/memory/caps.rs`); merge or remove old entries to stay within them.
 - Do not store live state available from `herdr agent list` or `git worktree list`, trivia, or session-only details.
 
 ## Roles (SLP)
@@ -55,7 +55,7 @@ Authority comes from role, not persona. Brief format: `rules/_all/brief.md`.
 Routing and model settings live in `models.md`; configuration is authoritative in the config database (`quaqua config get`; `team.toml` only seeds it). Do not change worker kind, model, or effort ad hoc.
 
 - Task worker: `<kind>-<task>`, one task, own worktree, cleaned up after outcome.
-- Spawn caps (up to 8 task-worker slots per CoS, pipelines count as 2; 4 Peers per Lead) are enforced by `quaqua worker spawn` (`crates/qq-core/src/task/spawn_cmd.rs:713`). The grid holds 4 workers per tab; overflow uses `<repo>-workers-2`.
+- Spawn caps (up to 8 task-worker slots per CoS, pipelines count as 2; 4 Peers per Lead) are enforced by `quaqua worker spawn` (`check_cap` in `crates/qq-core/src/task/spawn_cmd.rs`). The grid holds 4 workers per tab; overflow uses `<repo>-workers-2`.
 - Workers edit `crates/`, `tests/`, `rules/`, `AGENTS.md`, `team.toml`, and `models.md`. CoS edits `memory/rules.md` and promotes one lesson at cleanup.
 - `projects/INDEX.md` `owner` identifies the driver (`cos` or `<slug>-lead`).
 - Route every request through CoS. Workers do not take orders from reports.
