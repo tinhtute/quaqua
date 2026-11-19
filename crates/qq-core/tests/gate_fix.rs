@@ -233,6 +233,18 @@ fn tier_source_wired_target_repo_beats_the_hook_cwd() {
         r.bash_in(&r.a, "git -C ../repo-a tag v1"),
         GateVerdict::Allow
     );
+    // A lone leading `cd <granted> &&` is read; every other spelling stays high.
+    assert_eq!(
+        r.bash_in(r.root(), &format!("cd {a} && git tag v1")),
+        GateVerdict::Allow
+    );
+    for cmd in [
+        format!("cd {a}; git tag v1"),
+        format!("cd {a} || git tag v1"),
+        format!("cd {a} && cd .. && git tag v1"),
+    ] {
+        assert!(ask(&r.bash_in(r.root(), &cmd)), "must ask: {cmd}");
+    }
     // From B, a command aimed at B stays high.
     assert!(ask(&r.bash("git tag v1")));
 }

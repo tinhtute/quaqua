@@ -461,8 +461,19 @@ fn scan(command: &str) -> Found {
             });
         }
     }
-    if let Some(dir) = cd {
+    // The one common spelling is read: a single leading `cd <literal> && ...`
+    // with no other separator, so every `Here` hit follows the cd target.
+    let is_cd = |s: &Vec<String>| s.first().is_some_and(|w| w == "cd");
+    let lone = segs.iter().filter(|s| is_cd(s)).count() == 1
+        && segs.first().is_some_and(is_cd)
+        && !command.contains([';', '|', '(', '`'])
+        && !command.contains("$(");
+    if let (Some(Some(d)), true) = (&cd, lone) {
+        f = f.retarget(&Target::Dir(d.clone()));
+    } else if cd.is_some() {
         f = f.retarget(&Target::Unknown);
+    }
+    if let Some(dir) = cd {
         for h in &mut f.paths {
             match &dir {
                 Some(d) if !h.path.starts_with('/') && !h.path.starts_with('~') => {
