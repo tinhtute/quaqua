@@ -16,10 +16,8 @@ use qq_core::testkit::TestWorkspace;
 use rusqlite::{params, Connection};
 
 fn template() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/team.toml");
-    std::fs::read_to_string(p)
-        .expect("read template team.toml")
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
+    std::fs::read_to_string(p).expect("read template team.toml")
 }
 
 /// A database seeded from the shipped team.toml, with projects 1 and 2.
@@ -548,11 +546,14 @@ const TRIPWIRES: &[Tripwire] = &[
             "git config alias.p '!git push'",
             "git -C repo config --add alias.p push",
             "git config alias.p \"!f() { git push origin main; }; f\"",
+            "git config ALIAS.p push",
+            "git -c ALIAS.p=push status",
         ],
         &[
             "git config alias.st status",
             "git config user.name x",
             "git config --get alias.p",
+            "git config ALIAS.st status",
         ],
     ),
     (
@@ -567,6 +568,11 @@ const TRIPWIRES: &[Tripwire] = &[
             "gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA==",
             "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/main -f sha=abc",
             "gh api -X DELETE repos/o/r/git/refs/heads/main",
+            "gh api -X 'DELETE' repos/o/r/git/refs/heads/main",
+            "gh api -X \"PATCH\" repos/o/r/git/refs/heads/main",
+            "gh api -X=DELETE repos/o/r/git/refs/heads/main",
+            "gh api --method='DELETE' repos/o/r/git/refs/heads/main",
+            "gh api --method \"PUT\" repos/o/r/contents/README.md",
             "gh api repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
         ],
         &[
@@ -581,8 +587,14 @@ const TRIPWIRES: &[Tripwire] = &[
         "graphql enablePullRequestAutoMerge",
         &[
             "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
+            "gh api graphql -f query=\"mutation { enablePullRequestAutoMerge(input:{pullRequestId:\\\"x\\\"}) { clientMutationId } }\"",
+            "gh api graphql -f query=\"mutation { mergePullRequest(input:{pullRequestId:\\\"x\\\"}) { clientMutationId } }\"",
+            "gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
         ],
-        &["gh api graphql -f query='{ viewer { login } }'"],
+        &[
+            "gh api graphql -f query='{ viewer { login } }'",
+            "gh api graphql -f query=\"{ viewer { login } }\"",
+        ],
     ),
     (
         "graphql query from a file",
@@ -626,6 +638,9 @@ const TRIPWIRES: &[Tripwire] = &[
             "sqlite3 runs/qq.db < fix.sql",
             "cat fix.sql | sqlite3 runs/qq.db",
             "sqlite3 -cmd '.timeout 5' runs/qq.db 'insert into t values (1)'",
+            "sqlite3 -readonly :memory: \".open runs/qq.db\" \"delete from tasks\"",
+            "sqlite3 -readonly :memory: \"ATTACH 'runs/qq.db' AS q\" \"delete from q.tasks\"",
+            "sqlite3 --readonly :memory: \"attach 'runs/qq.db' as q\" \"delete from q.tasks\"",
         ],
         &[
             "sqlite3 -readonly runs/qq.db 'select 1'",
@@ -646,6 +661,10 @@ const TRIPWIRES: &[Tripwire] = &[
             "git -C repo branch -D main",
             "git branch -D feat main",
             "git branch -D refs/heads/main",
+            "git branch main -D",
+            "git branch master -d",
+            "git branch main --delete",
+            "git branch refs/heads/main -D",
         ],
         &[
             "git branch -D feat",
