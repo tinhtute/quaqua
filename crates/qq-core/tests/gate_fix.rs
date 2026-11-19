@@ -1585,3 +1585,111 @@ fn gate_fix4_glued_and_slot_command_lines_block() {
         ],
     );
 }
+
+// ---- review 4, finding B: git's own option, config and env surface ----
+
+/// CoS asks (or blocks); a worker and a down daemon block.
+fn gf5_stops(tag: &str, cmds: &[&str]) {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig(&format!("{tag}-{}", who as u8), who);
+        for cmd in cmds {
+            let v = r.bash(cmd);
+            if who == Who::Cos {
+                assert!(ask(&v) || block(&v), "cos must ask or block: {cmd}");
+            } else {
+                assert!(block(&v), "{who:?} must block: {cmd}");
+            }
+        }
+    }
+}
+
+/// Review-4 probes, spelled as the reviewer ran them.
+#[test]
+fn gate_fix5_review4_finding_b_probes_stop() {
+    gf5_stops(
+        "gf5-probe",
+        &[
+            "git --attr-source HEAD push origin main",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.ship GIT_CONFIG_VALUE_0=push git ship origin main",
+            "GIT_CONFIG_PARAMETERS=\"'alias.ship'='push'\" git ship origin main",
+            "env GIT_CONFIG_PARAMETERS=\"'alias.ship'='push'\" git ship origin main",
+            "git -c core.fsmonitor='git push origin HEAD:main;:' status",
+            "GIT_EXTERNAL_DIFF='git push origin HEAD:main;:' git diff",
+            "GIT_EDITOR='git push origin HEAD:main;:' git commit",
+            "GIT_SSH_COMMAND='git push origin HEAD:main;:' git fetch",
+            "git config core.fsmonitor 'git push origin HEAD:main;:'",
+            "git config diff.external 'git push origin HEAD:main;:'",
+        ],
+    );
+}
+
+/// Held-out spellings of the same surface, written before the fix.
+#[test]
+fn gate_fix5_heldout_git_surface_stops() {
+    gf5_stops(
+        "gf5-held",
+        &[
+            // global options the fast path must know exactly
+            "git --attr-source=HEAD push origin main",
+            "git --super-prefix x push origin main",
+            "git --no-such-flag push origin main",
+            "git --no-such-flag value log",
+            // config keys that name a program, glued or spaced
+            "git -c core.sshCommand='git push origin main' fetch",
+            "git -ccore.pager='git push origin main' log",
+            "git -c core.hooksPath=/tmp/h commit -m x",
+            "git -c include.path=/tmp/x status",
+            "git --config-env=alias.ship=SHIPENV ship origin main",
+            "git -c alias.ship='!git push origin main' ship",
+            // env that carries config or a program
+            "GIT_CONFIG_GLOBAL=/tmp/x git ship origin main",
+            "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.ship GIT_CONFIG_VALUE_0=push; git ship",
+            "GIT_PAGER='git push origin main' git log",
+            "GIT_SEQUENCE_EDITOR='git push origin main' git rebase -i HEAD~2",
+            "GIT_ASKPASS='git push origin main' git fetch",
+            "PAGER='git push origin main' git log",
+            "env GIT_EXTERNAL_DIFF='git push origin main' git diff",
+            // setting a program-valued key
+            "git config --global core.sshCommand 'git push origin main'",
+            "git config set core.fsmonitor 'git push origin main'",
+            "git config --local core.hooksPath /tmp/h",
+            "git config filter.x.clean 'git push origin main'",
+            "git config diff.foo.textconv 'git push origin main'",
+        ],
+    );
+}
+
+/// Ordinary CoS git use stays free: the corpus spellings and their cousins.
+#[test]
+fn gate_fix5_ordinary_git_stays_free() {
+    let r = rig("gf5-free", Who::Down);
+    for ok in [
+        "git status",
+        "git -C /tmp/x log --oneline",
+        "git -c user.name=a -c user.email=a@b commit -q --allow-empty -m msg",
+        "git -c user.name=a commit -m x",
+        "git -c commit.gpgsign=false commit -m x",
+        "git --no-pager log",
+        "git -p diff --stat",
+        "git --version",
+        "git --no-optional-locks status",
+        "git --git-dir=.git status",
+        "git --namespace foo status",
+        "git --bare log",
+        "GIT_CONFIG_GLOBAL=/dev/null git status",
+        "export HOME=/tmp/h GIT_CONFIG_GLOBAL=/dev/null; git log",
+        "GIT_CONFIG_NOSYSTEM=1 git log",
+        "GIT_EDITOR=true git rebase --continue",
+        "GIT_EDITOR=true git cherry-pick --continue",
+        "GIT_EDITOR=: git commit",
+        "git config user.name",
+        "git config --show-origin --get-all remote.origin.pushurl",
+        "git config --get core.fsmonitor",
+        "git config --global user.name tui",
+        "git config core.pager",
+        "git commit -m 'git push notes'",
+        "git log --grep push",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
