@@ -230,10 +230,20 @@ pub fn state_mail(ctx: &Ctx, agent: &str, role: &str, state: AgentState, detail:
         .and_then(|r| r["created"].as_bool())
         .unwrap_or(false);
     if created && state.notifies() {
-        let _ = ctx.herdr.notification_show(
-            &format!("quaqua: {agent} {}", state.word()),
-            &line,
-            Some("request"),
+        let title = format!("quaqua: {agent} {}", state.word());
+        let why = match ctx.herdr.notification_show(&title, &line, Some("request")) {
+            Ok(r) if r.ok => return,
+            Ok(r) => r.body.trim().chars().take(200).collect::<String>(),
+            Err(e) => e.to_string(),
+        };
+        // The state mail is stored but no one saw a notification: leave the
+        // reason where the CoS reads it.
+        let _ = daemon_mail(
+            ctx,
+            "cos",
+            "state",
+            &format!("notification for {agent} {} failed: {why}", state.word()),
+            None,
         );
     }
 }

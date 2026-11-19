@@ -82,6 +82,7 @@ pub enum Verb {
     PaneProcessInfo,
     PaneMove,
     WorkspaceList,
+    NotificationShow,
 }
 
 use std::io;

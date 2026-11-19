@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use qq_core::cli::Registry;
 use qq_core::daemon::{Config, Daemon, DaemonHandle};
-use qq_core::herdr::{FakeHerdr, HerdrClient};
+use qq_core::herdr::{FakeHerdr, HerdrClient, Reply, Verb};
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
 
@@ -222,4 +222,45 @@ fn state_mail_huge_stall_setting_does_not_kill_the_sweeper() {
     f.herdr.remove("sude-h");
 
     wait_for("the exited mail", || !cos_mail(&f.ws).is_empty());
+}
+
+#[test]
+fn state_mail_failed_notification_leaves_a_trace_for_the_cos() {
+    let f = farm("state-notify-fails", &[("sude-n", "peer")]);
+    f.herdr
+        .set_fault(Verb::NotificationShow, std::io::ErrorKind::Unsupported);
+    f.herdr.set_status("sude-n", "blocked");
+
+    wait_for("the trace mail", || cos_mail(&f.ws).len() >= 2);
+    settle();
+
+    let mail = cos_mail(&f.ws);
+    assert_eq!(mail.len(), 2, "state line plus one trace: {mail:?}");
+    assert!(mail[0].2.contains("sude-n") && mail[0].2.contains("blocked"));
+    assert_eq!(
+        (mail[1].0.as_str(), mail[1].1.as_str()),
+        ("daemon", "state")
+    );
+    assert!(
+        mail[1].2.contains("notification") && mail[1].2.contains("failed"),
+        "{}",
+        mail[1].2
+    );
+    assert!(f.herdr.notifications().is_empty());
+}
+
+#[test]
+fn state_mail_refused_notification_leaves_a_trace_for_the_cos() {
+    let f = farm("state-notify-refused", &[("sude-r", "peer")]);
+    f.herdr
+        .set_reply(Verb::NotificationShow, Reply::err("no_client"));
+    f.herdr.set_status("sude-r", "blocked");
+
+    wait_for("the trace mail", || cos_mail(&f.ws).len() >= 2);
+
+    let mail = cos_mail(&f.ws);
+    assert!(
+        mail[1].2.contains("failed") && mail[1].2.contains("no_client"),
+        "{mail:?}"
+    );
 }
