@@ -31,12 +31,16 @@ fi
 # `check_sqlite` and `check_herdr` in src/authority/gate.rs, the one predicate;
 # change them together.
 guarded='(pane[[:space:]]+(split|move|close|send-keys|send-text|run)|tab[[:space:]]+(create|close)|workspace[[:space:]]+(create|close)|agent[[:space:]]+start)'
-outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[[:space:]]+pr[[:space:]]+merge|gh[^"]*[[:space:]]api[^"]*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*alias\.[^[:space:]]*[[:space:]].*push)'
+outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[[:space:]]+pr[[:space:]]+merge|gh.*[[:space:]]api.*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*[aA][lL][iI][aA][sS]\.[^[:space:]]*[[:space:]].*push|git.*[[:space:]]-c[[:space:]]*[\\"'"'"']*[aA][lL][iI][aA][sS]\.[^[:space:]]*push)'
 
 # gh api ref/contents writes: a mutating method, or a field flag (gh then POSTs).
-gh_write='(-X|--method[ =])[[:space:]]*(PATCH|PUT|POST|DELETE)'
+gh_write="(-X|--method)[=[:space:]'\"\\\\]*(PATCH|PUT|POST|DELETE)"
 gh_field='[[:space:]](-f|-F|--field|--raw-field|--input)[[:space:]=]'
-trunk_del='git.*[[:space:]]branch.*([[:space:]]-[a-zA-Z]*[dD][a-zA-Z]*|--delete).*[[:space:]"'"'"'/](main|master)([^a-zA-Z0-9_-]|$)'
+trunk_flag='([[:space:]]-[a-zA-Z]*[dD][a-zA-Z]*|--delete)'
+trunk_pre='[[:space:]"'"'"'/]'
+trunk_name="$trunk_pre(main|master)([^a-zA-Z0-9_-]|\$)"
+# the delete flag may follow the name (`git branch main -D`)
+trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|master)([^a-zA-Z0-9_-].*)?$trunk_flag)"
 
 stdin=$(cat)
 hit=''
@@ -47,7 +51,9 @@ if grep -Eq 'gh.*[[:space:]]api.*(git/refs|/contents/)' <<<"$stdin" &&
   hit="${hit:+$hit and }outward action"
 fi
 grep -Eq 'herdr.*report-metadata.*grid_role=' <<<"$stdin" && hit="${hit:+$hit and }grid_role token"
-if grep -Eq 'sqlite3.*qq\.db' <<<"$stdin" && ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin"; then
+# `.open` and `ATTACH` reopen a database read-write, past -readonly.
+if grep -Eq 'sqlite3.*qq\.db' <<<"$stdin" &&
+  { ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin" || grep -Eiq '\.open|attach' <<<"$stdin"; }; then
   hit="${hit:+$hit and }qq.db write"
 fi
 grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"

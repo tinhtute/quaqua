@@ -234,7 +234,12 @@ fn check_find(a: &[String]) -> Verdict {
 /// `sqlite3` on the daemon's `qq.db` without `-readonly`.
 fn check_sqlite(a: &[String]) -> Verdict {
     let readonly = a.iter().any(|x| x == "-readonly" || x == "--readonly");
-    if !readonly && a.iter().any(|x| x.contains("qq.db")) {
+    // `.open` and `ATTACH` reopen a database read-write, past `-readonly`.
+    let reopens = a.iter().any(|x| {
+        let x = x.to_ascii_lowercase();
+        x.contains(".open") || x.contains("attach")
+    });
+    if (!readonly || reopens) && a.iter().any(|x| x.contains("qq.db")) {
         return Verdict::Block(DB_MESSAGE);
     }
     Verdict::Allow
@@ -338,7 +343,7 @@ fn check_git(a: &[String]) -> Verdict {
         if w == "-c" || (w.starts_with("-c") && w.len() > 2) {
             let cfg = if w == "-c" { a.get(i + 1) } else { Some(&a[i]) };
             let cfg = cfg.map(|c| c.trim_start_matches("-c")).unwrap_or("");
-            if let Some(rest) = cfg.strip_prefix("alias.") {
+            if let Some(rest) = strip_alias(cfg) {
                 let body = rest.split_once('=').map_or("", |x| x.1);
                 if body
                     .split_whitespace()
@@ -377,9 +382,15 @@ fn check_git(a: &[String]) -> Verdict {
     Verdict::Block(PUSH_MESSAGE)
 }
 
+/// The part after `alias.`: git config keys are case-insensitive.
+fn strip_alias(s: &str) -> Option<&str> {
+    let (head, rest) = (s.get(..6)?, s.get(6..)?);
+    head.eq_ignore_ascii_case("alias.").then_some(rest)
+}
+
 /// `git config … alias.<x> <value naming push>`: a push by another name.
 fn check_git_config(a: &[String]) -> Verdict {
-    let Some(k) = a.iter().position(|x| x.starts_with("alias.")) else {
+    let Some(k) = a.iter().position(|x| strip_alias(x).is_some()) else {
         return Verdict::Allow;
     };
     let names_push = a[k + 1..].iter().any(|v| {
