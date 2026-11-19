@@ -13,7 +13,7 @@ use qq_core::testkit::TestWorkspace;
 use rusqlite::params;
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Who {
     Cos,
     Worker,
@@ -233,12 +233,9 @@ fn tier_source_wired_target_repo_beats_the_hook_cwd() {
         r.bash_in(&r.a, "git -C ../repo-a tag v1"),
         GateVerdict::Allow
     );
-    // A lone leading `cd <granted> &&` is read; every other spelling stays high.
-    assert_eq!(
-        r.bash_in(r.root(), &format!("cd {a} && git tag v1")),
-        GateVerdict::Allow
-    );
+    // Every `cd` spelling stays high, the lone leading one included (gatefix2 N1).
     for cmd in [
+        format!("cd {a} && git tag v1"),
         format!("cd {a}; git tag v1"),
         format!("cd {a} || git tag v1"),
         format!("cd {a} && cd .. && git tag v1"),
@@ -680,5 +677,626 @@ fn fence_path_tier_covers_matcher_workflows_and_grant_sql() {
         "crates/qq-core/src/db/mod.rs",
     ] {
         assert!(!pr_merge::fence_path(p), "{p}");
+    }
+}
+
+// ---- gate fix round 2: N1-N3, P1, m-new-1..3 ----
+
+/// The CoS asks for each command; `cwd` picks the hook's directory.
+fn gf2_asks(tag: &str, from_a: bool, cmds: impl Fn(&Rig) -> Vec<String>) {
+    let r = rig(tag, Who::Cos);
+    let cwd = if from_a { r.a.clone() } else { r.b.clone() };
+    for cmd in cmds(&r) {
+        assert!(ask(&r.bash_in(&cwd, &cmd)), "must ask: {cmd}");
+    }
+}
+
+#[test]
+fn gate_fix2_n1_lone_cd_is_high() {
+    gf2_asks("gf2-n1-lone", false, |r| {
+        vec![format!("cd {} && git tag v1", r.a.display())]
+    });
+}
+
+#[test]
+fn gate_fix2_n1_background_amp() {
+    gf2_asks("gf2-n1-amp", false, |r| {
+        vec![format!("cd {} & git tag v1", r.a.display())]
+    });
+}
+
+#[test]
+fn gate_fix2_n1_builtin_cd() {
+    gf2_asks("gf2-n1-builtin", false, |r| {
+        let (a, b) = (r.a.display(), r.b.display());
+        vec![
+            format!("cd {a} && builtin cd {b} && git tag v1"),
+            format!("builtin cd {b} && git tag v1"),
+        ]
+    });
+}
+
+#[test]
+fn gate_fix2_n1_command_cd() {
+    gf2_asks("gf2-n1-command", false, |r| {
+        let (a, b) = (r.a.display(), r.b.display());
+        vec![
+            format!("cd {a} && command cd {b} && git tag v1"),
+            format!("command cd {b} && git tag v1"),
+        ]
+    });
+}
+
+#[test]
+fn gate_fix2_n1_eval_cd() {
+    gf2_asks("gf2-n1-eval", false, |r| {
+        let (a, b) = (r.a.display(), r.b.display());
+        vec![
+            format!("cd {a} && eval cd {b} && git tag v1"),
+            format!("cd {a} && eval 'cd {b}' && git tag v1"),
+            format!("eval 'cd {b}' && git tag v1"),
+        ]
+    });
+}
+
+#[test]
+fn gate_fix2_n1_env_chdir_after_cd() {
+    gf2_asks("gf2-n1-envc", false, |r| {
+        let (a, b) = (r.a.display(), r.b.display());
+        vec![format!("cd {a} && env -C {b} git tag v1")]
+    });
+}
+
+#[test]
+fn gate_fix2_n2_relative_dash_c_after_cd() {
+    gf2_asks("gf2-n2", true, |r| {
+        let b = r.b.display();
+        vec![
+            format!("cd {b} && git -C . tag v1"),
+            format!("cd {b} && git -C sub tag v1"),
+        ]
+    });
+}
+
+#[test]
+fn gate_fix2_n3_env_dash_c() {
+    gf2_asks("gf2-n3-envc", true, |r| {
+        vec![format!("env -C {} git tag v1", r.b.display())]
+    });
+}
+
+#[test]
+fn gate_fix2_n3_env_chdir_joined() {
+    gf2_asks("gf2-n3-envj", true, |r| {
+        vec![format!("env --chdir={} git tag v1", r.b.display())]
+    });
+}
+
+#[test]
+fn gate_fix2_n3_env_chdir_separate() {
+    gf2_asks("gf2-n3-envs", true, |r| {
+        vec![format!("env --chdir {} git tag v1", r.b.display())]
+    });
+}
+
+#[test]
+fn gate_fix2_n3_sudo_dash_d() {
+    gf2_asks("gf2-n3-sudo", true, |r| {
+        let b = r.b.display();
+        vec![
+            format!("sudo -D {b} git tag v1"),
+            format!("sudo --chdir {b} git tag v1"),
+        ]
+    });
+}
+
+#[test]
+fn gate_fix2_n3_export_git_dir() {
+    gf2_asks("gf2-n3-export", true, |r| {
+        let b = r.b.display();
+        vec![
+            format!("export GIT_DIR={b}/.git && git tag v1"),
+            format!("export GIT_DIR={b}/.git\ngit tag v1"),
+            format!("GIT_DIR={b}/.git; git tag v1"),
+            "export GH_REPO=o/b && gh release create v1".to_string(),
+        ]
+    });
+}
+
+fn gf2_blocks(tag: &str, cmds: &[&str]) {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig(&format!("{tag}-{}", who as u8), who);
+        for cmd in cmds {
+            assert!(block(&r.bash(cmd)), "must block: {cmd}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix2_p1_env_chdir_separate_value() {
+    gf2_blocks(
+        "gf2-p1-env",
+        &[
+            "env --chdir /tmp git push origin feat",
+            "env --chdir /tmp herdr pane split p1",
+            "env --unset FOO git push origin feat",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix2_p1_nice_adjustment() {
+    gf2_blocks("gf2-p1-nice", &["nice --adjustment 5 git push origin feat"]);
+}
+
+#[test]
+fn gate_fix2_p1_timeout_signal() {
+    gf2_blocks(
+        "gf2-p1-timeout",
+        &[
+            "timeout --signal KILL 5 git push origin feat",
+            "timeout --kill-after 3 5 git push origin feat",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix2_p1_sudo_user() {
+    gf2_blocks(
+        "gf2-p1-sudo",
+        &[
+            "sudo --user x git push origin feat",
+            "sudo --group g --user x git push origin HEAD:main",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix2_p1_xargs_max_args() {
+    gf2_blocks("gf2-p1-xargs", &["xargs --max-args 1 git push origin feat"]);
+}
+
+#[test]
+fn gate_fix2_p1_unknown_long_option_checks_both_readings() {
+    gf2_blocks(
+        "gf2-p1-unknown",
+        &[
+            "env --frobnicate /tmp git push origin feat",
+            "nohup --frob x git push origin feat",
+        ],
+    );
+    let r = rig("gf2-p1-ok", Who::Worker);
+    for ok in [
+        "env --chdir /tmp git status",
+        "timeout --signal KILL 5 git log",
+        "nice --adjustment 5 ls",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
+
+fn gf2_instr(tag: &str, cmd: impl Fn(&str, &str) -> String) {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig(&format!("{tag}-{}", who as u8), who);
+        let root = r.root().display().to_string();
+        let f = format!("{root}/AGENTS.md");
+        let c = cmd(&root, &f);
+        let v = r.bash(&c);
+        if who == Who::Cos {
+            assert!(ask(&v), "cos must ask: {c}");
+        } else {
+            assert!(block(&v), "non-cos must deny: {c}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix2_m1_ln() {
+    gf2_instr("gf2-m1-ln", |_, f| format!("ln -sf /tmp/x {f}"));
+}
+
+#[test]
+fn gate_fix2_m1_rsync() {
+    gf2_instr("gf2-m1-rsync", |_, f| format!("rsync /tmp/x {f}"));
+}
+
+#[test]
+fn gate_fix2_m1_perl_pi() {
+    gf2_instr("gf2-m1-perl", |_, f| format!("perl -pi -e s/a/b/ {f}"));
+}
+
+#[test]
+fn gate_fix2_m1_python() {
+    gf2_instr("gf2-m1-py", |_, f| {
+        format!("python3 -c \"open('{f}','w').write('x')\"")
+    });
+}
+
+#[test]
+fn gate_fix2_m1_git_checkout() {
+    gf2_instr("gf2-m1-git", |root, _| {
+        format!("git -C {root} checkout -- AGENTS.md")
+    });
+}
+
+#[test]
+fn gate_fix2_m1_reads_stay_free() {
+    let r = rig("gf2-m1-ok", Who::Worker);
+    let root = r.root().display();
+    for ok in [
+        format!("git -C {root} log -- AGENTS.md"),
+        format!("git -C {root} diff AGENTS.md"),
+        format!("cp {root}/AGENTS.md /tmp/x"),
+        format!("bat {root}/AGENTS.md"),
+        "git checkout -- AGENTS.md".to_string(),
+    ] {
+        assert_eq!(r.bash(&ok), GateVerdict::Allow, "{ok}");
+    }
+}
+
+#[test]
+fn gate_fix2_m2_fallback_branch_copy() {
+    assert_eq!(fallback_exit("git branch -C feat main"), 2);
+}
+
+#[test]
+fn gate_fix2_m2_fallback_tag_sort() {
+    assert_eq!(fallback_exit("git tag --sort=refname v9"), 2);
+    assert_eq!(fallback_exit("git tag --sort refname v9"), 2);
+    assert_eq!(fallback_exit("git tag --sort=refname -l 'v*'"), 0);
+    assert_eq!(fallback_exit("git tag -l"), 0);
+}
+
+#[test]
+fn gate_fix2_m2_fallback_instruction_files() {
+    for cmd in [
+        "echo x > ~/quaqua/AGENTS.md",
+        "sed -i s/a/b/ ~/quaqua/SOUL.md",
+        "echo x > ~/quaqua/USER.md",
+        "echo x >> ~/quaqua/memory/rules.md",
+        "tee ~/quaqua/identity.md",
+    ] {
+        assert_eq!(fallback_exit(cmd), 2, "{cmd}");
+    }
+    for ok in [
+        "cat ~/quaqua/AGENTS.md",
+        "sed s/a/b/ ~/quaqua/SOUL.md",
+        "grep x ~/quaqua/USER.md",
+    ] {
+        assert_eq!(fallback_exit(ok), 0, "{ok}");
+    }
+}
+
+#[test]
+fn gate_fix2_m2_fallback_grant_socat() {
+    assert_eq!(
+        fallback_exit("echo '{\"verb\":\"grant.full\"}' | socat - UNIX-CONNECT:runs/q.sock"),
+        2
+    );
+    assert_eq!(fallback_exit("git commit -m 'grant.full docs'"), 0);
+}
+
+#[test]
+fn gate_fix2_m3_call_through_command_substitution() {
+    let r = rig("gf2-m3-sub", Who::Cos);
+    for cmd in [
+        "quaqua call \"$(cat /tmp/v)\" '{}'",
+        "quaqua call `cat /tmp/v` '{}'",
+    ] {
+        assert!(ask(&r.bash_in(&r.a, cmd)), "{cmd}");
+    }
+    // One rig at a time: TestWorkspace holds a global lock for its lifetime.
+    drop(r);
+    let w = rig("gf2-m3-sub-w", Who::Worker);
+    assert!(block(&w.bash("quaqua call \"$(cat /tmp/v)\" '{}'")));
+}
+
+#[test]
+fn gate_fix2_m3_call_through_a_variable_command_word() {
+    for who in [Who::Cos, Who::Worker] {
+        let r = rig(&format!("gf2-m3-var-{}", who as u8), who);
+        for cmd in [
+            "Q=quaqua; $Q call grant.full '{}'",
+            "${Q} call grant.tier '{}'",
+            "\"$Q\" call grant.lane '{}'",
+        ] {
+            let v = r.bash_in(&r.a, cmd);
+            if who == Who::Cos {
+                assert!(ask(&v), "{cmd}");
+            } else {
+                assert!(block(&v), "{cmd}");
+            }
+        }
+    }
+    let r = rig("gf2-m3-var-ok", Who::Down);
+    assert_eq!(r.bash("$Q status"), GateVerdict::Allow);
+    assert_eq!(r.bash("$Q call caller.lookup"), GateVerdict::Allow);
+}
+
+#[test]
+fn gate_fix2_m3_mail_body_naming_a_grant_is_free() {
+    let r = rig("gf2-m3-mail", Who::Down);
+    for ok in [
+        "quaqua mail send --to x --body 'grant.full consent landed'",
+        "git commit -m 'grant.tier' && quaqua status",
+        "quaqua call task.spawn --args '{\"note\":\"see grant.full\"}'",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+    // The real verb, and the xargs placeholder, still ask.
+    drop(r);
+    let c = rig("gf2-m3-mail-cos", Who::Cos);
+    assert!(ask(&c.bash("printf grant.full | xargs -I{} quaqua call {}")));
+    assert!(ask(&c.bash("quaqua call grant.full '{}' --note 'x'")));
+}
+
+// ---- gate fix round 2, review follow-ups ----
+
+#[test]
+fn gate_fix2_m3_substituted_command_word_and_stdin_interpreter() {
+    for who in [Who::Cos, Who::Worker] {
+        let r = rig(&format!("gf2-m3-subw-{}", who as u8), who);
+        for cmd in [
+            "$(which quaqua) call grant.full '{}'",
+            "`which quaqua` call grant.tier '{}'",
+            "python3 - <<'EOF'\nsend('grant.full')\nEOF",
+            "echo grant.full | python3",
+        ] {
+            let v = r.bash_in(&r.a, cmd);
+            if who == Who::Cos {
+                assert!(ask(&v), "{cmd}");
+            } else {
+                assert!(block(&v), "{cmd}");
+            }
+        }
+    }
+    let r = rig("gf2-m3-subw-ok", Who::Down);
+    for ok in [
+        "python3 scripts/report.py --verb grant.full",
+        "node --test tests/grant.full.test.js",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
+
+#[test]
+fn gate_fix2_p1_short_flag_and_positional_wrappers() {
+    gf2_blocks(
+        "gf2-p1-short",
+        &[
+            "taskset -c 0 git push origin feat",
+            "taskset 0x1 git push origin feat",
+            "ionice -c 2 git push origin feat",
+            "stdbuf -o L git push origin feat",
+            "env -P /usr/bin git push origin feat",
+            "chrt 10 git push origin feat",
+            "env --a x --b x --c x --d x --e x --f x --g x --h x git push origin feat",
+        ],
+    );
+}
+
+fn fallback_exit_cwd(cmd: &str) -> i32 {
+    use std::io::Write;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/workspace/scripts/hooks/herdr-gate.sh");
+    let json = json!({"tool_name": "Bash", "cwd": "/Users/x/quaqua/node/python",
+        "tool_input": {"command": cmd}});
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .env("QUAQUA_BIN", "qq-binary-that-does-not-exist")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.to_string().as_bytes())
+        .unwrap();
+    child.wait().unwrap().code().unwrap()
+}
+
+#[test]
+fn gate_fix2_m2_fallback_ignores_cwd_and_word_fragments() {
+    for ok in [
+        "git commit -m 'grant.full docs'",
+        "git add AGENTS.md",
+        "grep x ~/quaqua/USER.md",
+    ] {
+        assert_eq!(fallback_exit_cwd(ok), 0, "{ok}");
+    }
+    assert_eq!(fallback_exit_cwd("sed -i s/a/b/ ~/quaqua/SOUL.md"), 2);
+}
+
+// ---- gatefix3 round 2: A. read-path tools that can write, B. old binary ----
+
+/// Memory-file spellings that write or truncate through a tool the read path
+/// used to wave through. `f` is the file as the command names it.
+fn writer_spellings(f: &str) -> Vec<String> {
+    vec![
+        format!("sed -n 'w {f}' /dev/null"),
+        format!("sed -n 'W {f}' /dev/null"),
+        format!("sed 's/a/b/w {f}' /dev/null"),
+        format!("sed -e 'w {f}' -n /dev/null"),
+        format!("sed --expression='w {f}' /dev/null"),
+        format!("sed '1e tee {f}' /dev/null"),
+        format!("sed -I '' s/u/v/ {f}"),
+        format!("sed -nI '' s/u/v/ {f}"),
+        format!("uniq /dev/null {f}"),
+        format!("uniq -c /dev/null {f}"),
+        format!("uniq -f 1 /dev/null {f}"),
+        format!("git grep -O'tee {f}' x"),
+        format!("git grep --open-files-in-pager='tee {f}' x"),
+        format!("git grep --open-files-in-pager 'tee {f}' x"),
+        format!("git -c core.editor=true grep -Otee x -- {f}"),
+    ]
+}
+
+#[test]
+fn gate_fix3_a_read_path_writers_are_denied_for_workers_and_cos_memory() {
+    for who in [Who::Worker, Who::Cos, Who::Down] {
+        let r = rig("gf3-a", who);
+        for name in ["USER.md", "memory/rules.md"] {
+            let abs = r.root().join(name).display().to_string();
+            for cmd in writer_spellings(&abs) {
+                let v = r.bash(&cmd);
+                assert!(block(&v), "{who:?} absolute: {cmd}");
+            }
+            for cmd in writer_spellings(name) {
+                let v = r.bash_in(r.root(), &cmd);
+                assert!(block(&v), "{who:?} relative: {cmd}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_a_read_path_writers_on_instruction_files_ask_cos_deny_workers() {
+    for who in [Who::Worker, Who::Cos] {
+        let r = rig("gf3-a-i", who);
+        for name in ["AGENTS.md", "SOUL.md", "identity.md"] {
+            let abs = r.root().join(name).display().to_string();
+            for cmd in writer_spellings(&abs) {
+                let v = r.bash(&cmd);
+                if who == Who::Cos {
+                    assert!(ask(&v), "cos must ask: {cmd}");
+                } else {
+                    assert!(block(&v), "worker must be denied: {cmd}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_a_provable_reads_stay_free() {
+    let r = rig("gf3-a-ok", Who::Worker);
+    for name in ["USER.md", "memory/rules.md", "AGENTS.md"] {
+        let f = r.root().join(name).display().to_string();
+        for ok in [
+            format!("sed -n 1,5p {f}"),
+            format!("git diff -- {f}"),
+            format!("git log -p -- {f}"),
+            format!("awk 1 {f}"),
+            format!("jq -R . {f}"),
+            format!("sort {f}"),
+            format!("uniq {f}"),
+            format!("uniq -c {f}"),
+            format!("uniq -f 1 {f}"),
+            format!("sed 's/a/b/g' {f}"),
+            format!("sed -E -n -e 's/u/v/p' {f}"),
+            format!("sed -ne 3p {f}"),
+            format!("sed -n '/new/p;$=' {f}"),
+            format!("sed -s -n '1~2p;/x/!d' {f}"),
+            format!("sed 'y/abc/xyz/;3q' {f}"),
+            format!("git grep foo -- {f}"),
+            format!("git grep -n -e foo -- {f}"),
+        ] {
+            assert_eq!(r.bash(&ok), GateVerdict::Allow, "{ok}");
+        }
+    }
+}
+
+/// Run the fallback-capable hook with `bin` as the installed binary.
+fn hook_exit_with(bin: &Path, tool: &str, input: Value) -> i32 {
+    use std::io::Write;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/workspace/scripts/hooks/herdr-gate.sh");
+    let json = json!({"tool_name": tool, "tool_input": input, "cwd": "/tmp"});
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .env("QUAQUA_BIN", bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.to_string().as_bytes())
+        .unwrap();
+    child.wait().unwrap().code().unwrap()
+}
+
+/// A stand-in `quaqua` that runs `body` (shell) with the hook JSON in `$IN`.
+fn stub_bin(tag: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("qq-gf3-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("quaqua");
+    std::fs::write(&p, format!("#!/bin/sh\nIN=$(cat)\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// What the binary at main (e723967) does with every Write: no Write arm, so the
+/// pane-spawn block, exit 2, for any tool name that is not Bash either.
+const OLD_BIN: &str = "echo 'quaqua: blocked: spawn/move panes and workspaces only through the quaqua daemon (quaqua call task.spawn / grid verbs)' >&2; exit 2";
+
+const EDIT_TOOLS: [(&str, &str); 4] = [
+    ("Write", "file_path"),
+    ("Edit", "file_path"),
+    ("MultiEdit", "file_path"),
+    ("NotebookEdit", "notebook_path"),
+];
+
+#[test]
+fn gate_fix3_b_old_binary_keeps_write_and_edit_on_ordinary_files() {
+    let bin = stub_bin("old-ok", OLD_BIN);
+    for (tool, key) in EDIT_TOOLS {
+        for p in [
+            "/tmp/ws/projects/p/notes.md",
+            "/tmp/ws/memory/notes.md",
+            "/tmp/ws/src/main.rs",
+        ] {
+            assert_eq!(hook_exit_with(&bin, tool, json!({ key: p })), 0, "{tool} {p}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_b_old_binary_still_protects_memory_and_instruction_files() {
+    let bin = stub_bin("old-prot", OLD_BIN);
+    for (tool, key) in EDIT_TOOLS {
+        for p in [
+            "/tmp/ws/memory/rules.md",
+            "/tmp/ws/USER.md",
+            "/tmp/ws/AGENTS.md",
+            "/tmp/ws/SOUL.md",
+            "/tmp/ws/identity.md",
+        ] {
+            assert_eq!(hook_exit_with(&bin, tool, json!({ key: p })), 2, "{tool} {p}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix3_b_old_binary_bash_still_goes_to_the_binary() {
+    let bin = stub_bin("old-bash", OLD_BIN);
+    assert_eq!(hook_exit_with(&bin, "Bash", json!({"command": "echo hi"})), 2);
+}
+
+#[test]
+fn gate_fix3_b_a_binary_with_the_write_gate_keeps_its_verdict() {
+    // Knows Write: allows ordinary paths, blocks one named path with its own reason.
+    let bin = stub_bin(
+        "new",
+        "case \"$IN\" in *blocked-by-new*) echo 'new gate says no' >&2; exit 2;; esac; exit 0",
+    );
+    for (tool, key) in EDIT_TOOLS {
+        assert_eq!(
+            hook_exit_with(&bin, tool, json!({ key: "/tmp/ws/blocked-by-new.txt" })),
+            2,
+            "{tool}: the binary's block must stand"
+        );
+        assert_eq!(
+            hook_exit_with(&bin, tool, json!({ key: "/tmp/ws/ok.txt" })),
+            0,
+            "{tool}"
+        );
     }
 }

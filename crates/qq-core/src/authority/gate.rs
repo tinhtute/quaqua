@@ -51,6 +51,8 @@ const MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written o
 const COS_MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written only through the cos-memory tools (memory_add, memory_replace, memory_remove), never directly";
 const TIER_DENY_MESSAGE: &str = "blocked: pushing to main and force-pushing are anh iu's call";
 
+const WRAP_MESSAGE: &str =
+    "blocked: too many wrapper options to read the command; run the command without the wrapper";
 const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
 const ASK_TRUNK_MOVE: &str = "approval list: rename or force-move main/master";
 const ASK_TAG: &str = "approval list: git tag";
@@ -139,6 +141,9 @@ struct Found {
     block: Option<&'static str>,
     listed: Vec<Hit>,
     paths: Vec<PathHit>,
+    /// A `cd`-like word, a `GIT_DIR=`-style assignment or a chdir flag was seen
+    /// (in a nested script too): the command may act on another directory.
+    moved: bool,
 }
 
 impl Found {
@@ -181,6 +186,15 @@ impl Found {
         self.block = self.block.or(o.block);
         self.listed.extend(o.listed);
         self.paths.extend(o.paths);
+        self.moved |= o.moved;
+    }
+
+    /// Point every hit at `t`, a `Dir` one included.
+    fn force_target(mut self, t: &Target) -> Self {
+        for h in &mut self.listed {
+            h.target = t.clone();
+        }
+        self
     }
 
     /// Point every hit that still acts on the cwd at `t`.
@@ -422,14 +436,36 @@ fn is_memory_file(root: &Path, resolved: &Path) -> bool {
         .any(|t| resolved == root.join(t.rel))
 }
 
-/// True when the word `w` (a path as the shell sees it, relative to `cwd`)
-/// names one of the memory files, or is `key=<path>` (`dd of=`, `--output=`).
-/// A leading `~`, `$HOME`, `${HOME}` is expanded; `$PWD` is each `dirs` entry.
-/// Cheap name test first: only a word ending in one of the two file names is
-/// resolved.
-fn names_memory_file(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
-    if !(w.ends_with("USER.md") || w.ends_with("rules.md")) {
-        return false;
+/// Which live file a Bash word names: a memory file (denied to everyone) or an
+/// instruction file (the CoS asks, the rest are denied).
+#[derive(Clone, Copy, PartialEq)]
+enum Live {
+    Memory,
+    Instruction,
+}
+
+fn live_kind(root: &Path, resolved: &Path) -> Option<Live> {
+    if ["AGENTS.md", "SOUL.md", "identity.md"]
+        .iter()
+        .any(|n| resolved == root.join(n))
+    {
+        Some(Live::Instruction)
+    } else if is_memory_file(root, resolved) {
+        Some(Live::Memory)
+    } else {
+        None
+    }
+}
+
+/// What the word `w` (a path as the shell sees it, relative to `cwd`) names
+/// among the live memory and instruction files, or is `key=<path>` (`dd of=`,
+/// `--output=`). A leading `~`, `$HOME`, `${HOME}` is expanded; `$PWD` is each
+/// `dirs` entry. Cheap name test first: only a word ending in one of the five
+/// file names is resolved. A memory hit wins over an instruction hit.
+fn names_live_file(root: &Path, dirs: &[PathBuf], w: &str) -> Option<Live> {
+    const NAMES: [&str; 5] = ["USER.md", "rules.md", "AGENTS.md", "SOUL.md", "identity.md"];
+    if !NAMES.iter().any(|n| w.ends_with(n)) {
+        return None;
     }
     let value = match w.split_once('=') {
         Some((k, v))
@@ -441,31 +477,39 @@ fn names_memory_file(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
         }
         _ => None,
     };
-    [Some(w), value]
+    let kinds = [Some(w), value]
         .into_iter()
         .flatten()
-        .any(|w| names_one(root, dirs, w))
+        .filter_map(|w| names_one(root, dirs, w));
+    kinds.fold(None, |acc, k| match (acc, k) {
+        (Some(Live::Memory), _) | (_, Live::Memory) => Some(Live::Memory),
+        _ => Some(Live::Instruction),
+    })
 }
 
-fn names_one(root: &Path, dirs: &[PathBuf], w: &str) -> bool {
+fn names_one(root: &Path, dirs: &[PathBuf], w: &str) -> Option<Live> {
+    let kind = |p: &Path| live_kind(root, &resolve(p));
     if let Some(rest) = w
         .strip_prefix("$PWD/")
         .or_else(|| w.strip_prefix("${PWD}/"))
     {
         return dirs
             .iter()
-            .any(|d| is_memory_file(root, &resolve(&d.join(rest))));
+            .filter_map(|d| kind(&d.join(rest)))
+            .max_by_key(|k| *k == Live::Memory);
     }
     let p = PathBuf::from(expand_home(w));
     if p.is_absolute() {
-        return is_memory_file(root, &resolve(&p));
+        return kind(&p);
     }
     dirs.iter()
-        .any(|d| is_memory_file(root, &resolve(&d.join(&p))))
+        .filter_map(|d| kind(&d.join(&p)))
+        .max_by_key(|k| *k == Live::Memory)
 }
 
-/// The directories a relative path in `cmd` may be read from: the hook's cwd
-/// and every `cd`/`pushd` target named in the command (one level deep).
+/// The directories a relative path in `cmd` may be read from: the hook's cwd,
+/// every `cd`/`pushd` target named in the command (one level deep) and every
+/// `-C`, `-D` or `--chdir` directory of any command (`git -C d`, `env -C d`).
 fn command_dirs(cmd: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
     let base = cwd.map_or_else(
         || std::env::current_dir().unwrap_or_default(),
@@ -478,25 +522,46 @@ fn command_dirs(cmd: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
                 dirs.push(base.join(t));
             }
         }
+        let mut cur = base.clone();
+        for (k, w) in seg.iter().enumerate() {
+            let d = match w.as_str() {
+                "-C" | "-D" | "--chdir" => seg.get(k + 1).map(String::as_str),
+                x => x.strip_prefix("--chdir="),
+            };
+            if let Some(d) = d.filter(|d| !d.contains(['$', '`'])) {
+                cur = cur.join(expand_home(d));
+                dirs.push(cur.clone());
+            }
+        }
     }
     dirs
 }
 
-/// A Bash command that writes one of the memory files: a redirect onto it, or
-/// a command that is not read-only naming it (`sed -i`, `tee`, `cp`, a shell
-/// `-c` string, …). A tripwire like the rest of the gate: a script that builds
-/// the path at run time gets past it.
+/// Commands whose last plain word is the file they write; the earlier words are
+/// only read.
+fn copy_like(base: &str) -> bool {
+    matches!(base, "cp" | "rsync" | "install" | "ln" | "scp")
+}
+
+/// A Bash command that writes one of the memory or instruction files: a
+/// redirect onto it, or a command that is not read-only naming it (`sed -i`,
+/// `tee`, `cp`, `perl -pi`, a shell `-c` string, …). A tripwire like the rest of
+/// the gate: a script that builds the path at run time gets past it. A memory
+/// hit is denied to everyone; an instruction hit asks the CoS. The source of a
+/// copy (`cp AGENTS.md /tmp/x`) is a read.
 fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
     let Some(root) = env.runs_dir.parent() else {
         return Found::pass();
     };
     let root = resolve(root);
     let dirs = command_dirs(cmd, cwd);
-    if redirect_targets(cmd)
-        .iter()
-        .any(|t| names_memory_file(&root, &dirs, t))
-    {
-        return Found::cos_only(ASK_MEMORY);
+    let mut instruction = false;
+    for t in redirect_targets(cmd) {
+        match names_live_file(&root, &dirs, &t) {
+            Some(Live::Memory) => return Found::cos_only(ASK_MEMORY),
+            Some(Live::Instruction) => instruction = true,
+            None => {}
+        }
     }
     for seg in tokenize(cmd) {
         let Some(i) = seg.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
@@ -506,27 +571,45 @@ fn bash_memory(env: &Env, cmd: &str, cwd: Option<&Path>, depth: u8) -> Found {
         if read_only_cmd(base, &seg[i + 1..]) {
             continue;
         }
+        let args = &seg[i + 1..];
+        let last_plain = args.iter().rposition(|x| !x.starts_with('-'));
         // An interpreter or awk program names its target inside a quoted
         // string (`open('USER.md','a')`): test the pieces between the quotes.
         let embedded = is_interp(base) || matches!(base, "awk" | "gawk" | "mawk");
-        for w in &seg[i + 1..] {
-            if names_memory_file(&root, &dirs, w)
-                || (embedded
-                    && w.split(|c: char| c.is_whitespace() || "'\"(),;{}[]".contains(c))
-                        .any(|p| names_memory_file(&root, &dirs, p)))
-            {
-                return Found::cos_only(ASK_MEMORY);
+        for (j, w) in args.iter().enumerate() {
+            let mut kind = names_live_file(&root, &dirs, w);
+            if embedded && kind != Some(Live::Memory) {
+                for p in w.split(|c: char| c.is_whitespace() || "'\"(),;{}[]".contains(c)) {
+                    match names_live_file(&root, &dirs, p) {
+                        Some(Live::Memory) => kind = Some(Live::Memory),
+                        Some(Live::Instruction) => kind = kind.or(Some(Live::Instruction)),
+                        None => {}
+                    }
+                }
+            }
+            let dest = Some(j) == last_plain
+                || (j > 0 && args[j - 1] == "-t")
+                || w.starts_with("--target-directory=");
+            match kind {
+                Some(Live::Memory) => return Found::cos_only(ASK_MEMORY),
+                Some(Live::Instruction) if !copy_like(base) || dest => instruction = true,
+                _ => {}
             }
             // A nested script (`bash -c '…'`, `eval '…'`).
             if depth < 3 && w.contains(char::is_whitespace) {
                 let inner = bash_memory(env, w, cwd, depth + 1);
-                if !inner.is_pass() {
+                if inner.listed.iter().any(|h| matches!(h.p, Pending::CosOnly)) {
                     return inner;
                 }
+                instruction |= !inner.is_pass();
             }
         }
     }
-    Found::pass()
+    if instruction {
+        Found::act(Action::InstructionFile, ASK_FILE)
+    } else {
+        Found::pass()
+    }
 }
 
 /// Lexical `.`/`..` removal, then symlinks resolved on the longest existing prefix.
@@ -588,21 +671,48 @@ fn scan(command: &str) -> Found {
             loose: false,
         });
     }
-    // A raw RPC door (socket client, interpreter) naming a grant verb.
+    // A raw RPC door naming a grant verb: a socket client with the verb anywhere
+    // in the command text (it may arrive on a pipe), or an interpreter with
+    // inline code that names it. `quaqua call` is read at its verb position.
     let lower = command.to_ascii_lowercase();
-    if GRANT_VERBS.iter().any(|v| lower.contains(v))
-        && segs.iter().any(|s| {
-            s.iter()
-                .any(|w| rpc_tool(w.rsplit('/').next().unwrap_or(w)))
-        })
-    {
+    let names_verb = |t: &str| GRANT_VERBS.iter().any(|v| t.contains(v));
+    if segs.iter().any(|s| {
+        let Some(i) = s.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+            return false;
+        };
+        let base = s[i].rsplit('/').next().unwrap_or(&s[i]);
+        match base {
+            "socat" | "nc" | "ncat" | "netcat" | "curl" => names_verb(&lower),
+            // Inline code names the verb in its own words; a script fed on stdin
+            // (`python3 -`, a heredoc, a pipe) can name it anywhere.
+            b if is_interp(b) => {
+                let args = &s[i + 1..];
+                args.iter().all(|x| x.starts_with('-')) && names_verb(&lower)
+                    || args.iter().any(|x| inline_code_flag(x))
+                        && args.iter().any(|x| names_verb(&x.to_ascii_lowercase()))
+            }
+            _ => false,
+        }
+    }) {
         f.absorb(Found::act(Action::GrantWrite, ASK_GRANT));
     }
-    // A `cd` moves what the command acts on: its hits are judged at high, and
-    // a relative write path is read against the last literal `cd` target.
-    let mut cd: Option<Option<String>> = None;
+    // `$(which quaqua) call grant.full`: the tokenizer drops the substituted
+    // command word, so `call <grant verb>` counts at any segment.
+    if segs.iter().any(|s| {
+        s.windows(2)
+            .any(|w| w[0] == "call" && GRANT_VERBS.contains(&w[1].to_ascii_lowercase().as_str()))
+    }) {
+        f.absorb(Found::act(Action::GrantWrite, ASK_GRANT));
+    }
+    // Anything that may change the directory or hide the command word (`cd`,
+    // `builtin cd`, `eval cd`, `$X`, `GIT_DIR=`) makes every hit unknown, which
+    // is judged at high. A literal `cd` target still reads relative write paths.
+    let mut cd: Option<Option<String>> = f.moved.then_some(None);
     for seg in &segs {
         let Some(i) = seg.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+            if seg.iter().any(|x| retargets(x)) {
+                cd = Some(None);
+            }
             continue;
         };
         let base = seg[i].rsplit('/').next().unwrap_or(&seg[i]);
@@ -615,18 +725,18 @@ fn scan(command: &str) -> Found {
                 _ => None,
             });
         }
+        // A cd-like word that is not the command word itself, a retargeting
+        // assignment or a command word built at run time.
+        if seg[i + 1..].iter().any(|x| cd_word(x))
+            || seg.iter().any(|x| retargets(x))
+            || base.contains(['$', '`'])
+        {
+            cd = Some(None);
+        }
     }
-    // The one common spelling is read: a single leading `cd <literal> && ...`
-    // with no other separator, so every `Here` hit follows the cd target.
-    let is_cd = |s: &Vec<String>| s.first().is_some_and(|w| w == "cd");
-    let lone = segs.iter().filter(|s| is_cd(s)).count() == 1
-        && segs.first().is_some_and(is_cd)
-        && !command.contains([';', '|', '(', '`'])
-        && !command.contains("$(");
-    if let (Some(Some(d)), true) = (&cd, lone) {
-        f = f.retarget(&Target::Dir(d.clone()));
-    } else if cd.is_some() {
-        f = f.retarget(&Target::Unknown);
+    if cd.is_some() {
+        f.moved = true;
+        f = f.force_target(&Target::Unknown);
     }
     if let Some(dir) = cd {
         for h in &mut f.paths {
@@ -650,9 +760,22 @@ fn scan(command: &str) -> Found {
 
 const GRANT_VERBS: [&str; 3] = ["grant.full", "grant.tier", "grant.lane"];
 
-/// Programs that can speak to the daemon's socket without `quaqua`.
-fn rpc_tool(base: &str) -> bool {
-    matches!(base, "socat" | "nc" | "ncat" | "netcat" | "curl" | "quaqua") || is_interp(base)
+/// `cd`, `pushd`, `popd` or `chdir`, however the word is spelled as a path.
+fn cd_word(w: &str) -> bool {
+    matches!(
+        w.rsplit('/').next().unwrap_or(w),
+        "cd" | "pushd" | "popd" | "chdir"
+    )
+}
+
+/// An interpreter flag that carries the program text (`-c`, `-e`, `-r`, `--eval`).
+fn inline_code_flag(w: &str) -> bool {
+    matches!(w, "--eval" | "--print" | "--exec")
+        || (w.starts_with('-')
+            && !w.starts_with("--")
+            && w[1..]
+                .chars()
+                .any(|c| matches!(c, 'c' | 'e' | 'E' | 'r' | 'p')))
 }
 
 fn is_interp(base: &str) -> bool {
@@ -878,10 +1001,16 @@ fn check_cmd(w: &[String], i: usize) -> Found {
         "busybox" if a.first().is_some_and(|x| is_shell(x)) => check_shell(&a[1..]),
         "eval" if !a.is_empty() => scan(&a.join(" ")),
         "find" => check_find(a),
+        // The command word was a substitution the tokenizer dropped.
+        "call" => check_quaqua(&w[i..]),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
         | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
         b => {
             let mut f = names_db(b, a);
+            // A command word built at run time (`$Q call …`) may be `quaqua`.
+            if b.contains(['$', '`']) {
+                f.absorb(check_quaqua(a));
+            }
             f.paths.extend(
                 write_targets(b, a)
                     .into_iter()
@@ -892,16 +1021,26 @@ fn check_cmd(w: &[String], i: usize) -> Found {
     }
 }
 
-/// `quaqua … call grant.full|tier|lane`: anh iu's consent, never silent. A verb
-/// the scanner cannot read (`call "$V"`) counts too.
+/// `quaqua … call grant.full|tier|lane`: anh iu's consent, never silent. Only
+/// the verb position counts: a word after `call` that is a grant verb, or a verb
+/// the scanner cannot read (missing, `"$V"`, a `{}` placeholder).
 fn check_quaqua(a: &[String]) -> Found {
-    let names_grant = a.iter().any(|x| {
-        let l = x.to_ascii_lowercase();
-        GRANT_VERBS.iter().any(|v| l.contains(v))
-    });
-    let opaque = a
-        .windows(2)
-        .any(|w| w[0] == "call" && w[1].contains(['$', '`']));
+    let Some(c) = a.iter().position(|x| x == "call") else {
+        return Found::pass();
+    };
+    let after = &a[c + 1..];
+    let readable = |x: &String| {
+        !x.is_empty()
+            && x.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let opaque = after
+        .iter()
+        .find(|x| !x.starts_with('-'))
+        .is_none_or(|x| !readable(x));
+    let names_grant = after
+        .iter()
+        .any(|x| GRANT_VERBS.contains(&x.to_ascii_lowercase().as_str()));
     if names_grant || opaque {
         Found::act(Action::GrantWrite, ASK_GRANT)
     } else {
@@ -915,7 +1054,7 @@ fn write_targets(base: &str, a: &[String]) -> Vec<String> {
     let in_place = |x: &String| {
         x == "--in-place"
             || x.starts_with("--in-place=")
-            || (x.starts_with('-') && !x.starts_with("--") && x.contains('i'))
+            || (x.starts_with('-') && !x.starts_with("--") && x.contains(['i', 'I']))
     };
     match base {
         "tee" | "mv" | "truncate" | "rm" | "unlink" | "shred" => plain().collect(),
@@ -970,6 +1109,8 @@ const READ_ONLY: &[&str] = &[
     "xxd",
     "hexdump",
     "od",
+    "bat",
+    "batcat",
 ];
 
 /// Read-only git subcommands.
@@ -995,10 +1136,9 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
     let short = |a: &str, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
     match base {
         _ if READ_ONLY.contains(&base) => true,
-        "jq" | "nl" | "cut" | "uniq" | "tac" => true,
-        "sed" => !args
-            .iter()
-            .any(|a| short(a, 'i') || a == "--in-place" || a.starts_with("--in-place=")),
+        "jq" | "nl" | "cut" | "tac" => true,
+        "uniq" => uniq_reads(args),
+        "sed" => sed_reads(args),
         "sort" => !args
             .iter()
             .any(|a| short(a, 'o') || a == "--output" || a.starts_with("--output=")),
@@ -1010,11 +1150,18 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
         "git" => {
             let mut it = args.iter();
             let mut sub = None;
+            // `-c k=v` can name a program (`diff.external`, `core.pager`).
+            let mut config = false;
             while let Some(a) = it.next() {
                 match a.as_str() {
-                    "-C" | "-c" => {
+                    "-C" => {
                         it.next();
                     }
+                    "-c" => {
+                        config = true;
+                        it.next();
+                    }
+                    x if x.starts_with("--config-env") => config = true,
                     x if x.starts_with('-') => {}
                     x => {
                         sub = Some(x);
@@ -1022,11 +1169,216 @@ fn read_only_cmd(base: &str, args: &[String]) -> bool {
                     }
                 }
             }
-            sub.is_some_and(|s| GIT_READ.contains(&s))
-                && !args.iter().any(|a| a.starts_with("--output"))
+            // `git grep -O<cmd>` / `--open-files-in-pager=<cmd>` runs the command
+            // (every `--o…` spelling, abbreviations included, fails closed).
+            let runs_pager = sub == Some("grep")
+                && args.iter().any(|a| {
+                    (a.starts_with("--o") && a != "--only-matching")
+                        || (a.starts_with('-') && !a.starts_with("--") && a.contains('O'))
+                });
+            // `--output=<file>`, abbreviations included (`--out=f`).
+            let writes_file = args.iter().any(|a| {
+                let name = a.split('=').next().unwrap_or(a);
+                name.len() >= 4 && "--output".starts_with(name) || a.starts_with("--output")
+            });
+            sub.is_some_and(|s| GIT_READ.contains(&s)) && !config && !runs_pager && !writes_file
         }
         _ => false,
     }
+}
+
+/// `uniq [OPTION]… [INPUT [OUTPUT]]`: the second operand is the file it
+/// writes, so it reads only with at most one operand. A long option it cannot
+/// place (an abbreviation of one that takes a value) fails closed.
+fn uniq_reads(args: &[String]) -> bool {
+    const VALUED: [&str; 3] = ["--skip-fields", "--skip-chars", "--check-chars"];
+    let mut operands = 0;
+    let mut done = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if done || a == "-" || !a.starts_with('-') {
+            operands += 1;
+        } else if a == "--" {
+            done = true;
+        } else if a.starts_with("--") {
+            if VALUED.contains(&a) {
+                it.next();
+            } else if !a.contains('=') && VALUED.iter().any(|v| v.starts_with(a)) {
+                return false;
+            }
+        } else if a.ends_with(['f', 's', 'w']) {
+            // `-f N`, `-s N`, `-w N` (the value is the next word)
+            it.next();
+        }
+    }
+    operands <= 1
+}
+
+/// `sed` reads unless a flag or a command of its script writes or runs a
+/// program: `-i`/`-I`/`--in-place` (abbreviations too), `-f` (a script file we
+/// cannot see), a `w`/`W`/`e` command, an `s///w` or `s///e` flag. The script
+/// is parsed against an allow-list of commands; anything it does not
+/// recognise is a writer, and it must pass whether or not `[...]` hides a
+/// delimiter (GNU and BSD disagree).
+fn sed_reads(args: &[String]) -> bool {
+    let opt = |name: &str, full: &str| !name.is_empty() && full.starts_with(name);
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut first_operand: Option<&str> = None;
+    let mut have_e = false;
+    let mut done = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if done || a == "-" || !a.starts_with('-') {
+            first_operand.get_or_insert(a);
+        } else if a == "--" {
+            done = true;
+        } else if let Some(long) = a.strip_prefix("--") {
+            let (name, val) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if opt(name, "in-place") || opt(name, "file") {
+                return false;
+            }
+            if opt(name, "expression") {
+                have_e = true;
+                match val.or_else(|| it.next().map(String::as_str)) {
+                    Some(v) => scripts.push(v),
+                    None => return false,
+                }
+            } else if opt(name, "line-length") && val.is_none() {
+                it.next();
+            }
+        } else {
+            let cl = &a[1..];
+            for (k, c) in cl.char_indices() {
+                match c {
+                    'i' | 'I' | 'f' => return false,
+                    'e' => {
+                        have_e = true;
+                        let rest = &cl[k + 1..];
+                        match if rest.is_empty() {
+                            it.next().map(String::as_str)
+                        } else {
+                            Some(rest)
+                        } {
+                            Some(v) => scripts.push(v),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    'l' => {
+                        if cl[k + 1..].is_empty() {
+                            it.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !have_e {
+        match first_operand {
+            Some(s) => scripts.push(s),
+            None => return false,
+        }
+    }
+    scripts
+        .iter()
+        .all(|s| sed_script_reads(s, false) && sed_script_reads(s, true))
+}
+
+/// True when every command of the sed script `s` is on the read-only list.
+fn sed_script_reads(s: &str, brackets: bool) -> bool {
+    let c: Vec<char> = s.chars().collect();
+    let n = c.len();
+    // `i` is the opening delimiter; the index just past the closing one.
+    let skip = |i: usize| -> Option<usize> {
+        let d = *c.get(i)?;
+        if d == '\\' || d == '\n' {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < n {
+            match c[j] {
+                '\\' => j += 2,
+                x if x == d => return Some(j + 1),
+                '[' if brackets => {
+                    j += 1;
+                    if c.get(j) == Some(&'^') {
+                        j += 1;
+                    }
+                    if c.get(j) == Some(&']') {
+                        j += 1;
+                    }
+                    while j < n && c[j] != ']' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                _ => j += 1,
+            }
+        }
+        None
+    };
+    let eol = |mut j: usize| {
+        while j < n && c[j] != '\n' {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < n {
+        match c[i] {
+            ' ' | '\t' | '\n' | ';' | '{' | '}' | '!' | ',' | '~' | '+' | '$' => i += 1,
+            x if x.is_ascii_digit() => i += 1,
+            '#' => i = eol(i),
+            '/' | '\\' => {
+                let start = if c[i] == '\\' { i + 1 } else { i };
+                let Some(j) = skip(start) else { return false };
+                i = j;
+                while i < n && matches!(c[i], 'I' | 'M') {
+                    i += 1;
+                }
+            }
+            'p' | 'P' | 'd' | 'D' | 'q' | 'Q' | 'n' | 'N' | 'g' | 'G' | 'h' | 'H' | 'x' | 'l'
+            | '=' | 'z' | 'F' => i += 1,
+            's' | 'y' => {
+                let subst = c[i] == 's';
+                let Some(j) = skip(i + 1).and_then(|j| skip(j - 1)) else {
+                    return false;
+                };
+                i = j;
+                while i < n && !matches!(c[i], ';' | '\n' | '}' | ' ' | '\t') {
+                    // `w` and `e` write or run; anything unknown fails closed.
+                    if !subst
+                        || !(matches!(c[i], 'g' | 'p' | 'i' | 'I' | 'm' | 'M')
+                            || c[i].is_ascii_digit())
+                    {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            // text and file names run to the end of the line (`a\` continues)
+            'a' | 'i' | 'c' | 'r' | 'R' => {
+                i = eol(i);
+                while i > 0 && i < n && c[i - 1] == '\\' {
+                    i = eol(i + 1);
+                }
+            }
+            'b' | 't' | 'T' | ':' => {
+                while i < n && !matches!(c[i], ';' | '\n') {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Any other command naming the daemon's `qq.db`, bar the read-only tools.
@@ -1514,7 +1866,32 @@ fn check_git_tag(a: &[String]) -> Found {
     }
 }
 
+/// How many `--flag VALUE` forks one wrapper command may open before it blocks.
+const WRAP_FORKS: u8 = 6;
+
 fn wrapper(base: &str, a: &[String]) -> Found {
+    wrap(
+        base,
+        a,
+        0,
+        matches!(base, "timeout" | "chrt" | "taskset"),
+        false,
+        0,
+    )
+}
+
+/// The command a wrapper runs. An unknown flag followed by a plain word may
+/// take that word as its value or not: both readings are checked and the
+/// strictest kept, so no table of value-taking options has to stay complete.
+/// `env -C`, `--chdir`, `sudo -D` move the command to another directory.
+fn wrap(
+    base: &str,
+    a: &[String],
+    mut k: usize,
+    mut duration_pending: bool,
+    mut moved: bool,
+    forks: u8,
+) -> Found {
     let value_flags: &str = match base {
         "sudo" => " u g h p C T U R t D ",
         "env" => " u C S ",
@@ -1523,12 +1900,17 @@ fn wrapper(base: &str, a: &[String]) -> Found {
         "xargs" => " I n L P s d E a ",
         _ => " ",
     };
-    let mut k = 0;
-    let mut duration_pending = base == "timeout";
-    let mut moved = false;
+    let chdir_short = match base {
+        "env" => 'C',
+        "sudo" => 'D',
+        _ => '\0',
+    };
+    let mut other_reading = Found::pass();
+    let mut main = Found::pass();
     while k < a.len() {
         if let Some(f) = single_letter_flag(&a[k]) {
             if value_flags.contains(&format!(" {f} ")) {
+                moved |= f == chdir_short;
                 // `env -S 'cmd args'`: the value is a command line.
                 if base == "env" && f == 'S' {
                     if let Some(p) = a.get(k + 1) {
@@ -1548,8 +1930,29 @@ fn wrapper(base: &str, a: &[String]) -> Found {
                 return f;
             }
         }
+        if a[k] == "--split-string" {
+            if let Some(p) = a.get(k + 1) {
+                let f = scan(p);
+                if !f.is_pass() {
+                    return f;
+                }
+            }
+        }
         if a[k].starts_with('-') || is_assignment(&a[k]) {
-            moved |= retargets(&a[k]);
+            moved |= retargets(&a[k])
+                || a[k] == "--chdir"
+                || a[k].starts_with("--chdir=")
+                || (chdir_short != '\0'
+                    && !a[k].starts_with("--")
+                    && a[k].starts_with(&format!("-{chdir_short}")));
+            let long_alone = (a[k].len() > 2 && a[k].starts_with("--") && !a[k].contains('='))
+                || single_letter_flag(&a[k]).is_some();
+            if long_alone && a.get(k + 1).is_some_and(|n| !n.starts_with('-')) {
+                if forks >= WRAP_FORKS {
+                    return Found::block(WRAP_MESSAGE);
+                }
+                other_reading.absorb(wrap(base, a, k + 2, duration_pending, moved, forks + 1));
+            }
             k += 1;
             continue;
         }
@@ -1559,9 +1962,11 @@ fn wrapper(base: &str, a: &[String]) -> Found {
             continue;
         }
         let t = if moved { Target::Unknown } else { Target::Here };
-        return check_words(&a[k..]).retarget(&t);
+        main = check_words(&a[k..]).retarget(&t);
+        break;
     }
-    Found::pass()
+    main.absorb(other_reading);
+    main
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a

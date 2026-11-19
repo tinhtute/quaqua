@@ -22,9 +22,27 @@
 set -uo pipefail
 
 bin=${QUAQUA_BIN:-quaqua}
+stdin=$(cat)
+tool=$(grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$stdin" | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/')
+why="not found"
 if command -v "$bin" >/dev/null 2>&1; then
-  # The hook JSON stays on stdin; `quaqua gate` blocks (exit 2) on empty or unparseable input.
-  exec "$bin" gate
+  # A binary from before the Write/Edit gate answers every non-Bash tool with the
+  # pane-spawn block, which would lock a worker out of every file. Ask it about a
+  # Write to a path no policy protects: a binary that knows the tool allows it
+  # (exit 0), an older one blocks (exit 2). That is a behaviour probe, not a
+  # parse of its message. An old binary falls through to the text rules below.
+  stale=''
+  case $tool in
+  Write | Edit | MultiEdit | NotebookEdit)
+    "$bin" gate >/dev/null 2>&1 <<<'{"tool_name":"Write","tool_input":{"file_path":"/dev/null/qq-gate-probe"},"cwd":"/"}' ||
+      stale=1
+    ;;
+  esac
+  if [[ -z $stale ]]; then
+    # The hook JSON stays on stdin; `quaqua gate` blocks (exit 2) on empty or unparseable input.
+    exec "$bin" gate <<<"$stdin"
+  fi
+  why="predates the Write/Edit gate"
 fi
 
 # The fallback guarded list mirrors `guarded_pair`, `check_git`, `check_gh`,
@@ -34,7 +52,7 @@ guarded='(pane[[:space:]]+(split|move|close|send-keys|send-text|run)|tab[[:space
 outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[^"|;&]*[[:space:]]pr[[:space:]]+merge|gh.*[[:space:]]api.*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*[aA][lL][iI][aA][sS]\.[^[:space:]]*[[:space:]].*push|git.*[[:space:]]-c[[:space:]]*[\\"'"'"']*[aA][lL][iI][aA][sS]\.[^[:space:]]*push)'
 
 # T3 approval list: branch delete, trunk rename/force-move, tag, release, history rewrite.
-listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[^"|;&]*[[:space:]]release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMf][a-zA-Z]*|--move|--force)[[:space:]].*(main|master))'
+listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|--(sort|format)(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)[[:space:]]+[^-[:space:]"\\]|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[^"|;&]*[[:space:]]release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMfcC][a-zA-Z]*|--move|--copy|--force)[[:space:]].*(main|master))'
 mcp_outward=(
   '^mcp__plugin_tinyfish_tinyfish__(run_deep_research(_async)?|run_web_automation(_async)?|create_dataset|populate_dataset|top_up_wallet)$'
   '^mcp__claude_ai_Claude_Data__share_(connector|live_queries)$'
@@ -50,9 +68,16 @@ trunk_name="$trunk_pre(main|master)([^a-zA-Z0-9_-]|\$)"
 # the delete flag may follow the name (`git branch main -D`)
 trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|master)([^a-zA-Z0-9_;|&-][^;|&]*)?$trunk_flag)"
 
-stdin=$(cat)
+# Bash writes to the live instruction and memory files (the binary resolves the
+# workspace root; the fallback matches the basename, a superset), and a grant
+# verb sent through a raw socket client or inline interpreter code.
+live_names='((AGENTS|SOUL|identity|USER)\.md|memory/rules\.md)([^a-zA-Z0-9_.-]|$)'
+live_redirect=">[[:space:]]*[^[:space:]\";&|]*$live_names"
+live_tools="(^|[^a-zA-Z0-9_.-])(tee|mv|cp|dd|install|truncate|rm|unlink|shred|ln|rsync|python[0-9.]*|node|ruby|perl|php)[[:space:]][^\"|;&]*$live_names"
+live_sed="(^|[^a-zA-Z0-9_.-])sed[[:space:]][^\"|;&]*(-[a-zA-Z]*i|--in-place)[^\"|;&]*$live_names"
+grant_door='(^|[^a-zA-Z0-9_.-])(socat|nc|ncat|netcat|curl|python[0-9.]*|node|ruby|perl|php|deno|bun|lua)[[:space:]]'
+
 hit=''
-tool=$(grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$stdin" | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/')
 case $tool in
 mcp__*)
   # The same three regexes as MCP_OUTWARD in src/authority/gate.rs.
@@ -85,15 +110,21 @@ Write | Edit | MultiEdit | NotebookEdit)
   if grep -Eq '(rm|mv|cp|tee|sed|truncate|dd|install|unlink|shred|python[0-9.]*|node|ruby|perl|php)[[:space:]][^"|;&]*qq\.db|>[[:space:]]*[^[:space:]";&|]*qq\.db' <<<"$stdin"; then
     hit="${hit:+$hit and }qq.db write"
   fi
+  if grep -Eq "$live_redirect|$live_tools|$live_sed" <<<"$stdin"; then
+    hit="${hit:+$hit and }instruction or memory file write"
+  fi
+  if grep -Eq 'grant\.(full|tier|lane)' <<<"$stdin" && grep -Eq "$grant_door" <<<"$stdin"; then
+    hit="${hit:+$hit and }grant verb"
+  fi
   grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"
   ;;
 esac
 
 if [[ -n $hit ]]; then
-  echo "quaqua gate: '$bin' not found — fallback match on $hit (fail-closed)" >&2
-  echo "blocked: '$bin' is missing and '$hit' cannot be cleared by the fallback — install quaqua or set QUAQUA_BIN, then retry — rules/_all/fanout-agent-grid.md, AGENTS.md rule 3" >&2
+  echo "quaqua gate: '$bin' $why — fallback match on $hit (fail-closed)" >&2
+  echo "blocked: '$bin' $why and '$hit' cannot be cleared by the fallback — install or rebuild quaqua or set QUAQUA_BIN, then retry — rules/_all/fanout-agent-grid.md, AGENTS.md rule 3" >&2
   exit 2
 fi
 
-echo "quaqua gate: '$bin' not found — install quaqua or set QUAQUA_BIN; only pane/tab/workspace spawn+move+close+input, push, merge, the approval list, outward MCP tools and instruction-file writes are blocked meanwhile" >&2
+echo "quaqua gate: '$bin' $why — install or rebuild quaqua or set QUAQUA_BIN; only pane/tab/workspace spawn+move+close+input, push, merge, the approval list, outward MCP tools and instruction-file writes are blocked meanwhile" >&2
 exit 0
