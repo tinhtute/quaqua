@@ -1029,3 +1029,83 @@ fn gate_fix2_m3_mail_body_naming_a_grant_is_free() {
     assert!(ask(&c.bash("printf grant.full | xargs -I{} quaqua call {}")));
     assert!(ask(&c.bash("quaqua call grant.full '{}' --note 'x'")));
 }
+
+// ---- gate fix round 2, review follow-ups ----
+
+#[test]
+fn gate_fix2_m3_substituted_command_word_and_stdin_interpreter() {
+    for who in [Who::Cos, Who::Worker] {
+        let r = rig(&format!("gf2-m3-subw-{}", who as u8), who);
+        for cmd in [
+            "$(which quaqua) call grant.full '{}'",
+            "`which quaqua` call grant.tier '{}'",
+            "python3 - <<'EOF'\nsend('grant.full')\nEOF",
+            "echo grant.full | python3",
+        ] {
+            let v = r.bash_in(&r.a, cmd);
+            if who == Who::Cos {
+                assert!(ask(&v), "{cmd}");
+            } else {
+                assert!(block(&v), "{cmd}");
+            }
+        }
+    }
+    let r = rig("gf2-m3-subw-ok", Who::Down);
+    for ok in [
+        "python3 scripts/report.py --verb grant.full",
+        "node --test tests/grant.full.test.js",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
+
+#[test]
+fn gate_fix2_p1_short_flag_and_positional_wrappers() {
+    gf2_blocks(
+        "gf2-p1-short",
+        &[
+            "taskset -c 0 git push origin feat",
+            "taskset 0x1 git push origin feat",
+            "ionice -c 2 git push origin feat",
+            "stdbuf -o L git push origin feat",
+            "env -P /usr/bin git push origin feat",
+            "chrt 10 git push origin feat",
+            "env --a x --b x --c x --d x --e x --f x --g x --h x git push origin feat",
+        ],
+    );
+}
+
+fn fallback_exit_cwd(cmd: &str) -> i32 {
+    use std::io::Write;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/workspace/scripts/hooks/herdr-gate.sh");
+    let json = json!({"tool_name": "Bash", "cwd": "/Users/x/quaqua/node/python",
+        "tool_input": {"command": cmd}});
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .env("QUAQUA_BIN", "qq-binary-that-does-not-exist")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.to_string().as_bytes())
+        .unwrap();
+    child.wait().unwrap().code().unwrap()
+}
+
+#[test]
+fn gate_fix2_m2_fallback_ignores_cwd_and_word_fragments() {
+    for ok in [
+        "git commit -m 'grant.full docs'",
+        "git add AGENTS.md",
+        "grep x ~/quaqua/USER.md",
+    ] {
+        assert_eq!(fallback_exit_cwd(ok), 0, "{ok}");
+    }
+    assert_eq!(fallback_exit_cwd("sed -i s/a/b/ ~/quaqua/SOUL.md"), 2);
+}

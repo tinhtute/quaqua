@@ -55,9 +55,9 @@ trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|mas
 # verb sent through a raw socket client or inline interpreter code.
 live_names='((AGENTS|SOUL|identity|USER)\.md|memory/rules\.md)([^a-zA-Z0-9_.-]|$)'
 live_redirect=">[[:space:]]*[^[:space:]\";&|]*$live_names"
-live_tools="(tee|mv|cp|dd|install|truncate|rm|unlink|shred|ln|rsync|python[0-9.]*|node|ruby|perl|php)[[:space:]][^\"|;&]*$live_names"
-live_sed="sed[[:space:]][^\"|;&]*(-[a-zA-Z]*i|--in-place)[^\"|;&]*$live_names"
-grant_door='(^|[^a-zA-Z0-9_.-])(socat|nc|ncat|netcat|curl|quaqua|python[0-9.]*|node|ruby|perl|php|deno|bun|lua)([^a-zA-Z0-9_-]|$)'
+live_tools="(^|[^a-zA-Z0-9_.-])(tee|mv|cp|dd|install|truncate|rm|unlink|shred|ln|rsync|python[0-9.]*|node|ruby|perl|php)[[:space:]][^\"|;&]*$live_names"
+live_sed="(^|[^a-zA-Z0-9_.-])sed[[:space:]][^\"|;&]*(-[a-zA-Z]*i|--in-place)[^\"|;&]*$live_names"
+grant_door='(^|[^a-zA-Z0-9_.-])(socat|nc|ncat|netcat|curl|python[0-9.]*|node|ruby|perl|php|deno|bun|lua)[[:space:]]'
 
 stdin=$(cat)
 hit=''

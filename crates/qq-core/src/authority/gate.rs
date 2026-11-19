@@ -51,6 +51,8 @@ const MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written o
 const COS_MEMORY_MESSAGE: &str = "blocked: USER.md and memory/rules.md are written only through the cos-memory tools (memory_add, memory_replace, memory_remove), never directly";
 const TIER_DENY_MESSAGE: &str = "blocked: pushing to main and force-pushing are anh iu's call";
 
+const WRAP_MESSAGE: &str =
+    "blocked: too many wrapper options to read the command; run the command without the wrapper";
 const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
 const ASK_TRUNK_MOVE: &str = "approval list: rename or force-move main/master";
 const ASK_TAG: &str = "approval list: git tag";
@@ -681,14 +683,24 @@ fn scan(command: &str) -> Found {
         let base = s[i].rsplit('/').next().unwrap_or(&s[i]);
         match base {
             "socat" | "nc" | "ncat" | "netcat" | "curl" => names_verb(&lower),
+            // Inline code names the verb in its own words; a script fed on stdin
+            // (`python3 -`, a heredoc, a pipe) can name it anywhere.
             b if is_interp(b) => {
-                s[i + 1..].iter().any(|x| inline_code_flag(x))
-                    && s[i + 1..]
-                        .iter()
-                        .any(|x| names_verb(&x.to_ascii_lowercase()))
+                let args = &s[i + 1..];
+                args.iter().all(|x| x.starts_with('-')) && names_verb(&lower)
+                    || args.iter().any(|x| inline_code_flag(x))
+                        && args.iter().any(|x| names_verb(&x.to_ascii_lowercase()))
             }
             _ => false,
         }
+    }) {
+        f.absorb(Found::act(Action::GrantWrite, ASK_GRANT));
+    }
+    // `$(which quaqua) call grant.full`: the tokenizer drops the substituted
+    // command word, so `call <grant verb>` counts at any segment.
+    if segs.iter().any(|s| {
+        s.windows(2)
+            .any(|w| w[0] == "call" && GRANT_VERBS.contains(&w[1].to_ascii_lowercase().as_str()))
     }) {
         f.absorb(Found::act(Action::GrantWrite, ASK_GRANT));
     }
@@ -989,6 +1001,8 @@ fn check_cmd(w: &[String], i: usize) -> Found {
         "busybox" if a.first().is_some_and(|x| is_shell(x)) => check_shell(&a[1..]),
         "eval" if !a.is_empty() => scan(&a.join(" ")),
         "find" => check_find(a),
+        // The command word was a substitution the tokenizer dropped.
+        "call" => check_quaqua(&w[i..]),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
         | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
         b => {
@@ -1641,14 +1655,21 @@ fn check_git_tag(a: &[String]) -> Found {
     }
 }
 
-/// How many `--long VALUE` forks one wrapper command may open before it asks.
+/// How many `--flag VALUE` forks one wrapper command may open before it blocks.
 const WRAP_FORKS: u8 = 6;
 
 fn wrapper(base: &str, a: &[String]) -> Found {
-    wrap(base, a, 0, base == "timeout", false, 0)
+    wrap(
+        base,
+        a,
+        0,
+        matches!(base, "timeout" | "chrt" | "taskset"),
+        false,
+        0,
+    )
 }
 
-/// The command a wrapper runs. An unknown `--long` followed by a plain word may
+/// The command a wrapper runs. An unknown flag followed by a plain word may
 /// take that word as its value or not: both readings are checked and the
 /// strictest kept, so no table of value-taking options has to stay complete.
 /// `env -C`, `--chdir`, `sudo -D` move the command to another directory.
@@ -1713,10 +1734,11 @@ fn wrap(
                 || (chdir_short != '\0'
                     && !a[k].starts_with("--")
                     && a[k].starts_with(&format!("-{chdir_short}")));
-            let long_alone = a[k].len() > 2 && a[k].starts_with("--") && !a[k].contains('=');
+            let long_alone = (a[k].len() > 2 && a[k].starts_with("--") && !a[k].contains('='))
+                || single_letter_flag(&a[k]).is_some();
             if long_alone && a.get(k + 1).is_some_and(|n| !n.starts_with('-')) {
                 if forks >= WRAP_FORKS {
-                    return Found::act(Action::Bypass, ASK_BYPASS);
+                    return Found::block(WRAP_MESSAGE);
                 }
                 other_reading.absorb(wrap(base, a, k + 2, duration_pending, moved, forks + 1));
             }
