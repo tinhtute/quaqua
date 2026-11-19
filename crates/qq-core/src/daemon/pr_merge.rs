@@ -225,19 +225,23 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         return Err(deny(ctx, req, &target, "sha is not the reviewed sha"));
     }
 
-    let (program, base_repo, base_lane) = {
+    let repo_dir = Path::new(&repo);
+    let (program, base) = {
         let h = hooks().lock().unwrap_or_else(|p| p.into_inner());
         match h.get(&ctx.runs_dir) {
-            Some(h) => (h.gh.clone(), h.repo, h.lane),
+            // The seam stands in for the rows; a full grant still applies.
+            Some(h) => (
+                h.gh.clone(),
+                tier::apply_grant(&ctx.runs_dir, repo_dir, true, h.repo.max(h.lane)),
+            ),
             None => (
                 PathBuf::from("gh"),
-                tier::repo_tier(&ctx.runs_dir, Path::new(&repo)),
-                tier::lane_tier(),
+                tier::effective_context_tier(&ctx.runs_dir, repo_dir, true),
             ),
         }
     };
     // A high base needs no diff to refuse.
-    if base_repo.max(base_lane) >= Tier::High {
+    if base >= Tier::High {
         return Err(deny(
             ctx,
             req,
@@ -268,10 +272,10 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         &repo,
         &["pr", "diff", &pr, "--color", "never"],
     )) {
-        Some(out) => pr_tier(base_repo, base_lane, &diff_paths(&out)),
+        Some(out) => pr_tier(base, base, &diff_paths(&out)),
         None => Tier::High,
     };
-    if tier::decide(true, Action::MergeRequest, tier, base_lane) != Decision::Allow {
+    if tier::decide(true, Action::MergeRequest, tier, base) != Decision::Allow {
         return Err(deny(
             ctx,
             req,
