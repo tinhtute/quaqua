@@ -734,6 +734,86 @@ fn cleanup_with_the_repo_gone_names_the_worktree_that_remains() {
     assert!(!herdr.has_pane(&pane) && !ended(&conn, "w1"));
 }
 
+fn scope_me() -> grid::Scope {
+    grid::Scope {
+        owner: Some("me".into()),
+        farm: Some("f1".into()),
+    }
+}
+
+#[test]
+fn cleanup_names_a_live_pane_the_scope_rejects() {
+    let herdr = FakeHerdr::new();
+    let (dir, conn, repo, wt, _pane) = worker_fixture("cleanup-oos", &herdr);
+    let theirs = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[
+            ("grid_role", "worker"),
+            ("grid_owner", "x"),
+            ("grid_farm", "f1"),
+        ],
+    );
+    herdr.agent_start("w1", "pi", &theirs, 1000, &[]).unwrap();
+    set_pane(&conn, "w1", "p999");
+    let panes = HerdrPanes(&herdr);
+    let t = target(&dir, &repo, &wt, false);
+    let r = cleanup::cleanup_worker_live(&conn, &panes, &herdr, &scope_me(), &t, 5);
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.contains(&theirs) && m.contains("out of scope"))),
+        "{r:?}"
+    );
+    assert!(herdr.has_pane(&theirs) && !ended(&conn, "w1"));
+}
+
+#[test]
+fn lead_cleanup_names_a_live_lead_pane_the_scope_rejects() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn, _repo, mine) = lead_fixture("lead-oos", &herdr);
+    herdr
+        .agent_start("proj-lead", "ni", &mine, 1000, &[])
+        .unwrap();
+    let panes = HerdrPanes(&herdr);
+    let r = cleanup::cleanup_lead_live(
+        &conn,
+        &panes,
+        &herdr,
+        &grid::Scope {
+            owner: None,
+            farm: Some("f2".into()),
+        },
+        "proj",
+        9,
+    );
+    assert!(
+        matches!(&r, Err(OpsError::Remains(v)) if v.iter().any(|m| m.contains(&mine) && m.contains("out of scope"))),
+        "{r:?}"
+    );
+    assert!(herdr.has_pane(&mine) && !ended(&conn, "proj-lead"));
+}
+
+#[test]
+fn lead_rerun_ignores_the_stale_recorded_pane_of_an_ended_row() {
+    let herdr = FakeHerdr::new();
+    let (_d, conn, _repo, mine) = lead_fixture("lead-ended-stale", &herdr);
+    // the ended Lead's old id is now a live worker pane in scope
+    let reused = herdr.seed_pane(
+        "repo-workers",
+        Some("pi"),
+        &[("grid_role", "worker"), ("grid_farm", "f1")],
+    );
+    set_pane(&conn, "proj-lead", &reused);
+    conn.execute("UPDATE agent SET ended_ms = 3 WHERE name = 'proj-lead'", [])
+        .unwrap();
+    let panes = HerdrPanes(&herdr);
+    cleanup::cleanup_lead_live(&conn, &panes, &herdr, &scope_f1(), "proj", 9).unwrap();
+    assert!(
+        herdr.has_pane(&reused),
+        "an ended row's recorded id is not trusted"
+    );
+    let _ = mine;
+}
+
 #[test]
 fn stop_never_sends_ctrl_c_and_leaves_the_worker_alive() {
     let (_dir, conn) = seeded("stop");
