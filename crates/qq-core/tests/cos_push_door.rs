@@ -77,7 +77,10 @@ fn repo_with_origin(r: &Rig) -> (PathBuf, PathBuf) {
     git(&work, &["commit", "-qm", "c"]);
     git(&work, &["branch", "main"]);
     git(r.ws.root(), &["init", "-q", "--bare", "origin.git"]);
-    git(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(
+        &work,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
     (work, origin)
 }
 
@@ -85,7 +88,12 @@ fn has_ref(origin: &Path, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(origin)
-        .args(["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ])
         .status()
         .unwrap()
         .success()
@@ -124,7 +132,11 @@ fn cos_push_door_cos_main_refuse() {
     git(&work, &["branch", "trunk"]);
     git(
         &work,
-        &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
     );
     for b in ["main", "master", "trunk"] {
         let e = push(&r, args(&work, b)).unwrap_err();
