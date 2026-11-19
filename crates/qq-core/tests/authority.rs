@@ -532,7 +532,11 @@ fn unknown_caller_refusal_records_attempted_target() {
 
 // U3 gate tripwires: (name, must block, must allow). The same table drives the
 // binary verdict and the shell fallback, so the two stay in step.
-type Tripwire = (&'static str, &'static [&'static str], &'static [&'static str]);
+type Tripwire = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
 
 const TRIPWIRES: &[Tripwire] = &[
     (
@@ -601,7 +605,6 @@ const TRIPWIRES: &[Tripwire] = &[
         ],
         &[
             "herdr agent send-keys worker enter",
-            "herdr pane send-keys --help",
             "herdr pane read p",
             "herdr pane list",
         ],
@@ -664,6 +667,8 @@ fn gate_blocks_u3_tripwires() {
             assert_eq!(gate_exit(cmd), 0, "{name}: must allow: {cmd}");
         }
     }
+    // The fallback is a superset and cannot tell `--help`; the binary can.
+    assert_eq!(gate_exit("herdr pane send-keys --help"), 0);
 }
 
 fn fallback_exit(cmd: &str) -> i32 {

@@ -1,8 +1,11 @@
 //! The `gate` verb: the Claude Code PreToolUse(Bash) hook, ported from
 //! the legacy engine. Stateless: it tokenizes the hook's command and
 //! blocks what the daemon alone may do under R11 — a herdr pane, tab or
-//! workspace spawn/move/close, any `git push`, and a `gh` merge. Everything
-//! else is allowed. It fails closed: empty input, a read error, a body that
+//! workspace spawn/move/close, any `git push`, and a `gh` merge — plus the
+//! U3 tripwires for the same powers by another name (alias push, `gh api` ref
+//! and contents writes, auto-merge, pane input, `grid_role` tokens, writes to
+//! `runs/qq.db`, deleting main/master). A tripwire, not a fence: a same-uid
+//! process can still route around it. Everything else is allowed. It fails closed: empty input, a read error, a body that
 //! is not JSON, or a missing or non-string `tool_input.command` all block.
 //!
 //! Not ported: the old gate's `ask` prompts, `pkill -f`, removed worker
@@ -20,6 +23,12 @@ const PUSH_MESSAGE: &str =
     "blocked: git push only through the quaqua daemon (the daemon is the one door for push)";
 const MERGE_MESSAGE: &str =
     "blocked: merge only through the quaqua daemon (the daemon is the one door for merge)";
+const QUERY_FILE_MESSAGE: &str =
+    "blocked: a gh api query read from a file hides the mutation; pass the query inline";
+const INPUT_MESSAGE: &str = "blocked: pane input and grid_role tokens only through the quaqua daemon (herdr pane send-keys|send-text|run, report-metadata grid_role=)";
+const DB_MESSAGE: &str =
+    "blocked: runs/qq.db is the daemon's; read it with `sqlite3 -readonly`, write it only through quaqua verbs";
+const BRANCH_MESSAGE: &str = "blocked: deleting main or master is anh iu's call, never a worker's";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -169,6 +178,9 @@ fn guarded_pair(a: &str, b: &str) -> bool {
             | ("workspace", "create")
             | ("workspace", "close")
             | ("agent", "start")
+            | ("pane", "send-keys")
+            | ("pane", "send-text")
+            | ("pane", "run")
     )
 }
 
@@ -182,6 +194,7 @@ fn check_words(w: &[String]) -> Verdict {
         "herdr" => check_herdr(a),
         "git" => check_git(a),
         "gh" => check_gh(a),
+        "sqlite3" => check_sqlite(a),
         b if is_shell(b) => check_shell(a),
         "busybox" if a.first().is_some_and(|x| is_shell(x)) => check_shell(&a[1..]),
         "eval" if !a.is_empty() => check(&a.join(" ")),
@@ -218,7 +231,46 @@ fn check_find(a: &[String]) -> Verdict {
     Verdict::Allow
 }
 
-/// `gh pr merge`, a merge endpoint through `gh api`, or a merge mutation.
+/// `sqlite3` on the daemon's `qq.db` without `-readonly`.
+fn check_sqlite(a: &[String]) -> Verdict {
+    let readonly = a.iter().any(|x| x == "-readonly" || x == "--readonly");
+    if !readonly && a.iter().any(|x| x.contains("qq.db")) {
+        return Verdict::Block(DB_MESSAGE);
+    }
+    Verdict::Allow
+}
+
+/// The HTTP method `gh api` is given: an explicit one (`-X M`, `-XM`,
+/// `--method M`, `--method=M`, upper-cased), else `POST` when any field flag is
+/// present (gh's own default), else `GET`.
+fn gh_api_method(a: &[String]) -> String {
+    for (k, x) in a.iter().enumerate() {
+        let v = if matches!(x.as_str(), "-X" | "--method") {
+            a.get(k + 1).map(String::as_str)
+        } else if let Some(v) = x.strip_prefix("--method=") {
+            Some(v)
+        } else if let Some(v) = x.strip_prefix("-X") {
+            Some(v)
+        } else {
+            None
+        };
+        if let Some(v) = v {
+            return v.to_ascii_uppercase();
+        }
+    }
+    let field = a.iter().any(|x| {
+        matches!(
+            x.as_str(),
+            "-f" | "-F" | "--field" | "--raw-field" | "--input"
+        ) || x.starts_with("--field=")
+            || x.starts_with("--raw-field=")
+            || x.starts_with("--input=")
+    });
+    if field { "POST" } else { "GET" }.to_string()
+}
+
+/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation, or a
+/// ref/contents write that is a push by another name.
 fn check_gh(a: &[String]) -> Verdict {
     let pr = a.iter().position(|x| x == "pr");
     if pr.is_some_and(|p| a[p + 1..].iter().any(|x| x == "merge")) {
@@ -232,8 +284,20 @@ fn check_gh(a: &[String]) -> Verdict {
         let explicit_get = a.windows(2).any(|w| {
             matches!(w[0].as_str(), "-X" | "--method") && w[1].eq_ignore_ascii_case("GET")
         }) || a.iter().any(|x| x.eq_ignore_ascii_case("-XGET"));
-        if (merge_path && !explicit_get) || a.iter().any(|x| x.contains("mergePullRequest")) {
+        if (merge_path && !explicit_get)
+            || a.iter()
+                .any(|x| x.contains("mergePullRequest") || x.contains("enablePullRequestAutoMerge"))
+        {
             return Verdict::Block(MERGE_MESSAGE);
+        }
+        if a.iter().any(|x| x.contains("query=@")) {
+            return Verdict::Block(QUERY_FILE_MESSAGE);
+        }
+        let writes_ref = a
+            .iter()
+            .any(|x| !x.starts_with('-') && (x.contains("/git/refs") || x.contains("/contents/")));
+        if writes_ref && gh_api_method(a) != "GET" {
+            return Verdict::Block(PUSH_MESSAGE);
         }
     }
     Verdict::Allow
@@ -244,6 +308,14 @@ fn check_gh(a: &[String]) -> Verdict {
 fn check_herdr(a: &[String]) -> Verdict {
     if matches!(a.first().map(String::as_str), Some("--help" | "-h")) {
         return Verdict::Allow;
+    }
+    // `report-metadata … grid_role=…` forges the CoS identity (a pane token).
+    if let Some(k) =
+        (0..a.len().saturating_sub(1)).find(|&k| a[k] == "pane" && a[k + 1] == "report-metadata")
+    {
+        if a[k + 2..].iter().any(|x| x.contains("grid_role=")) {
+            return Verdict::Block(INPUT_MESSAGE);
+        }
     }
     let Some(first) = (0..a.len().saturating_sub(1)).find(|&k| guarded_pair(&a[k], &a[k + 1]))
     else {
@@ -291,6 +363,11 @@ fn check_git(a: &[String]) -> Verdict {
             break;
         }
     }
+    match a.get(i).map(String::as_str) {
+        Some("config") => return check_git_config(&a[i + 1..]),
+        Some("branch") => return check_git_branch(&a[i + 1..]),
+        _ => {}
+    }
     if a.get(i).map(String::as_str) != Some("push") {
         return Verdict::Allow;
     }
@@ -298,6 +375,44 @@ fn check_git(a: &[String]) -> Verdict {
         return Verdict::Allow;
     }
     Verdict::Block(PUSH_MESSAGE)
+}
+
+/// `git config … alias.<x> <value naming push>`: a push by another name.
+fn check_git_config(a: &[String]) -> Verdict {
+    let Some(k) = a.iter().position(|x| x.starts_with("alias.")) else {
+        return Verdict::Allow;
+    };
+    let names_push = a[k + 1..].iter().any(|v| {
+        v.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .any(|t| t == "push")
+    });
+    if names_push {
+        Verdict::Block(PUSH_MESSAGE)
+    } else {
+        Verdict::Allow
+    }
+}
+
+/// `git branch` deleting `main` or `master` (`-d`, `-D`, `--delete`, `-df`…).
+fn check_git_branch(a: &[String]) -> Verdict {
+    let delete = a.iter().any(|x| {
+        x == "--delete"
+            || (x.starts_with('-')
+                && !x.starts_with("--")
+                && x[1..].chars().any(|c| c == 'd' || c == 'D'))
+    });
+    let names_trunk = a.iter().any(|x| {
+        !x.starts_with('-')
+            && matches!(
+                x.strip_prefix("refs/heads/").unwrap_or(x),
+                "main" | "master"
+            )
+    });
+    if delete && names_trunk {
+        Verdict::Block(BRANCH_MESSAGE)
+    } else {
+        Verdict::Allow
+    }
 }
 
 fn wrapper(base: &str, a: &[String]) -> Verdict {
