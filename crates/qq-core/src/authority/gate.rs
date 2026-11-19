@@ -1028,6 +1028,10 @@ fn check_cmd(w: &[String], i: usize, deep: bool) -> Found {
             // `watch`, `ssh host …`). Check them all, at an unknown target.
             if deep && !read_only_cmd(b, a) {
                 f.absorb(scan_suffixes(a, 0));
+                // The command word may itself be a command line (`sudo -s 'git push'`).
+                let mut g = spaced_word(&w[i]);
+                g.moved |= !g.is_pass();
+                f.absorb(g.force_target(&Target::Unknown));
             }
             f.paths.extend(
                 write_targets(b, a)
@@ -2186,30 +2190,61 @@ fn scan_suffixes(a: &[String], from: usize) -> Found {
     let mut f = Found::pass();
     for j in from..a.len() {
         f.absorb(check_flat(&a[j..]));
-        if a[j].contains(char::is_whitespace) {
-            f.absorb(scan_with(&a[j], false));
-        }
+        f.absorb(spaced_word(&a[j]));
     }
     f.moved |= !f.is_pass();
     f.force_target(&Target::Unknown)
 }
 
-/// One suffix as a command, known command words only and no recursion into
-/// other suffix scans (that would be exponential in the word count).
+/// A word that holds a command line: the word itself, and for an option the text
+/// after `=` and after each cluster letter (`--command='git push'`,
+/// `-qc'git push'`). The command word of the line must be known.
+fn spaced_word(x: &str) -> Found {
+    let mut f = Found::pass();
+    if !x.contains(char::is_whitespace) {
+        return f;
+    }
+    f.absorb(scan_with(x, false));
+    if x.starts_with('-') {
+        if let Some((_, v)) = x.split_once('=') {
+            f.absorb(scan_with(v, false));
+        }
+        if !x.starts_with("--") {
+            for (p, c) in x.char_indices().skip(1) {
+                f.absorb(scan_with(&x[p + c.len_utf8()..], false));
+            }
+        }
+    }
+    f
+}
+
+/// One suffix as a command through the ordinary path, shallow: a wrapper word
+/// passes (its own words are suffixes of the same scan), and no suffix scan runs
+/// inside (that would be exponential in the word count). Every other check of
+/// [`check_cmd`] (db writes, path writers, grants) still applies.
 fn check_flat(w: &[String]) -> Found {
     let base = w[0].rsplit('/').next().unwrap_or(&w[0]);
-    let a = &w[1..];
-    match base {
-        "herdr" => check_herdr(a),
-        "git" => check_git(a),
-        "gh" => check_gh(a),
-        "quaqua" => check_quaqua(a),
-        "sqlite3" => check_sqlite(a),
-        b if is_shell(b) => check_shell(a),
-        "eval" if !a.is_empty() => scan(&a.join(" ")),
-        "find" => check_find(a),
-        _ => Found::pass(),
+    if matches!(
+        base,
+        "sudo"
+            | "env"
+            | "command"
+            | "exec"
+            | "nice"
+            | "time"
+            | "nohup"
+            | "setsid"
+            | "stdbuf"
+            | "xargs"
+            | "builtin"
+            | "chrt"
+            | "ionice"
+            | "taskset"
+            | "timeout"
+    ) {
+        return Found::pass();
     }
+    check_cmd(w, 0, false)
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
