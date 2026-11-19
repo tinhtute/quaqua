@@ -33,6 +33,14 @@ fi
 guarded='(pane[[:space:]]+(split|move|close|send-keys|send-text|run)|tab[[:space:]]+(create|close)|workspace[[:space:]]+(create|close)|agent[[:space:]]+start)'
 outward='(git[^"]*[[:space:]]push([^a-z]|$)|gh[[:space:]]+pr[[:space:]]+merge|gh.*[[:space:]]api.*(/merges?([^a-z]|$)|mergePullRequest|enablePullRequestAutoMerge|query=@)|git[^"]*[[:space:]]config.*[aA][lL][iI][aA][sS]\.[^[:space:]]*[[:space:]].*push|git.*[[:space:]]-c[[:space:]]*[\\"'"'"']*[aA][lL][iI][aA][sS]\.[^[:space:]]*push)'
 
+# T3 approval list: branch delete, trunk rename/force-move, tag, release, history rewrite.
+listed='(git[^"|;&]*[[:space:]]tag[[:space:]]+(-[asdfmu]|--(delete|annotate|sign|force)|[^-[:space:]"\\])|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[dD][a-zA-Z]*|--delete)([[:space:]]|$|[\\"])|gh[[:space:]]+release[[:space:]]+create|git[[:space:]]+(filter-branch|filter-repo)|git[^"|;&]*[[:space:]]update-ref[[:space:]].*refs/(remotes|tags|heads/(main|master))|git[^"|;&]*[[:space:]]branch[^"|;&]*[[:space:]](-[a-zA-Z]*[mMf][a-zA-Z]*|--move|--force)[[:space:]].*(main|master))'
+mcp_outward=(
+  '^mcp__plugin_tinyfish_tinyfish__(run_deep_research(_async)?|run_web_automation(_async)?|create_dataset|populate_dataset|top_up_wallet)$'
+  '^mcp__claude_ai_Claude_Data__share_(connector|live_queries)$'
+  '^mcp__claude_ai_(Asana|Atlassian|Box|Canva|Gmail|Google_Calendar|Google_Docs|Google_Drive|Google_Sheets|Google_Slides|Higgsfield|HubSpot|Intercom|Linear|Notion|Slack|monday_com)__.*(send|post|reply|publish|share|invite|comment|message|upload|generate)'
+)
+
 # gh api ref/contents writes: a mutating method, or a field flag (gh then POSTs).
 gh_write="(-X|--method)[=[:space:]'\"\\\\]*(PATCH|PUT|POST|DELETE)"
 gh_field='[[:space:]](-f|-F|--field|--raw-field|--input)[[:space:]=]'
@@ -44,19 +52,37 @@ trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|mas
 
 stdin=$(cat)
 hit=''
-grep -Eq "herdr.*$guarded" <<<"$stdin" && hit='pane/tab/workspace spawn+move+close'
-grep -Eq "$outward" <<<"$stdin" && hit="${hit:+$hit and }outward action"
-if grep -Eq 'gh.*[[:space:]]api.*(git/refs|/contents/)' <<<"$stdin" &&
-  { grep -Eiq "$gh_write" <<<"$stdin" || grep -Eq "$gh_field" <<<"$stdin"; }; then
-  hit="${hit:+$hit and }outward action"
-fi
-grep -Eq 'herdr.*report-metadata.*grid_role=' <<<"$stdin" && hit="${hit:+$hit and }grid_role token"
-# `.open` and `ATTACH` reopen a database read-write, past -readonly.
-if grep -Eq 'sqlite3.*qq\.db' <<<"$stdin" &&
-  { ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin" || grep -Eiq '\.open|\battach\b' <<<"$stdin"; }; then
-  hit="${hit:+$hit and }qq.db write"
-fi
-grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"
+tool=$(grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$stdin" | head -1 | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/')
+case $tool in
+mcp__*)
+  # The same three regexes as MCP_OUTWARD in src/authority/gate.rs.
+  for re in "${mcp_outward[@]}"; do
+    [[ $tool =~ $re ]] && hit='MCP tool that sends, publishes or spends'
+  done
+  ;;
+Write | Edit | MultiEdit | NotebookEdit)
+  # Only the live instruction files; the content is never scanned. The binary
+  # tells the live workspace copy from a template; the fallback cannot.
+  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"([^"]*/)?(AGENTS|SOUL|identity)\.md"' <<<"$stdin" &&
+    hit='write to an instruction file'
+  ;;
+*)
+  grep -Eq "herdr.*$guarded" <<<"$stdin" && hit='pane/tab/workspace spawn+move+close'
+  grep -Eq "$outward" <<<"$stdin" && hit="${hit:+$hit and }outward action"
+  grep -Eq "$listed" <<<"$stdin" && hit="${hit:+$hit and }approval-list action"
+  if grep -Eq 'gh.*[[:space:]]api.*(git/refs|/contents/)' <<<"$stdin" &&
+    { grep -Eiq "$gh_write" <<<"$stdin" || grep -Eq "$gh_field" <<<"$stdin"; }; then
+    hit="${hit:+$hit and }outward action"
+  fi
+  grep -Eq 'herdr.*report-metadata.*grid_role=' <<<"$stdin" && hit="${hit:+$hit and }grid_role token"
+  # `.open` and `ATTACH` reopen a database read-write, past -readonly.
+  if grep -Eq 'sqlite3.*qq\.db' <<<"$stdin" &&
+    { ! grep -Eq 'sqlite3.*--?readonly' <<<"$stdin" || grep -Eiq '\.open|\battach\b' <<<"$stdin"; }; then
+    hit="${hit:+$hit and }qq.db write"
+  fi
+  grep -Eq "$trunk_del" <<<"$stdin" && hit="${hit:+$hit and }main/master delete"
+  ;;
+esac
 
 if [[ -n $hit ]]; then
   echo "quaqua gate: '$bin' not found — fallback match on $hit (fail-closed)" >&2
@@ -64,5 +90,5 @@ if [[ -n $hit ]]; then
   exit 2
 fi
 
-echo "quaqua gate: '$bin' not found — install quaqua or set QUAQUA_BIN; only pane/tab/workspace spawn+move+close+input, push, merge and the tripwires are blocked meanwhile" >&2
+echo "quaqua gate: '$bin' not found — install quaqua or set QUAQUA_BIN; only pane/tab/workspace spawn+move+close+input, push, merge, the approval list, outward MCP tools and instruction-file writes are blocked meanwhile" >&2
 exit 0
