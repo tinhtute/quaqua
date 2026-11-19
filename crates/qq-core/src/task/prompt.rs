@@ -115,6 +115,10 @@ pub fn check_brief(
     match at_col1(head, "Playbook:") {
         None => warnings.push("warning: brief has no 'Playbook:' header".into()),
         Some("none") => warnings.push("warning: 'Playbook: none' needs a reason".into()),
+        // `none, <reason>` is the trivial-unit form: no lookup, no warning.
+        Some(p)
+            if p.strip_prefix("none")
+                .is_some_and(|r| r.starts_with([',', ';', ' '])) => {}
         Some(p) if p.contains('<') => {
             warnings.push("warning: 'Playbook:' still holds a '<…>' placeholder".into())
         }

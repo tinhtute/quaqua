@@ -133,6 +133,19 @@ fn prompt_check_brief_and_resume() {
     let missing = BRIEF.replace("Playbook: feature", "Playbook: nope");
     let e = prompt::check_brief(&missing, None, Some(&pb)).unwrap_err();
     assert!(e.contains("nope"), "{e}");
+    // `none, <reason>` is the documented trivial-unit form: accepted, no warning,
+    // even with an index; bare `none` still warns; an unknown name still fails
+    let nr = BRIEF.replace("Playbook: feature", "Playbook: none, one-command unit");
+    let ok = prompt::check_brief(&nr, None, Some(&pb)).unwrap();
+    assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+    let bare = BRIEF.replace("Playbook: feature", "Playbook: none");
+    let w = prompt::check_brief(&bare, None, Some(&pb)).unwrap();
+    assert!(
+        w.warnings.iter().any(|m| m.contains("needs a reason")),
+        "{:?}",
+        w.warnings
+    );
+    assert!(prompt::check_brief(&missing, None, Some(&pb)).is_err());
     // no index at all: the name is not checked
     assert!(prompt::check_brief(&missing, None, Some(&pb.join("absent"))).is_ok());
 
