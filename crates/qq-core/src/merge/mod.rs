@@ -202,6 +202,13 @@ fn op(msg: impl Into<String>) -> MergeError {
 pub fn run(req: &Request) -> Result<Vec<Merged>, MergeError> {
     let _lane = LANE.lock().unwrap_or_else(|p| p.into_inner());
     let repo = req.repo.as_path();
+    // Every caller of the queue, the pipeline included, stops here.
+    if protected_integ(repo, &req.integ) {
+        return Err(op(format!(
+            "integration branch '{}' is the repo's main or default branch",
+            req.integ
+        )));
+    }
     let integ_ref = format!("refs/heads/{}", req.integ);
     if resolve(repo, &integ_ref).is_none() {
         return Err(op(format!(
@@ -305,7 +312,7 @@ pub fn run(req: &Request) -> Result<Vec<Merged>, MergeError> {
 
 /// A branch no merge lands on: `main`, `master`, the default branch of any
 /// configured remote, or `init.defaultBranch` (the push verb's own rule).
-fn protected_integ(repo: &Path, integ: &str) -> bool {
+pub(crate) fn protected_integ(repo: &Path, integ: &str) -> bool {
     let r = repo.to_string_lossy();
     let remotes: Vec<String> = git(repo, &["remote"])
         .map(|o| stdout(&o).lines().map(String::from).collect())

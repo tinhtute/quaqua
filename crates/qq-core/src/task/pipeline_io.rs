@@ -478,6 +478,39 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
         let id = format!("pipeline:{}", input.task);
         let db = deps.runs_dir.join(crate::db::path::DB_FILE);
         let conn = crate::db::open(&db).map_err(internal)?;
+        // A flow ends in a merge: the caller needs the merge authority, and the
+        // integ branch is never main or the default branch. A refused flow
+        // starts nothing, so its `check` never runs.
+        let denied = |d: authority::Decision| match d {
+            authority::Decision::Refused(r) => Err(RpcError::new(
+                "refused",
+                format!("{} -> {}: {}", r.caller, r.target, r.reason),
+            )),
+            authority::Decision::Allowed => Ok(()),
+        };
+        if let Some(caller) = req.caller.as_deref() {
+            denied(
+                authority::check_orchestration(
+                    &conn,
+                    caller,
+                    authority::Op::Merge,
+                    authority::Fence::Fenced,
+                )
+                .map_err(|e| internal(e.0))?,
+            )?;
+        }
+        if merge::protected_integ(Path::new(&input.repo), &input.integ) {
+            denied(
+                authority::refuse(
+                    &conn,
+                    req.caller.as_deref().unwrap_or("cos"),
+                    "pipeline",
+                    &input.integ,
+                    "integ is the repo's main or default branch",
+                )
+                .map_err(|e| internal(e.0))?,
+            )?;
+        }
         check_kinds(&conn, &input.builder_kind, &input.reviewer_kind)?;
 
         if let Some(w) = ctx.store.workflow(&id).map_err(internal)? {
