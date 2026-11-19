@@ -247,48 +247,104 @@ fn check_sqlite(a: &[String]) -> Verdict {
     Verdict::Allow
 }
 
-/// Every explicit method of `gh api` (`-X M`, `-XM`, `--method M`, `--method=M`,
-/// upper-cased). gh keeps the last one, but a flag value such as `-p -XGET`
-/// looks like a later `-X`, so the gate reads all of them and trusts none.
-fn explicit_methods(a: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for (k, x) in a.iter().enumerate() {
-        let v = if matches!(x.as_str(), "-X" | "--method") {
-            a.get(k + 1).map(String::as_str)
-        } else if let Some(v) = x.strip_prefix("--method=") {
-            Some(v)
-        } else if let Some(v) = x.strip_prefix("-X") {
-            Some(v)
-        } else {
-            None
-        };
-        if let Some(v) = v {
-            out.push(v.to_ascii_uppercase());
-        }
-    }
-    out
+/// What `gh api`'s own flag parser (pflag) sees in the words after `api`.
+struct ApiCall {
+    /// Every real `-X`/`--method` value, upper-cased.
+    methods: Vec<String>,
+    /// A field or `--input` flag is present (gh then defaults to POST).
+    has_fields: bool,
 }
 
-/// The HTTP method `gh api` is given: any explicit non-GET one (the first), else
-/// GET when every explicit one is GET, else `POST` when any field flag is
-/// present (gh's own default), else `GET`.
-fn gh_api_method(a: &[String]) -> String {
-    let m = explicit_methods(a);
-    if let Some(w) = m.iter().find(|x| *x != "GET") {
-        return w.clone();
+impl ApiCall {
+    /// gh's method: the last explicit one, else POST with fields, else GET.
+    fn effective(&self) -> &str {
+        match self.methods.last() {
+            Some(m) => m,
+            None if self.has_fields => "POST",
+            None => "GET",
+        }
     }
-    if !m.is_empty() {
-        return "GET".into();
+
+    /// Fail closed: the effective method or any explicit one is not GET.
+    fn writes(&self) -> bool {
+        self.effective() != "GET" || self.methods.iter().any(|m| m != "GET")
     }
-    let field = a.iter().any(|x| {
-        matches!(
-            x.as_str(),
-            "-f" | "-F" | "--field" | "--raw-field" | "--input"
-        ) || x.starts_with("--field=")
-            || x.starts_with("--raw-field=")
-            || x.starts_with("--input=")
-    });
-    if field { "POST" } else { "GET" }.to_string()
+
+    fn explicit_get(&self) -> bool {
+        !self.methods.is_empty() && self.methods.iter().all(|m| m == "GET")
+    }
+}
+
+/// `gh api` value-taking flags, short and long: they consume the next word
+/// (unless joined: `-Xv`, `-X=v`, `--flag=v`), so a word like `-XGET` after
+/// `-p` or `--jq` is a value, not a method.
+fn takes_value(short: Option<char>, long: &str) -> bool {
+    short.is_some_and(|c| matches!(c, 'p' | 'q' | 't' | 'H' | 'f' | 'F' | 'X'))
+        || matches!(
+            long,
+            "preview"
+                | "jq"
+                | "template"
+                | "header"
+                | "raw-field"
+                | "field"
+                | "input"
+                | "hostname"
+                | "cache"
+                | "method"
+        )
+}
+
+fn parse_gh_api(a: &[String]) -> ApiCall {
+    let mut call = ApiCall {
+        methods: Vec::new(),
+        has_fields: false,
+    };
+    let mut k = a.iter().position(|x| x == "api").map_or(a.len(), |p| p + 1);
+    while k < a.len() {
+        let w = a[k].as_str();
+        k += 1;
+        if w == "--" {
+            break;
+        }
+        // (flag name, joined value) for a flag that takes a value.
+        let mut flag: Option<(String, Option<String>)> = None;
+        if let Some(long) = w.strip_prefix("--") {
+            let (name, joined) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            if takes_value(None, name) {
+                flag = Some((name.to_string(), joined));
+            }
+        } else if let Some(shorts) = w.strip_prefix('-').filter(|x| !x.is_empty()) {
+            // A shorthand group: bool flags, then the first value-taking one.
+            for (i, c) in shorts.char_indices() {
+                if takes_value(Some(c), "") {
+                    let rest = &shorts[i + c.len_utf8()..];
+                    let rest = rest.strip_prefix('=').unwrap_or(rest);
+                    flag = Some((c.to_string(), (!rest.is_empty()).then(|| rest.to_string())));
+                    break;
+                }
+            }
+        }
+        let Some((name, joined)) = flag else {
+            continue;
+        };
+        let value = match joined {
+            Some(v) => Some(v),
+            None => {
+                k += 1;
+                a.get(k - 1).cloned()
+            }
+        };
+        match name.as_str() {
+            "X" | "method" => call.methods.extend(value.map(|v| v.to_ascii_uppercase())),
+            "f" | "F" | "field" | "raw-field" | "input" => call.has_fields = true,
+            _ => {}
+        }
+    }
+    call
 }
 
 /// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation, or a
@@ -303,8 +359,8 @@ fn check_gh(a: &[String]) -> Verdict {
             let path = x.split('?').next().unwrap_or(x).trim_end_matches('/');
             !x.starts_with('-') && (path.ends_with("/merge") || path.ends_with("/merges"))
         });
-        let methods = explicit_methods(a);
-        let explicit_get = !methods.is_empty() && methods.iter().all(|m| m == "GET");
+        let call = parse_gh_api(a);
+        let explicit_get = call.explicit_get();
         if (merge_path && !explicit_get)
             || a.iter()
                 .any(|x| x.contains("mergePullRequest") || x.contains("enablePullRequestAutoMerge"))
@@ -317,7 +373,7 @@ fn check_gh(a: &[String]) -> Verdict {
         let writes_ref = a
             .iter()
             .any(|x| !x.starts_with('-') && (x.contains("/git/refs") || x.contains("/contents/")));
-        if writes_ref && gh_api_method(a) != "GET" {
+        if writes_ref && call.writes() {
             return Verdict::Block(PUSH_MESSAGE);
         }
     }
