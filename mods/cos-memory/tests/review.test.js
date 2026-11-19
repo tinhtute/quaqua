@@ -311,3 +311,31 @@ test('a reply that is not an array is no review at all', async () => {
 
   assert.equal(made.store.review.stops, 10)
 })
+
+test('a fork reply whose final state is over the cap writes nothing', async () => {
+  const made = engine({
+    prompts: 10,
+    stops: 9,
+    files: { [RULES]: 'aaaaaaaaaaaaaaaa\nstale\n' },
+    fork: answered(
+      JSON.stringify([
+        { op: 'add', file: 'memory/rules.md', text: 'x'.repeat(30) },
+        { op: 'remove', file: 'memory/rules.md', text: 'stale' },
+      ]),
+    ),
+  })
+  const run = made.$.process.run
+  made.$.process.run = async (argv, init) => {
+    await run(argv, init)
+    const { content } = JSON.parse(init.stdin).tool_input
+    if ([...content].length <= 20) return allowVerdict
+    return denyVerdict(`${[...content].length} chars > 20 cap`)
+  }
+  const hooks = await wire(made)
+
+  await stops(hooks, made.$, 1)
+  await settle()
+
+  assert.equal(made.files[RULES], 'aaaaaaaaaaaaaaaa\nstale\n')
+  assert.equal(made.calls.writes?.length ?? 0, 0)
+})

@@ -31,6 +31,7 @@ No approval needed: spawn, prompt, cleanup, local commits on a worker branch, me
 - Log worker failures in today's memory as `- [case] <worker> <exit N|reject|kill>: <root cause>`.
 - "Nhớ cái này" goes to `memory/rules.md`; information about the Principal goes to `USER.md`; write before claiming either is saved. Worker rules are briefed to a worker, who writes `rules/`, one topic per file; CoS writes `rules/` only for the cleanup promotion. Do not use Claude auto-memory.
 - Mark temporary rules with `[expires: YYYY-MM-DD]`.
+- Caps (`memory/rules.md` 2200 chars, `USER.md` 1375) are enforced by the memory hook (`crates/qq-core/src/memory/caps.rs:25`); merge or remove old entries to stay within them.
 - Do not store live state available from `herdr agent list` or `git worktree list`, trivia, or session-only details.
 
 ## Roles (SLP)

@@ -1,6 +1,6 @@
 # cos-memory
 
-A local Claude Code mod for the CoS: three capped memory tools, a periodic review
+A local Claude Code mod for the CoS: four capped memory tools, a periodic review
 fork, and correction capture. It decides nothing about memory itself — the
 quaqua engine does, through `quaqua memory hook pre` for the capped files and
 `quaqua memory scan` for one captured correction line.
@@ -13,7 +13,7 @@ mods/
     hooks/hooks.json                   {"modules":["./register.js"]}
     hooks/register.js                  the entry point
     src/memory-gate.js                 the engine gate and the line screen
-    src/tools.js                       memory_add / memory_replace / memory_remove
+    src/tools.js                       memory_add / memory_replace / memory_remove / memory_batch
     src/counter.js                     the review trigger
     src/review.js                      the fork and its operations
     src/corrections.js                 correction capture
