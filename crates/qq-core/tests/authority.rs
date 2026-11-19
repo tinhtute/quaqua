@@ -657,18 +657,63 @@ const TRIPWIRES: &[Tripwire] = &[
     ),
 ];
 
-#[test]
-fn gate_blocks_u3_tripwires() {
-    for (name, blocked, allowed) in TRIPWIRES {
-        for cmd in *blocked {
-            assert_eq!(gate_exit(cmd), 2, "{name}: must block: {cmd}");
-        }
-        for cmd in *allowed {
-            assert_eq!(gate_exit(cmd), 0, "{name}: must allow: {cmd}");
-        }
+fn tripwire(name: &str) -> &'static Tripwire {
+    TRIPWIRES.iter().find(|t| t.0 == name).unwrap()
+}
+
+/// One test per behaviour: the binary verdict, then the shell fallback.
+fn assert_tripwire(name: &str) {
+    let (_, blocked, allowed) = tripwire(name);
+    for cmd in *blocked {
+        assert_eq!(gate_exit(cmd), 2, "{name}: must block: {cmd}");
+        assert_eq!(fallback_exit(cmd), 2, "{name}: fallback must block: {cmd}");
     }
+    for cmd in *allowed {
+        assert_eq!(gate_exit(cmd), 0, "{name}: must allow: {cmd}");
+        assert_eq!(fallback_exit(cmd), 0, "{name}: fallback must allow: {cmd}");
+    }
+}
+
+#[test]
+fn gate_blocks_alias_push() {
+    assert_tripwire("alias push");
+}
+
+#[test]
+fn gate_blocks_gh_api_ref_and_contents_writes() {
+    assert_tripwire("gh api ref and contents writes");
+}
+
+#[test]
+fn gate_blocks_graphql_auto_merge() {
+    assert_tripwire("graphql enablePullRequestAutoMerge");
+}
+
+#[test]
+fn gate_blocks_graphql_query_from_file() {
+    assert_tripwire("graphql query from a file");
+}
+
+#[test]
+fn gate_blocks_herdr_pane_input() {
+    assert_tripwire("herdr pane input");
     // The fallback is a superset and cannot tell `--help`; the binary can.
     assert_eq!(gate_exit("herdr pane send-keys --help"), 0);
+}
+
+#[test]
+fn gate_blocks_grid_role_metadata() {
+    assert_tripwire("grid_role metadata");
+}
+
+#[test]
+fn gate_blocks_qq_db_writes() {
+    assert_tripwire("sqlite3 on qq.db");
+}
+
+#[test]
+fn gate_blocks_main_or_master_delete() {
+    assert_tripwire("delete main or master");
 }
 
 fn fallback_exit(cmd: &str) -> i32 {
@@ -691,16 +736,4 @@ fn fallback_exit(cmd: &str) -> i32 {
         .write_all(json.to_string().as_bytes())
         .unwrap();
     child.wait().unwrap().code().unwrap()
-}
-
-#[test]
-fn gate_fallback_blocks_u3_tripwires_without_the_binary() {
-    for (name, blocked, allowed) in TRIPWIRES {
-        for cmd in *blocked {
-            assert_eq!(fallback_exit(cmd), 2, "{name}: fallback must block: {cmd}");
-        }
-        for cmd in *allowed {
-            assert_eq!(fallback_exit(cmd), 0, "{name}: fallback must allow: {cmd}");
-        }
-    }
 }
