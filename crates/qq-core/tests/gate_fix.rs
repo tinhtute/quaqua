@@ -1704,3 +1704,103 @@ fn gate_fix5_ordinary_git_stays_free() {
         assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
     }
 }
+
+/// Second round (advisor): a flag's value must not shift the key, `+=` is an
+/// assignment, and a program-valued env without a `push` word is still unknown.
+#[test]
+fn gate_fix5_config_write_with_value_flags_stops() {
+    gf5_stops(
+        "gf5-cfgflag",
+        &[
+            "git config --file .git/config core.fsmonitor 'git push origin HEAD:main;:'",
+            "git config -f x core.fsmonitor 'git push origin HEAD:main;:'",
+            "git config -t path core.hooksPath /tmp/h",
+            "git config --file x core.hooksPath /tmp/h",
+            "git config remote.origin.uploadpack /tmp/x",
+            "git config alias.x '!sh /tmp/x'",
+            "git config interactive.diffFilter /tmp/x",
+            "git config init.templateDir /tmp/t",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix5_append_assignments_stop() {
+    gf5_stops(
+        "gf5-append",
+        &[
+            "GIT_EXTERNAL_DIFF+='git push origin HEAD:main;:' git diff",
+            "GIT_CONFIG_COUNT+=1 GIT_CONFIG_KEY_0+=alias.ship GIT_CONFIG_VALUE_0+=push git ship origin main",
+            "GIT_SSH_COMMAND+=/tmp/x git fetch",
+        ],
+    );
+}
+
+#[test]
+fn gate_fix5_program_env_and_exec_path_without_push_word_stop() {
+    gf5_stops(
+        "gf5-prog",
+        &[
+            "GIT_EXTERNAL_DIFF=/tmp/x.sh git diff",
+            "GIT_SSH_COMMAND=/tmp/x git fetch",
+            "GIT_PAGER=/tmp/x git log",
+            "EDITOR=/tmp/x git commit",
+            "GIT_EXEC_PATH=/tmp/x git status",
+            "git --exec-path=/tmp/x status",
+            "git -c core.pager=/tmp/x log",
+        ],
+    );
+}
+
+/// A literal push in a config value or exec option is the same hard deny as a
+/// push, for every role.
+#[test]
+fn gate_fix5_push_payloads_block_every_role() {
+    gf5_blocks_all(
+        "gf5-payload",
+        &[
+            "git -c core.fsmonitor='git push origin HEAD:main;:' status",
+            "git config core.fsmonitor 'git push origin HEAD:main;:'",
+            "git config --file x core.fsmonitor 'git push origin HEAD:main;:'",
+            "GIT_EXTERNAL_DIFF+='git push origin HEAD:main;:' git diff",
+            "git rebase -x 'git push origin HEAD:main' main",
+            "git rebase --exec 'git push origin HEAD:main' main",
+            "git bisect run git push origin HEAD:main",
+            "git submodule foreach 'git push origin HEAD:main'",
+            "git fetch --upload-pack='git push origin HEAD:main' origin",
+            "git ls-remote --upload-pack='git push origin HEAD:main' origin",
+        ],
+    );
+}
+
+fn gf5_blocks_all(tag: &str, cmds: &[&str]) {
+    for who in [Who::Cos, Who::Worker, Who::Down] {
+        let r = rig(&format!("{tag}-{}", who as u8), who);
+        for cmd in cmds {
+            assert!(block(&r.bash(cmd)), "{who:?} must block: {cmd}");
+        }
+    }
+}
+
+#[test]
+fn gate_fix5_ordinary_git_stays_free_round_two() {
+    let r = rig("gf5-free2", Who::Down);
+    for ok in [
+        "git config pull.rebase false",
+        "git config --global init.defaultBranch main",
+        "git config --file .git/config user.email a@b",
+        "git config --get-regexp remote",
+        "git rebase -x 'cargo test' main",
+        "git bisect run cargo test",
+        "git submodule foreach 'ls'",
+        "git fetch --upload-pack=git-upload-pack origin",
+        "GIT_SSH_COMMAND=ssh git fetch",
+        "GIT_EDITOR='code --wait' git commit",
+        "EDITOR=vim git commit",
+        "PAGER=cat git log",
+        "GIT_PAGER=less git log",
+        "git commit -m 'git push notes'",
+    ] {
+        assert_eq!(r.bash(ok), GateVerdict::Allow, "{ok}");
+    }
+}
