@@ -5,8 +5,10 @@
 //! no resolvable kind counts as unfenced (fail closed), and a request with no
 //! caller is refused.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command as Proc;
+use std::process::{Command as Proc, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -103,34 +105,155 @@ pub(crate) fn protected_branch(repo: &str, remote: &str, b: &str) -> bool {
 /// What the remote itself says its default branch is.
 #[derive(Debug, PartialEq)]
 pub(crate) enum RemoteDefault {
-    /// HEAD is a symref to this branch.
-    Branch(String),
-    /// The remote has no refs at all: there is no default branch yet.
+    /// Every push URL's HEAD is a symref; these are the branches (deduplicated).
+    Branches(Vec<String>),
+    /// No push URL has any refs: there is no default branch to read yet. The
+    /// remote's unborn HEAD is invisible to `ls-remote`, so this is unproven.
     Empty,
-    /// The read failed, or the remote has refs but HEAD names no branch.
+    /// Unproven: a read failed or timed out, a push URL is not stable under
+    /// URL rewriting, HEAD names no branch, or the push URLs disagree on
+    /// whether the remote is empty.
     Unknown,
 }
 
-/// Asks the remote (`git ls-remote --symref`) for its default branch.
-pub(crate) fn remote_default(repo: &str, remote: &str) -> RemoteDefault {
-    let Ok(o) = git(repo)
-        .args(["ls-remote", "--symref", "--", remote])
-        .output()
-    else {
-        return RemoteDefault::Unknown;
+/// How long one `ls-remote` may take before the remote counts as unproven.
+const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Runs `cmd` with stdin closed and stderr dropped, killing it after
+/// `limit`. `None` on a spawn failure, a non-zero exit or a timeout.
+pub(crate) fn stdout_within(mut cmd: Proc, limit: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    // Drain on a thread so a long listing cannot fill the pipe and stall git.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
     };
-    if !o.status.success() {
+    let buf = reader.join().ok()?;
+    status.filter(|s| s.success()).map(|_| buf)
+}
+
+/// The URLs `git push <remote>` goes to: `pushurl` entries, else the URL, with
+/// `insteadOf` / `pushInsteadOf` applied. Not the fetch URL.
+fn push_urls(repo: &str, remote: &str) -> Option<Vec<String>> {
+    let out = stdout_within(
+        {
+            let mut c = git(repo);
+            c.args(["remote", "get-url", "--push", "--all", "--", remote]);
+            c
+        },
+        LS_REMOTE_TIMEOUT,
+    )?;
+    let urls: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (!urls.is_empty() && urls.iter().all(|u| !u.is_empty())).then_some(urls)
+}
+
+/// `u` survives git's URL handling unchanged, so `ls-remote -- u` and
+/// `push -- remote` cannot land on different repos: no `insteadOf` rewrites
+/// it again, no `pushInsteadOf` prefix matches it, and it is not a remote name.
+fn url_is_stable(repo: &str, u: &str) -> bool {
+    let clean = git(repo)
+        .args([
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^url\..*\.(insteadof|pushinsteadof)$",
+        ])
+        .output()
+        .is_ok_and(|o| match o.status.code() {
+            // Exit 1: no rewrite rules at all.
+            Some(1) => true,
+            Some(0) => String::from_utf8_lossy(&o.stdout)
+                .split('\0')
+                .filter_map(|e| e.split_once('\n'))
+                .all(|(_, prefix)| !u.starts_with(prefix)),
+            _ => false,
+        });
+    clean
+        && stdout_within(
+            {
+                let mut c = git(repo);
+                c.args(["ls-remote", "--get-url", "--", u]);
+                c
+            },
+            LS_REMOTE_TIMEOUT,
+        )
+        .is_some_and(|b| String::from_utf8_lossy(&b).trim_end_matches('\n') == u)
+}
+
+/// `ls-remote --symref` against one URL.
+fn url_default(repo: &str, url: &str) -> RemoteDefault {
+    if !url_is_stable(repo, url) {
         return RemoteDefault::Unknown;
     }
-    let text = String::from_utf8_lossy(&o.stdout);
+    let Some(out) = stdout_within(
+        {
+            let mut c = git(repo);
+            c.args(["ls-remote", "--symref", "--", url]);
+            c
+        },
+        LS_REMOTE_TIMEOUT,
+    ) else {
+        return RemoteDefault::Unknown;
+    };
+    let text = String::from_utf8_lossy(&out);
     if text.trim().is_empty() {
         return RemoteDefault::Empty;
     }
     text.lines()
         .find_map(|l| l.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD"))
         .map_or(RemoteDefault::Unknown, |b| {
-            RemoteDefault::Branch(b.to_string())
+            RemoteDefault::Branches(vec![b.to_string()])
         })
+}
+
+/// Asks every URL `git push <remote>` will push to (`ls-remote --symref`, not
+/// the fetch URL) for its default branch. Any unproven URL makes the whole
+/// answer [`Unknown`](RemoteDefault::Unknown).
+pub(crate) fn remote_default(repo: &str, remote: &str) -> RemoteDefault {
+    let Some(urls) = push_urls(repo, remote) else {
+        return RemoteDefault::Unknown;
+    };
+    let (mut branches, mut empty) = (Vec::<String>::new(), 0);
+    for u in &urls {
+        match url_default(repo, u) {
+            RemoteDefault::Unknown => return RemoteDefault::Unknown,
+            RemoteDefault::Empty => empty += 1,
+            RemoteDefault::Branches(b) => branches.extend(b),
+        }
+    }
+    match (branches.is_empty(), empty) {
+        (true, _) => RemoteDefault::Empty,
+        (false, 0) => {
+            branches.sort();
+            branches.dedup();
+            RemoteDefault::Branches(branches)
+        }
+        (false, _) => RemoteDefault::Unknown,
+    }
 }
 
 fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
@@ -197,7 +320,7 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
             }
             if protected_branch(repo, remote, branch)
                 || match remote_default(repo, remote) {
-                    RemoteDefault::Branch(d) => same_branch(&d, branch),
+                    RemoteDefault::Branches(d) => d.iter().any(|d| same_branch(d, branch)),
                     RemoteDefault::Empty => false,
                     RemoteDefault::Unknown => true,
                 }
@@ -242,4 +365,27 @@ pub(super) fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<()
         help: "push <repo> <remote> <branch>: git push through the daemon (fenced Lead only)",
         run: push_cli,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_within_kills_a_hang_and_keeps_fast_output() {
+        let mut slow = Proc::new("sleep");
+        slow.arg("30");
+        let t = Instant::now();
+        assert!(stdout_within(slow, Duration::from_millis(200)).is_none());
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "did not kill the hang"
+        );
+        let mut fast = Proc::new("echo");
+        fast.arg("hi");
+        assert_eq!(
+            stdout_within(fast, Duration::from_secs(5)).unwrap(),
+            b"hi\n"
+        );
+    }
 }

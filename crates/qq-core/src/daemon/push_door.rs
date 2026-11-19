@@ -87,20 +87,22 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             "branch is the repo's main or default branch",
         ));
     }
-    // Ask the remote itself: the local remote-HEAD ref is the caller's to
-    // clear. A failed or unreadable answer refuses (fail closed); an empty
-    // remote has no default branch yet.
+    // Ask the remote itself, at every URL `git push <remote>` goes to: the
+    // local remote-HEAD ref is the caller's to clear, and the fetch URL is not
+    // where the push lands. Anything unproven refuses (fail closed): a failed,
+    // timed-out or unstable read, and an empty remote (its unborn HEAD is
+    // invisible, so a first push needs the owner).
     match remote_default(repo, remote) {
-        RemoteDefault::Unknown => {
+        RemoteDefault::Unknown | RemoteDefault::Empty => {
             return Err(refused(
                 ctx,
                 req,
                 remote,
-                "cannot learn the remote's default branch",
+                "cannot prove the remote's default branch",
             ))
         }
-        RemoteDefault::Branch(d)
-            if same_branch(&d, branch)
+        RemoteDefault::Branches(ds)
+            if ds.iter().any(|d| same_branch(d, branch))
                 && tier::decide(true, Action::PushMain, tier::Tier::Low, tier::Tier::Low)
                     != Decision::Allow =>
         {
@@ -111,7 +113,7 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
                 "branch is the repo's main or default branch",
             ));
         }
-        _ => {}
+        RemoteDefault::Branches(_) => {}
     }
     let base = tier::effective_context_tier(&ctx.runs_dir, &repo_dir, true);
     if tier::decide(true, Action::PushNonMain, base, base) != Decision::Allow {

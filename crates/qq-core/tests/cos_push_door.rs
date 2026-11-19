@@ -117,7 +117,7 @@ fn refusals(r: &Rig) -> usize {
 #[test]
 fn cos_push_door_cos_non_main_allow() {
     let r = rig("cpd-allow", Who::Cos);
-    let (work, origin) = repo_with_origin(&r);
+    let (work, origin) = repo_with_trunk_remote(&r);
     let out = push(&r, args(&work, "feat")).unwrap();
     assert_eq!(out["pushed"], true);
     assert!(has_ref(&origin, "feat"));
@@ -294,14 +294,14 @@ fn cos_push_door_unreadable_remote_refused() {
     assert_eq!(e.code, "refused", "{e:?}");
 }
 
-/// An empty bare remote has no refs, so no default branch to protect: a
-/// non-main branch goes through (decision: "no default", not "cannot learn").
+/// An empty bare remote has no readable default branch (an unborn HEAD is
+/// invisible to `ls-remote`), so the first push to it needs the owner.
 #[test]
-fn cos_push_door_empty_remote_has_no_default() {
+fn cos_push_door_empty_remote_refused() {
     let r = rig("cpd-empty", Who::Cos);
     let (work, origin) = repo_with_origin(&r);
-    assert!(push(&r, args(&work, "feat")).is_ok());
-    assert!(has_ref(&origin, "feat"));
+    assert_eq!(push(&r, args(&work, "feat")).unwrap_err().code, "refused");
+    assert!(!has_ref(&origin, "feat"));
 }
 
 /// A bare repo `name` under the rig root with HEAD `head`, optionally holding a
@@ -386,4 +386,76 @@ fn cos_push_door_push_insteadof_refused() {
     let before = rev(&origin, "refs/heads/trunk");
     assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
     assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+/// Several push URLs: every one must be proven, and any default refuses.
+#[test]
+fn cos_push_door_multiple_pushurls_each_checked() {
+    let r = rig("cpd-multi", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let other = decoy_bare(&r, &work, "other.git", "decoy", true);
+    git(
+        &work,
+        &["config", "remote.origin.pushurl", other.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            origin.to_str().unwrap(),
+        ],
+    );
+    let before = rev(&origin, "refs/heads/trunk");
+    assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+    // An unreadable second push URL refuses even a harmless branch.
+    let gone = r.ws.root().join("gone.git");
+    git(
+        &work,
+        &[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            gone.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(push(&r, args(&work, "feat")).unwrap_err().code, "refused");
+    assert!(!has_ref(&origin, "feat"));
+}
+
+/// A URL that git rewrites again (chained `insteadOf`) is unproven: the URL
+/// checked would not be the one pushed to.
+#[test]
+fn cos_push_door_chained_insteadof_refused() {
+    let r = rig("cpd-chain", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let decoy = decoy_bare(&r, &work, "decoy.git", "decoy", true);
+    git(
+        &work,
+        &["config", "remote.origin.pushurl", decoy.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &[
+            "config",
+            &format!("url.{}.pushInsteadOf", origin.display()),
+            decoy.to_str().unwrap(),
+        ],
+    );
+    let before = rev(&origin, "refs/heads/trunk");
+    assert_eq!(push(&r, args(&work, "trunk")).unwrap_err().code, "refused");
+    assert_eq!(rev(&origin, "refs/heads/trunk"), before, "trunk moved");
+}
+
+/// A URL in the `remote` slot is not a configured remote name.
+#[test]
+fn cos_push_door_url_as_remote_refused() {
+    let r = rig("cpd-urlremote", Who::Cos);
+    let (work, origin) = repo_with_trunk_remote(&r);
+    let mut a = args(&work, "feat");
+    a["remote"] = json!(origin.to_str().unwrap());
+    assert_eq!(push(&r, a).unwrap_err().code, "refused");
+    assert!(!has_ref(&origin, "feat"));
 }
