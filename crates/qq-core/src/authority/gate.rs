@@ -247,10 +247,11 @@ fn check_sqlite(a: &[String]) -> Verdict {
     Verdict::Allow
 }
 
-/// The explicit method of `gh api` (`-X M`, `-XM`, `--method M`, `--method=M`,
-/// upper-cased). gh keeps the LAST one (pflag), so the last one wins here too.
-fn last_method(a: &[String]) -> Option<String> {
-    let mut method = None;
+/// Every explicit method of `gh api` (`-X M`, `-XM`, `--method M`, `--method=M`,
+/// upper-cased). gh keeps the last one, but a flag value such as `-p -XGET`
+/// looks like a later `-X`, so the gate reads all of them and trusts none.
+fn explicit_methods(a: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
     for (k, x) in a.iter().enumerate() {
         let v = if matches!(x.as_str(), "-X" | "--method") {
             a.get(k + 1).map(String::as_str)
@@ -262,17 +263,22 @@ fn last_method(a: &[String]) -> Option<String> {
             None
         };
         if let Some(v) = v {
-            method = Some(v.to_ascii_uppercase());
+            out.push(v.to_ascii_uppercase());
         }
     }
-    method
+    out
 }
 
-/// The HTTP method `gh api` is given: the explicit one, else `POST` when any
-/// field flag is present (gh's own default), else `GET`.
+/// The HTTP method `gh api` is given: any explicit non-GET one (the first), else
+/// GET when every explicit one is GET, else `POST` when any field flag is
+/// present (gh's own default), else `GET`.
 fn gh_api_method(a: &[String]) -> String {
-    if let Some(m) = last_method(a) {
-        return m;
+    let m = explicit_methods(a);
+    if let Some(w) = m.iter().find(|x| *x != "GET") {
+        return w.clone();
+    }
+    if !m.is_empty() {
+        return "GET".into();
     }
     let field = a.iter().any(|x| {
         matches!(
@@ -297,7 +303,8 @@ fn check_gh(a: &[String]) -> Verdict {
             let path = x.split('?').next().unwrap_or(x).trim_end_matches('/');
             !x.starts_with('-') && (path.ends_with("/merge") || path.ends_with("/merges"))
         });
-        let explicit_get = last_method(a).is_some_and(|m| m == "GET");
+        let methods = explicit_methods(a);
+        let explicit_get = !methods.is_empty() && methods.iter().all(|m| m == "GET");
         if (merge_path && !explicit_get)
             || a.iter()
                 .any(|x| x.contains("mergePullRequest") || x.contains("enablePullRequestAutoMerge"))
