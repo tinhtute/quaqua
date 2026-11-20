@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub(super) const PRE_COMMIT_TEMPLATE: &str = r#"#!/usr/bin/env bash
-# pre-commit — rules/_all/portable-paths.md: reject a commit whose ADDED lines
+# pre-commit — portable-paths gate: reject a commit whose ADDED lines
 # carry a machine-specific absolute path (/home/<name>/…, /Users/<name>/…).
 # The repo syncs across machines, so committed scripts, docs, settings and run
 # reports must use repo-relative paths, ~/, $HOME or $(dirname "$0").
@@ -19,9 +19,8 @@ pub(super) const PRE_COMMIT_TEMPLATE: &str = r#"#!/usr/bin/env bash
 # its content, so a moved file is re-checked under its new name; a pure rename
 # adds nothing and passes. Binary diffs carry no lines and pass.
 #
-# Allowlist: rules/_all/portable-paths.md (it names the pattern) and tests/**
-# (fixtures must spell real machine paths). Excluded via pathspec, so the
-# allowlist is exact — "tests-helper.sh" is still checked.
+# Allowlist: tests/** (fixtures must spell real machine paths). Excluded via
+# pathspec, so the allowlist is exact — "tests-helper.sh" is still checked.
 #
 # Heuristic guardrail, like scripts/hooks/herdr-gate.sh: not a security
 # boundary. Known holes — a user component outside [A-Za-z0-9._-], a path that
@@ -41,8 +40,7 @@ path_re='/(home|Users)/[A-Za-z0-9._-]+'
 
 diff=$(git -c core.quotePath=false diff --cached -U0 --no-prefix --no-ext-diff \
          --no-textconv --diff-filter=ACMR -- . \
-         ':(exclude,literal)tests' \
-         ':(exclude,literal)rules/_all/portable-paths.md' || true)
+         ':(exclude,literal)tests' || true)
 [[ -n $diff ]] || exit 0
 
 bad=0
@@ -69,7 +67,7 @@ done <<<"$diff"
 {
   echo "pre-commit: machine-specific absolute path in the added lines above."
   echo "Use a repo-relative path, ~/, \$HOME or \$(dirname \"\$0\") instead"
-  echo "— rules/_all/portable-paths.md"
+  echo "— quaqua portable-paths pre-commit gate"
 } >&2
 exit 1
 "#;

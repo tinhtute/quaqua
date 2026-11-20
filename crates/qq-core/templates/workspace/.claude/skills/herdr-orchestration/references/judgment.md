@@ -1,6 +1,6 @@
 # Assignment and acceptance judgment
 
-For an independent bounded Peer, open with `Read PEER.md in the workspace root first.` and name task ID, real repo/cwd, disposition (Engineer/Architect/Reviewer/Scout), owned/excluded paths, authority (local commit, never push/deploy/external calls), verification commands/resource ownership, and report path. Use the five Goal / Hard constraints / Current design / Unknowns / Evidence sections from `rules/_all/brief.md`.
+For an independent bounded Peer, name task ID, real repo/cwd, disposition (Engineer/Architect/Reviewer/Scout), owned/excluded paths, authority (local commit, never push/deploy/external calls), verification commands/resource ownership, and report path. Use the five Goal / Hard constraints / Current design / Unknowns / Evidence sections from `rules/_all/brief.md`.
 
 ## Optional extra review and blind design lanes
 

@@ -45,7 +45,6 @@ Rules:
 |---|---|
 | `templates/workspace/AGENTS.md` | Workspace entrypoint: SLP roles, memory policy, worker protocol (the root `AGENTS.md` is an engine contributor stub) |
 | `templates/workspace/identity.md` | CoS persona and voice (injected at session start) |
-| `templates/workspace/PEER.md` | Worker contract: boundaries, contract-before-test, git commit gates, handback |
 | `templates/workspace/rules/_all/` | Worker rules a brief or skill names (brief shape, fanout grid, timebox); they are not injected |
 | `.claude/settings.json` | Engine worktree gate: denies the built-in `Agent` tool and routes Bash through the template hook; `templates/workspace/.claude/settings.json` is the workspace copy |
 | `templates/workspace/.claude/skills/herdr-orchestration/` | Worker flow + consolidated command, recovery, and assignment/acceptance references |

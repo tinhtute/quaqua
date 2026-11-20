@@ -20,4 +20,4 @@ Worker names: `<kind>-<task>`, ASCII `[a-z0-9-]`, at most 20 characters, never e
 ## References
 - Read `references/operations.md` before manual pane/tab commands, layout recovery, plugin operations, or launcher/environment advice.
 - Read `references/recovery.md` on watchdog exits 2–5, blocked/timeout/stalled/not-ready/unknown state, before any input.
-- Read `references/judgment.md` for the Peer brief opener, when an extra Reviewer is worth it, blind design lanes, and the acceptance checklist. Independent bounded-task handbacks use the one report contract in `rules/_all/brief.md` (`## Report format`); `PEER.md` holds the commit gates around it.
+- Read `references/judgment.md` for the Peer brief opener, when an extra Reviewer is worth it, blind design lanes, and the acceptance checklist. Independent bounded-task handbacks use the one report contract in `rules/_all/brief.md` (`## Report format`).
