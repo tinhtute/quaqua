@@ -155,11 +155,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/principles/attack-the-premise.md"),
     ),
     (
-        "principles/boundary-discipline.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/boundary-discipline.md"),
-    ),
-    (
         "principles/build-the-lever.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/build-the-lever.md"),
@@ -173,11 +168,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "principles/exhaust-the-design-space.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/exhaust-the-design-space.md"),
-    ),
-    (
-        "principles/experience-first.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/experience-first.md"),
     ),
     (
         "principles/explain-the-number.md",
@@ -232,11 +222,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/principles/never-block-on-the-human.md"),
     ),
     (
-        "principles/outcome-oriented-execution.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/outcome-oriented-execution.md"),
-    ),
-    (
         "principles/prove-it-works.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/prove-it-works.md"),
@@ -267,11 +252,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "principles/test-behavior-not-implementation.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/test-behavior-not-implementation.md"),
-    ),
-    (
-        "principles/type-system-discipline.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/type-system-discipline.md"),
     ),
     (
         "rules/_all/brief.md",
