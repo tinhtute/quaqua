@@ -40,6 +40,11 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/AGENTS.md"),
     ),
     (
+        ".claude/rules/brief.md",
+        0o644,
+        include_bytes!("../../templates/workspace/.claude/rules/brief.md"),
+    ),
+    (
         "identity.md",
         0o644,
         include_bytes!("../../templates/workspace/identity.md"),
@@ -205,31 +210,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "principles/sequence-verifiable-units.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/sequence-verifiable-units.md"),
-    ),
-    (
-        "rules/_all/brief.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/brief.md"),
-    ),
-    (
-        "rules/_all/fanout-agent-grid.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/fanout-agent-grid.md"),
-    ),
-    (
-        "rules/_all/lead-gate.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/lead-gate.md"),
-    ),
-    (
-        "rules/_all/no-gui-driving.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/no-gui-driving.md"),
-    ),
-    (
-        "rules/_all/worker-timebox.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/worker-timebox.md"),
     ),
     (
         "scripts/hooks/cos-inbox.sh",
