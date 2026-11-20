@@ -50,7 +50,7 @@ Rules:
 | `.claude/settings.json` | Engine worktree gate: denies the built-in `Agent` tool and routes Bash through the template hook; `templates/workspace/.claude/settings.json` is the workspace copy |
 | `templates/workspace/.claude/skills/herdr-orchestration/` | Worker flow + consolidated command, recovery, and assignment/acceptance references |
 | `quaqua auditor run` | Auditor: read-only drift + pipeline-run audit → `reports/audit-*.md` |
-| `quaqua init`, `templates/workspace/`, seeds embedded from `src/init/seeds.rs` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
+| `quaqua init`, `templates/workspace/`, seeds embedded from `crates/qq-core/src/init/seeds.rs` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
 | `quaqua memory check`, `quaqua memory hook pre\|batch` | CoS memory gate: caps `memory/rules.md` at 2200 and `USER.md` at 1375 Unicode chars, scans both for secrets; `quaqua init` installs the `PreToolUse` (`Write\|Edit\|MultiEdit`) deny and the `PostToolBatch` flag |
 | `tests/` | `hermetic.sh` (strace guard against live-DB opens), `e2e/`, `manual/`; the Rust suite lives in `crates/qq-core/tests/` |
 | `SETUP-PROMPT.md` | Original prompt used to bootstrap this setup |
@@ -74,7 +74,7 @@ is safe to re-run after a pull. The one exception is `.claude/settings.json`,
 which it merges into: the two CoS memory hooks are added only when absent and
 every other hook in the file is left alone. Then edit `USER.md` for the workspace, add one
 row per project to `projects/INDEX.md` (copy `projects/_template.md` for the
-card). The seeds are embedded in the binary (`src/init/seeds.rs`).
+card). The seeds are embedded in the binary (`crates/qq-core/src/init/seeds.rs`).
 
 The installed hooks enforce AGENTS.md '## Memory'. A `Write`/`Edit`/`MultiEdit`
 that would push `memory/rules.md` past 2200 chars or `USER.md` past 1375, or

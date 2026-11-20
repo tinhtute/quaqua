@@ -68,7 +68,7 @@ model = "sonnet-5.5"
 effort = "medium"
 fallback = "suhuynh"
 can_review = true
-use_for = "default: every task unless a tier is named; hard multi-file impl, audits (on request)"
+use_for = "default: every task unless a tier is named; hard multi-file impl, audits (on request), read-only questions"
 
 [kinds.ni]
 harness = "claude"
@@ -92,7 +92,7 @@ model = "opus-5.5"
 effort = "high"
 can_review = true
 spawn = "auto" # "approve" requires Principal approval.
-use_for = "design, architecture, hard trade-offs"
+use_for = "design unclear (before any builder), architecture, hard trade-offs, escalation after a cheaper tier failed a run"
 avoid = "anything a cheaper tier can do"
 
 [merge]

@@ -13,7 +13,7 @@ You own the plan, not the code. The plan is the deliverable; the coordinator aud
 4. Copy the skeleton below into `docs/plans/active/{slug}.md` (or the named path) and fill every placeholder, keeping every heading in order. One section per unit; one unit is one change with its own evidence (principle-sequence-verifiable-units).
 5. Write short declarative sentences. The body is a how-to checklist; appendices explain. Each heading states the task or the finding.
 6. Every box needs concrete evidence and explicit dependencies (principle-encode-lessons-in-structure).
-7. Verification rule, opening every verification block: Tests alone are not sufficient verification. A unit is verified only when its unit, live, and perf boxes are all checked. The live block drives the real surface (CLI/TUI/API/Web). The perf gate is dual-sided: base and head both produce the named metric. If base lacks the feature, gate the behavior the diff adds and the end state the user waits for, with an absolute budget, instead of a ratio.
+7. Verification rule, stated in "How to read this" and opening each unit's verify block (the live and perf blocks do not repeat it): Tests alone are not sufficient verification. A unit is verified only when its unit, live, and perf boxes are all checked. The live block drives the real surface (CLI/TUI/API/Web). The perf gate is dual-sided: base and head both produce the named metric. If base lacks the feature, gate the behavior the diff adds and the end state the user waits for, with an absolute budget, instead of a ratio.
 8. Hand back the plan path and a summary, then stop. Execution starts on explicit confirmation under the coordinator or project Lead (`<slug>-lead`).
 
 ```markdown
@@ -35,7 +35,7 @@ One box is one unit of work and names its evidence. Check a box only when the ev
 
 ### Spawn owners
 - [ ] Spawn one worker per unit via `quaqua worker spawn <name> <kind> <repo>` per `quaqua roster`.
-- [ ] Follow the dependency graph: <Unit 1> and <Unit 2> are independent and first; <Unit 3> after <Unit 1>.
+- [ ] Follow the dependency graph: <Unit 1> and <Unit 2> are independent and first; <Unit 3> after <Unit 1>. Start dependent work only after its parent is verified and merged.
 - [ ] Hold the file boundaries (<Unit> touches only `<glob>`) and the review gate for critical interfaces.
 
 ### Every unit
