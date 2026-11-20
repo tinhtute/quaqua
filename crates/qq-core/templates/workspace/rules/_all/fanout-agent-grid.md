@@ -1,11 +1,3 @@
-<!-- audience: orchestrator -->
-# Fanout agent grid — MANDATORY
-
-Every spawn/fanout of task workers MUST end with the workers arranged in the agent grid before any `herdr agent prompt`:
-- `quaqua worker spawn` / `quaqua worker cleanup` run the grid themselves; run `quaqua grid reconcile --tab <repo>-workers` by hand only to repair a layout.
-- The harness decides placement, not the agent: the grid only moves the caller's own workers, grouped by project.
-- An orchestrator with exactly 1 worker in total → split beside it. Otherwise each project gets its own `<repo>-workers` tab (e.g. `monotinhtute-workers`) in a grid (1 = full, 2 = left|right, 3 = left full + right stacked `A │ B/C`, 4 = 2x2 `A B / D C`; 5–8 overflow into `<repo>-workers-2` with the same layout, max 4 per tab); a Lead's workers default to `<slug>-workers`; the orchestrator tab keeps only the orchestrator.
-- The shape is built one split at a time, and cleanup restores it: 2 = split the first right, 3 = split the second down, 4 = split the first down. 4→3 keeps the target when a left-column pane left and re-places the column when a right-column pane left; 3→2 is already the target unless the first worker left, then the last pane moves right of the second. Tabs stay compact: fill `<repo>-workers` first, pulling the next pane out of the last tab (herdr closes a tab whose last pane left).
-- Each SLP team gets its own herdr workspace `<slug>` (`quaqua lead spawn <slug>`): the Lead and its Peers' tabs live there; the CoS (the one Supervisor) stays in its own workspace and reaches Leads by agent name. `quaqua lead cleanup <slug>` closes it when the project is done.
+# Fanout agent grid
 - One project per workers tab; never mix projects or owners, or put 2+ workers in the CoS tab.
 - Label each pane with the worker name. Moving or swapping a pane while its agent runs is allowed — the move keeps the pane, its terminal, the agent process and its session, and a tool call started before the move still completes (issue #192). The grid still defers a `working` pane (`[grid] deferred_statuses = ["working"]`), so the allowance is a herdr capability, not a licence for the repair to move a busy pane; still avoid moving panes during `--wait`.
