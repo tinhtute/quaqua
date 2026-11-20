@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PreToolUse gate (rules/_all/fanout-agent-grid.md + AGENTS.md rule 3). Binary
+# PreToolUse gate (rules/_all/fanout-agent-grid.md + AGENTS.md '## Coordinator Rules'). Binary
 # resolution: $QUAQUA_BIN, else `quaqua` on PATH; the binary owns the real
 # tokenizer + policy (`quaqua gate`).
 #
@@ -122,7 +122,7 @@ esac
 
 if [[ -n $hit ]]; then
   echo "quaqua gate: '$bin' $why — fallback match on $hit (fail-closed)" >&2
-  echo "blocked: '$bin' $why and '$hit' cannot be cleared by the fallback — install or rebuild quaqua or set QUAQUA_BIN, then retry — rules/_all/fanout-agent-grid.md, AGENTS.md rule 3" >&2
+  echo "blocked: '$bin' $why and '$hit' cannot be cleared by the fallback — install or rebuild quaqua or set QUAQUA_BIN, then retry — rules/_all/fanout-agent-grid.md, AGENTS.md '## Coordinator Rules'" >&2
   exit 2
 fi
 
