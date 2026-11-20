@@ -1,6 +1,6 @@
 # Worker briefs
 
-Run `quaqua worker prompt --check-brief "<brief>"` before sending; it names every missing or malformed line. Header lines start at column 1, in this order:
+Run `quaqua worker prompt --check-brief "<brief>"` before sending; it stops at the first error and names it. Header lines start at column 1, in this order:
 
 ```
 Topology: <solo|lead — why>

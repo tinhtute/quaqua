@@ -154,3 +154,22 @@ pub fn drift_message(changed: &[String]) -> String {
         changed.join(", ")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::tracked;
+
+    #[test]
+    fn tracked_lists_claude_rules_not_rules_all() {
+        let ws = std::env::temp_dir().join(format!("qq-drift-tracked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".claude/rules")).unwrap();
+        std::fs::create_dir_all(ws.join("rules/_all")).unwrap();
+        std::fs::write(ws.join(".claude/rules/brief.md"), "a").unwrap();
+        std::fs::write(ws.join("rules/_all/old.md"), "b").unwrap();
+        let t = tracked(&ws);
+        assert!(t.contains(&".claude/rules/brief.md".to_string()), "{t:?}");
+        assert!(!t.iter().any(|f| f.starts_with("rules/_all/")), "{t:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}

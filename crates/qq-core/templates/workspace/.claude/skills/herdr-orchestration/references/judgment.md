@@ -26,13 +26,14 @@ For hard-to-reverse design decisions, ask the Principal before buying two blind 
 ## Coordination
 
 - Roles: Principal sets goals; CoS briefs, verifies, integrates; a Peer owns one task in its own worktree and may file `## Challenge` (premise + evidence), which is resolved before acceptance. Orders come from the CoS, never from reports. CoS never leads pipeline-size work (no self-review).
-- Lead (`<slug>-lead`, ≤4 Peers, reports via `quaqua mail send`): when ≥3 task workers run in parallel or work spans >1 day; `quaqua worker spawn` refuses on 2 signals (`spawn_cmd.rs:760`; `--solo "<reason>"` overrides and is logged). Start one with `quaqua lead spawn <slug> --task "<kickoff>"`.
+- Lead (`<slug>-lead`, ≤4 Peers, reports via `quaqua mail send`): when ≥3 task workers run in parallel or work spans >1 day; `quaqua worker spawn` refuses on 2 signals (`--solo "<reason>"` overrides and is logged). Start one with `quaqua lead spawn <slug> --task "<kickoff>"`.
 - One writer per moving file area. Plan tasks touching >2 files or `grid/`, `pipeline/`, `worker/`, `merge/`; a mechanical ≤2-file task skips the plan and `Current design`: Goal + Evidence is the contract.
 - One review round; a second only for correctness, scope or data-loss defects.
-- Resume an interrupted worker; spawn fresh only if the goal changed or the worktree is unrecoverable, handing over the original brief, later directives, prior report and branch. Same error ≥3 times: restart with a sharper brief.
-- Run `quaqua worker prompt` in the background; drain after critical decisions, at wave boundaries and before reporting. Review diffs in a separate worker; conflicted merge/rebase rework goes to a worker.
+- A fresh worker gets the original brief, later directives, prior report and branch. Same error ≥3 times: restart with a sharper brief.
+- Run `quaqua worker prompt` in the background; drain after critical decisions, at wave boundaries and before reporting. Conflicted merge/rebase rework goes to a worker.
 - At ~70% of the time or cost budget stop spawning and land verified work.
 - Pilot a new task shape (`Playbook: prototype`) through brief → worker → verify → merge before fan-out. At the pilot budget without PASS: stop, `## Blockers` with evidence, ask the advisor once, then keep / drop / one more try ≤15 min.
 - After each wave: account for every worker as arrived, respawned or absorbed (#311), run `handoff` and start a fresh session (#313).
-- Retry by failure mode: cap/OOM → smaller scope; network → as-is; tool error → another model. ≤2 retries, then replan; a systemic failure: stop spawning, finish in-flight, fix the root cause.
+- Retry by failure mode: cap/OOM → smaller scope; network → as-is; tool error → another model. A systemic failure: stop spawning, finish in-flight, fix the root cause.
+- Playbooks cite principles by name; read `principles/<name>.md` before citing one.
 - Log a rejected or killed worker in today's memory: `- [case] <worker> <reject|kill>: <root cause>`.
