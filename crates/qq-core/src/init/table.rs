@@ -4,6 +4,11 @@
 
 pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
     (
+        ".claude/rules/brief.md",
+        0o644,
+        include_bytes!("../../templates/workspace/.claude/rules/brief.md"),
+    ),
+    (
         ".claude/settings.json",
         0o644,
         include_bytes!("../../templates/workspace/.claude/settings.json"),
@@ -35,19 +40,14 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         ),
     ),
     (
-        "AGENTS.md",
-        0o644,
-        include_bytes!("../../templates/workspace/AGENTS.md"),
-    ),
-    (
         ".mcp.json",
         0o644,
         include_bytes!("../../templates/workspace/.mcp.json"),
     ),
     (
-        ".claude/rules/brief.md",
+        "AGENTS.md",
         0o644,
-        include_bytes!("../../templates/workspace/.claude/rules/brief.md"),
+        include_bytes!("../../templates/workspace/AGENTS.md"),
     ),
     (
         "identity.md",

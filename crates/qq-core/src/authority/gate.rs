@@ -2522,19 +2522,19 @@ mod drift_tests {
     fn a_dispatch_from_a_drifted_session_is_warned_and_still_allowed() {
         let ws = std::env::temp_dir().join(format!("qq-gate-drift-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
-        std::fs::create_dir_all(ws.join("rules/_all")).unwrap();
+        std::fs::create_dir_all(ws.join(".claude/rules")).unwrap();
         std::fs::write(ws.join("AGENTS.md"), "v1").unwrap();
         crate::memory::record_session(&ws, "s1", "startup");
         let hook = |c: &str| {
             serde_json::json!({"session_id": "s1", "tool_input": {"command": c}}).to_string()
         };
-        std::fs::write(ws.join("rules/_all/new.md"), "rule").unwrap();
+        std::fs::write(ws.join(".claude/rules/new.md"), "rule").unwrap();
         assert!(
             drift_warning(&ws, &hook("quaqua status")).is_none(),
             "not a dispatch"
         );
         let msg = drift_warning(&ws, &hook("cd x && quaqua worker spawn a b c")).unwrap();
-        assert!(msg.contains("rules/_all/new.md"), "{msg}");
+        assert!(msg.contains(".claude/rules/new.md"), "{msg}");
         assert!(
             drift_warning(&ws, &hook("quaqua lead prompt a")).is_none(),
             "warned once"
