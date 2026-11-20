@@ -8,10 +8,11 @@ pub(super) const SEEDS: &[(&str, &str)] = &[
         r#"# CoS rules (always loaded)
 
 Durable lessons from anh iu. One rule per bullet: rule — why (date).
-Pane layout, herdr mechanics and the watchdog live in `rules/_all/`.
+Pane layout, herdr mechanics and the watchdog live in the `herdr-orchestration` skill.
 
-<!-- Add rules here. Cap: 2200 chars (AGENTS.md '## Memory'). Over cap, merge
-     or drop the oldest entry first — never raise the cap. -->
+<!-- Add rules here. Cap: 2200 chars. Over cap, merge
+     or drop the oldest entry first — never raise the cap.
+     A temporary rule ends with `[expires: YYYY-MM-DD]`. -->
 
 - Advisor workers (suhuynh) only advise, never edit code; their findings go to a build worker (2026-09-30).
 - Clean up each worker (pane + worktree) right after its run is verified and its tests pass; keep the branch — branch delete/push/merge need approval (2026-10-05).

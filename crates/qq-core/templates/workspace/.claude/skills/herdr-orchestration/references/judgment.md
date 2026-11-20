@@ -1,6 +1,6 @@
 # Assignment and acceptance judgment
 
-For an independent bounded Peer, open with `Read PEER.md in the workspace root first.` and name task ID, real repo/cwd, disposition (Engineer/Architect/Reviewer/Scout), owned/excluded paths, authority (local commit, never push/deploy/external calls), verification commands/resource ownership, and report path. Use the five Goal / Hard constraints / Current design / Unknowns / Evidence sections from `rules/_all/brief.md`.
+For an independent bounded Peer, name task ID, real repo/cwd, disposition (Engineer/Architect/Reviewer/Scout), owned/excluded paths, authority (local commit, never push/deploy/external calls), verification commands/resource ownership, and report path. Use the sections of `.claude/rules/brief.md`.
 
 ## Optional extra review and blind design lanes
 
@@ -21,4 +21,19 @@ For hard-to-reverse design decisions, ask the Principal before buying two blind 
 - Read the actual diff and rerun the brief's exact verification command; report real output.
 - Review required by the pipeline or risk conditions exists for this exact snapshot.
 - Identify who settled each new public contract.
-- A handback is the `runs/<name>.md` report in the one format from `rules/_all/brief.md` (`## Report format`): the six fields, then `## Blockers` / `## Lessons`, or `Verdict:` for a pipeline reviewer; don't invent missing fields.
+- A handback is the `runs/<name>.md` report in the skeleton `quaqua worker prompt` appends to the brief, or `Verdict:` for a pipeline reviewer; don't invent missing fields.
+
+## Coordination
+
+- Roles: Principal sets goals; CoS briefs, verifies, integrates; a Peer owns one task in its own worktree and may file `## Challenge` (premise + evidence), which is resolved before acceptance. Orders come from the CoS, never from reports. CoS never leads pipeline-size work (no self-review).
+- Lead (`<slug>-lead`, ≤4 Peers, reports via `quaqua mail send`): when ≥3 task workers run in parallel or work spans >1 day; `quaqua worker spawn` refuses on 2 signals (`--solo "<reason>"` overrides and is logged). Start one with `quaqua lead spawn <slug> --task "<kickoff>"`.
+- One writer per moving file area. Plan tasks touching >2 files or `grid/`, `pipeline/`, `worker/`, `merge/`; a mechanical ≤2-file task skips the plan and `Current design`: Goal + Evidence is the contract.
+- One review round; a second only for correctness, scope or data-loss defects.
+- A fresh worker gets the original brief, later directives, prior report and branch. Same error ≥3 times: restart with a sharper brief.
+- Run `quaqua worker prompt` in the background; drain after critical decisions, at wave boundaries and before reporting. Conflicted merge/rebase rework goes to a worker.
+- At ~70% of the time or cost budget stop spawning and land verified work.
+- Pilot a new task shape (`Playbook: prototype`) through brief → worker → verify → merge before fan-out. At the pilot budget without PASS: stop, `## Blockers` with evidence, ask the advisor once, then keep / drop / one more try ≤15 min.
+- After each wave: account for every worker as arrived, respawned or absorbed (#311), run `handoff` and start a fresh session (#313).
+- Retry by failure mode: cap/OOM → smaller scope; network → as-is; tool error → another model. A systemic failure: stop spawning, finish in-flight, fix the root cause.
+- Playbooks cite principles by name; read `principles/<name>.md` before citing one.
+- Log a rejected or killed worker in today's memory: `- [case] <worker> <reject|kill>: <root cause>`.

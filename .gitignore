@@ -17,6 +17,5 @@ target/
 
 # per-workspace project content — never ships in the boilerplate
 rules/*/
-!rules/_all/
 docs/plans/
 spec-raw/

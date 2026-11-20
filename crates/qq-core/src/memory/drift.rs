@@ -11,19 +11,19 @@ use std::path::{Path, PathBuf};
 const REREAD: &[&str] = &["AGENTS.md", "memory/rules.md", "projects/INDEX.md"];
 
 /// Tracked rule files under `root`, as sorted relative paths: team.toml,
-/// AGENTS.md and every `rules/_all/*.md`. Missing files are left out.
+/// AGENTS.md and every `.claude/rules/*.md`. Missing files are left out.
 pub fn tracked(root: &Path) -> Vec<String> {
     let mut out: Vec<String> = ["team.toml", "AGENTS.md"]
         .iter()
         .filter(|f| root.join(f).is_file())
         .map(|f| f.to_string())
         .collect();
-    if let Ok(rd) = std::fs::read_dir(root.join("rules/_all")) {
+    if let Ok(rd) = std::fs::read_dir(root.join(".claude/rules")) {
         let mut rules: Vec<String> = rd
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.ends_with(".md"))
-            .map(|n| format!("rules/_all/{n}"))
+            .map(|n| format!(".claude/rules/{n}"))
             .collect();
         rules.sort();
         out.extend(rules);
@@ -153,4 +153,23 @@ pub fn drift_message(changed: &[String]) -> String {
         "Rule files changed since this session started: {}. Re-read them before this spawn/prompt; your loaded rules may be stale (issue #72).",
         changed.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tracked;
+
+    #[test]
+    fn tracked_lists_claude_rules_not_rules_all() {
+        let ws = std::env::temp_dir().join(format!("qq-drift-tracked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".claude/rules")).unwrap();
+        std::fs::create_dir_all(ws.join("rules/_all")).unwrap();
+        std::fs::write(ws.join(".claude/rules/brief.md"), "a").unwrap();
+        std::fs::write(ws.join("rules/_all/old.md"), "b").unwrap();
+        let t = tracked(&ws);
+        assert!(t.contains(&".claude/rules/brief.md".to_string()), "{t:?}");
+        assert!(!t.iter().any(|f| f.starts_with("rules/_all/")), "{t:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

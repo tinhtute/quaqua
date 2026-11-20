@@ -1,7 +1,7 @@
 # AGENTS.md — quaqua engine
 
 This repository is the **engine** (`crates/qq-core`), not a workspace. Worker spawn
-lives in `crates/qq-core/src/task/spawn.rs`; worker rules ship in `crates/qq-core/templates/workspace/rules/_all/`.
+lives in `crates/qq-core/src/task/spawn.rs`; the worker brief rule ships in `crates/qq-core/templates/workspace/.claude/rules/brief.md`.
 
 - The CoS document for the consuming workspace is `templates/workspace/AGENTS.md`.
 - Managed workspace files live under `templates/workspace/`; seed-once files come from `crates/qq-core/src/init/seeds.rs`.

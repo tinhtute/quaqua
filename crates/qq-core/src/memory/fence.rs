@@ -1,5 +1,5 @@
 //! The CoS code fence: "CoS never edits code or config" (AGENTS.md
-//! '## Coordinator Rules') as a `PreToolUse` check.
+//! '## Work') as a `PreToolUse` check.
 //!
 //! The hook learns its caller from its own input only: the CoS session runs in
 //! the workspace root (`projects/INDEX.md` beside `cwd`, never a worker
@@ -28,7 +28,7 @@ use crate::identity::is_eligible_workspace;
 
 const FENCED_DIRS: &[&str] = &["crates", "tests", ".github"];
 const REASON: &str =
-    "CoS never edits code or config (AGENTS.md '## Coordinator Rules'): assign it to a worker";
+    "CoS never edits code or config (AGENTS.md '## Work'): assign it to a worker";
 
 const MEMORY_REASON: &str = "USER.md and memory/rules.md are written only through the cos-memory tools (memory_add, memory_replace, memory_remove), never directly";
 
