@@ -356,13 +356,13 @@ mod tests {
         let d = ws(
             "nb4",
             &[
-                (".quaqua/pending/models.md", "x"),
+                (".quaqua/pending/soul.md", "x"),
                 (".quaqua/pending/bk/a", "x"),
             ],
         );
         let s = compute(d.root(), 0, "");
-        assert_eq!(s.pending, vec!["bk/".to_string(), "models.md".to_string()]);
-        assert!(render_block(&s).contains(".quaqua/pending/models.md → "));
+        assert_eq!(s.pending, vec!["bk/".to_string(), "soul.md".to_string()]);
+        assert!(render_block(&s).contains(".quaqua/pending/soul.md → "));
     }
 
     #[test]
@@ -401,7 +401,7 @@ mod tests {
         let f = fill_of("USER.md", &text).unwrap();
         assert_eq!((f.used, f.cap, f.pct()), (1100, 1375, 80));
         assert_eq!(f.header(), "[80% · 1100/1375 chars]");
-        assert!(fill_of("SOUL.md", "x").is_none());
+        assert!(fill_of("soul.md", "x").is_none());
     }
 
     #[test]

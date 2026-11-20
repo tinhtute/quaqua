@@ -68,18 +68,23 @@ model = "sonnet-5.5"
 effort = "medium"
 fallback = "suhuynh"
 can_review = true
+use_for = "default: every task unless a tier is named; hard multi-file impl, audits (on request)"
 
 [kinds.ni]
 harness = "claude"
 model = "opus-5.5"
 effort = "low"
 can_review = true
+use_for = "small Claude edits, quick answers"
+avoid = "design, long work"
 
 [kinds.suhuynh]
 harness = "claude"
 model = "opus-5.5"
 effort = "medium"
 can_review = true
+use_for = "refactor, review of intent"
+avoid = "long mechanical edits"
 
 [kinds.truonglao]
 harness = "claude"
@@ -87,6 +92,8 @@ model = "opus-5.5"
 effort = "high"
 can_review = true
 spawn = "auto" # "approve" requires Principal approval.
+use_for = "design, architecture, hard trade-offs"
+avoid = "anything a cheaper tier can do"
 
 [merge]
 integ_branch = "quaqua/{slug}-integ"

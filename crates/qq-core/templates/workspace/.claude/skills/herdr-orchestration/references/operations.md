@@ -1,6 +1,6 @@
 # Herdr operations
 
-`AGENTS.md`, `models.md`, and `rules/_all/` are authoritative. Prefer the `quaqua` subcommand over manual orchestration (`quaqua --help` lists them). Check `HERDR_ENV=1`; never run bare `herdr`. Use `herdr --help` / `herdr <group>` for current syntax.
+`AGENTS.md`, `team.toml`, and `rules/_all/` are authoritative. Prefer the `quaqua` subcommand over manual orchestration (`quaqua --help` lists them). Check `HERDR_ENV=1`; never run bare `herdr`. Use `herdr --help` / `herdr <group>` for current syntax.
 
 ## Command recipes
 
@@ -8,7 +8,7 @@
 # Normally use quaqua worker spawn (own worktree, rules injection, rollback on failure).
 herdr pane split --current --direction right --cwd <owned-worktree> --no-focus
 # Read .result.pane.pane_id; never reuse a pane rooted in someone else's checkout.
-herdr agent start <name> --kind <kind> --pane <pane_id> -- <launch args from models.md>
+herdr agent start <name> --kind <kind> --pane <pane_id> -- <launch args from `team.toml`>
 
 # Always use quaqua worker prompt (never raw herdr agent prompt) for the watchdog and file-only stdout contract.
 quaqua worker prompt <name> "<brief>"

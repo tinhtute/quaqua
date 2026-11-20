@@ -22,7 +22,7 @@ Before writing any worker brief, route through `/poteto-mode`:
 3. Run `quaqua playbook show <name>` to view the `## Orchestrator` instructions and required structure.
 4. Prepare the brief using the five-part format (`rules/_all/brief.md`), setting `Playbook: <name>` and `Context:`.
 5. Run `quaqua worker prompt --check-brief "<brief>"` to validate brief headers and time budget.
-6. Spawn the worker via `quaqua worker spawn <name> <kind> <repo>` per `models.md`.
+6. Spawn the worker via `quaqua worker spawn <name> <kind> <repo>` per `quaqua roster`.
 7. Prompt the worker via `quaqua worker prompt <name> "<brief>"`.
 
 ## Non-negotiables
@@ -99,7 +99,7 @@ Read the full `principles/<name>.md` leaf before citing it.
 
 Workers are spawned via `quaqua worker spawn <name> <kind> <repo>`.
 
-- **Match the kind to the job:** Assign worker kinds (`tieude`, `sude`, `ni`, `suhuynh`, `truonglao`) strictly per `models.md`.
+- **Match the kind to the job:** Assign worker kinds (`tieude`, `sude`, `ni`, `suhuynh`, `truonglao`) strictly per `quaqua roster`.
 - **Coordinator owns the outcome:** You own every worker's work. Review the diff and verify evidence yourself; never pass through unverified claims.
 - **Resume vs fresh:** Resume is the default for existing work. A half-done, stalled or killed worker resumes the same session (`quaqua worker prompt --resume`); a fresh spawn only when the goal changed or the worktree is unrecoverable (`AGENTS.md`). New work gets a fresh worker with consolidated scope (original brief, directives, prior report and branch).
 - **Worker boundary:** Never route inside a worker. Workers do not run `/poteto-mode`. Under S4, `quaqua worker prompt` injects the playbook's `## Worker` steps and cited principles, pinning `runs/.<name>.playbook`. A worker that loads this skill stops immediately.

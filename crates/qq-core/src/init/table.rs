@@ -70,11 +70,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/identity.md"),
     ),
     (
-        "models.md",
-        0o644,
-        include_bytes!("../../templates/workspace/models.md"),
-    ),
-    (
         "playbooks/babysit.md",
         0o644,
         include_bytes!("../../templates/workspace/playbooks/babysit.md"),

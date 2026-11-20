@@ -38,7 +38,7 @@ Tests alone are not sufficient verification. A unit is verified only when its un
 
 ### Spawn owners
 
-- [ ] Spawn one worker per unit via `quaqua worker spawn <name> <kind> <repo>` per `models.md`.
+- [ ] Spawn one worker per unit via `quaqua worker spawn <name> <kind> <repo>` per `quaqua roster`.
 - [ ] Follow the dependency graph. Start dependent work only after its parent is verified and merged.
   - [ ] <Unit 1> and <Unit 2> are independent and first. Both branch from the integration base.
   - [ ] <Unit 3> after <Unit 1>.

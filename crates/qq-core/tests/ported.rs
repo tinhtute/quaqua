@@ -677,15 +677,15 @@ fn registered_cmds_report_exit_codes() {
 
     // init: a locally changed template file is a conflict -> exit 3, kept, pending copy.
     assert_eq!(code(init::init_cmd(&env, &[])), 0);
-    write(&ws.root().join("models.md"), "mine\n");
+    write(&ws.root().join("SOUL.md"), "mine\n");
     let lock = std::fs::read_to_string(ws.root().join(".quaqua/template.lock")).unwrap();
-    assert!(lock.contains("models.md"));
+    assert!(lock.contains("SOUL.md"));
     assert_eq!(code(init::init_cmd(&env, &args(&["--update"]))), 3);
     assert_eq!(
-        std::fs::read_to_string(ws.root().join("models.md")).unwrap(),
+        std::fs::read_to_string(ws.root().join("SOUL.md")).unwrap(),
         "mine\n"
     );
-    assert!(ws.root().join(".quaqua/pending/models.md").is_file());
+    assert!(ws.root().join(".quaqua/pending/SOUL.md").is_file());
 
     // The hooks fail open: no stdin, no answer, exit 0.
     assert_eq!(

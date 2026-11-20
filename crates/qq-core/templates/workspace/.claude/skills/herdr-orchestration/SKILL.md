@@ -5,11 +5,11 @@ description: Herdr command recipes and worker spawn, prompt, monitoring, recover
 
 # Herdr orchestration
 
-Authority: `AGENTS.md`, `models.md`, and `rules/_all/`; references explain mechanics, not new roles.
+Authority: `AGENTS.md`, `team.toml`, and `rules/_all/`; references explain mechanics, not new roles.
 Precondition: `test "${HERDR_ENV:-}" = 1`, else tell anh iu and stop. Never run bare `herdr` (it attaches the TUI). `herdr --help` / `herdr <group>` are the syntax authority.
 
 ## Flow
-1. Pick kind from `models.md`. Task-worker cap per orchestrator is `[limits] max_workers_per_orchestrator` in `team.toml` (effective value: `quaqua config get limits.max_workers_per_orchestrator`); a pipeline counts as 2. Project Leads do not count toward that cap, and a Lead's own Peers cap at `[roles.lead] max_peers` (`quaqua config get roles.lead.max_peers`, default 4) — the same gate every spawn path checks. Query `herdr agent list`, never infer live names from memory. In agent shells invoke `~/.cargo/bin/quaqua` directly; the shell's `quaqua` function may launch Claude instead.
+1. Pick kind from `quaqua roster`. Task-worker cap per orchestrator is `[limits] max_workers_per_orchestrator` in `team.toml` (effective value: `quaqua config get limits.max_workers_per_orchestrator`); a pipeline counts as 2. Project Leads do not count toward that cap, and a Lead's own Peers cap at `[roles.lead] max_peers` (`quaqua config get roles.lead.max_peers`, default 4) — the same gate every spawn path checks. Query `herdr agent list`, never infer live names from memory. In agent shells invoke `~/.cargo/bin/quaqua` directly; the shell's `quaqua` function may launch Claude instead.
 2. `quaqua worker spawn [--base <ref>] <name> <kind> <repo>` → prints pane + worktree. For engine work `<repo>` is the engine checkout from `projects/INDEX.md` (e.g. `~/Lab/quaqua`); `~/quaqua` is a workspace, not a git repo. It grids the pane itself — `quaqua grid reconcile` only to repair a layout (`rules/_all/fanout-agent-grid.md`).
 3. Use the five-part brief from `rules/_all/brief.md`; set `PROMPT_WORKER_BUDGET_SEC` to its time budget. Call `quaqua worker prompt <name> "<brief>"`, never raw `herdr agent prompt` (single authority: wraps `herdr agent prompt --wait`, watchdog, and atomic report delivery). A pipeline-size builder plans before code; its project Lead approves via `quaqua pipeline --resume` after the plan-ready pause.
 4. Trust `runs/<name>.md`, not terminal output. Read the report and re-run its test yourself before reporting completion. Update the project card's `## Now` and today's `memory/YYYY-MM-DD.md` per `AGENTS.md`.
