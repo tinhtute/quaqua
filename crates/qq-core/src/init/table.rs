@@ -35,11 +35,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         ),
     ),
     (
-        ".claude/skills/poteto-mode/SKILL.md",
-        0o644,
-        include_bytes!("../../templates/workspace/.claude/skills/poteto-mode/SKILL.md"),
-    ),
-    (
         "AGENTS.md",
         0o644,
         include_bytes!("../../templates/workspace/AGENTS.md"),
