@@ -34,7 +34,7 @@ Probes (paths absolute, because `cd` and `ls` are shadowed by zoxide/eza in this
 ```
 $ herdr agent get sude-spendsrc        # → agent_session.value = 66b20fdf-… (session id), cwd, pane_id
 # transcript = ~/.claude/projects/<cwd with "/" and "." → "-">/<agent_session>.jsonl
-# ~/Lab/.wt/sude-spendsrc → -home-tinhpt-Lab--wt-sude-spendsrc
+# ~/Lab/.wt/sude-spendsrc → -home-<user>-Lab--wt-sude-spendsrc
 ```
 
 Shape of a finished worker's transcript (`sude-briefnone`, session `abfa7a63-…`, 178 lines): top-level record types include `assistant`, `user`, `api-request`, and **`cost-state`**. Each `assistant` record has `message.model` and `message.usage` with `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens`, `output_tokens_details.thinking_tokens`, `server_tool_use.*`. **No per-message USD.** The `cost-state` record has: `totalCostUSD`, `modelUsage{<model>:{inputTokens, outputTokens, thinkingTokens, cacheReadInputTokens, cacheCreationInputTokens, cacheCreationEphemeral{5m,1h}InputTokens, webSearchRequests, costUSD}}`, `hasUnknownModelCost`, `totalAPIDuration`, `totalDuration`, `startTime`.
@@ -60,7 +60,7 @@ The 3 without: two sessions last written on 2026-11-19 (one is this session, 0 `
 ### Worked example (finished worker `sude-briefnone`, session `abfa7a63-6a14-4fc6-81de-f7ca51889de3`)
 
 ```
-$ grep '"type":"cost-state"' ~/.claude/projects/-home-tinhpt-Lab--wt-sude-briefnone/abfa7a63-6a14-4fc6-81de-f7ca51889de3.jsonl | tail -1 | jq '{totalCostUSD, modelUsage}'
+$ grep '"type":"cost-state"' ~/.claude/projects/-home-<user>-Lab--wt-sude-briefnone/abfa7a63-6a14-4fc6-81de-f7ca51889de3.jsonl | tail -1 | jq '{totalCostUSD, modelUsage}'
 totalCostUSD 0.2990416
 claude-sonnet-5-5: inputTokens 1066, outputTokens 6173, cacheRead 923949, cacheWrite1h 35647, costUSD 0.2988449
 claude-haiku-5-5 : inputTokens 1867, outputTokens 20,   costUSD 0.0001967

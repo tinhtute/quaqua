@@ -379,11 +379,11 @@ Counts (one row = one rule):
 | Builders run only the targeted tests named in the brief (`cargo test --locked -p qq-core <filter>`), foreground; no `pgrep -f` wait loops | live prose | no check |
 | `bash tests/run.sh --slow` runs once, at the Lead's gate | dead | `ls tests/run.sh` fails; `tests/` holds hermetic.sh, qq-test.sh, e2e/, manual/ |
 
-## ~/quaqua/rules/llmhub/production-path-test.md
+## ~/quaqua/rules/<project>/production-path-test.md
 
 | Rule | Tag | Evidence |
 | --- | --- | --- |
-| Every ported slice ships one test that drives the live caller (executor or handler path), not only the new helper | live prose | no check; applies to the llmhub repo, outside this engine |
+| Every ported slice ships one test that drives the live caller (executor or handler path), not only the new helper | live prose | no check; applies to the <project> repo, outside this engine |
 
 ## ~/quaqua/rules/quaqua/*.md
 
