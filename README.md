@@ -50,7 +50,6 @@ Rules:
 | `.claude/settings.json` | Engine worktree gate: denies the built-in `Agent` tool and routes Bash through the template hook; `templates/workspace/.claude/settings.json` is the workspace copy |
 | `templates/workspace/.claude/skills/herdr-orchestration/` | Worker flow + consolidated command, recovery, and assignment/acceptance references |
 | `quaqua auditor run` | Auditor: read-only drift + pipeline-run audit → `reports/audit-*.md` |
-| `quaqua source github-ci poll --repo <owner/name>` | GitHub CI source: one `ci_failed` trigger per failed run on a `quaqua/*` branch that has a thread; deduped by run id, read position persisted |
 | `quaqua init`, `templates/workspace/`, seeds embedded from `src/init/seeds.rs` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
 | `quaqua memory check`, `quaqua memory hook pre\|batch` | CoS memory gate: caps `memory/rules.md` at 2200 and `USER.md` at 1375 Unicode chars, scans both for secrets; `quaqua init` installs the `PreToolUse` (`Write\|Edit\|MultiEdit`) deny and the `PostToolBatch` flag |
 | `tests/` | `hermetic.sh` (strace guard against live-DB opens), `e2e/`, `manual/`; the Rust suite lives in `crates/qq-core/tests/` |
@@ -139,7 +138,7 @@ cargo install --path crates/qq-core --locked   # installs the quaqua binary to ~
 quaqua init     # dirs + rules.md, INDEX.md, _template.md, USER.md
 ```
 
-Schedule `quaqua auditor run` (07:00 and 19:00) and `quaqua source github-ci poll --repo <owner/name>` (every 5 minutes) with your own user systemd timer or LaunchAgent; the repo ships no installer. `gh` and `quaqua` must be on the unit's PATH, and the unit must pin `QUAQUA_RUNS_DIR` to this workspace's `runs/`.
+Schedule `quaqua auditor run` (07:00 and 19:00) with your own user systemd timer or LaunchAgent; the repo ships no installer. `quaqua` and `claude` must be on the unit's PATH, and the unit must pin `QUAQUA_RUNS_DIR` to this workspace's `runs/`.
 
 Tests: `cargo test --locked -p qq-core`. `tests/hermetic.sh` (needs `strace`) runs the suite under a tracer and fails if any test opens the live workspace database.
 
