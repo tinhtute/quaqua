@@ -18,11 +18,3 @@ You own the deletion. Removal happens only through `quaqua worker cleanup <name>
 **Reply:** `df -h /` before and after with space reclaimed, the worktrees pruned with the `quaqua worker cleanup` name and path for each, and a one-line reason for every worktree held back (in use by which agent, uncommitted edits with the diff size, untracked files named, or not quaqua-managed).
 
 ## Worker
-
-1. Snapshot before classifying. Record `df -h /` and `git worktree list --porcelain`. Build the audit as a script that reads those paths, never as hand-typed arguments, and prove it by rerunning it on one known worktree per principle-build-the-lever. Cite principle-encode-lessons-in-structure: the classification lives in the script, not in a paragraph that drifts.
-2. Classify each worktree by size, age, merge state, uncommitted work, and owner. Size comes from `du -sh <path>`; age from `git -C <path> log -1 --format=%ct`; merge state from `git -C <path> merge-base --is-ancestor HEAD quaqua/<slug>-integ`; uncommitted work from `git -C <path> status --porcelain` with `wip:N` tracked and `scratch:N` untracked; owner from `quaqua status`, `herdr agent list`, and `runs/<name>.owner` where present. Emit one bucket per path: `safe`, `wip`, `scratch`, `in-use`, or `not-quaqua`.
-3. Cross-check every in-use candidate against the live agent list and report each match with the agent name and worktree path. A live agent wins over every heuristic. Keep large outputs off the coordinator thread per principle-guard-the-context-window: summarize per worktree instead of inlining full status output.
-4. Report the proposed set with the `quaqua worker cleanup` name for each path, the space each would reclaim, and the held-back list with one reason each. Delete nothing; removal is the Orchestrator's action.
-5. Check every Evidence line, then write `Verified: <level> <sha>`, citing principle-prove-it-works.
-
-**Reply:** the audit command, the bucket table, the proposed removals with their `quaqua worker cleanup` name, the held-back list with a reason each, and the `df -h /` before value.

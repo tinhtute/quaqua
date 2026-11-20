@@ -24,15 +24,3 @@ When the task matches no narrower playbook, design an auditable workflow. The de
 10. Final check: verify the whole against the Phase A done predicate on the real product, not just the harness. Encode any recurring correction structurally as a gate, lint rule, check, or script.
 
 ## Worker
-
-Execute each unit under experimental discipline, recording decisions as units land.
-
-1. Frame the unit outcome as a falsifiable done predicate and establish baseline measurements before modifying code. Quantify scope in units, effort, and known blockers.
-2. Order execution into atomic, independently landable units sequenced riskiest-unknown-first, verifying each before advancing, citing principle-sequence-verifiable-units. Scaffold and verification checks come before feature logic.
-3. When multiple attempts fail the same gate, stop and test the shared premise directly, citing principle-attack-the-premise.
-4. Run each unit as a hypothesis experiment: state the hypothesis, make the smallest change, measure against the predicate on the real artifact (never rely on a self-report; when something passes too easily, suspect the observation method before the system). Keep the change if it advanced the predicate; revert it if it did not.
-5. Record verdicts as VERIFIED, NOT VERIFIED, or INCONCLUSIVE. Inconclusive is not a pass. Don't hide a negative. Maintain an audit trail row as each unit lands, and commit the trail with the change so the reviewer reads it.
-6. Check the whole against the done predicate on the real product, not just the harness. Propose recurring corrections as structural gates rather than prose reminders.
-7. Check every Evidence line, then write `Verified: <level> <sha>`, citing principle-prove-it-works.
-
-**Reply:** the playbook you designed, the rigor level and why, the decision trail path, what is verified against the predicate, and what is still open.
