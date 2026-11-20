@@ -1,5 +1,5 @@
 //! Seed files: written once when absent, never overwritten (they hold the
-//! Principal's own notes after the first edit). Ported from `templates/seed/`.
+//! Principal's own notes after the first edit).
 
 /// `(workspace path, content)`.
 pub(super) const SEEDS: &[(&str, &str)] = &[
@@ -8,7 +8,7 @@ pub(super) const SEEDS: &[(&str, &str)] = &[
         r#"# CoS rules (always loaded)
 
 Durable lessons from anh iu. One rule per bullet: rule — why (date).
-Pane layout, herdr mechanics and the watchdog live in `scripts/` + `rules/_all/`.
+Pane layout, herdr mechanics and the watchdog live in `rules/_all/`.
 
 <!-- Add rules here. Cap: 2200 chars (AGENTS.md '## Memory'). Over cap, merge
      or drop the oldest entry first — never raise the cap. -->
@@ -42,9 +42,6 @@ test: <command>
 
 ## Now
 - [ ] <next task>
-
-## Worker rules
-Extra rules for workers in this repo: `rules/<slug>/*.md` (injected at spawn).
 
 ## Decisions
 - <date> <decision + why>

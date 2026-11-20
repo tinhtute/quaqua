@@ -9,9 +9,6 @@ use super::HerdrClient;
 use serde_json::Value;
 use std::path::Path;
 
-/// Default staleness threshold for hook-reported state (10 minutes, matching PROMPT_WORKER_STALL_SEC).
-pub const DEFAULT_STATE_STALENESS_SEC: u64 = 600;
-
 /// Normalized agent/worker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerState {

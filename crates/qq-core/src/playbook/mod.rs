@@ -40,11 +40,6 @@ pub struct Playbook {
 }
 
 impl Playbook {
-    /// Return the step IDs as a vector of integers.
-    pub fn step_ids(&self) -> Vec<u32> {
-        self.steps.iter().map(|s| s.id).collect()
-    }
-
     /// Return the body of the Orchestrator section without the `## Orchestrator` header.
     pub fn orchestrator_body(&self) -> &str {
         let trimmed = self.orchestrator.trim();
@@ -504,18 +499,6 @@ pub fn find_playbook(
 pub fn resolve_principle_path(name: &str, principles_dir: &Path) -> PathBuf {
     let leaf_name = name.strip_prefix("principle-").unwrap_or(name);
     principles_dir.join(format!("{leaf_name}.md"))
-}
-
-/// Read the content of a principle leaf file given its name.
-pub fn read_principle(name: &str, principles_dir: &Path) -> Result<String, PlaybookError> {
-    let path = resolve_principle_path(name, principles_dir);
-    if !path.is_file() {
-        return Err(PlaybookError::UnknownPrinciple {
-            principle: name.to_string(),
-            path,
-        });
-    }
-    Ok(fs::read_to_string(&path)?)
 }
 
 /// The directory `name` under the workspace (the parent of `runs/`), unless the

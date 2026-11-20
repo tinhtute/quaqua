@@ -160,6 +160,20 @@ fn qq(runs: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn version_flags_print_version_and_exit_0() {
+    let ws = TestWorkspace::new("version");
+    for flag in ["--version", "-V"] {
+        let out = qq(&ws.runs_dir(), &[flag]);
+        assert_eq!(out.status.code(), Some(0), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            concat!("quaqua ", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+}
+
+#[test]
 fn daemon_rpc_roundtrip() {
     let ws = TestWorkspace::new("rpc");
     let daemon = start_daemon(&ws, Arc::new(FakeHerdr::new())).expect("daemon starts");

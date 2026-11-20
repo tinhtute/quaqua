@@ -4,11 +4,6 @@
 
 pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
     (
-        ".claude/rules/herdr-fanout-grid.md",
-        0o644,
-        include_bytes!("../../templates/workspace/.claude/rules/herdr-fanout-grid.md"),
-    ),
-    (
         ".claude/settings.json",
         0o644,
         include_bytes!("../../templates/workspace/.claude/settings.json"),
@@ -68,11 +63,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "identity.md",
         0o644,
         include_bytes!("../../templates/workspace/identity.md"),
-    ),
-    (
-        "models.md",
-        0o644,
-        include_bytes!("../../templates/workspace/models.md"),
     ),
     (
         "playbooks/babysit.md",
@@ -299,11 +289,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/rules/_all/caller-identity.md"),
     ),
     (
-        "rules/_all/change-policy.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/change-policy.md"),
-    ),
-    (
         "rules/_all/config-dynamic.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/config-dynamic.md"),
@@ -312,26 +297,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "rules/_all/fanout-agent-grid.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/fanout-agent-grid.md"),
-    ),
-    (
-        "rules/_all/git-hygiene.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/git-hygiene.md"),
-    ),
-    (
-        "rules/_all/handoff.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/handoff.md"),
-    ),
-    (
-        "rules/_all/herdr-plugin-smoke.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/herdr-plugin-smoke.md"),
-    ),
-    (
-        "rules/_all/hooks.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/hooks.md"),
     ),
     (
         "rules/_all/lead-gate.md",
@@ -349,19 +314,9 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/rules/_all/no-gui-driving.md"),
     ),
     (
-        "rules/_all/opencode-no-bg-wait.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/opencode-no-bg-wait.md"),
-    ),
-    (
         "rules/_all/portable-paths.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/portable-paths.md"),
-    ),
-    (
-        "rules/_all/worker-interrupt.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/worker-interrupt.md"),
     ),
     (
         "rules/_all/worker-timebox.md",

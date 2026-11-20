@@ -1,1 +1,0 @@
-- Gitignore `dir/` patterns match at any depth: never put a tracked template under a gitignored dir name; assert trackability with `git check-ignore` — 2026-10-12, runs/tieude-skeleton.md

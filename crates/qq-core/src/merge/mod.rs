@@ -14,7 +14,7 @@ use std::process::{Command, Output};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::daemon::{Daemon, Handler};
 use crate::rpc::{self, RpcError};
@@ -376,11 +376,4 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
         }
     });
     daemon.register_verb("merge", handler)
-}
-
-/// JSON form of a request, for the CLI.
-pub fn parse_request(text: &str) -> Result<Value, String> {
-    let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    serde_json::from_value::<Request>(v.clone()).map_err(|e| e.to_string())?;
-    Ok(v)
 }

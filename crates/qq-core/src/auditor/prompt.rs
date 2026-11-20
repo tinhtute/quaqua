@@ -11,7 +11,7 @@ Audit six things:
    Flag: claimed outcomes the code or git history does not back; project
    "Now"/"Log" entries contradicted by repo state; memory rules or lessons that
    rest on stale facts.
-2. Stale docs vs real code/scripts. Flag: AGENTS.md, memory/rules.md, models.md,
+2. Stale docs vs real code/scripts. Flag: AGENTS.md, memory/rules.md, team.toml,
    rules/ entries that reference removed scripts/behaviors or describe a flow the
    scripts no longer implement; scripts or docs/plans that contradict each other;
    instruction docs over 100 lines (doc-rot: agents trust them over the code).
