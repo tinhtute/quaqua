@@ -482,7 +482,7 @@ fn pane_input_gate_qq_db_writes_by_redirect_and_interpreter() {
 
 #[test]
 fn instruction_file_gate_bash_writes() {
-    for name in ["AGENTS.md", "SOUL.md", "identity.md"] {
+    for name in ["AGENTS.md", "identity.md"] {
         for who in [Who::Cos, Who::Worker, Who::Down] {
             let r = rig("gf-ifb", who);
             let f = r.root().join(name);
@@ -527,7 +527,7 @@ fn instruction_file_gate_bash_reads_and_neighbours_are_free() {
         format!("echo x > {root}/crates/qq-core/templates/workspace/AGENTS.md"),
         format!("echo x > {root}/projects/p/AGENTS.md"),
         format!("echo x > {root}/notes.md"),
-        "echo x > /tmp/elsewhere/SOUL.md".to_string(),
+        "echo x > /tmp/elsewhere/identity.md".to_string(),
     ] {
         assert_eq!(r.bash(&ok), GateVerdict::Allow, "{ok}");
     }
@@ -951,7 +951,7 @@ fn gate_fix2_m2_fallback_tag_sort() {
 fn gate_fix2_m2_fallback_instruction_files() {
     for cmd in [
         "echo x > ~/quaqua/AGENTS.md",
-        "sed -i s/a/b/ ~/quaqua/SOUL.md",
+        "sed -i s/a/b/ ~/quaqua/identity.md",
         "echo x > ~/quaqua/USER.md",
         "echo x >> ~/quaqua/memory/rules.md",
         "tee ~/quaqua/identity.md",
@@ -960,7 +960,7 @@ fn gate_fix2_m2_fallback_instruction_files() {
     }
     for ok in [
         "cat ~/quaqua/AGENTS.md",
-        "sed s/a/b/ ~/quaqua/SOUL.md",
+        "sed s/a/b/ ~/quaqua/identity.md",
         "grep x ~/quaqua/USER.md",
     ] {
         assert_eq!(fallback_exit(ok), 0, "{ok}");
@@ -1107,7 +1107,7 @@ fn gate_fix2_m2_fallback_ignores_cwd_and_word_fragments() {
     ] {
         assert_eq!(fallback_exit_cwd(ok), 0, "{ok}");
     }
-    assert_eq!(fallback_exit_cwd("sed -i s/a/b/ ~/quaqua/SOUL.md"), 2);
+    assert_eq!(fallback_exit_cwd("sed -i s/a/b/ ~/quaqua/identity.md"), 2);
 }
 
 // ---- gatefix3 round 2: A. read-path tools that can write, B. old binary ----
@@ -1156,7 +1156,7 @@ fn gate_fix3_a_read_path_writers_are_denied_for_workers_and_cos_memory() {
 fn gate_fix3_a_read_path_writers_on_instruction_files_ask_cos_deny_workers() {
     for who in [Who::Worker, Who::Cos] {
         let r = rig("gf3-a-i", who);
-        for name in ["AGENTS.md", "SOUL.md", "identity.md"] {
+        for name in ["AGENTS.md", "identity.md"] {
             let abs = r.root().join(name).display().to_string();
             for cmd in writer_spellings(&abs) {
                 let v = r.bash(&cmd);
@@ -1270,7 +1270,6 @@ fn gate_fix3_b_old_binary_still_protects_memory_and_instruction_files() {
             "/tmp/ws/memory/rules.md",
             "/tmp/ws/USER.md",
             "/tmp/ws/AGENTS.md",
-            "/tmp/ws/SOUL.md",
             "/tmp/ws/identity.md",
         ] {
             assert_eq!(
@@ -1414,7 +1413,7 @@ fn gate_fix4_readers_that_write_memory_files_block_every_role() {
 fn gate_fix4_readers_that_write_instruction_files_ask_cos_deny_workers() {
     for who in [Who::Worker, Who::Cos] {
         let r = rig("gf4-rd-ins", who);
-        for name in ["AGENTS.md", "SOUL.md"] {
+        for name in ["AGENTS.md", "identity.md"] {
             let abs = r.root().join(name).display().to_string();
             for cmd in gf4_reader_writers(&abs) {
                 let v = r.bash(&cmd);

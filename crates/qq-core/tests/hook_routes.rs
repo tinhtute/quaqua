@@ -368,7 +368,7 @@ fn hook_settings_route_fallback_missing_binary() {
         0
     );
     assert_eq!(fallback_exit(&w("Edit", "/tmp/a.rs", "git tag v1")), 0);
-    for f in ["AGENTS.md", "SOUL.md", "identity.md"] {
+    for f in ["AGENTS.md", "identity.md"] {
         for t in ["Write", "Edit", "MultiEdit"] {
             assert_eq!(fallback_exit(&w(t, &format!("/ws/{f}"), "x")), 2, "{t} {f}");
         }

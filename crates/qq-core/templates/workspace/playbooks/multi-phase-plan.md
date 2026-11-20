@@ -9,7 +9,7 @@ You own the plan, not the code. The plan is the deliverable; the coordinator aud
 
 1. When the change is one or two files with an obvious approach, skip the plan. State so and stop.
 2. Settle open questions by prototype before writing; keep the branch, the SHA, and the observations. Ask the human only about a product or preference call no run can settle, with concrete options per principle-never-block-on-the-human.
-3. Explore in focused subagents that return file pointers, conventions, test commands, and entry points, not dumps (principle-guard-the-context-window).
+3. Explore in focused workers that return file pointers, conventions, test commands, and entry points, not dumps (principle-guard-the-context-window).
 4. Copy the skeleton below into `docs/plans/active/{slug}.md` (or the named path) and fill every placeholder, keeping every heading in order. One section per unit; one unit is one change with its own evidence (principle-sequence-verifiable-units).
 5. Write short declarative sentences. The body is a how-to checklist; appendices explain. Each heading states the task or the finding.
 6. Every box needs concrete evidence and explicit dependencies (principle-encode-lessons-in-structure).

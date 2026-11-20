@@ -4,7 +4,7 @@ Always look first: `herdr agent get <name>` then `herdr agent read <name> --sour
 
 | Signal | Meaning | Do |
 |--------|---------|----|
-| `blocked` | approval/question UI on screen | Safe in-worktree choice → `herdr agent send-keys <name> <key>`. Destructive/outward (push, delete, network publish) → ask anh iu. |
+| `blocked` | approval/question UI on screen | Safe in-worktree choice → `herdr agent send-keys <name> <key>`. Anything on the `AGENTS.md` approval list → ask anh iu. |
 | `timeout` / `agent_prompt_stalled` | prompt may or may not have landed | Never re-prompt blind. Text sitting unsubmitted → `send-keys <name> enter`. Still working → wait again. |
 | `unknown` | herdr can't tell turn end | Wait for a nonempty, byte-stable `runs/<name>.md` via `quaqua worker prompt --resume`; read it and re-run its test before accepting. |
 | `agent_not_ready` at start | startup dialog (e.g. a first-run trust prompt) | `herdr pane read <pane> --source visible`, answer, then `herdr agent wait <name> --until idle`. |

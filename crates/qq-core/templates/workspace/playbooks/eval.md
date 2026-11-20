@@ -19,14 +19,3 @@ when: Testing how a skill, structure, or prompt change affects agent behavior be
 6. Read every output end to end, compare it to the judge's verdict, and interpret numbers per principle-explain-the-number. Disagreement means a biased model or an ambiguous rubric. Synthesize.
 
 ## Worker
-
-1. Frame the evaluation: the variant under test or audit scope, what counts as success, and for comparative runs a 3-6 criteria rubric held back from candidates. For telemetry, define the window and metrics.
-2. Set up sanitized environments or data sources: per-candidate working directories with the variant in place, or the `runs/` reports and `runs/qq.db`.
-3. Author one organic prompt, with no leakage of what is measured, or the telemetry queries: playbook spread (every name, `none`, `figure-it-out`), `playbook_gap` events (note absence if not yet recorded), and briefs with a missing header that ended in a failed or respawned unit.
-4. Run the candidates, each in its own directory with the identical prompt, or aggregate counts across reports and journal events.
-5. Judge blind on a separate session of a different model family, by sanitized label only.
-6. Verify the chain from transcripts under the active workspace only (principle-guard-the-context-window): which files each candidate opened and which tools ran, never self-report.
-7. Read every output end to end against the verdict (principle-explain-the-number) and synthesize.
-8. Check every Evidence line, then write `Verified: <level> <sha>`, citing principle-prove-it-works.
-
-**Reply:** variant under test, rubric, per-candidate notes (or telemetry summary), the judge's verdict, your synthesis, and a recommendation on promotion.

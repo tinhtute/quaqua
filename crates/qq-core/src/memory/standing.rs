@@ -14,7 +14,6 @@ pub const BUDGET: usize = 8000;
 /// section the budget drops.
 const SECTIONS: &[(&str, &str)] = &[
     ("persona", "identity.md"),
-    ("persona", "SOUL.md"),
     ("owner", "USER.md"),
     ("rules", "memory/rules.md"),
     ("projects", INDEX),
@@ -104,7 +103,7 @@ fn render_standing_at(root: &Path, now_ms: u64) -> String {
     let n = size(&out) + 1 + size(&now);
     if n > BUDGET {
         out.push_str(&format!(
-            "\n(standing block {n} chars, over the {BUDGET} budget: shorten identity.md, SOUL.md, USER.md or memory/rules.md)\n"
+            "\n(standing block {n} chars, over the {BUDGET} budget: shorten identity.md, USER.md or memory/rules.md)\n"
         ));
     }
     out.push('\n');
@@ -137,7 +136,6 @@ mod tests {
                 ("projects/INDEX.md", "IDX"),
                 ("memory/rules.md", "RULES"),
                 ("USER.md", "# Tinh\nUSR"),
-                ("SOUL.md", "SOUL"),
                 ("identity.md", "ID"),
             ],
         );
@@ -146,8 +144,8 @@ mod tests {
             out.find(s)
                 .unwrap_or_else(|| panic!("{s} missing in {out}"))
         };
-        assert!(at("identity.md") < at("SOUL.md"));
-        assert!(at("SOUL.md") < at("USER.md"));
+        assert_eq!(out.matches("## persona —").count(), 1, "{out}");
+        assert!(at("identity.md") < at("USER.md"));
         assert!(at("USER.md") < at("memory/rules.md"));
         assert!(at("memory/rules.md") < at("projects/INDEX.md"));
         assert!(at("RULES") < at("IDX"));
@@ -155,9 +153,9 @@ mod tests {
 
     #[test]
     fn missing_files_are_skipped() {
-        let d = ws("t2", &[("SOUL.md", "SOUL")]);
+        let d = ws("t2", &[("identity.md", "ID")]);
         let out = render_standing(d.root());
-        assert!(out.contains("SOUL.md") && !out.contains("identity.md"));
+        assert!(out.contains("identity.md") && !out.contains("USER.md"));
         assert!(!out.contains("memory/rules.md") && !out.contains("INDEX"));
         drop(d);
         assert_eq!(render_standing(ws("t3", &[]).root()), "");
@@ -167,7 +165,10 @@ mod tests {
     fn template_user_is_skipped_filled_user_is_kept() {
         let tpl = ws(
             "t4",
-            &[("USER.md", "# <Owner name>\n\n- Role\n"), ("SOUL.md", "S")],
+            &[
+                ("USER.md", "# <Owner name>\n\n- Role\n"),
+                ("identity.md", "S"),
+            ],
         );
         assert!(!render_standing(tpl.root()).contains("USER.md"));
         drop(tpl);
@@ -213,7 +214,7 @@ mod tests {
 
     #[test]
     fn overrun_without_index_is_stated() {
-        let d = ws("t8", &[("SOUL.md", &"s".repeat(BUDGET + 10))]);
+        let d = ws("t8", &[("identity.md", &"s".repeat(BUDGET + 10))]);
         let out = render_standing(d.root());
         assert!(out.contains("over the 8000 budget"));
     }
@@ -225,7 +226,7 @@ mod tests {
             &[
                 ("memory/rules.md", &"é".repeat(1100)),
                 ("USER.md", "# Tinh\nUSR"),
-                ("SOUL.md", "SOUL"),
+                ("identity.md", "ID"),
                 ("projects/INDEX.md", "IDX"),
             ],
         );
@@ -239,7 +240,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("## persona — SOUL.md\n"),
+            out.contains("## persona — identity.md\n"),
             "uncapped: no header"
         );
         let now = out.find("## Now (computed)").unwrap();

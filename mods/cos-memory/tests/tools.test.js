@@ -200,7 +200,7 @@ test('a batch with a secret verdict is refused as a whole', async () => {
 test('an empty or foreign-file batch is refused', async () => {
   const { $, calls } = fakeEngine({ verb: allowVerdict })
   assert.match((await runTool($, 'memory_batch', { ops: [] })).deny, /empty/)
-  const out = await runTool($, 'memory_batch', { ops: [{ op: 'add', file: 'SOUL.md', text: 'x' }] })
+  const out = await runTool($, 'memory_batch', { ops: [{ op: 'add', file: 'identity.md', text: 'x' }] })
   assert.match(out.deny, /not a capped memory file/)
   assert.equal(calls.process.length, 0)
 })

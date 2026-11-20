@@ -12,9 +12,3 @@ when: New or changed behavior, built from a named data shape.
 5. Re-run verify checks on the matching surface before integrating or merging. "Inconclusive" or wrong-surface is not a pass (flag it); a green suite shows branch behavior, not bug absence.
 
 ## Worker
-
-1. Clarify the core domain model, state transitions, and boundary interfaces before writing business logic.
-2. Design mutating operations and lifecycle steps to converge to the correct state across retries and restarts, citing principle-make-operations-idempotent.
-3. Write tests that assert what users and callers observe through the contract, citing principle-test-behavior-not-implementation.
-4. Implement the feature code. Verify on the matching surface; "inconclusive" or wrong-surface is not a pass (flag it). A green suite shows branch behavior, not absence of bugs. Confirm new and existing targeted test suites pass cleanly.
-5. Check every Evidence line, then write `Verified: <level> <sha>`, citing principle-prove-it-works.

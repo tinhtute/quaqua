@@ -12,15 +12,3 @@ when: Pixel-exact UI equivalence: matching two implementations or migrating a st
 5. Review each component's image diff evidence before accepting or merging via `quaqua merge`.
 
 ## Worker
-
-1. Establish the baseline first before any migration: a visual regression harness that screenshots the current component across its states, plus the target when matching two implementations. No baseline, no parity claim: this is a blocking prerequisite, not a follow-up.
-2. Anti-shortcut clauses, stated and held:
-   - No harness modifications.
-   - No baseline tampering.
-   - No component restructuring to make a diff pass.
-   - If the baseline looks wrong, stop and ask; do not edit it.
-3. Migrate one component at a time within your assigned worktree per principle-separate-before-serializing-shared-state. Shared primitives migrate first as a blocking phase.
-4. Verify each component against its baseline via automated image diff on the matching surface run headless only per rules/_all/no-gui-driving.md. Never drive the real display. A nonzero diff is a failure. Investigate the pixel delta and iterate per component until the diff is zero.
-5. Check every Evidence line, then write `Verified: <level> <sha>`, citing principle-prove-it-works.
-
-**Reply:** components migrated, the diff result for each, the baseline harness location, what's left.

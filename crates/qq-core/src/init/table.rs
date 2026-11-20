@@ -50,11 +50,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/PEER.md"),
     ),
     (
-        "SOUL.md",
-        0o644,
-        include_bytes!("../../templates/workspace/SOUL.md"),
-    ),
-    (
         "herdr/sidebar-chip.toml",
         0o644,
         include_bytes!("../../templates/workspace/herdr/sidebar-chip.toml"),
@@ -160,29 +155,9 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/principles/attack-the-premise.md"),
     ),
     (
-        "principles/boundary-discipline.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/boundary-discipline.md"),
-    ),
-    (
-        "principles/build-the-lever.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/build-the-lever.md"),
-    ),
-    (
         "principles/encode-lessons-in-structure.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/encode-lessons-in-structure.md"),
-    ),
-    (
-        "principles/exhaust-the-design-space.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/exhaust-the-design-space.md"),
-    ),
-    (
-        "principles/experience-first.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/experience-first.md"),
     ),
     (
         "principles/explain-the-number.md",
@@ -210,18 +185,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/principles/laziness-protocol.md"),
     ),
     (
-        "principles/make-operations-idempotent.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/make-operations-idempotent.md"),
-    ),
-    (
-        "principles/migrate-callers-then-delete-legacy-apis.md",
-        0o644,
-        include_bytes!(
-            "../../templates/workspace/principles/migrate-callers-then-delete-legacy-apis.md"
-        ),
-    ),
-    (
         "principles/minimize-reader-load.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/minimize-reader-load.md"),
@@ -235,11 +198,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "principles/never-block-on-the-human.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/never-block-on-the-human.md"),
-    ),
-    (
-        "principles/outcome-oriented-execution.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/outcome-oriented-execution.md"),
     ),
     (
         "principles/prove-it-works.md",
@@ -264,34 +222,9 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/principles/sequence-verifiable-units.md"),
     ),
     (
-        "principles/subtract-before-you-add.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/subtract-before-you-add.md"),
-    ),
-    (
-        "principles/test-behavior-not-implementation.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/test-behavior-not-implementation.md"),
-    ),
-    (
-        "principles/type-system-discipline.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/type-system-discipline.md"),
-    ),
-    (
         "rules/_all/brief.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/brief.md"),
-    ),
-    (
-        "rules/_all/caller-identity.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/caller-identity.md"),
-    ),
-    (
-        "rules/_all/config-dynamic.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/config-dynamic.md"),
     ),
     (
         "rules/_all/fanout-agent-grid.md",
@@ -302,11 +235,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "rules/_all/lead-gate.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/lead-gate.md"),
-    ),
-    (
-        "rules/_all/merge-queue.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/merge-queue.md"),
     ),
     (
         "rules/_all/no-gui-driving.md",

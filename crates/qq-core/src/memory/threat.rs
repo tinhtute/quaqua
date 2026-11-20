@@ -590,7 +590,6 @@ mod tests {
         let ws = TestWorkspace::new("threat-all5");
         crate::init::run(ws.root(), false, false).expect("init");
         for rel in [
-            "SOUL.md",
             "identity.md",
             "projects/INDEX.md",
             "USER.md",
@@ -694,7 +693,6 @@ mod tests {
         let mut checked = 0;
         for rel in [
             "identity.md",
-            "SOUL.md",
             "USER.md",
             "memory/rules.md",
             "projects/INDEX.md",
@@ -705,6 +703,6 @@ mod tests {
             assert_eq!(scan(&text, Scope::Context), Vec::<String>::new(), "{rel}");
             checked += 1;
         }
-        assert_eq!(checked, 5);
+        assert_eq!(checked, 4);
     }
 }
