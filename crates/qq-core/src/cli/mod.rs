@@ -131,6 +131,10 @@ pub fn assemble(env: &Env) -> Result<(Registry, Daemon), String> {
 /// Entry point of the `quaqua` binary.
 pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("quaqua {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
     let env = Env {
         runs_dir: crate::db::path::default_runs_dir(),
     };

@@ -21,15 +21,12 @@
 #   tests/hermetic.sh --scan-only LOG replay a saved trace through the
 #                                             same detector, no cargo run
 #
-# Exit: 0 - the suite never opened the live DB; on a host without strace the
-#           guard prints one line, "skipped: strace unavailable", and exits 0
+# Exit: 0 - the suite never opened the live DB
 #       1 - one or more opens of the live DB (listed, aggregated), or a tracer
 #           that produced no trace at all (a silent tracer must never pass)
 #       N - the traced command's own status N when it fails without a hit
 #
-# Requires strace (Linux). HERMETIC_REQUIRE_STRACE=1 turns the missing-tracer
-# skip into a failure; .github/workflows/test.yml sets it, so CI installs the
-# tracer and runs the guard for real instead of silently skipping.
+# Requires strace (Linux); a host without it fails with exit 1, never skips.
 #
 # Reproducing a detection (planted-test procedure, run in CI or any Linux box
 # with strace):
@@ -53,7 +50,6 @@ set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/.." && pwd)
-require=${HERMETIC_REQUIRE_STRACE:-0}
 
 usage() {
   printf 'usage: %s [--scan-only TRACE_LOG]\n' "${BASH_SOURCE[0]##*/}" >&2
@@ -191,12 +187,8 @@ main() {
   esac
 
   if ! command -v strace >/dev/null 2>&1; then
-    if [[ $require == 1 ]]; then
-      printf 'error: strace is required (HERMETIC_REQUIRE_STRACE=1) but not on PATH\n' >&2
-      return 1
-    fi
-    printf 'skipped: strace unavailable\n'
-    return 0
+    printf 'error: strace is required but not on PATH\n' >&2
+    return 1
   fi
 
   local status trace='open,openat'

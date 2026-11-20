@@ -67,9 +67,7 @@ jobs:
       # property, and the step above keeps reporting the suite's own result.
       # The build is already warm in target/, so the cost is suite runtime only.
       #
-      # ubuntu-latest ships no strace; install it, and set
-      # HERMETIC_REQUIRE_STRACE=1 so a failed install fails the step instead of
-      # turning the guard into a silent skip.
+      # ubuntu-latest ships no strace; install it (the guard fails without it).
       #
       # Both hermetic steps run even after an earlier step failed: a clippy
       # warning must not hide the hermetic-DB result until the lint is fixed.
@@ -85,8 +83,6 @@ jobs:
 
       - name: hermetic workspace (no live workspace DB opens)
         if: success() || failure()
-        env:
-          HERMETIC_REQUIRE_STRACE: '1'
         run: bash tests/hermetic.sh
 
   # The engine ships darwin release assets, and cfg(target_os = "macos") code
