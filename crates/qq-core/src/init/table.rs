@@ -155,19 +155,9 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/principles/attack-the-premise.md"),
     ),
     (
-        "principles/build-the-lever.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/build-the-lever.md"),
-    ),
-    (
         "principles/encode-lessons-in-structure.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/encode-lessons-in-structure.md"),
-    ),
-    (
-        "principles/exhaust-the-design-space.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/exhaust-the-design-space.md"),
     ),
     (
         "principles/explain-the-number.md",
@@ -193,18 +183,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "principles/laziness-protocol.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/laziness-protocol.md"),
-    ),
-    (
-        "principles/make-operations-idempotent.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/make-operations-idempotent.md"),
-    ),
-    (
-        "principles/migrate-callers-then-delete-legacy-apis.md",
-        0o644,
-        include_bytes!(
-            "../../templates/workspace/principles/migrate-callers-then-delete-legacy-apis.md"
-        ),
     ),
     (
         "principles/minimize-reader-load.md",
@@ -242,16 +220,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "principles/sequence-verifiable-units.md",
         0o644,
         include_bytes!("../../templates/workspace/principles/sequence-verifiable-units.md"),
-    ),
-    (
-        "principles/subtract-before-you-add.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/subtract-before-you-add.md"),
-    ),
-    (
-        "principles/test-behavior-not-implementation.md",
-        0o644,
-        include_bytes!("../../templates/workspace/principles/test-behavior-not-implementation.md"),
     ),
     (
         "rules/_all/brief.md",
