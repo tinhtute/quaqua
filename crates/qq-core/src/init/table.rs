@@ -259,16 +259,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         include_bytes!("../../templates/workspace/rules/_all/brief.md"),
     ),
     (
-        "rules/_all/caller-identity.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/caller-identity.md"),
-    ),
-    (
-        "rules/_all/config-dynamic.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/config-dynamic.md"),
-    ),
-    (
         "rules/_all/fanout-agent-grid.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/fanout-agent-grid.md"),
@@ -277,11 +267,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         "rules/_all/lead-gate.md",
         0o644,
         include_bytes!("../../templates/workspace/rules/_all/lead-gate.md"),
-    ),
-    (
-        "rules/_all/merge-queue.md",
-        0o644,
-        include_bytes!("../../templates/workspace/rules/_all/merge-queue.md"),
     ),
     (
         "rules/_all/no-gui-driving.md",
