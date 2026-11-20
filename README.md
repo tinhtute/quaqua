@@ -9,7 +9,7 @@ A read-only **Auditor** runs at 07:00 and 19:00 local time via systemd (Linux) o
 
 This repo is the live workspace: clone it to `~/quaqua`. Per-workspace personal state
 (`USER.md`, `MEMORY.md`, `memory/`, `projects/`, `raw/`, `runs/`, `reports/`) is gitignored and stays local; start
-`USER.md` from `USER.example.md`.
+`USER.md` from the seed `quaqua init` writes.
 
 ## Architecture
 
@@ -46,17 +46,15 @@ Rules:
 | `templates/workspace/AGENTS.md` | Workspace entrypoint: SLP roles, memory policy, worker protocol (the root `AGENTS.md` is an engine contributor stub) |
 | `templates/workspace/{identity.md,SOUL.md}` | CoS persona and voice (injected at session start) |
 | `templates/workspace/PEER.md` | Worker contract: boundaries, contract-before-test, git commit gates, handback |
-| `templates/workspace/rules/_all/` | Worker rules injected as the system prompt (brief shape, fanout grid, timebox) |
+| `templates/workspace/rules/_all/` | Worker rules a brief or skill names (brief shape, fanout grid, timebox); they are not injected |
 | `.claude/settings.json` | Engine worktree gate: denies the built-in `Agent` tool and routes Bash through the template hook; `templates/workspace/.claude/settings.json` is the workspace copy |
 | `templates/workspace/.claude/skills/herdr-orchestration/` | Worker flow + consolidated command, recovery, and assignment/acceptance references |
 | `quaqua auditor run` | Auditor: read-only drift + pipeline-run audit → `reports/audit-*.md` |
 | `templates/workspace/scripts/auditor/install-auditor.sh`, `templates/workspace/scripts/auditor/systemd/`, `templates/workspace/scripts/auditor/launchd/` | Auditor scheduling: systemd user units (Linux) or a rendered LaunchAgent plist (macOS), 2×/day |
 | `quaqua source github-ci poll --repo <owner/name>` | GitHub CI source: one `ci_failed` trigger per failed run on a `quaqua/*` branch that has a thread; deduped by run id, read position persisted |
-| `templates/workspace/scripts/github-ci-poll/install-github-ci-poll.sh`, `templates/workspace/scripts/github-ci-poll/systemd/`, `templates/workspace/scripts/github-ci-poll/launchd/` | GitHub CI poll scheduling: systemd user unit+timer (Linux) or a rendered LaunchAgent plist (macOS), every 5 minutes |
-| `quaqua init`, `templates/workspace/`, `templates/seed/` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
+| `quaqua init`, `templates/workspace/`, seeds embedded from `src/init/seeds.rs` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
 | `quaqua memory check`, `quaqua memory hook pre\|batch` | CoS memory gate: caps `memory/rules.md` at 2200 and `USER.md` at 1375 Unicode chars, scans both for secrets; `quaqua init` installs the `PreToolUse` (`Write\|Edit\|MultiEdit`) deny and the `PostToolBatch` flag |
 | `tests/` | Sandboxed test suite: `tests/run.sh` runs every `tests/test_*.sh` (the 2 slow suites only when the change touches a script they cover, or with `--slow`) and exits non-zero on any failure |
-| `templates/seed/USER.example.md` | Template for the per-workspace `USER.md` |
 | `SETUP-PROMPT.md` | Original prompt used to bootstrap this setup |
 | `docs/slp.png` | Diagram: Principal → CoS → Lead → Peers |
 
@@ -78,9 +76,7 @@ is safe to re-run after a pull. The one exception is `.claude/settings.json`,
 which it merges into: the two CoS memory hooks are added only when absent and
 every other hook in the file is left alone. Then edit `USER.md` for the workspace, add one
 row per project to `projects/INDEX.md` (copy `projects/_template.md` for the
-card), and continue with the auditor install below. Templates live in
-`templates/seed/` under depth-safe names because `.gitignore`'s `memory/` and
-`projects/` patterns match at any depth.
+card), and continue with the auditor install below. The seeds are embedded in the binary (`src/init/seeds.rs`).
 
 The installed hooks enforce AGENTS.md '## Memory'. A `Write`/`Edit`/`MultiEdit`
 that would push `memory/rules.md` past 2200 chars or `USER.md` past 1375, or
