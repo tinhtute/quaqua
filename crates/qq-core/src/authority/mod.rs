@@ -123,12 +123,6 @@ pub enum Decision {
     Refused(Refusal),
 }
 
-impl Decision {
-    pub fn is_allowed(&self) -> bool {
-        matches!(self, Decision::Allowed)
-    }
-}
-
 /// The decision could not be made (database or config unreadable).
 #[derive(Debug)]
 pub struct AuthError(pub String);

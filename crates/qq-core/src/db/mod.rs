@@ -83,8 +83,3 @@ pub fn open(path: &Path) -> Result<Connection, DbError> {
     migrate::migrate(&mut conn)?;
     Ok(conn)
 }
-
-/// [`open`] at `<runs>/qq.db`.
-pub fn open_default() -> Result<Connection, DbError> {
-    open(&path::default_db_path())
-}

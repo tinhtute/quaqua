@@ -88,16 +88,6 @@ impl WorkflowContext {
         });
     }
 
-    /// Returns true if any actions have been scheduled in this context.
-    pub fn has_scheduled(&self) -> bool {
-        !self.scheduled.is_empty()
-    }
-
-    /// Returns a slice of the scheduled actions.
-    pub fn scheduled(&self) -> &[ScheduledAction] {
-        &self.scheduled
-    }
-
     /// Drains and returns all scheduled actions from the context.
     pub fn drain_scheduled(&mut self) -> Vec<ScheduledAction> {
         std::mem::take(&mut self.scheduled)
