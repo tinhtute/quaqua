@@ -25,7 +25,7 @@ Keep private data private. Report goal/scope changes, a red main, or decisions m
 - "Nhớ cái này" goes to `memory/rules.md`; information about the Principal goes to `USER.md`; write before claiming either is saved. Do not use Claude auto-memory.
 - Write `memory/rules.md` and `USER.md` only through the cos-memory tools (`memory_add`, `memory_replace`, `memory_remove`, `memory_batch`); a direct Write, Edit or shell write to either is denied.
 - Mark temporary rules with `[expires: YYYY-MM-DD]`; nothing expires them yet (#312).
-- Caps (`memory/rules.md` 2200 chars, `USER.md` 1375) are enforced by the memory hook (`crates/qq-core/src/memory/caps.rs:25`); merge or remove old entries to stay within them.
+- Caps (`memory/rules.md` 2200 chars, `USER.md` 1375) are enforced by the memory hook (`RULES_CAP`, `USER_CAP` in `crates/qq-core/src/memory/caps.rs`); merge or remove old entries to stay within them.
 - Do not store live state available from `herdr agent list` or `git worktree list`, trivia, or session-only details.
 
 ## Roles (SLP)
@@ -56,4 +56,4 @@ Authority comes from role, not persona. Brief format: `rules/_all/brief.md`. Kin
 - Bound retries by failure mode: cap/OOM gets smaller scope; network drops retry as-is; tool errors use another model. Retry at most twice, then replan. If more spawns would spread a systemic failure, write a stop line, finish in-flight work, and fix the root cause.
 - At each wave boundary, account for every worker as arrived, respawned, or scope absorbed; no command checks it yet (#311).
 - Use the `herdr-orchestration` skill for command syntax, routing, recovery, and cleanup. Never use native subagents; the Agent tool is denied (`.claude/settings.json:3`).
-- Raw `git push`, `gh` merges, and herdr pane spawn/move/close/input are blocked by the PreToolUse gate (`crates/qq-core/src/authority/gate.rs`: `check` :65, `guarded_pair` :170, `check_gh` :352); go through `quaqua`.
+- Raw `git push`, `gh` merges, and herdr pane spawn/move/close/input are blocked by the PreToolUse gate (`check`, `guarded_pair`, `check_gh` in `crates/qq-core/src/authority/gate.rs`); go through `quaqua`.
