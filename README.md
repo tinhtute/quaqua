@@ -138,7 +138,7 @@ cargo install --path crates/qq-core --locked   # installs the quaqua binary to ~
 quaqua init     # dirs + rules.md, INDEX.md, _template.md, USER.md
 ```
 
-Schedule `quaqua auditor run` (07:00 and 19:00) with your own user systemd timer or LaunchAgent; the repo ships no installer. `quaqua` and `claude` must be on the unit's PATH, and the unit must pin `QUAQUA_RUNS_DIR` to this workspace's `runs/`.
+Schedule `quaqua auditor run` (07:00 and 19:00) with your own user systemd timer or LaunchAgent; the repo ships no installer. `quaqua` and `claude` must be on the unit's PATH, and the unit needs `QUAQUA_HOME` (or `QUAQUA_RUNS_DIR` for the runs dir alone) only when the workspace is not `$HOME/quaqua`; the root does not depend on the working directory.
 
 Tests: `cargo test --locked -p qq-core`. `tests/hermetic.sh` (needs `strace`) runs the suite under a tracer and fails if any test opens the live workspace database.
 
