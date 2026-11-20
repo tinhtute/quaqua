@@ -40,11 +40,6 @@ pub(super) const TABLE: &[(&str, u32, &[u8])] = &[
         ),
     ),
     (
-        ".mcp.json",
-        0o644,
-        include_bytes!("../../templates/workspace/.mcp.json"),
-    ),
-    (
         "AGENTS.md",
         0o644,
         include_bytes!("../../templates/workspace/AGENTS.md"),
