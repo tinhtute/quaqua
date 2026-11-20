@@ -401,7 +401,7 @@ mod tests {
         let f = fill_of("USER.md", &text).unwrap();
         assert_eq!((f.used, f.cap, f.pct()), (1100, 1375, 80));
         assert_eq!(f.header(), "[80% · 1100/1375 chars]");
-        assert!(fill_of("soul.md", "x").is_none());
+        assert!(fill_of("SOUL.md", "x").is_none());
     }
 
     #[test]
