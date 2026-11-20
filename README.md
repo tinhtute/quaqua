@@ -20,7 +20,7 @@ This repo is the live workspace: clone it to `~/quaqua`. Per-workspace personal 
         │ goal                ▲ digest
         ▼                     │
  CoS (Quả Quả) — full SDLC: intake, sizing, brief, verify, release  ◄── report ── Auditor
-        │ small task (<15 min, 1 file, or needs live feedback) ──► one worker, no SLP   (scripts/auditor/systemd/launchd
+        │ small task (<15 min, 1 file, or needs live feedback) ──► one worker, no SLP   (systemd/launchd
         │ spawn Lead + brief                                                           2×/day)
         ▼
  Lead (<slug>-lead) — project state, plan approval, acceptance,
@@ -50,11 +50,10 @@ Rules:
 | `.claude/settings.json` | Engine worktree gate: denies the built-in `Agent` tool and routes Bash through the template hook; `templates/workspace/.claude/settings.json` is the workspace copy |
 | `templates/workspace/.claude/skills/herdr-orchestration/` | Worker flow + consolidated command, recovery, and assignment/acceptance references |
 | `quaqua auditor run` | Auditor: read-only drift + pipeline-run audit → `reports/audit-*.md` |
-| `templates/workspace/scripts/auditor/install-auditor.sh`, `templates/workspace/scripts/auditor/systemd/`, `templates/workspace/scripts/auditor/launchd/` | Auditor scheduling: systemd user units (Linux) or a rendered LaunchAgent plist (macOS), 2×/day |
 | `quaqua source github-ci poll --repo <owner/name>` | GitHub CI source: one `ci_failed` trigger per failed run on a `quaqua/*` branch that has a thread; deduped by run id, read position persisted |
 | `quaqua init`, `templates/workspace/`, seeds embedded from `src/init/seeds.rs` | Bootstraps a fresh clone's gitignored personal state (dirs + `memory/rules.md`, `projects/INDEX.md`, `_template.md`, `USER.md`); idempotent, never overwrites |
 | `quaqua memory check`, `quaqua memory hook pre\|batch` | CoS memory gate: caps `memory/rules.md` at 2200 and `USER.md` at 1375 Unicode chars, scans both for secrets; `quaqua init` installs the `PreToolUse` (`Write\|Edit\|MultiEdit`) deny and the `PostToolBatch` flag |
-| `tests/` | Sandboxed test suite: `tests/run.sh` runs every `tests/test_*.sh` (the 2 slow suites only when the change touches a script they cover, or with `--slow`) and exits non-zero on any failure |
+| `tests/` | `hermetic.sh` (strace guard against live-DB opens), `e2e/`, `manual/`; the Rust suite lives in `crates/qq-core/tests/` |
 | `SETUP-PROMPT.md` | Original prompt used to bootstrap this setup |
 | `docs/slp.png` | Diagram: Principal → CoS → Lead → Peers |
 
@@ -76,7 +75,7 @@ is safe to re-run after a pull. The one exception is `.claude/settings.json`,
 which it merges into: the two CoS memory hooks are added only when absent and
 every other hook in the file is left alone. Then edit `USER.md` for the workspace, add one
 row per project to `projects/INDEX.md` (copy `projects/_template.md` for the
-card), and continue with the auditor install below. The seeds are embedded in the binary (`src/init/seeds.rs`).
+card). The seeds are embedded in the binary (`src/init/seeds.rs`).
 
 The installed hooks enforce AGENTS.md '## Memory'. A `Write`/`Edit`/`MultiEdit`
 that would push `memory/rules.md` past 2200 chars or `USER.md` past 1375, or
@@ -138,76 +137,11 @@ git clone git@github.com:tinhtute/quaqua.git ~/quaqua && cd ~/quaqua
 cargo install --path crates/qq-core --locked   # installs the quaqua binary to ~/.cargo/bin
 ~/.cargo/bin/quaqua --version   # verify; an interactive `quaqua` shell function can shadow the binary, so call it by path
 quaqua init     # dirs + rules.md, INDEX.md, _template.md, USER.md
-bash templates/workspace/scripts/auditor/install-auditor.sh  # installs scheduling files; prints manual activation command
 ```
 
-Linux: the installer renders the user service from `quaqua-auditor.service.in`, pinning the
-install-time PATH (systemd's user manager starts jobs with a bare PATH that lacks
-`~/.local/bin`, so a bare unit cannot find `claude`), symlinks the timer, and calls only
-`systemctl --user daemon-reload`. Activate manually with
-`systemctl --user enable --now quaqua-auditor.timer`. Reinstall after moving the harness
-CLI or changing toolchain paths; an older install (symlinked service) needs one reinstall to pick up the PATH.
+Schedule `quaqua auditor run` (07:00 and 19:00) and `quaqua source github-ci poll --repo <owner/name>` (every 5 minutes) with your own user systemd timer or LaunchAgent; the repo ships no installer. `gh` and `quaqua` must be on the unit's PATH, and the unit must pin `QUAQUA_RUNS_DIR` to this workspace's `runs/`.
 
-macOS: install a current Bash (e.g. `brew install bash`), then put its `bin` directory
-first on PATH (`export PATH="$(brew --prefix bash)/bin:$PATH"` for Homebrew).
-Run `bash templates/workspace/scripts/auditor/install-auditor.sh` with `claude` on PATH. The installer requires
-Bash >= 4.4 from `command -v bash` and refuses the macOS system Bash 3.2.
-It renders `templates/workspace/scripts/auditor/launchd/com.quaqua.auditor.plist.in` into
-`~/Library/LaunchAgents/com.quaqua.auditor.plist`, pinning the discovered Bash,
-the resolved `quaqua auditor run` path, and the install-time PATH (including
-claude's directory). Logs go to `~/Library/Logs/quaqua-auditor.log`; reports still go
-in this checkout's `reports/`. It never calls launchctl; run the printed bootstrap
-command yourself. Reinstall after moving the checkout or changing toolchain paths.
-Calendar intervals run at 07:00/19:00; unlike systemd's `Persistent=true`, launchd does
-not replay missed runs while logged out (sleep wakeups may coalesce missed intervals).
-
-### GitHub CI poll timer
-
-`quaqua source github-ci poll --repo <owner/name>` records a `ci_failed` trigger for
-each failed run on a `quaqua/*` branch that already has a thread. Schedule it with:
-
-```bash
-bash templates/workspace/scripts/github-ci-poll/install-github-ci-poll.sh [--repo <owner/name>]
-```
-
-`--repo` defaults to the `origin` remote of the checkout the script lives in, so a
-clone of any fork polls its own repository; the origin must be a clone URL
-(`https://`, `ssh://`, `git@host:owner/name`), never a local path. `gh` and `quaqua`
-must be on PATH.
-
-Both units pin the install-time PATH and `QUAQUA_RUNS_DIR` (`$QUAQUA_RUNS_DIR`, else
-`<checkout>/runs`): the managers start the job with a bare PATH and no shell profile,
-and the poll must record into this workspace's database rather than `$HOME/quaqua/runs`.
-
-Linux: renders `~/.config/systemd/user/quaqua-github-ci-poll.service`, symlinks the
-timer beside it, and calls only `systemctl --user daemon-reload`. Activate with
-`systemctl --user enable --now quaqua-github-ci-poll.timer`; `OnCalendar=*:0/5` with
-`Persistent=true` runs it every 5 minutes and replays a missed run. `quaqua doctor`
-checks the pair: an installed, active timer is fine; a dangling symlink or an inactive
-timer fails the run; a timer that was never installed warns (installing it is a
-per-workspace choice).
-
-macOS: renders `~/Library/LaunchAgents/com.quaqua.github-ci-poll.plist` with
-`StartInterval` 300, the resolved `quaqua` path, the install-time PATH and the runs
-dir (launchd does not source shell profiles, so `gh` must be on that PATH). Logs go to
-`~/Library/Logs/quaqua-github-ci-poll.log`. It never calls launchctl; run the printed
-`launchctl bootstrap` command yourself.
-
-`--dry-run` prints the rendered unit and writes nothing, which is the safe way to
-inspect the result on a machine where the timer should not be installed.
-
-Tests live in `tests/` and require Bash >= 4.4 (macOS system Bash 3.2 is insufficient),
-git, jq, Perl, python3 (for plist validation), and ripgrep. They use temporary homes and
-stub herdr/claude/managers; no network, real agents, or service activation is needed:
-
-```bash
-# On macOS, put your installed Bash's bin directory first on PATH as above.
-tests/run.sh   # PASS/FAIL per test, then a count; exits non-zero on any failure
-RUN_SLOW_TESTS=1 tests/run.sh   # also run the 2 slow suites (or: tests/run.sh --slow)
-```
-
-`tests/run.sh` skips the two slow suites (`test_prompt_worker.sh`, `test_pipeline.sh`)
-unless the change touches a script they cover, and prints which it skipped and why.
+Tests: `cargo test --locked -p qq-core`. `tests/hermetic.sh` (needs `strace`) runs the suite under a tracer and fails if any test opens the live workspace database.
 
 CI: `.github/workflows/test.yml` runs `cargo test --locked` and actionlint on every PR
 and push to `main`; `.github/workflows/release.yml` runs on a `v*` tag and builds and
