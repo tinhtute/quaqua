@@ -186,7 +186,7 @@ fn memory_write_owner_other_paths_refused() {
     let r = rig("mw-owner-path", Who::Cos);
     for rel in [
         "AGENTS.md",
-        "SOUL.md",
+        "identity.md",
         "../escape.md",
         "/etc/passwd",
         "memory/corrections.md",

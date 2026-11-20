@@ -448,7 +448,9 @@ fn standing_block_of_the_shipped_template() {
         "{start}"
     );
     assert!(
-        start.contains("## persona — SOUL.md") && start.contains("## projects — projects/INDEX.md")
+        start.contains("## persona — identity.md")
+            && start.matches("## persona —").count() == 1
+            && start.contains("## projects — projects/INDEX.md")
     );
     assert!(!start.contains("USER.md"), "the seed USER.md is skipped");
     let now_at = start.find("## Now (computed)").expect("Now section");
@@ -677,15 +679,15 @@ fn registered_cmds_report_exit_codes() {
 
     // init: a locally changed template file is a conflict -> exit 3, kept, pending copy.
     assert_eq!(code(init::init_cmd(&env, &[])), 0);
-    write(&ws.root().join("SOUL.md"), "mine\n");
+    write(&ws.root().join("identity.md"), "mine\n");
     let lock = std::fs::read_to_string(ws.root().join(".quaqua/template.lock")).unwrap();
-    assert!(lock.contains("SOUL.md"));
+    assert!(lock.contains("identity.md"));
     assert_eq!(code(init::init_cmd(&env, &args(&["--update"]))), 3);
     assert_eq!(
-        std::fs::read_to_string(ws.root().join("SOUL.md")).unwrap(),
+        std::fs::read_to_string(ws.root().join("identity.md")).unwrap(),
         "mine\n"
     );
-    assert!(ws.root().join(".quaqua/pending/SOUL.md").is_file());
+    assert!(ws.root().join(".quaqua/pending/identity.md").is_file());
 
     // The hooks fail open: no stdin, no answer, exit 0.
     assert_eq!(

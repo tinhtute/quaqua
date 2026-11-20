@@ -11,7 +11,7 @@
 //!   history rewrite on shared refs, the #297 bypass spellings (alias push,
 //!   `gh api` ref/contents writes off main, `query=@file`), pane input and
 //!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
-//!   AGENTS.md, SOUL.md and identity.md. Only a hit asks the daemon who is
+//!   AGENTS.md and identity.md. Only a hit asks the daemon who is
 //!   calling (`caller.lookup`); only the CoS gets past `deny`, and the tier
 //!   table (`tier.rs`) says allow or ask. No daemon answer is `deny`. A branch
 //!   delete is classed live against the remote default: merged is low, unmerged
@@ -385,12 +385,12 @@ fn target_dir(d: &str, here: &Path) -> Option<PathBuf> {
 /// Which protected workspace file a basename names (the live instruction files).
 fn protected_kind(file: &str) -> Option<Action> {
     match file.rsplit('/').next().unwrap_or(file) {
-        "AGENTS.md" | "SOUL.md" | "identity.md" => Some(Action::InstructionFile),
+        "AGENTS.md" | "identity.md" => Some(Action::InstructionFile),
         _ => None,
     }
 }
 
-/// A Write/Edit to the live AGENTS.md, SOUL.md or identity.md: the path is
+/// A Write/Edit to the live AGENTS.md or identity.md: the path is
 /// resolved (cwd, `..`, symlinks) and compared under the CoS workspace root, so
 /// a template or a repo AGENTS.md with the same basename is not a hit.
 fn edit_found(env: &Env, file: &str, cwd: Option<&Path>, loose: bool) -> Found {
@@ -409,7 +409,7 @@ fn edit_found(env: &Env, file: &str, cwd: Option<&Path>, loose: bool) -> Found {
             .join(p);
     }
     let p = resolve(&p);
-    if ["AGENTS.md", "SOUL.md", "identity.md"]
+    if ["AGENTS.md", "identity.md"]
         .iter()
         .any(|n| p == root.join(n))
     {
@@ -443,7 +443,7 @@ enum Live {
 }
 
 fn live_kind(root: &Path, resolved: &Path) -> Option<Live> {
-    if ["AGENTS.md", "SOUL.md", "identity.md"]
+    if ["AGENTS.md", "identity.md"]
         .iter()
         .any(|n| resolved == root.join(n))
     {
@@ -461,7 +461,7 @@ fn live_kind(root: &Path, resolved: &Path) -> Option<Live> {
 /// `dirs` entry. Cheap name test first: only a word ending in one of the five
 /// file names is resolved. A memory hit wins over an instruction hit.
 fn names_live_file(root: &Path, dirs: &[PathBuf], w: &str) -> Option<Live> {
-    const NAMES: [&str; 5] = ["USER.md", "rules.md", "AGENTS.md", "SOUL.md", "identity.md"];
+    const NAMES: [&str; 4] = ["USER.md", "rules.md", "AGENTS.md", "identity.md"];
     if !NAMES.iter().any(|n| w.ends_with(n)) {
         return None;
     }

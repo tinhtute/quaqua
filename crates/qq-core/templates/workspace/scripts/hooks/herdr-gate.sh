@@ -71,7 +71,7 @@ trunk_del="git.*[[:space:]]branch.*($trunk_flag.*$trunk_name|$trunk_pre(main|mas
 # Bash writes to the live instruction and memory files (the binary resolves the
 # workspace root; the fallback matches the basename, a superset), and a grant
 # verb sent through a raw socket client or inline interpreter code.
-live_names='((AGENTS|SOUL|identity|USER)\.md|memory/rules\.md)([^a-zA-Z0-9_.-]|$)'
+live_names='((AGENTS|identity|USER)\.md|memory/rules\.md)([^a-zA-Z0-9_.-]|$)'
 live_redirect=">[[:space:]]*[^[:space:]\";&|]*$live_names"
 live_tools="(^|[^a-zA-Z0-9_.-])(tee|mv|cp|dd|install|truncate|rm|unlink|shred|ln|rsync|python[0-9.]*|node|ruby|perl|php)[[:space:]][^\"|;&]*$live_names"
 live_sed="(^|[^a-zA-Z0-9_.-])sed[[:space:]][^\"|;&]*(-[a-zA-Z]*i|--in-place)[^\"|;&]*$live_names"
@@ -88,7 +88,7 @@ mcp__*)
 Write | Edit | MultiEdit | NotebookEdit)
   # Only the live instruction files; the content is never scanned. The binary
   # tells the live workspace copy from a template; the fallback cannot.
-  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"(([^"]*/)?(AGENTS|SOUL|identity|USER)\.md|([^"]*/)?memory/rules\.md)"' <<<"$stdin" &&
+  grep -Eq '"(file|notebook)_path"[[:space:]]*:[[:space:]]*"(([^"]*/)?(AGENTS|identity|USER)\.md|([^"]*/)?memory/rules\.md)"' <<<"$stdin" &&
     hit='write to an instruction file'
   ;;
 *)

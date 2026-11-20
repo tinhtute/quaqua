@@ -262,7 +262,7 @@ fn target_for(path: &Path) -> Option<&'static Target> {
 }
 
 /// The standing files without a cap: threat-scanned on write, not capped.
-const UNCAPPED_STANDING: &[&str] = &["SOUL.md", "identity.md", "projects/INDEX.md"];
+const UNCAPPED_STANDING: &[&str] = &["identity.md", "projects/INDEX.md"];
 
 /// The uncapped standing file `path` names, if it sits in a workspace.
 fn standing_rel(path: &Path) -> Option<&'static str> {

@@ -1397,10 +1397,6 @@ mod caller_gate {
         file_case("ifg-agents", "AGENTS.md");
     }
     #[test]
-    fn instruction_file_gate_soul_md() {
-        file_case("ifg-soul", "SOUL.md");
-    }
-    #[test]
     fn instruction_file_gate_identity_md() {
         file_case("ifg-ident", "identity.md");
     }
@@ -1418,7 +1414,7 @@ mod caller_gate {
                 root.join("projects/x/AGENTS.md"),
                 root.join("runs/AGENTS.md"),
                 root.join("notes.md"),
-                std::path::PathBuf::from("/tmp/elsewhere/SOUL.md"),
+                std::path::PathBuf::from("/tmp/elsewhere/identity.md"),
             ] {
                 assert_eq!(
                     r.edit("Write", p.to_str().unwrap()),
