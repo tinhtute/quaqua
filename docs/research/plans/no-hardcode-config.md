@@ -24,7 +24,7 @@ lane: normal
 - **?** doubtful, needs CoS judgment (about 27 rows across lanes).
 
 ## Target architecture
-Global config (`~/.config/quaqua/config.toml`, written by `quaqua init --from`). All values in both TOML examples are illustrative, not decided:
+Global config (`~/.config/quaqua/config.toml`, written by `quaqua init --from`). Manifest values mirror today's engine (checked against origin/main 800a410) so phase `standing` is behavior-preserving; global-config values are illustrative:
 ```toml
 [template]
 url      = "git@github.com:org/quaqua-template.git"  # no default in the binary
@@ -42,25 +42,33 @@ Manifest in the template repo:
 ```toml
 engine = ">=0.9"                  # sync refuses a template newer than the engine
 
-[files]
-managed = ["AGENTS.md", ".claude/rules/*.md", "scripts/hooks/*.sh"]
-seed    = ["USER.md", "identity.md", "team.toml"]   # written once, never overwritten
-private = ["memory/", "projects/", "runs/", "raw/", "reports/", "USER.md"]
+[files]                           # mirrors init/table.rs, init/seeds.rs, init/mod.rs today
+managed = ["AGENTS.md", "identity.md", "team.toml", ".claude/rules/*.md", "scripts/hooks/*.sh"]  # full list: init/table.rs
+seed    = ["memory/rules.md", "projects/INDEX.md", "projects/_template.md", "USER.md"]  # written once, never overwritten
+private = ["memory", "projects", "raw", "runs", "reports"]   # PRIVATE_DIRS
 executable = ["scripts/hooks/*.sh"]   # sync asks before changing these
 
 [roles]                           # one list, queried by role (gate, caps, drift, fence...)
 instruction = ["AGENTS.md", "identity.md"]
-capped      = { "rules.md" = 10000, "USER.md" = 6000 }
-standing    = ["## Now (computed)", "# <Owner name>"]
 
-[standing]  order = ["now", "owner", "rules"]
-[caps]      rules = 10000  user = 6000  leaf_depth = 3
+[standing]                        # memory/standing.rs SECTIONS, render order; INDEX last, the budget drops it
+budget = 8000
+sections = [ { title = "persona",  path = "identity.md" },
+             { title = "owner",    path = "USER.md" },
+             { title = "rules",    path = "memory/rules.md" },
+             { title = "projects", path = "projects/INDEX.md" } ]
+
+[caps]                            # the only cap table (memory/caps.rs RULES_CAP, USER_CAP)
+"memory/rules.md" = 2200
+"USER.md"         = 1375
 
 [formats]                         # the one report contract
-outcomes = ["COMPLETE","NO_CHANGES","BLOCKED","DISPUTED","REOPEN_REQUEST","DEPENDENCY_REQUEST"]
-passing  = ["COMPLETE","NO_CHANGES"]
-headings = ["## Changes","## Verify","## Risks","## Lessons"]
-severities = ["important","pre_existing","nit"]
+# Engine skeleton today (report_contract.rs report_skeleton): Changes/Verify/Risks/Lessons.
+# brief.md says Blockers/Lessons (issue #317). [formats] must pick ONE; shown here: brief.md.
+brief_headers = ["Topology","Playbook","Context","Goal","Hard constraints","Current design (open to challenge)","Unknowns","Evidence","Time budget","Cost budget"]
+outcomes   = ["COMPLETE","NO_CHANGES","BLOCKED","DISPUTED","REOPEN_REQUEST","DEPENDENCY_REQUEST"]
+headings   = ["## Blockers","## Lessons"]
+severities = ["critical","major","minor","trivial"]    # brief.md `Must fix:`
 
 [threat]   add = [ { id = "x", pattern = "..." } ]   # ADD only, see Q2
 [fence]    add = ["scripts/hooks/"]                  # ADD only, see Q2
@@ -98,7 +106,7 @@ severities = ["important","pre_existing","nit"]
 - phase `formats` — report-contract manifest; depends_on: `dups`
   - one `[formats]` source read by `pipeline.rs`, `worker_flow.rs`, `report_contract.rs`, `auditor/precheck.rs`; exit codes 10-14 stay K and are not merged.
   - check: fixture with a renamed outcome word passes gate and auditor; the 3 copies are gone.
-- phase `standing` — standing order, caps, seeds, private dirs; depends_on: `formats`
+- phase `standing` — standing order, caps, seeds, private dirs (copy today's values from the manifest example; no behavior change); depends_on: `formats`
   - one `[roles]` source for the 7+ copied file lists (`gate.rs`, `caps.rs`, `drift.rs`, `standing.rs`, `fence.rs`, `journal.rs`, `situation.rs`, `threat.rs`); `"cos"` string compare and the "anh iu" persona text from W/M; `PRIVATE_DIRS`, `SECTIONS`, `RULES_CAP`/`USER_CAP`; seed bodies generated from the manifest sentinels. Audit `tokenizer.rs` first.
   - check: renamed-file fixture passes gate, caps and drift; `rg` for file-name literals outside tests returns only K rows.
 - phase `fetch` — remote fetch and sync; depends_on: `standing`
