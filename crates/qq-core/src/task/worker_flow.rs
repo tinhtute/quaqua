@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 #[path = "spawn_cmd.rs"]
@@ -46,6 +47,8 @@ const BLOCKED: i32 = 11;
 const PROMPT_FAILED: i32 = 12;
 const UNVERIFIED: i32 = 13;
 const REPORTED_BLOCKED: i32 = 14;
+const REOPEN_REQUESTED: i32 = 15;
+const DEPENDENCY_REQUESTED: i32 = 16;
 
 fn outcome_of(code: i32) -> &'static str {
     match code {
@@ -53,6 +56,8 @@ fn outcome_of(code: i32) -> &'static str {
         BLOCKED => "blocked",
         PROMPT_FAILED => "prompt_failed",
         REPORTED_BLOCKED => "reported_blocked",
+        REOPEN_REQUESTED => "reopen_request",
+        DEPENDENCY_REQUESTED => "dependency_request",
         UNVERIFIED => "unverified",
         _ => "failed",
     }
@@ -163,9 +168,9 @@ fn judge(report: &str) -> Result<WorkerOutput, (i32, String)> {
                 candidate_sha: Some(sha.to_string()),
             })
         }
-        "BLOCKED" | "DISPUTED" | "REOPEN_REQUEST" | "DEPENDENCY_REQUEST" => {
-            Err((REPORTED_BLOCKED, format!("worker reported {word}")))
-        }
+        "REOPEN_REQUEST" => Err((REOPEN_REQUESTED, format!("worker reported {word}"))),
+        "DEPENDENCY_REQUEST" => Err((DEPENDENCY_REQUESTED, format!("worker reported {word}"))),
+        "BLOCKED" | "DISPUTED" => Err((REPORTED_BLOCKED, format!("worker reported {word}"))),
         _ => Err((UNVERIFIED, "report has no recognised Outcome".into())),
     }
 }
@@ -335,8 +340,23 @@ fn record_end(journal: &dyn Journal, db_path: &Path, id: &str) -> Result<(), Str
         return Ok(());
     };
     let conn = crate::db::open(db_path).map_err(|e| e.to_string())?;
-    crate::run::close(&conn, id, &outcome, sha.as_deref(), now_ms()).map_err(|e| e.to_string())?;
-    Ok(())
+    // The run closes once and its task takes the end state the Lead reads in
+    // the same transaction: a repeat finds the run closed and writes nothing,
+    // so an old verdict never overwrites a later state.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let closed = crate::run::close(&tx, id, &outcome, sha.as_deref(), now_ms())
+        .map_err(|e| e.to_string())?;
+    if closed {
+        let task: Option<i64> = tx
+            .query_row("SELECT task_id FROM run WHERE workflow_id = ?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        if let Some(task) = task {
+            super::graph::settle(&tx, task, &outcome).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// The inner machine plus the run record: when the workflow ends, the run
@@ -568,6 +588,19 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
             None => {}
         }
 
+        // A child starts only after its parents are verified. A repeat of a
+        // flow already there converged above and is not gated again.
+        if let (None, Some(task)) = (&existing, task_id) {
+            let waiting = super::graph::unverified_parents(&conn, task).map_err(internal)?;
+            if !waiting.is_empty() {
+                let reason = format!("task {task} waits for unverified parents {waiting:?}");
+                let target = format!("task:{task}");
+                crate::authority::refuse(&conn, req.caller.as_deref().unwrap_or("daemon"), "start", &target, &reason)
+                    .map_err(|e| internal(e.0))?;
+                return Err(RpcError::new("parents_unverified", reason));
+            }
+        }
+
         // Gate and attribute the spawn. The gate is skipped only for the open
         // agent's own spawner retrying (it converges and spawns nothing new);
         // any other caller goes through it. A request with no caller is not
@@ -719,10 +752,10 @@ mod tests {
             ("Outcome:   No   Changes \n".into(), "no_changes", None),
             ("Outcome: BLOCKED\n".into(), "reported_blocked", None),
             ("Outcome: DISPUTED\n".into(), "reported_blocked", None),
-            ("Outcome: REOPEN_REQUEST\n".into(), "reported_blocked", None),
+            ("Outcome: REOPEN_REQUEST\n".into(), "reopen_request", None),
             (
                 "Outcome: DEPENDENCY_REQUEST\n".into(),
-                "reported_blocked",
+                "dependency_request",
                 None,
             ),
             ("Outcome: DONE\n".into(), "unverified", None),

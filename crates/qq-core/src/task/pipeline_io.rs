@@ -3,9 +3,10 @@
 //! and the `INSTALL` seam that also registers the `merge` verb.
 //!
 //! `pipeline {task, builder_kind, reviewer_kind, brief, repo, branch, integ,
-//! pane, [project_id, max_rounds, timeout_ms, check]}` refuses a reviewer on
-//! the builder's harness (review is cross-harness) and a kind that cannot
-//! review. A repeat with the same input converges; another input for the same
+//! pane, [project_id, task_id, max_rounds, timeout_ms, check]}` refuses a reviewer on
+//! the builder's model (the same harness is allowed) and a kind that cannot
+//! review. `task_id` names the task row: it starts only after its parents are
+//! verified, and a merge verifies it. A repeat with the same input converges; another input for the same
 //! task is a `conflict`.
 
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use super::worker_flow::spawn_cmd::{existing_pane, spawn_placed, Ctx, Placed, Wo
 use crate::authority::{self, Role as AuthRole};
 use crate::cli::{CliError, Command, Install, Registry as CliRegistry};
 use crate::config;
-use crate::daemon::supervisor::{Factory, Machine};
+use crate::daemon::supervisor::{Factory, Machine, Progress, WorkflowDriver};
 use crate::daemon::{Daemon, Handler};
 use crate::driver::Registry as Drivers;
 use crate::engine::activity::{
@@ -27,7 +28,7 @@ use crate::engine::activity::{
 use crate::engine::clock::SystemClock;
 use crate::engine::journal::Journal;
 use crate::engine::journal_sqlite::SqliteJournal;
-use crate::engine::{Activity, ActivityError, ActivityRequest, ActivityResult};
+use crate::engine::{Activity, ActivityError, ActivityRequest, ActivityResult, WorkflowEvent};
 use crate::herdr::{CliHerdr, HerdrClient};
 use crate::merge;
 use crate::rpc::{self, RpcError};
@@ -330,13 +331,87 @@ fn factory(deps: &Arc<Deps>) -> Factory {
             }
         };
         let acts = Box::new(Effects::new(Arc::clone(&deps), input.clone()));
+        let task_id = input.task_id;
         let machine = if fresh {
             Machine::new(PipelineFlow, id, PipelineState::new(input), acts)
         } else {
             Machine::resume_only(PipelineFlow, id, acts)
         };
-        Ok(Box::new(machine))
+        Ok(Box::new(VerifyingMachine {
+            inner: machine,
+            id: id.to_string(),
+            task_id,
+            db_path: deps.runs_dir.join(crate::db::path::DB_FILE),
+        }))
     })
+}
+
+/// The run outcome of the escalation a pause names, when the flow now waits
+/// on a report that ended in REOPEN_REQUEST, DEPENDENCY_REQUEST or BLOCKED
+/// (the pause reason reads `the report ends in <WORD>`).
+fn escalation_of(events: &[crate::engine::journal::EventRecord]) -> Option<&'static str> {
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind.as_str(), "pause_for_approval" | "approval_resolved"))?;
+    if last.kind != "pause_for_approval" {
+        return None;
+    }
+    let reason = serde_json::from_str::<Value>(&last.payload_json).ok()?;
+    let (_, word) = reason.get("reason")?.as_str()?.split_once("the report ends in ")?;
+    match word.trim() {
+        "REOPEN_REQUEST" => Some("reopen_request"),
+        "DEPENDENCY_REQUEST" => Some("dependency_request"),
+        "BLOCKED" | "DISPUTED" => Some("reported_blocked"),
+        _ => None,
+    }
+}
+
+/// The flow plus the task record: a merge (or nothing to do) makes its task
+/// row `verified`, so the children may start; a report that asks to reopen,
+/// to depend or that is blocked leaves the task in that state. The write is
+/// idempotent and lives here, never in a replayed step.
+struct VerifyingMachine {
+    inner: Machine<PipelineFlow>,
+    id: String,
+    task_id: Option<i64>,
+    db_path: PathBuf,
+}
+
+impl WorkflowDriver for VerifyingMachine {
+    fn advance(
+        &mut self,
+        journal: &mut dyn Journal,
+        events: Vec<WorkflowEvent>,
+    ) -> Result<Progress, String> {
+        let progress = self.inner.advance(journal, events)?;
+        let Some(task) = self.task_id else {
+            return Ok(progress);
+        };
+        let all = journal.load_events(&self.id, 1).map_err(|e| e.to_string())?;
+        let outcome = match &progress {
+            Progress::Completed => all
+                .iter()
+                .find(|e| e.kind == "workflow_completed")
+                .and_then(|e| serde_json::from_str::<pipeline::PipelineOutput>(&e.payload_json).ok())
+                .and_then(|o| match o.status.as_str() {
+                    "merged" => Some("verified"),
+                    "no_changes" => Some("no_changes"),
+                    _ => None,
+                }),
+            Progress::Running => escalation_of(&all),
+            Progress::Failed(_) => None,
+        };
+        if let Some(outcome) = outcome {
+            let conn = crate::db::open(&self.db_path).map_err(|e| e.to_string())?;
+            super::graph::settle(&conn, task, outcome).map_err(|e| e.to_string())?;
+        }
+        Ok(progress)
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.inner.next_deadline()
+    }
 }
 
 fn bad(msg: impl Into<String>) -> RpcError {
@@ -390,7 +465,7 @@ fn input_of(a: &Value, runs_dir: &Path) -> Result<PipelineInput, RpcError> {
     // A new start plans first (the serde default stays false so a journaled
     // flow replays as it started).
     v["plan"] = json!(true);
-    for k in ["project_id", "max_rounds", "timeout_ms", "check", "plan"] {
+    for k in ["project_id", "task_id", "max_rounds", "timeout_ms", "check", "plan"] {
         if let Some(x) = a.get(k) {
             v[k] = x.clone();
         }
@@ -505,6 +580,18 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
         }
         check_kinds(&conn, &input.builder_kind, &input.reviewer_kind)?;
 
+        // A child starts only after its parents are verified; a repeat of a
+        // flow already there converges below and is not gated again.
+        if let (None, Some(task)) = (ctx.store.workflow(&id).map_err(internal)?, input.task_id) {
+            let waiting = super::graph::unverified_parents(&conn, task).map_err(internal)?;
+            if !waiting.is_empty() {
+                let reason = format!("task {task} waits for unverified parents {waiting:?}");
+                authority::refuse(&conn, caller, "start", &format!("task:{task}"), &reason)
+                    .map_err(|e| internal(e.0))?;
+                return Err(RpcError::new("parents_unverified", reason));
+            }
+        }
+
         if let Some(w) = ctx.store.workflow(&id).map_err(internal)? {
             // Fail closed: when the journaled input cannot be read the repeat
             // is not known to be the same task.
@@ -521,6 +608,7 @@ fn start_verb(deps: Arc<Deps>) -> Handler {
                 && old.integ == input.integ
                 && old.check == input.check
                 && old.plan == input.plan
+                && old.task_id == input.task_id
                 && old.pane == input.pane;
             if !same {
                 return Err(RpcError::new(
@@ -603,7 +691,7 @@ fn install(cli: &mut CliRegistry, daemon: &mut Daemon) -> Result<(), String> {
     merge::register(daemon)?;
     cli.register(Command {
         name: "pipeline",
-        help: "pipeline '<json>' [--rounds <N>] [--wait] | --resume <task> [<repo>] [--rounds <N>] [--wait] | --cancel <task> [--wait]: build -> cross-harness review -> gate -> merge for one task; --wait blocks until the run ends or pauses for approval (exit 0 merged or no changes, 3 cancelled, 4 held or disputed, 5 paused: the JSON names it in `paused`, approve with --resume and wait again, 1 failed, daemon gone or loop stopped)",
+        help: "pipeline '<json>' [--rounds <N>] [--wait] | --resume <task> [<repo>] [--rounds <N>] [--wait] | --cancel <task> [--wait]: build -> review on another model (the same harness is allowed) -> gate -> merge for one task; --wait blocks until the run ends or pauses for approval (exit 0 merged or no changes, 3 cancelled, 4 held or disputed, 5 paused: the JSON names it in `paused`, approve with --resume and wait again, 1 failed, daemon gone or loop stopped)",
         run: |env, args| {
             let (wait, rest) = split_wait(args);
             let call = pipeline_args(&rest)?;

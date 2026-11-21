@@ -1,4 +1,4 @@
-//! Per-task flow: build -> review on another harness -> gate -> merge, bound to
+//! Per-task flow: build -> review on another model -> gate -> merge, bound to
 //! the candidate sha (R22). The flow runs through the real runner against a
 //! real git repo and the production effects; herdr is the fake, the report
 //! watcher is a recording closure.
@@ -24,6 +24,7 @@ use qq_core::engine::{
 use qq_core::herdr::{FakeHerdr, HerdrClient, Verb};
 use qq_core::merge::{self, Entry, MergeError};
 use qq_core::rpc::{self, Request};
+use qq_core::task::{create, graph, worker_flow};
 use qq_core::task::pipeline::{PipelineFlow, PipelineInput, PipelineOutput, PipelineState};
 use qq_core::task::pipeline_io::{self, Deps, Effects};
 use qq_core::testkit::TestWorkspace;
@@ -1258,5 +1259,259 @@ fn pipeline_start_without_a_caller_fails_closed() {
     let args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
     assert_eq!(refused(verb_call_anon(&ws, args)), "refused");
     assert!(herdr.prompts().is_empty(), "a refusal starts nothing");
+    daemon.stop().unwrap();
+}
+
+// ---- the task graph (R9, R22) ----
+
+const GRAPH_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A daemon with the pipeline, worker and task.create verbs over a seeded workspace.
+fn graph_rig(tag: &str) -> (TestWorkspace, Fixture, Arc<FakeHerdr>, String, qq_core::daemon::DaemonHandle) {
+    let ws = TestWorkspace::new(tag);
+    let fx = Fixture::new(tag);
+    let mut conn = db::open(&ws.db_path()).expect("open qq db");
+    seed(&mut conn);
+    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", [])
+        .unwrap();
+    let herdr = Arc::new(FakeHerdr::new());
+    let anchor = herdr.seed_pane("work", None, &[]);
+    let mut d = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: herdr.clone(),
+    });
+    let watcher = d.report_watcher();
+    pipeline_io::register(
+        &mut d,
+        Deps::new(herdr.clone(), ws.runs_dir(), Registry::native(), watcher),
+    )
+    .expect("register pipeline");
+    worker_flow::register(
+        &mut d,
+        worker_flow::Deps {
+            herdr: herdr.clone(),
+            runs_dir: ws.runs_dir(),
+            drivers: Registry::native(),
+        },
+    )
+    .expect("register worker flow");
+    create::register(&mut d, ws.runs_dir()).expect("register task.create");
+    (ws, fx, herdr, anchor, d.spawn().expect("daemon starts"))
+}
+
+fn call(ws: &TestWorkspace, caller: Option<&str>, verb: &str, args: Value) -> rpc::Response {
+    let mut req = Request::new(verb, args);
+    req.caller = caller.map(String::from);
+    rpc::call(&rpc::socket_path(&ws.runs_dir()), &req).expect("rpc transport")
+}
+
+fn new_task(ws: &TestWorkspace, title: &str, extra: Value) -> i64 {
+    let mut a = json!({ "project": "p", "title": title });
+    for (k, v) in extra.as_object().unwrap() {
+        a[k] = v.clone();
+    }
+    let r = call(ws, Some("cos"), "task.create", a);
+    assert!(r.ok, "task.create {title}: {:?}", r.error);
+    r.result["task_id"].as_i64().unwrap()
+}
+
+fn start_args(name: &str, task: i64) -> Value {
+    json!({
+        "name": name, "kind": "ni", "role": "peer", "pane": format!("pane-{name}"),
+        "prompt": "do the thing", "report": format!("{name}.md"),
+        "timeout_ms": 600_000, "base": "main", "project_id": 1, "task_id": task,
+    })
+}
+
+fn publish(ws: &TestWorkspace, name: &str, body: &str) {
+    let tmp = ws.runs_dir().join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, body).unwrap();
+    std::fs::rename(tmp, ws.runs_dir().join(format!("{name}.md"))).unwrap();
+}
+
+fn task_state(ws: &TestWorkspace, id: i64) -> String {
+    db::open(&ws.db_path())
+        .unwrap()
+        .query_row("SELECT state FROM task WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap()
+}
+
+fn start_refusals(ws: &TestWorkspace) -> Vec<(String, String)> {
+    let conn = db::open(&ws.db_path()).unwrap();
+    qq_core::authority::refusals(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.edge, r.target))
+        .collect()
+}
+
+/// A child task starts only after its parents are verified, on both doors
+/// (`task.start` and `pipeline`); a cycle is refused when declared.
+#[test]
+fn task_dag_order() {
+    let (ws, fx, herdr, anchor, daemon) = graph_rig("graph-dag");
+    let a = new_task(&ws, "a", json!({}));
+    let b = new_task(&ws, "b", json!({ "parents": [a] }));
+    let c = new_task(&ws, "c", json!({ "parents": [b] }));
+
+    // a cycle, a self-parent and a stranger are refused; nothing is stored
+    for (task, parent) in [(a, c), (a, a), (a, 999)] {
+        let r = call(&ws, Some("cos"), "task.create", json!({ "project": "p", "title": "a", "parents": [parent] }));
+        assert_eq!(refused(r), "bad_parent", "task {task} parent {parent}");
+    }
+    let deps: i64 = db::open(&ws.db_path())
+        .unwrap()
+        .query_row("SELECT count(*) FROM task_dep", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(deps, 2);
+
+    // b waits for a: refused and journaled, nothing spawned
+    assert_eq!(refused(call(&ws, None, "task.start", start_args("w-b", b))), "parents_unverified");
+    let mut pipe = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    pipe["task_id"] = json!(c);
+    assert_eq!(refused(call(&ws, Some("cos"), "pipeline", pipe)), "parents_unverified");
+    assert!(herdr.prompts().is_empty(), "a refusal starts nothing");
+    let agents: i64 = db::open(&ws.db_path())
+        .unwrap()
+        .query_row("SELECT count(*) FROM agent WHERE name != 'cos'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(agents, 0);
+    assert_eq!(
+        start_refusals(&ws),
+        vec![
+            ("start".to_string(), format!("task:{b}")),
+            ("start".to_string(), format!("task:{c}")),
+        ]
+    );
+
+    // a has no parents: it starts, and until it is verified b still waits
+    let r = call(&ws, None, "task.start", start_args("w-a", a));
+    assert!(r.ok, "{:?}", r.error);
+    wait_for("a's prompt", || herdr.prompts().len() == 1);
+    assert_eq!(refused(call(&ws, None, "task.start", start_args("w-b", b))), "parents_unverified");
+
+    // a verified: b starts; c (grandchild) still waits for b
+    publish(&ws, "w-a", &format!("Outcome: COMPLETE\nVerified: unit-test-verified {GRAPH_SHA}\n\n## Blockers\nnone\n"));
+    wait_for("a verified", || task_state(&ws, a) == graph::VERIFIED);
+    let r = call(&ws, None, "task.start", start_args("w-b", b));
+    assert!(r.ok, "{:?}", r.error);
+    wait_for("b's prompt", || herdr.prompts().len() == 2);
+    assert_eq!(refused(call(&ws, None, "task.start", start_args("w-c", c))), "parents_unverified");
+    // a repeat of the running flow converges and is not gated again
+    assert!(call(&ws, None, "task.start", start_args("w-b", b)).ok);
+
+    // a repeat of a finished start never replays its old verdict: once the
+    // Lead moves a to reopen_request, asking again leaves it there
+    wait_for("a's flow finished", || {
+        call(&ws, None, "task.start", start_args("w-a", a)).result["finished"] == json!(true)
+    });
+    db::open(&ws.db_path())
+        .unwrap()
+        .execute("UPDATE task SET state = ?2 WHERE id = ?1", rusqlite::params![a, graph::REOPEN_REQUEST])
+        .unwrap();
+    assert!(call(&ws, None, "task.start", start_args("w-a", a)).ok);
+    assert_eq!(task_state(&ws, a), graph::REOPEN_REQUEST);
+    daemon.stop().unwrap();
+}
+
+/// A task's disposition is its own column: every kind carries every
+/// disposition, the default does not depend on the kind, and settling a run
+/// never touches it.
+#[test]
+fn disposition_independent_of_kind() {
+    let (ws, _fx, _herdr, _anchor, daemon) = graph_rig("graph-disp");
+    let kinds: Vec<String> = {
+        let conn = db::open(&ws.db_path()).unwrap();
+        let mut st = conn.prepare("SELECT name FROM kind ORDER BY name").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert!(kinds.len() >= 2, "{kinds:?}");
+    let conn = db::open(&ws.db_path()).unwrap();
+    for kind in &kinds {
+        for d in graph::DISPOSITIONS {
+            let id = new_task(&ws, &format!("{kind}-{d}"), json!({ "kind": kind, "disposition": d }));
+            assert_eq!(graph::disposition(&conn, id).unwrap().as_deref(), Some(*d), "{kind}");
+            graph::settle(&conn, id, "reported_blocked").unwrap();
+            assert_eq!(graph::disposition(&conn, id).unwrap().as_deref(), Some(*d), "settle keeps it");
+        }
+        let id = new_task(&ws, &format!("{kind}-default"), json!({ "kind": kind }));
+        assert_eq!(
+            graph::disposition(&conn, id).unwrap().as_deref(),
+            Some(graph::DEFAULT_DISPOSITION),
+            "the default is the same for {kind}"
+        );
+    }
+    let r = call(&ws, Some("cos"), "task.create", json!({ "project": "p", "title": "x", "disposition": "chief" }));
+    assert!(!r.ok, "an unknown disposition is refused");
+    daemon.stop().unwrap();
+}
+
+/// A report that ends in REOPEN_REQUEST, DEPENDENCY_REQUEST or BLOCKED leaves
+/// its task in a state of that name, the run keeps the same name, and the
+/// task's children stay unstarted. No report edge is needed: the state is the
+/// route to the Lead.
+#[test]
+fn report_escalation_states() {
+    let (ws, _fx, herdr, _anchor, daemon) = graph_rig("graph-esc");
+    let cases = [
+        ("REOPEN_REQUEST", graph::REOPEN_REQUEST, "reopen_request"),
+        ("DEPENDENCY_REQUEST", graph::DEPENDENCY_REQUEST, "dependency_request"),
+        ("BLOCKED", graph::BLOCKED, "reported_blocked"),
+    ];
+    for (n, (word, state, outcome)) in cases.iter().enumerate() {
+        let t = new_task(&ws, word, json!({}));
+        let child = new_task(&ws, &format!("{word}-child"), json!({ "parents": [t] }));
+        let name = format!("w-{}", word.to_lowercase().replace('_', "-"));
+        let r = call(&ws, None, "task.start", start_args(&name, t));
+        assert!(r.ok, "{:?}", r.error);
+        wait_for("prompt", || herdr.prompts().len() == n + 1);
+        publish(&ws, &name, &format!("Outcome: {word}\n\n## Changes\nnone\n"));
+        wait_for(word, || task_state(&ws, t) == *state);
+        let run: String = db::open(&ws.db_path())
+            .unwrap()
+            .query_row(
+                "SELECT outcome FROM run WHERE task_id = ?1",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run, *outcome);
+        assert_eq!(
+            refused(call(&ws, None, "task.start", start_args(&format!("{name}-c"), child))),
+            "parents_unverified",
+            "{word} does not verify the task"
+        );
+    }
+    assert!(
+        start_refusals(&ws).iter().all(|(edge, _)| edge == "start"),
+        "no report edge was asked for: {:?}",
+        start_refusals(&ws)
+    );
+    daemon.stop().unwrap();
+}
+
+/// The pipeline door writes the task row too: a builder report that asks to
+/// reopen leaves the task in `reopen_request` while the flow waits for the
+/// Lead; after the Lead resumes it, the flow's end verifies the task.
+#[test]
+fn pipeline_task_follows_its_flow() {
+    let (ws, fx, herdr, anchor, daemon) = graph_rig("graph-pipe");
+    let t = new_task(&ws, "t", json!({}));
+    let mut args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    args["task_id"] = json!(t);
+    let r = call(&ws, Some("cos"), "pipeline", args);
+    assert!(r.ok, "{:?}", r.error);
+    wait_for("build prompt", || herdr.prompts().len() == 1);
+
+    publish(&ws, "t1.build.a1", "Outcome: REOPEN_REQUEST\n\n## Changes\nnone\n");
+    wait_for("reopen_request", || task_state(&ws, t) == graph::REOPEN_REQUEST);
+
+    let r = call(&ws, Some("cos"), "pipeline", json!({ "resume": "t1" }));
+    assert!(r.ok, "{:?}", r.error);
+    wait_for("second build prompt", || herdr.prompts().len() == 2);
+    assert_eq!(task_state(&ws, t), graph::REOPEN_REQUEST, "the flow has not ended");
+    let base = git(&fx.repo, &["rev-parse", "integ"]);
+    publish(&ws, "t1.build.a2", &build_report(&base));
+    wait_for("verified", || task_state(&ws, t) == graph::VERIFIED);
     daemon.stop().unwrap();
 }
