@@ -859,6 +859,35 @@ fn roster_profiles_next_spawn() {
     assert_eq!((t.harness.name.as_str(), t.model.as_str()), ("pi", "m-pi"));
     assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
 
+    // The roster verb runs in the daemon: it answers with the profile its
+    // client named, and never reads its own env. Key is "fast" here.
+    let rpc_roster = |profile: Option<&str>| {
+        let mut body = serde_json::json!({ "argv": [] });
+        if let Some(p) = profile {
+            body["profile"] = serde_json::json!(p);
+        }
+        qq_core::cli::rpc_call(&env, "roster", body).unwrap()["out"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(rpc_roster(None).contains("haiku-5.5 (low)"));
+    assert!(rpc_roster(Some("alt")).contains("sonnet-5.5"));
+    {
+        // A daemon-side env is not a switch: only the client's argument is.
+        let _p = ProfileEnv::set("alt");
+        assert!(rpc_roster(None).contains("haiku-5.5 (low)"));
+        // The CLI client forwards its own env.
+        assert!(config::roster_cmd(&env, &[])
+            .unwrap()
+            .contains("sonnet-5.5"));
+    }
+    assert_eq!(run(&["config", "set", "profile.none", "{}"]), 1);
+    assert_eq!(
+        run(&["config", "set", "profile.null.ni", r#"{"model":"m"}"#]),
+        1
+    );
+
     // The env beats the key; a bad env name fails the spawn read, not silently.
     {
         let _p = ProfileEnv::set("alt");

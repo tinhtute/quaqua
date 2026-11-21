@@ -596,6 +596,11 @@ fn validate(p: &Parsed) -> Result<(), ConfigError> {
         }
     }
     for (profile, per_kind) in &p.profiles {
+        if matches!(profile.as_str(), "none" | "null" | "") {
+            return Err(ConfigError::Invalid(format!(
+                "profile name '{profile}' is reserved (`config set profile none` clears the switch)"
+            )));
+        }
         for (kname, o) in per_kind {
             let at = format!("profiles.{profile}.{kname}");
             let Some(k) = p.kinds.get(kname) else {
@@ -781,19 +786,48 @@ fn stored_profiles(
 /// reaches the next spawn and no running worker (a worker's harness, model
 /// and effort were fixed when it was launched).
 pub fn active_profile(conn: &Connection) -> Result<Option<String>, ConfigError> {
-    if let Some(v) = std::env::var(PROFILE_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(v) = env_profile() {
         return Ok(Some(v));
     }
     Ok(setting(conn, ACTIVE_PROFILE)?.and_then(|v| v.as_str().map(String::from)))
 }
 
+/// This process's `QUAQUA_PROFILE`, if set.
+pub fn env_profile() -> Option<String> {
+    std::env::var(PROFILE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The roster as profile `requested` makes it; with none, the stored
+/// `profile` setting. The process env is not read: the daemon answers the
+/// `roster` verb with the profile its client's env named.
+pub fn roster_as(conn: &Connection, requested: Option<&str>) -> Result<Vec<Kind>, ConfigError> {
+    let name = match requested {
+        Some(r) => Some(r.to_string()),
+        None => setting(conn, ACTIVE_PROFILE)?.and_then(|v| v.as_str().map(String::from)),
+    };
+    let o = overrides_for(conn, name)?;
+    let mut kinds = base_roster(conn)?;
+    for k in &mut kinds {
+        if let Some(x) = o.get(&k.name) {
+            apply(k, x);
+        }
+    }
+    Ok(kinds)
+}
+
 /// The active profile's overrides by kind; none when no profile is active.
 fn active_overrides(conn: &Connection) -> Result<BTreeMap<String, RawOverride>, ConfigError> {
-    let Some(name) = active_profile(conn)? else {
+    overrides_for(conn, active_profile(conn)?)
+}
+
+fn overrides_for(
+    conn: &Connection,
+    name: Option<String>,
+) -> Result<BTreeMap<String, RawOverride>, ConfigError> {
+    let Some(name) = name else {
         return Ok(BTreeMap::new());
     };
     let known: Option<i64> = conn

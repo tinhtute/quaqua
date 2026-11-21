@@ -194,7 +194,13 @@ pub fn diff(conn: &Connection, default_text: &str) -> Result<String, ConfigError
     super::seed(&mut scratch, default_text)?;
     let (mut want, mut have) = (BTreeMap::new(), BTreeMap::new());
     flatten("", &export_table(&scratch)?, &mut want);
-    flatten("", &export_table(conn)?, &mut have);
+    flatten(
+        "",
+        &export_table(conn).map_err(|e| {
+            ConfigError::Invalid(format!("diff: the stored config cannot be exported: {e}"))
+        })?,
+        &mut have,
+    );
 
     let keys: std::collections::BTreeSet<&String> = want.keys().chain(have.keys()).collect();
     let mut lines = Vec::new();

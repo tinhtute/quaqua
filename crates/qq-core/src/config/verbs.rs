@@ -35,11 +35,12 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     )?;
     daemon.register_verb(
         "roster",
-        Box::new(|ctx, req| serve(ctx, req, |c, _| exec_roster(c), false)),
+        Box::new(|ctx, req| serve(ctx, req, |c, _, p| exec_roster(c, p), false)),
     )
 }
 
-type Exec = fn(&mut Connection, &[String]) -> Result<String, CliError>;
+/// The third argument is the profile the caller's `QUAQUA_PROFILE` named.
+type Exec = fn(&mut Connection, &[String], Option<&str>) -> Result<String, CliError>;
 
 /// `guarded`: every subcommand but `get` and `validate` is a write (so a new
 /// one is guarded by default) and needs a caller that may run an orchestration
@@ -83,7 +84,12 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
             ));
         }
     }
-    match exec(&mut conn, &argv) {
+    let profile = req
+        .args
+        .get("profile")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    match exec(&mut conn, &argv, profile) {
         Ok(out) => Ok(json!({ "out": out })),
         Err(e) if e.code == 2 => Err(RpcError::new(BAD_REQUEST, e.message)),
         Err(e) => Err(RpcError::new("config_refused", e.message)),
@@ -91,7 +97,11 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
 }
 
 fn client(env: &Env, verb: &str, args: &[String]) -> Result<String, CliError> {
-    let v = rpc_call(env, verb, json!({ "argv": args }))?;
+    let mut body = json!({ "argv": args });
+    if let Some(p) = super::env_profile() {
+        body["profile"] = json!(p);
+    }
+    let v = rpc_call(env, verb, body)?;
     Ok(v.get("out")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -158,7 +168,11 @@ fn pretty(v: &Value) -> String {
 
 // ---- commands ----------------------------------------------------------------
 
-fn exec_config(conn: &mut Connection, args: &[String]) -> Result<String, CliError> {
+fn exec_config(
+    conn: &mut Connection,
+    args: &[String],
+    _profile: Option<&str>,
+) -> Result<String, CliError> {
     let a = |i: usize| args.get(i).map(String::as_str);
     match a(0) {
         Some("get") => get(conn, a(1)).map(|v| match v {
@@ -204,8 +218,8 @@ fn exec_config(conn: &mut Connection, args: &[String]) -> Result<String, CliErro
     }
 }
 
-fn exec_roster(conn: &mut Connection) -> Result<String, CliError> {
-    let kinds = super::roster(conn).map_err(fail)?;
+fn exec_roster(conn: &mut Connection, profile: Option<&str>) -> Result<String, CliError> {
+    let kinds = super::roster_as(conn, profile).map_err(fail)?;
     Ok(kinds
         .iter()
         .map(|k| {
@@ -665,7 +679,7 @@ fn upsert_kind(
     let mut p = Parsed {
         harnesses: super::stored_harnesses(tx).map_err(fail)?,
         kinds: Default::default(),
-        profiles: Default::default(),
+        profiles: super::stored_profiles(tx).map_err(fail)?,
         purposes: vec![],
         reviewers: vec![],
         edges: Default::default(),
