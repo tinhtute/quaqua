@@ -377,8 +377,10 @@ impl WorkflowDriver for RecordingMachine {
     ) -> Result<Progress, String> {
         let progress = self.inner.advance(journal, events)?;
         if progress != Progress::Running {
-            record_end(journal, &self.db_path, &self.id)?;
+            // Capture first: the close is what readers wait on, so the capture
+            // (or its journaled failure) is already there when the run reads closed.
             crate::run::capture::capture_closed(journal, self.herdr.as_ref(), &self.drivers, &self.db_path, &self.id);
+            record_end(journal, &self.db_path, &self.id)?;
         }
         Ok(progress)
     }
