@@ -5,14 +5,11 @@
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-use crate::cli::{Install, Registry};
-use crate::daemon::Daemon;
+use crate::cli::Install;
 
-pub const INSTALL: Install = install;
+mod verbs;
 
-fn install(_: &mut Registry, _: &mut Daemon) -> Result<(), String> {
-    Ok(())
-}
+pub const INSTALL: Install = verbs::install;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Risk {

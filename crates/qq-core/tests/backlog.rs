@@ -5,8 +5,16 @@ use qq_core::backlog::{
     classify, decide, file, record_score, task_from_proposal, BacklogError, Change, Decider,
     NewProposal, Risk, Surface, Text,
 };
+use qq_core::cli::{Env, Registry};
+use qq_core::daemon::{Config, Daemon};
 use qq_core::db;
+use qq_core::herdr::{FakeHerdr, HerdrClient};
+use qq_core::identity::peer::HerdrPeers;
+use qq_core::rpc::{self, Request};
+use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
+use serde_json::{json, Value};
+use std::sync::Arc;
 
 fn conn() -> (Connection, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("qq-t61-{}-{:?}", std::process::id(), std::thread::current().id()));
@@ -125,4 +133,108 @@ fn proposal_task_link_recorded() {
         .collect();
     assert_eq!(ts, vec![100, 200]);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A daemon with the backlog installed whose socket peer (this process) is the
+/// CoS or a worker, and the registry holding the same install.
+fn rig(ws: &TestWorkspace, cos: bool) -> (qq_core::daemon::DaemonHandle, Registry) {
+    let herdr = Arc::new(FakeHerdr::new());
+    let pid = std::process::id();
+    if cos {
+        let p = herdr.seed_pane("c", Some("claude"), &[("grid_role", "cos")]);
+        herdr.set_pane_pids(&p, pid, &[]);
+    } else {
+        let p = herdr.seed_pane("w", None, &[]);
+        herdr.agent_start("w-1", "claude", &p, 0, &[]).unwrap();
+        herdr.set_pane_pids(&p, pid, &[]);
+    }
+    let mut d = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: herdr.clone() as Arc<dyn HerdrClient>,
+    });
+    d.require_peer(Arc::new(HerdrPeers::new(herdr)));
+    let mut reg = Registry::new();
+    (qq_core::backlog::INSTALL)(&mut reg, &mut d).expect("backlog installs");
+    (d.spawn().expect("daemon starts"), reg)
+}
+
+fn list(ws: &TestWorkspace) -> Vec<Value> {
+    let r = rpc::call(&rpc::socket_path(&ws.runs_dir()), &Request::new("backlog.list", json!({})))
+        .expect("transport")
+        .into_result()
+        .expect("list");
+    r["proposals"].as_array().unwrap().clone()
+}
+
+fn run(reg: &Registry, env: &Env, args: &[&str]) -> i32 {
+    let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    reg.dispatch(env, &a)
+}
+
+#[test]
+fn backlog_commands_end_to_end() {
+    let ws = TestWorkspace::new("t61b");
+    ws.seal_herdr();
+    let c = db::open(&ws.db_path()).unwrap();
+    c.execute("INSERT INTO project (slug, created_ms) VALUES ('p', 1)", []).unwrap();
+    let a = file(&c, &proposal(low(), None, Some(1)), 10).unwrap();
+    let b = file(&c, &proposal(Change { external_effect: true, ..low() }, None, Some(1)), 11).unwrap();
+    let d = file(&c, &proposal(low(), None, Some(1)), 12).unwrap();
+    let env = Env { runs_dir: ws.runs_dir() };
+
+    // a worker is refused: no verdict is recorded
+    let (worker, wreg) = rig(&ws, false);
+    assert_eq!(run(&wreg, &env, &["backlog", "decide", &a.to_string(), "approve"]), 1);
+    let refused = rpc::call(
+        &rpc::socket_path(&ws.runs_dir()),
+        &Request::new("backlog.decide", json!({ "id": a, "verdict": "approve" })),
+    )
+    .unwrap();
+    assert_eq!(refused.error.unwrap().code, "refused");
+    assert_eq!(list(&ws).iter().filter(|p| p["status"] == "open").count(), 3);
+    worker.stop().unwrap();
+
+    let (cos, reg) = rig(&ws, true);
+    // the list names id, loop, kind, risk, status; no task yet
+    let rows = list(&ws);
+    assert_eq!(rows.len(), 3);
+    assert_eq!((rows[0]["id"].as_i64(), rows[0]["risk"].as_str(), rows[0]["loop"].as_i64()), (Some(a), Some("low"), Some(1)));
+    assert_eq!(rows[1]["risk"], "high");
+    assert!(rows.iter().all(|p| p["status"] == "open" && p["task_id"].is_null()));
+    assert_eq!(run(&reg, &env, &["backlog", "list"]), 0);
+    assert_eq!(run(&reg, &env, &["backlog", "list", "bogus"]), 1);
+
+    // CoS approves low: a task carrying the proposal id appears
+    assert_eq!(run(&reg, &env, &["backlog", "decide", &a.to_string(), "approve", "--title", "fix gate", "--note", "ok"]), 0);
+    let (title, proposal_id): (String, i64) = c
+        .query_row("SELECT title, proposal_id FROM task", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((title.as_str(), proposal_id), ("fix gate", a));
+    // a decided proposal is not decided twice
+    assert_eq!(run(&reg, &env, &["backlog", "decide", &a.to_string(), "reject"]), 1);
+    // high stays open and makes no task, even when the CoS approves
+    assert_eq!(run(&reg, &env, &["backlog", "decide", &b.to_string(), "approve"]), 1);
+    // reject records a verdict and makes no task
+    assert_eq!(run(&reg, &env, &["backlog", "decide", &d.to_string(), "reject", "--note", "no"]), 0);
+    // bad input is refused before any write
+    assert_eq!(run(&reg, &env, &["backlog", "decide", "999", "approve"]), 1);
+    assert_eq!(run(&reg, &env, &["backlog", "decide", &d.to_string(), "maybe"]), 1);
+
+    let rows = list(&ws);
+    let by = |id: i64| rows.iter().find(|p| p["id"] == id).unwrap().clone();
+    assert_eq!((by(a)["status"].as_str(), by(a)["task_id"].is_null()), (Some("approved"), false));
+    assert_eq!((by(b)["status"].as_str(), by(b)["task_id"].is_null()), (Some("open"), true));
+    assert_eq!((by(d)["status"].as_str(), by(d)["task_id"].is_null()), (Some("rejected"), true));
+    let verdicts: Vec<(i64, String, String)> = c
+        .prepare("SELECT proposal_id, decider_role, verdict FROM decision ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(verdicts, vec![(a, "cos".into(), "approve".into()), (d, "cos".into(), "reject".into())]);
+    let tasks: i64 = c.query_row("SELECT COUNT(*) FROM task", [], |r| r.get(0)).unwrap();
+    assert_eq!(tasks, 1);
+    cos.stop().unwrap();
+    ws.finish();
 }
