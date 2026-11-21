@@ -1,0 +1,146 @@
+//! T62: the source interface and the schedule-driven pull (R24).
+
+use std::path::{Path, PathBuf};
+
+use qq_core::config;
+use qq_core::daemon::schedule;
+use qq_core::db;
+use qq_core::source::{FailureSource, IdeaInbox, Source, FAILURE_SOURCE, IDEA_SOURCE};
+use rusqlite::Connection;
+
+struct Fx {
+    conn: Connection,
+    dir: PathBuf,
+}
+
+fn fx(tag: &str) -> Fx {
+    let dir = std::env::temp_dir().join(format!("qq-t62-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("inbox/ideas")).unwrap();
+    let mut conn = db::open(&dir.join("t62.db")).expect("open");
+    let team = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
+    )
+    .unwrap();
+    config::seed(&mut conn, &team).expect("seed");
+    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", []).unwrap();
+    Fx { conn, dir }
+}
+
+fn failed_run(conn: &Connection, name: &str, outcome: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO agent (name, role, kind, project_id, started_ms) VALUES (?1, 'peer', 'ni', 1, 1)",
+        [name],
+    )
+    .unwrap();
+    let agent = conn.last_insert_rowid();
+    let wf = format!("worker:{name}");
+    conn.execute(
+        "INSERT INTO workflow (id, kind, state, started_ms, updated_ms) VALUES (?1, 'worker', 'done', 1, 1)",
+        [&wf],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO run (agent_id, kind, workflow_id, harness, model, started_ms, ended_ms, outcome, cost_state) \
+         VALUES (?1, 'ni', ?2, 'claude', 'm', 1, 2, ?3, 'unknown')",
+        rusqlite::params![agent, wf, outcome],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn proposals(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM proposal", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn loop1_gate_failure_files_proposal() {
+    let Fx { mut conn, dir } = fx("l1");
+    failed_run(&conn, "ok", "merged");
+    let run = failed_run(&conn, "bad", "check_failed");
+    schedule::add(&conn, FAILURE_SOURCE, 1000, 0).unwrap();
+    let src = FailureSource;
+    let ids = schedule::pull_due(&mut conn, &[&src], 0).unwrap();
+    assert_eq!(ids.len(), 1, "only the failed run files");
+    let (loop_no, risk, project, obs): (i64, String, Option<i64>, String) = conn
+        .query_row(
+            "SELECT loop, risk, project_id, observation FROM proposal WHERE id = ?1",
+            [ids[0]],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((loop_no, risk.as_str(), project), (1, "low", Some(1)));
+    assert!(obs.contains(&format!("run {run}")) && obs.contains("check_failed"));
+    // once: the next due pull, and a repeat of the same tick, file nothing more
+    assert!(schedule::pull_due(&mut conn, &[&src], 0).unwrap().is_empty());
+    assert!(schedule::pull_due(&mut conn, &[&src], 5000).unwrap().is_empty());
+    assert_eq!(proposals(&conn), 1);
+    // a new failure files its own proposal
+    failed_run(&conn, "bad2", "gate_failed");
+    assert_eq!(schedule::pull_due(&mut conn, &[&src], 9000).unwrap().len(), 1);
+    assert_eq!(proposals(&conn), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn loop3_inbox_files_proposal() {
+    let Fx { mut conn, dir } = fx("l3");
+    let ideas = dir.join("inbox/ideas");
+    std::fs::write(ideas.join("dark-mode.md"), "# Dark mode\n\nThe grid view should have one.\n").unwrap();
+    std::fs::write(ideas.join("notes.txt"), "not an idea").unwrap();
+    std::fs::write(ideas.join("empty.md"), "  \n").unwrap();
+    schedule::add(&conn, IDEA_SOURCE, 1000, 0).unwrap();
+    let src = IdeaInbox::new(&dir);
+    let ids = schedule::pull_due(&mut conn, &[&src], 0).unwrap();
+    assert_eq!(ids.len(), 1);
+    let (loop_no, risk, status, obs, ev): (i64, String, String, String, String) = conn
+        .query_row(
+            "SELECT loop, risk, status, observation, evidence FROM proposal WHERE id = ?1",
+            [ids[0]],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!((loop_no, risk.as_str(), status.as_str()), (3, "high", "open"));
+    assert!(obs.contains("The grid view should have one."));
+    assert_eq!(ev, "inbox/ideas/dark-mode.md");
+    // once, even when the file is edited; a new file files its own
+    std::fs::write(ideas.join("dark-mode.md"), "# Dark mode\nedited\n").unwrap();
+    assert!(schedule::pull_due(&mut conn, &[&src], 2000).unwrap().is_empty());
+    std::fs::write(ideas.join("export.md"), "Export runs as CSV\n").unwrap();
+    assert_eq!(schedule::pull_due(&mut conn, &[&src], 4000).unwrap().len(), 1);
+    assert_eq!(proposals(&conn), 2);
+    // a missing inbox is an empty inbox
+    let none = IdeaInbox::new(&dir.join("nowhere"));
+    assert!(none.pull(&conn).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn trigger_schedule_pull_only() {
+    let Fx { mut conn, dir } = fx("tr");
+    let src = FailureSource;
+    failed_run(&conn, "bad", "test_failed");
+    // no schedule row: nothing is pulled, whatever the clock says
+    assert!(schedule::pull_due(&mut conn, &[&src], i64::MAX / 2).unwrap().is_empty());
+    assert_eq!(proposals(&conn), 0);
+    // a schedule not yet due pulls nothing; due, it pulls once; the clock pair moves by the interval
+    schedule::add(&conn, FAILURE_SOURCE, 1000, 500).unwrap();
+    assert_eq!(schedule::next_deadline(&conn).unwrap(), Some(500));
+    assert!(schedule::pull_due(&mut conn, &[&src], 499).unwrap().is_empty());
+    assert_eq!(schedule::pull_due(&mut conn, &[&src], 500).unwrap().len(), 1);
+    assert_eq!(schedule::next_deadline(&conn).unwrap(), Some(1500));
+    // a schedule whose source is not given is skipped and moves on
+    schedule::add(&conn, "unknown", 10, 0).unwrap();
+    assert!(schedule::pull_due(&mut conn, &[&src], 600).unwrap().is_empty());
+    assert!(schedule::due(&conn, 600).unwrap().is_empty());
+    // no listening endpoint in the source or schedule modules
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for f in ["source/mod.rs", "daemon/schedule.rs"] {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        for needle in ["Listener", "::bind(", "hyper", "axum", "tiny_http", "webhook"] {
+            let hits = text.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains(needle)).count();
+            assert_eq!(hits, 0, "{f} must not use {needle}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
