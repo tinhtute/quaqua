@@ -105,6 +105,8 @@ fn daemon_runs_due_jobs() {
     let (score_due, sensors_due) = (due_at(&conn, SCORE_JOB), due_at(&conn, SENSORS_JOB));
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM schedule WHERE last_run_ms IS NOT NULL"), 0);
 
+    // an earlier pass left the cursor at 4: the run that ended at 5 is new
+    conn.execute("UPDATE schedule SET cursor_ms = 4 WHERE name = ?1", [SCORE_JOB]).unwrap();
     finished_run(&conn, "one", 5);
     let ideas = ws.root().join("inbox/ideas");
     std::fs::create_dir_all(&ideas).unwrap();
@@ -184,14 +186,14 @@ fn scoring_off_without_scorer() {
     let mut conn = seeded(&ws);
     // unset is the shipped default; an empty value is unset too
     assert!(schedule::configured_scorer(&conn).is_none());
-    conn.execute("INSERT INTO setting (key, value_json) VALUES ('supervisor.scorer', '\"\"')", []).unwrap();
+    conn.execute("INSERT INTO setting (key, value_json) VALUES ('limits.supervisor_scorer', '\"\"')", []).unwrap();
     assert!(schedule::configured_scorer(&conn).is_none());
-    conn.execute("UPDATE setting SET value_json = '\"/bin/echo\"' WHERE key = 'supervisor.scorer'", []).unwrap();
+    conn.execute("UPDATE setting SET value_json = '\"/bin/echo\"' WHERE key = 'limits.supervisor_scorer'", []).unwrap();
     assert!(schedule::configured_scorer(&conn).is_some());
-    conn.execute("DELETE FROM setting WHERE key = 'supervisor.scorer'", []).unwrap();
+    conn.execute("DELETE FROM setting WHERE key = 'limits.supervisor_scorer'", []).unwrap();
 
     finished_run(&conn, "old", 5);
-    conn.execute("UPDATE schedule SET next_due_ms = 0, cursor_ms = 0 WHERE name = ?1", [SCORE_JOB]).unwrap();
+    conn.execute("UPDATE schedule SET next_due_ms = 0 WHERE name = ?1", [SCORE_JOB]).unwrap();
     let sn = sensors(&ws);
     let set = rubric::defaults();
     let jobs = Jobs {
@@ -204,10 +206,18 @@ fn scoring_off_without_scorer() {
     let ran = schedule::run_due(&mut conn, &jobs, 10).unwrap();
     assert!(!ran.jobs.contains(&SCORE_JOB), "scoring did nothing");
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM score"), 0);
-    let cursor: i64 = conn
+    let cursor: Option<i64> = conn
         .query_row("SELECT cursor_ms FROM schedule WHERE name = ?1", [SCORE_JOB], |r| r.get(0))
         .unwrap();
-    assert_eq!(cursor, 0, "the cursor did not move");
+    assert_eq!(cursor, None, "the cursor did not move");
+
+    // the setting is reachable through team.toml and survives export and diff
+    let mut conn = db::open(&ws.root().join("runs/second.db")).unwrap();
+    let text = template().replacen("[limits]\n", "[limits]\nsupervisor_scorer = \"/bin/echo\"\n", 1);
+    config::seed(&mut conn, &text).unwrap();
+    assert!(schedule::configured_scorer(&conn).is_some());
+    assert!(config::export_toml(&conn).unwrap().contains("supervisor_scorer"));
+    config::diff(&conn, &text).unwrap();
 }
 
 #[test]
@@ -235,8 +245,9 @@ fn scoring_cursor_new_runs_only() {
     }
 
     let mut conn = seeded(&ws);
-    let r1 = finished_run(&conn, "a", 10);
-    let r2 = finished_run(&conn, "b", 20);
+    // runs that finish before the first pass are history: the first pass starts the cursor, scores nothing
+    finished_run(&conn, "a", 10);
+    finished_run(&conn, "b", 20);
     conn.execute("UPDATE schedule SET next_due_ms = 0 WHERE name = ?1", [SCORE_JOB]).unwrap();
     let sn = sensors(&ws);
     let set = rubric::defaults();
@@ -258,8 +269,9 @@ fn scoring_cursor_new_runs_only() {
         c.query_row("SELECT cursor_ms FROM schedule WHERE name = ?1", [SCORE_JOB], |r| r.get(0)).unwrap()
     };
 
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schedule WHERE name = 'supervisor.score' AND cursor_ms IS NULL"), 1);
     schedule::run_due(&mut conn, &jobs, 100).unwrap();
-    assert_eq!(seen(&fake), [r1, r2]);
+    assert!(fake.0.borrow().is_empty(), "no history is scored");
     assert_eq!(cursor(&conn), 20);
 
     // a pass with nothing new asks the scorer nothing

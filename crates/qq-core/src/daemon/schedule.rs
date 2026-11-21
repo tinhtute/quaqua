@@ -6,7 +6,7 @@
 //! `source.pull` verb ([`crate::source::pull_now`]); both file each item
 //! once. The Supervisor jobs are [`SCORE_JOB`] (scoring, only runs that ended
 //! since the last pass, and only once a scorer program is set as the
-//! `supervisor.scorer` setting; unset is the shipped default) and
+//! `limits.supervisor_scorer` setting; unset is the shipped default) and
 //! [`SENSORS_JOB`] (the computational sensors of loop 2 in the order of the
 //! sensor table). [`run_due`] runs the due pulls, then scoring, then the
 //! sensors; [`spawn_runner`] calls it from a daemon thread. The migration
@@ -22,6 +22,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection};
 
 use super::Ctx;
+use crate::auditor::AuditorRunOptions;
 use crate::source::{file_once, FailureSource, IdeaInbox, Source, FAILURE_SOURCE, IDEA_SOURCE};
 use crate::supervisor::agent::{AgentRunner, TemplateAgent};
 use crate::supervisor::job::{self, ExecScorer, Scorer, Sensors, SCORE_JOB};
@@ -30,8 +31,9 @@ use crate::supervisor::rubric::{self, Rubric};
 /// The sensors job: loop 2's computational sensors in the order of the sensor table.
 pub const SENSORS_JOB: &str = "supervisor.sensors";
 
-/// The setting that names the scorer program. Unset: scoring does nothing.
-pub const SCORER_SETTING: &str = "supervisor.scorer";
+/// The setting that names the scorer program. Unset: scoring does nothing. It lives
+/// under `limits` because `config set` and team.toml accept only the known sections.
+pub const SCORER_SETTING: &str = "limits.supervisor_scorer";
 
 /// How often a source is pulled when the daemon adds its row.
 const SOURCE_INTERVAL_MS: i64 = 300_000;
@@ -139,7 +141,7 @@ pub struct Ran {
     pub errors: Vec<String>,
 }
 
-/// The scorer program from the `supervisor.scorer` setting; none when unset or empty.
+/// The scorer program from the `limits.supervisor_scorer` setting; none when unset or empty.
 pub fn configured_scorer(conn: &Connection) -> Option<ExecScorer> {
     let v = crate::config::setting(conn, SCORER_SETTING).ok().flatten()?;
     let program = v.as_str().map(str::trim).filter(|s| !s.is_empty())?;
@@ -205,13 +207,16 @@ fn tick(runs_dir: &std::path::Path) -> Result<(), String> {
     let mut conn = crate::db::open(&runs_dir.join(crate::db::path::DB_FILE))
         .map_err(|e| e.to_string())?;
     let now = clock_ms();
-    ensure_sources(&conn, now).map_err(|e| e.to_string())?;
     if !due(&conn, now).map_err(|e| e.to_string())?.is_empty() {
         let inbox = IdeaInbox::new(workspace);
         let sources: [&dyn Source; 2] = [&FailureSource, &inbox];
         let sensors = Sensors {
             root: workspace.to_path_buf(),
-            auditor: Default::default(),
+            // Deterministic prechecks only: a model-run audit spends tokens and needs the owner.
+            auditor: AuditorRunOptions {
+                dry_run: true,
+                ..Default::default()
+            },
             static_checks: job::default_static_checks(workspace),
             arch_rules: job::default_arch_rules(),
         };
@@ -235,6 +240,14 @@ fn tick(runs_dir: &std::path::Path) -> Result<(), String> {
 /// The daemon's schedule thread: until `stop`, it runs the due pulls and
 /// Supervisor jobs, then waits for the earliest next due time (at most a second).
 pub fn spawn_runner(ctx: Weak<Ctx>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    // The source rows are added before the thread starts, so this write cannot
+    // race with a verb that writes right after the daemon is up.
+    if let Some(c) = ctx.upgrade() {
+        let db = c.runs_dir.join(crate::db::path::DB_FILE);
+        if let Ok(conn) = crate::db::open(&db) {
+            let _ = ensure_sources(&conn, clock_ms());
+        }
+    }
     std::thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
             let Some(c) = ctx.upgrade() else { return };
