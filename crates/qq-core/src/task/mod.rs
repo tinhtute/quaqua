@@ -6,3 +6,4 @@ pub mod pipeline_io;
 pub mod cleanup;
 pub mod prompt;
 pub mod report_contract;
+pub mod review_pair;

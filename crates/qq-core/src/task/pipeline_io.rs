@@ -115,6 +115,7 @@ impl Effects {
     fn spawn_reviewer(&self, name: &str, kind: &str) -> Result<(), String> {
         let db = self.deps.runs_dir.join(crate::db::path::DB_FILE);
         let conn = crate::db::open(&db).map_err(|e| format!("cannot open the run database: {e}"))?;
+        super::review_pair::check(&conn, &self.input.builder_kind, kind)?;
         // A restart re-enters this step: an agent already open under this name
         // and kind is reused, herdr is not asked to start it again.
         let open: Option<String> = conn
