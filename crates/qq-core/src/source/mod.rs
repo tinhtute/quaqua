@@ -9,14 +9,94 @@ use std::path::PathBuf;
 
 use rusqlite::{params, Connection};
 
+use serde_json::{json, Value};
+
 use crate::backlog::{self, Change, NewProposal, Text};
-use crate::cli::{Install, Registry};
-use crate::daemon::Daemon;
+use crate::cli::{rpc_call, CliError, Command, Env, Install, Registry};
+use crate::daemon::{Ctx, Daemon};
+use crate::db::path::DB_FILE;
+use crate::rpc::{Request, RpcError};
 
 pub const INSTALL: Install = install;
 
-fn install(_: &mut Registry, _: &mut Daemon) -> Result<(), String> {
-    Ok(())
+pub const PULL: &str = "source.pull";
+
+fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
+    registry.register(Command {
+        name: "source",
+        help: "source pull: pull every source now and file its new proposals once",
+        run: source_cmd,
+    })?;
+    daemon.register_verb(PULL, Box::new(serve_pull))
+}
+
+fn source_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
+    if args.len() != 1 || args[0] != "pull" {
+        return Err(CliError::new(2, "usage: quaqua source pull"));
+    }
+    let v = rpc_call(env, PULL, json!({}))?;
+    let ids: Vec<String> = v["filed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.as_i64().map(|i| i.to_string()))
+        .collect();
+    Ok(if ids.is_empty() {
+        "filed 0 proposals".to_string()
+    } else {
+        format!("filed {} proposals: {}", ids.len(), ids.join(" "))
+    })
+}
+
+fn serve_pull(ctx: &Ctx, _: &Request) -> Result<Value, RpcError> {
+    let internal = |e: String| RpcError::new("internal", e);
+    let workspace = ctx
+        .runs_dir
+        .parent()
+        .ok_or_else(|| internal("runs dir has no workspace".into()))?;
+    let mut conn =
+        crate::db::open(&ctx.runs_dir.join(DB_FILE)).map_err(|e| internal(e.to_string()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let inbox = IdeaInbox::new(workspace);
+    let filed = pull_now(&mut conn, &[&FailureSource, &inbox], now_ms).map_err(internal)?;
+    Ok(json!({ "filed": filed }))
+}
+
+/// Pulls every given source now, whatever its schedule says, and files each
+/// item once. Every source runs; the first error comes back after the rest.
+pub fn pull_now(
+    conn: &mut Connection,
+    sources: &[&dyn Source],
+    now_ms: i64,
+) -> Result<Vec<i64>, String> {
+    let mut filed = Vec::new();
+    let mut first_err = None;
+    for src in sources {
+        let name = src.name();
+        match src.pull(conn) {
+            Ok(items) => {
+                for item in &items {
+                    match file_once(conn, name, item, now_ms) {
+                        Ok(Some(id)) => filed.push(id),
+                        Ok(None) => {}
+                        Err(e) => {
+                            first_err.get_or_insert(format!("source {name}: {e}"));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                first_err.get_or_insert(format!("source {name}: {e}"));
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(filed),
+    }
 }
 
 /// One thing a source found: `key` is stable across pulls, so the same thing
