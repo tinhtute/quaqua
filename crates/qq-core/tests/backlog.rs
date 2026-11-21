@@ -180,6 +180,7 @@ fn backlog_commands_end_to_end() {
     let a = file(&c, &proposal(low(), None, Some(1)), 10).unwrap();
     let b = file(&c, &proposal(Change { external_effect: true, ..low() }, None, Some(1)), 11).unwrap();
     let d = file(&c, &proposal(low(), None, Some(1)), 12).unwrap();
+    file(&c, &proposal(Change { surfaces: vec![Surface::Skill], ..low() }, None, Some(1)), 13).unwrap();
     let env = Env { runs_dir: ws.runs_dir() };
 
     // a worker is refused: no verdict is recorded
@@ -191,15 +192,17 @@ fn backlog_commands_end_to_end() {
     )
     .unwrap();
     assert_eq!(refused.error.unwrap().code, "refused");
-    assert_eq!(list(&ws).iter().filter(|p| p["status"] == "open").count(), 3);
+    assert_eq!(list(&ws).iter().filter(|p| p["status"] == "open").count(), 4);
     worker.stop().unwrap();
 
     let (cos, reg) = rig(&ws, true);
-    // the list names id, loop, kind, risk, status; no task yet
+    // the list names id, loop, kind, risk, surface, status; no task yet
     let rows = list(&ws);
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
     assert_eq!((rows[0]["id"].as_i64(), rows[0]["risk"].as_str(), rows[0]["loop"].as_i64()), (Some(a), Some("low"), Some(1)));
     assert_eq!(rows[1]["risk"], "high");
+    assert_eq!(rows[3]["surface"], "skill");
+    assert!(rows[..3].iter().all(|p| p["surface"].is_null()));
     assert!(rows.iter().all(|p| p["status"] == "open" && p["task_id"].is_null()));
     assert_eq!(run(&reg, &env, &["backlog", "list"]), 0);
     assert_eq!(run(&reg, &env, &["backlog", "list", "bogus"]), 1);

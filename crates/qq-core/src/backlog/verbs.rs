@@ -59,7 +59,7 @@ fn serve_list(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     // A proposal has no kind of its own; the kind shown is its task's.
     let mut stmt = conn
         .prepare(
-            "SELECT p.id, p.loop, t.kind, p.risk, p.status, t.id \
+            "SELECT p.id, p.loop, t.kind, p.risk, p.status, t.id, p.surface \
              FROM proposal p LEFT JOIN task t ON t.id = \
                (SELECT MIN(id) FROM task WHERE proposal_id = p.id) \
              WHERE (?1 IS NULL OR p.status = ?1) ORDER BY p.id",
@@ -74,6 +74,7 @@ fn serve_list(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
                 "risk": r.get::<_, String>(3)?,
                 "status": r.get::<_, String>(4)?,
                 "task_id": r.get::<_, Option<i64>>(5)?,
+                "surface": r.get::<_, Option<String>>(6)?,
             }))
         })
         .map_err(internal)?
@@ -219,7 +220,7 @@ fn backlog_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
 }
 
 fn render(v: &Value) -> String {
-    let mut out = String::from("id\tloop\tkind\trisk\tstatus\ttask");
+    let mut out = String::from("id\tloop\tkind\trisk\tsurface\tstatus\ttask");
     for p in v["proposals"].as_array().into_iter().flatten() {
         let num = |k: &str| {
             p[k].as_i64()
@@ -228,11 +229,12 @@ fn render(v: &Value) -> String {
         };
         let txt = |k: &str| p[k].as_str().unwrap_or("-").to_string();
         out.push_str(&format!(
-            "\n{}\t{}\t{}\t{}\t{}\t{}",
+            "\n{}\t{}\t{}\t{}\t{}\t{}\t{}",
             num("id"),
             num("loop"),
             txt("kind"),
             txt("risk"),
+            txt("surface"),
             txt("status"),
             num("task_id")
         ));

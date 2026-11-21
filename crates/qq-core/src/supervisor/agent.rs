@@ -118,7 +118,8 @@ pub fn brief(f: &Finding) -> String {
 
 /// The agent in its plain form, no model call: the six fields come from the
 /// finding. The change is a review of one run, reversible and inside the
-/// run's project, so a run with no project still files high.
+/// run's project, and it names the rubric's surface, so it files high; a run
+/// with no project files high as well.
 pub struct TemplateAgent;
 
 impl AgentRunner for TemplateAgent {
@@ -138,7 +139,7 @@ impl AgentRunner for TemplateAgent {
             change: Change {
                 reversible: true,
                 projects: 1,
-                surfaces: vec![],
+                surfaces: vec![f.rubric.surface],
                 external_effect: false,
             },
         };

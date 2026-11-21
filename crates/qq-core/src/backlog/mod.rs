@@ -35,6 +35,23 @@ pub enum Surface {
     Protocol,
 }
 
+impl Surface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Surface::Rule => "rule",
+            Surface::Skill => "skill",
+            Surface::Config => "config",
+            Surface::Protocol => "protocol",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Surface> {
+        [Surface::Rule, Surface::Skill, Surface::Config, Surface::Protocol]
+            .into_iter()
+            .find(|x| x.as_str() == s)
+    }
+}
+
 /// What a proposal would change, as the three loops state it.
 #[derive(Clone, Debug)]
 pub struct Change {
@@ -125,7 +142,8 @@ impl From<rusqlite::Error> for BacklogError {
     }
 }
 
-/// Files an open proposal; the risk is derived, never passed in. A proposal
+/// Files an open proposal; the risk is derived, never passed in. The proposal
+/// records the first surface its change names. A proposal
 /// that names no project is not inside one project, so it is high.
 pub fn file(conn: &Connection, p: &NewProposal, now_ms: i64) -> Result<i64, BacklogError> {
     let mut risk = classify(&p.change, p.protocol_floor);
@@ -134,8 +152,8 @@ pub fn file(conn: &Connection, p: &NewProposal, now_ms: i64) -> Result<i64, Back
     }
     conn.execute(
         "INSERT INTO proposal (loop, risk, project_id, observation, evidence, \
-         suspected_mechanism, impact, question, recommendation, created_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         suspected_mechanism, impact, question, recommendation, created_ms, surface) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             p.loop_no,
             risk.as_str(),
@@ -146,7 +164,8 @@ pub fn file(conn: &Connection, p: &NewProposal, now_ms: i64) -> Result<i64, Back
             p.text.impact,
             p.text.question,
             p.text.recommendation,
-            now_ms
+            now_ms,
+            p.change.surfaces.first().map(|s| s.as_str())
         ],
     )?;
     Ok(conn.last_insert_rowid())

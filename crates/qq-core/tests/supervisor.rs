@@ -8,7 +8,7 @@ use qq_core::auditor::AuditorRunOptions;
 use qq_core::authority::{
     self, check_mail, check_question, check_spawn, Decision, Role,
 };
-use qq_core::backlog::{Change, Text};
+use qq_core::backlog::{self, Change, Decider, Surface, Text};
 use qq_core::cli::{Env, Registry};
 use qq_core::config;
 use qq_core::daemon::{Config, Daemon};
@@ -133,7 +133,7 @@ fn supervisor_scores_and_proposes() {
     assert_eq!(count(&conn, "SELECT count(*) FROM score WHERE value = 0"), 2);
     assert_eq!(count(&conn, "SELECT count(*) FROM proposal"), 2);
 
-    // the proposal of the run inside a project is low and carries all six fields
+    // the proposal of the run inside a project is high (a rule surface) and carries all six fields
     let (loop_no, risk, project, obs, ev, mech, imp, q, rec): (i64, String, Option<i64>, String, String, String, String, String, String) = conn
         .query_row(
             "SELECT loop, risk, project_id, observation, evidence, suspected_mechanism, impact, question, recommendation \
@@ -142,7 +142,7 @@ fn supervisor_scores_and_proposes() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
         )
         .unwrap();
-    assert_eq!((loop_no, risk.as_str(), project), (2, "low", Some(1)));
+    assert_eq!((loop_no, risk.as_str(), project), (2, "high", Some(1)));
     assert!(obs.contains(&format!("run {r1}")) && obs.contains("self-acceptance"));
     assert_eq!(ev, "I reviewed my own change");
     assert!(mech.contains("separate reviewer verdict"));
@@ -179,7 +179,8 @@ fn supervisor_scores_and_proposes() {
 
     // an owner's file replaces the set
     let custom = rubric::parse("[[rubric]]\nid = 'x'\ncriterion = 'y'\n").unwrap();
-    assert_eq!(custom, vec![Rubric { id: "x".into(), criterion: "y".into() }]);
+    assert_eq!(custom, vec![Rubric { id: "x".into(), criterion: "y".into(), surface: Surface::Rule }]);
+    assert!(rubric::parse("[[rubric]]\nid = 'x'\ncriterion = 'y'\nsurface = 'nope'\n").is_err());
     assert!(rubric::parse("[[rubric]]\nid = 'x'\n").is_err());
     let missing = ws.root().join("none.toml");
     assert_eq!(rubric::load_or_default(&missing).unwrap().len(), 17);
@@ -207,6 +208,39 @@ fn supervisor_scores_and_proposes() {
 }
 
 #[test]
+fn score_zero_in_project_is_high() {
+    // the default set names skill for skill pollution and rule for the other 16
+    let set = rubric::defaults();
+    assert_eq!(set.iter().filter(|r| r.surface == Surface::Skill).count(), 1);
+    assert_eq!(set.iter().find(|r| r.id == "skill pollution").unwrap().surface, Surface::Skill);
+    assert_eq!(set.iter().filter(|r| r.surface == Surface::Rule).count(), 16);
+
+    let ws = TestWorkspace::new("sup-surface");
+    let mut conn = setup(&ws);
+    let run = finished_run(&conn, "a", true);
+    let scorer = Fake::new(&["self-acceptance", "skill pollution"], Some("quoted"));
+    let rep = score_runs(&mut conn, &set, &scorer, &TemplateAgent, 100).unwrap();
+    assert_eq!(rep.proposals.len(), 2);
+    let row = |id: i64| -> (String, Option<i64>, Option<String>) {
+        conn.query_row("SELECT risk, project_id, surface FROM proposal WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+    };
+    assert_eq!(row(rep.proposals[0]), ("high".into(), Some(1), Some("rule".into())));
+    assert_eq!(row(rep.proposals[1]), ("high".into(), Some(1), Some("skill".into())));
+    let _ = run;
+
+    // the CoS cannot decide it; it stays open
+    assert_eq!(
+        backlog::decide(&mut conn, rep.proposals[0], Decider::Cos, true, None, 200),
+        Err(backlog::BacklogError::OwnerOnly(rep.proposals[0]))
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM proposal WHERE status = 'open'"), 2);
+    assert_eq!(count(&conn, "SELECT count(*) FROM decision"), 0);
+}
+
+#[test]
 fn supervisor_agent_read_only() {
     use AgentAction::*;
     for a in [ReadRun, ReadFile, ReadZbrain, CodeLookup, QuestionLead, FileProposal] {
@@ -228,7 +262,7 @@ fn supervisor_agent_read_only() {
     let f = Finding {
         run_id: 7,
         project_id: Some(1),
-        rubric: Rubric { id: "self-acceptance".into(), criterion: "c".into() },
+        rubric: Rubric { id: "self-acceptance".into(), criterion: "c".into(), surface: Surface::Rule },
         quote: "q".into(),
     };
     let b = brief(&f);

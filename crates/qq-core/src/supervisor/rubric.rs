@@ -1,13 +1,17 @@
 //! Rubrics: owner-replaceable data. A TOML file of `[[rubric]]` tables
-//! (`id`, `criterion`) replaces the default set, which is the 17
-//! anti-patterns, one criterion each.
+//! (`id`, `criterion`, optional `surface`) replaces the default set, which is
+//! the 17 anti-patterns, one criterion each. The surface is what a fix for the
+//! pattern would change: `skill` for skill pollution, `rule` for the rest.
 
 use std::path::{Path, PathBuf};
+
+use crate::backlog::Surface;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rubric {
     pub id: String,
     pub criterion: String,
+    pub surface: Surface,
 }
 
 /// One scale for every rubric. Low is score 0.
@@ -39,6 +43,7 @@ pub fn defaults() -> Vec<Rubric> {
         .map(|(id, criterion)| Rubric {
             id: id.to_string(),
             criterion: criterion.to_string(),
+            surface: if *id == "skill pollution" { Surface::Skill } else { Surface::Rule },
         })
         .collect()
 }
@@ -71,10 +76,15 @@ pub fn parse(text: &str) -> Result<Vec<Rubric>, String> {
         let (Some(id), Some(criterion)) = (field("id"), field("criterion")) else {
             return Err(format!("rubrics: entry {} needs id and criterion", i + 1));
         };
+        let surface = match field("surface") {
+            None => Surface::Rule,
+            Some(s) => Surface::parse(&s)
+                .ok_or_else(|| format!("rubrics: entry {} has unknown surface '{s}'", i + 1))?,
+        };
         if out.iter().any(|r| r.id == id) {
             return Err(format!("rubrics: duplicate id '{id}'"));
         }
-        out.push(Rubric { id, criterion });
+        out.push(Rubric { id, criterion, surface });
     }
     if out.is_empty() {
         return Err("rubrics: the set is empty".to_string());

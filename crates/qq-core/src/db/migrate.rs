@@ -20,6 +20,7 @@ pub const LADDER: &[(u32, &str)] = &[
     (8, include_str!("sql/0008_agent_pin.sql")),
     (9, include_str!("sql/0009_schedule_source.sql")),
     (10, include_str!("sql/0010_schedule_jobs.sql")),
+    (11, include_str!("sql/0011_proposal_surface.sql")),
 ];
 
 pub fn latest_version() -> u32 {
