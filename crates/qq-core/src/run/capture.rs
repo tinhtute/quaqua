@@ -200,6 +200,69 @@ pub fn store(
     })
 }
 
+/// The agent session herdr reports for a pane (`pane get`).
+fn pane_session(herdr: &dyn crate::herdr::HerdrClient, pane: &str) -> Option<String> {
+    let reply = herdr.pane_get(pane).ok().filter(|r| r.ok)?;
+    let v: Value = serde_json::from_str(&reply.body).ok()?;
+    v.pointer("/result/pane/agent_session/value")
+        .or_else(|| v.pointer("/result/pane/agent_session"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Captures the run of `workflow_id` when its worker flow ends: resolves the
+/// run's driver, reads the agent session from the agent's pane and stores it.
+/// A driver with no session source captures nothing. A failure (no pane, no
+/// session, a session file that is gone, a database error) is appended to the
+/// workflow's journal as `run_capture_failed` and never stops the caller.
+pub fn capture_closed(
+    journal: &mut dyn crate::engine::journal::Journal,
+    herdr: &dyn crate::herdr::HerdrClient,
+    drivers: &crate::driver::Registry,
+    db_path: &Path,
+    workflow_id: &str,
+) {
+    let fail = |journal: &mut dyn crate::engine::journal::Journal, reason: String| {
+        let ts = crate::engine::clock::SystemClock.now_ms();
+        let payload = serde_json::json!({ "reason": reason }).to_string();
+        let ev = crate::engine::journal::EventRecord::new(0, ts, "run_capture_failed", payload);
+        if let Err(e) = journal.append_event(workflow_id, &ev) {
+            eprintln!("warning: cannot journal run_capture_failed for {workflow_id}: {e}");
+        }
+    };
+    let go = || -> Result<Option<()>, String> {
+        let mut conn = crate::db::open(db_path).map_err(|e| e.to_string())?;
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT r.harness, a.pane_id FROM run r JOIN agent a ON a.id = r.agent_id \
+                 WHERE r.workflow_id = ?1",
+                [workflow_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((harness, pane)) = row else {
+            return Err("no run record".into());
+        };
+        let h = crate::config::harness(&conn, &harness)
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or_else(|| format!("unknown harness {harness}"))?;
+        let driver = drivers.resolve(&h).ok_or_else(|| format!("no driver for {harness}"))?;
+        if Format::of(&*driver).is_none() {
+            return Ok(None);
+        }
+        let pane = pane.ok_or("the agent has no recorded pane")?;
+        let session = pane_session(herdr, &pane).ok_or("herdr reports no agent session")?;
+        capture(&mut conn, workflow_id, &*driver, Some(&session), None)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(()))
+    };
+    if let Err(reason) = go() {
+        fail(journal, reason);
+    }
+}
+
 /// Records one artifact of a run; the same kind, path and sha converge.
 pub fn add_artifact(
     conn: &Connection,

@@ -3,10 +3,17 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use qq_core::cli::Env;
 use qq_core::config;
+use qq_core::daemon::{Config, Daemon, DaemonHandle};
 use qq_core::db;
 use qq_core::driver::Registry;
+use qq_core::herdr::{FakeHerdr, Reply, Verb};
+use qq_core::rpc::{self, Request};
+use qq_core::task::worker_flow::{self, Deps};
 use qq_core::run::{self, capture, show};
 use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
@@ -247,4 +254,97 @@ fn claude_session_found_by_id_and_lost_session_is_an_error() {
     let wf = open_run(&mut conn, "l2", "claude", 1);
     let e = capture::capture(&mut conn, &wf, &*d, Some("missing"), Some(&projects)).unwrap_err();
     assert!(matches!(e, capture::CaptureError::SessionNotFound(_)), "{e}");
+}
+
+fn flow_daemon(ws: &TestWorkspace, herdr: Arc<FakeHerdr>) -> DaemonHandle {
+    let mut d = Daemon::new(Config { runs_dir: ws.runs_dir(), herdr: herdr.clone() });
+    worker_flow::register(
+        &mut d,
+        Deps { herdr, runs_dir: ws.runs_dir(), drivers: Registry::native() },
+    )
+    .expect("register worker flow");
+    d.spawn().expect("daemon starts")
+}
+
+/// Runs one task to its end through the daemon; the report verifies it.
+fn run_task(ws: &TestWorkspace, conn: &Connection, herdr: &FakeHerdr, name: &str) {
+    conn.execute(
+        "INSERT INTO task(project_id, title, kind, disposition, state, created_ms) \
+         VALUES (1, 't', 'ni', 'engineer', 'open', 1)",
+        [],
+    )
+    .unwrap();
+    let args = serde_json::json!({
+        "name": name, "kind": "ni", "role": "peer", "pane": "p1",
+        "prompt": "do the thing", "report": format!("{name}.md"),
+        "timeout_ms": 60_000, "base": "main", "project_id": 1, "task_id": 1,
+    });
+    rpc::call(&rpc::socket_path(&ws.runs_dir()), &Request::new("task.start", args))
+        .expect("rpc transport")
+        .into_result()
+        .expect("task.start");
+    std::fs::write(
+        ws.runs_dir().join(format!("{name}.md")),
+        format!("Outcome: COMPLETE\nVerified: unit-test-verified {SHA}\n\n## Blockers\nnone\n"),
+    )
+    .unwrap();
+    let wf = format!("worker:{name}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !run::by_workflow(conn, &wf).unwrap().is_some_and(|r| r.ended_ms.is_some()) {
+        assert!(Instant::now() < deadline, "timed out waiting for the run to close");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = herdr;
+}
+
+#[test]
+fn closed_run_has_its_capture() {
+    let ws = TestWorkspace::new("run-closed-capture");
+    let mut conn = seeded(&ws);
+    let session = ws.root().join("session.jsonl");
+    std::fs::write(&session, CLAUDE_SESSION).unwrap();
+    let herdr = Arc::new(FakeHerdr::new());
+    herdr.set_reply(
+        Verb::PaneGet,
+        Reply::ok(
+            serde_json::json!({"result":{"pane":{"agent_session":{"kind":"path","value":session}}}})
+                .to_string(),
+        ),
+    );
+    let daemon = flow_daemon(&ws, herdr.clone());
+    run_task(&ws, &conn, &herdr, "w1");
+    // The capture lands in the same step that closes the run.
+    let full = show::render(&show::load(&conn, "worker:w1").unwrap().unwrap());
+    for want in ["outcome verified", "transcript (3)", "tool calls (1)", "tokens in=130 out=12", "cost unknown"] {
+        assert!(full.contains(want), "closed run lacks {want:?}:\n{full}");
+    }
+    let failed: i64 = conn
+        .query_row("SELECT count(*) FROM events WHERE kind = 'run_capture_failed'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(failed, 0);
+    daemon.stop().unwrap();
+    let _ = &mut conn;
+}
+
+#[test]
+fn closed_run_without_session_journals_the_failure() {
+    let ws = TestWorkspace::new("run-closed-nosession");
+    let conn = seeded(&ws);
+    let herdr = Arc::new(FakeHerdr::new());
+    let daemon = flow_daemon(&ws, herdr.clone());
+    run_task(&ws, &conn, &herdr, "w2");
+    // The run still closed; the lost capture is a journal event, not an error.
+    let full = show::render(&show::load(&conn, "worker:w2").unwrap().unwrap());
+    assert!(full.contains("outcome verified") && full.contains("transcript (0)"), "{full}");
+    let (n, payload): (i64, String) = conn
+        .query_row(
+            "SELECT count(*), COALESCE(max(payload_json), '') FROM events \
+             WHERE workflow_id = 'worker:w2' AND kind = 'run_capture_failed'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(payload.contains("no agent session"), "{payload}");
+    daemon.stop().unwrap();
 }

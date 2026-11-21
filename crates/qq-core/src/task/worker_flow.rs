@@ -365,6 +365,8 @@ struct RecordingMachine {
     inner: Machine<WorkerFlow>,
     id: String,
     db_path: PathBuf,
+    herdr: Arc<dyn HerdrClient>,
+    drivers: Drivers,
 }
 
 impl WorkflowDriver for RecordingMachine {
@@ -376,6 +378,7 @@ impl WorkflowDriver for RecordingMachine {
         let progress = self.inner.advance(journal, events)?;
         if progress != Progress::Running {
             record_end(journal, &self.db_path, &self.id)?;
+            crate::run::capture::capture_closed(journal, self.herdr.as_ref(), &self.drivers, &self.db_path, &self.id);
         }
         Ok(progress)
     }
@@ -410,6 +413,8 @@ fn factory(deps: &Arc<Deps>) -> Factory {
             inner,
             id: id.to_string(),
             db_path: deps.runs_dir.join(crate::db::path::DB_FILE),
+            herdr: Arc::clone(&deps.herdr),
+            drivers: deps.drivers.clone(),
         }))
     })
 }
