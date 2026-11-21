@@ -2,10 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
+use qq_core::cli::{Env, Registry};
 use qq_core::config;
 use qq_core::daemon::schedule;
+use qq_core::daemon::{Config, Daemon};
 use qq_core::db;
+use qq_core::herdr::{FakeHerdr, HerdrClient};
 use qq_core::source::{FailureSource, IdeaInbox, Source, FAILURE_SOURCE, IDEA_SOURCE};
+use qq_core::testkit::TestWorkspace;
 use rusqlite::Connection;
 
 struct Fx {
@@ -293,4 +299,62 @@ fn trigger_schedule_pull_only() {
         }
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn source_pull_command_runs_once() {
+    let ws = TestWorkspace::new("t62b");
+    ws.seal_herdr();
+    let conn = db::open(&ws.db_path()).unwrap();
+    conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", [])
+        .unwrap();
+    let ws_root = ws.runs_dir().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(ws_root.join("inbox/ideas")).unwrap();
+    std::fs::write(
+        ws_root.join("inbox/ideas/dark-mode.md"),
+        "# Dark mode\n\nOne for the grid.\n",
+    )
+    .unwrap();
+    std::fs::write(ws_root.join("inbox/ideas/export.md"), "Export as CSV\n").unwrap();
+
+    let herdr = Arc::new(FakeHerdr::new());
+    let mut d = Daemon::new(Config {
+        runs_dir: ws.runs_dir(),
+        herdr: herdr as Arc<dyn HerdrClient>,
+    });
+    let mut reg = Registry::new();
+    (qq_core::source::INSTALL)(&mut reg, &mut d).expect("source installs");
+    let handle = d.spawn().expect("daemon starts");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let run = |args: &[&str]| {
+        let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        reg.dispatch(&env, &a)
+    };
+    let count = || proposals(&conn);
+
+    // no schedule row exists: the command pulls now, all sources, once
+    assert_eq!(run(&["source", "pull"]), 0);
+    assert_eq!(count(), 2);
+    let loops: Vec<i64> = conn
+        .prepare("SELECT loop FROM proposal ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(loops, vec![3, 3]);
+    // a second run files nothing more
+    assert_eq!(run(&["source", "pull"]), 0);
+    assert_eq!(count(), 2);
+    // a new idea files its own, once
+    std::fs::write(ws_root.join("inbox/ideas/new.md"), "A new idea\n").unwrap();
+    assert_eq!(run(&["source", "pull"]), 0);
+    assert_eq!(run(&["source", "pull"]), 0);
+    assert_eq!(count(), 3);
+    // bad usage is refused
+    assert_eq!(run(&["source"]), 2);
+    assert_eq!(run(&["source", "pull", "x"]), 2);
+    handle.stop().unwrap();
 }
