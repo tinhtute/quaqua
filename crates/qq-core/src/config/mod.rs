@@ -609,13 +609,12 @@ fn validate(p: &Parsed) -> Result<(), ConfigError> {
                     kind: kname.clone(),
                 });
             };
-            let harness = o.harness.as_ref().unwrap_or(&k.harness);
-            if natives.get(harness).is_none() && !p.harnesses.contains_key(harness) {
-                return Err(ConfigError::UnknownHarness {
-                    kind: at,
-                    harness: harness.clone(),
-                });
+            if o.harness.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{at}: a profile cannot override the harness (a switch must never change how a running worker is stopped or fenced); set model and effort only"
+                )));
             }
+            let harness = &k.harness;
             if o.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
                 return Err(ConfigError::Invalid(format!("{at}: empty model")));
             }
@@ -842,9 +841,7 @@ fn overrides_for(
 }
 
 fn apply(k: &mut Kind, o: &RawOverride) {
-    if let Some(h) = &o.harness {
-        k.harness = h.clone();
-    }
+    // The harness is never overridden: live-worker control resolves it too.
     if let Some(m) = &o.model {
         k.model = m.clone();
     }

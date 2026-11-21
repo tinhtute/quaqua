@@ -700,7 +700,7 @@ fn config_seed_set_export_roundtrip() {
             "profile.swap",
             r#"{"ni":{"harness":"pi","model":"m-pi"}}"#
         ]),
-        0
+        1
     );
     assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
 
@@ -844,20 +844,35 @@ fn roster_profiles_next_spawn() {
         "opus-5.5"
     );
 
-    // A harness override switches the harness the next spawn resolves.
-    assert_eq!(
-        run(&[
+    // A harness override is refused everywhere, so a switch never changes
+    // the harness of a running worker: nothing is stored, the spawn is unchanged.
+    let before = config::resolve_spawn(&open(&ws), "ni").unwrap();
+    for args in [
+        vec![
             "config",
             "set",
             "profile.swap",
-            r#"{"ni":{"harness":"pi","model":"m-pi"}}"#
-        ]),
-        0
+            r#"{"ni":{"harness":"pi","model":"m-pi"}}"#,
+        ],
+        vec!["config", "set", "profile.fast.ni", r#"{"harness":"pi"}"#],
+    ] {
+        let e = config::config_cmd(&env, &strs(&args[1..])).unwrap_err();
+        assert!(
+            e.message.contains("cannot override the harness"),
+            "{}",
+            e.message
+        );
+    }
+    let mut with_swap = config::export_toml(&open(&ws)).unwrap();
+    with_swap.push_str("\n[profiles.swap.ni]\nharness = \"pi\"\n");
+    std::fs::write(ws.team_toml(), with_swap).unwrap();
+    let toml = ws.team_toml();
+    assert_eq!(run(&["config", "import", toml.to_str().unwrap()]), 1);
+    let after = config::resolve_spawn(&open(&ws), "ni").unwrap();
+    assert_eq!(
+        (before.harness.name.as_str(), before.model.as_str()),
+        (after.harness.name.as_str(), after.model.as_str())
     );
-    assert_eq!(run(&["config", "set", "profile", "swap"]), 0);
-    let t = config::resolve_spawn(&open(&ws), "ni").unwrap();
-    assert_eq!((t.harness.name.as_str(), t.model.as_str()), ("pi", "m-pi"));
-    assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
 
     // The roster verb runs in the daemon: it answers with the profile its
     // client named, and never reads its own env. Key is "fast" here.
@@ -903,7 +918,7 @@ fn roster_profiles_next_spawn() {
     }
     assert_eq!(model("ni").unwrap().0, "haiku-5.5");
 
-    // Refused: an unknown profile, an override naming an unknown harness.
+    // Refused: an unknown profile, an override naming a harness.
     assert_eq!(run(&["config", "set", "profile", "ghost"]), 1);
     assert_eq!(
         run(&["config", "set", "profile.bad.ni", r#"{"harness":"ghost"}"#]),
