@@ -115,6 +115,7 @@ impl Effects {
     fn spawn_reviewer(&self, name: &str, kind: &str) -> Result<(), String> {
         let db = self.deps.runs_dir.join(crate::db::path::DB_FILE);
         let conn = crate::db::open(&db).map_err(|e| format!("cannot open the run database: {e}"))?;
+        super::review_pair::check(&conn, &self.input.builder_kind, kind)?;
         // A restart re-enters this step: an agent already open under this name
         // and kind is reused, herdr is not asked to start it again.
         let open: Option<String> = conn
@@ -352,13 +353,11 @@ fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .ok_or_else(|| bad(format!("missing string argument '{key}'")))
 }
 
-/// Review is cross-harness: the reviewer kind must be allowed to review and
-/// must not run on the builder's harness.
+/// The reviewer kind must be allowed to review and must not run on the
+/// builder's model (any harness); the refusal is journaled.
 fn check_kinds(conn: &rusqlite::Connection, builder: &str, reviewer: &str) -> Result<(), RpcError> {
-    let b =
-        config::resolve_spawn(conn, builder).map_err(|e| bad(format!("builder kind: {e:?}")))?;
-    let r =
-        config::resolve_spawn(conn, reviewer).map_err(|e| bad(format!("reviewer kind: {e:?}")))?;
+    config::resolve_spawn(conn, builder).map_err(|e| bad(format!("builder kind: {e:?}")))?;
+    config::resolve_spawn(conn, reviewer).map_err(|e| bad(format!("reviewer kind: {e:?}")))?;
     let can_review: i64 = conn
         .query_row(
             "SELECT can_review FROM kind WHERE name = ?1",
@@ -372,16 +371,8 @@ fn check_kinds(conn: &rusqlite::Connection, builder: &str, reviewer: &str) -> Re
             format!("kind '{reviewer}' cannot review"),
         ));
     }
-    if b.harness.name == r.harness.name {
-        return Err(RpcError::new(
-            "same_harness",
-            format!(
-                "review must run on another harness than '{}'",
-                b.harness.name
-            ),
-        ));
-    }
-    Ok(())
+    super::review_pair::check(conn, builder, reviewer)
+        .map_err(|cause| RpcError::new("same_model", cause))
 }
 
 fn input_of(a: &Value, runs_dir: &Path) -> Result<PipelineInput, RpcError> {

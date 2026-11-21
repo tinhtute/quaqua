@@ -1070,10 +1070,10 @@ fn pipeline_verb_enforces_cross_harness_review_and_converges() {
     let daemon = daemon_with(&ws, herdr.clone(), None);
     let args = |b: &str, r: &str, brief: &str| verb_args(&fx, b, r, brief, &anchor);
 
-    // ni and suhuynh both run on claude; tieude cannot review.
+    // ni and suhuynh share the model opus-5.5; tieude cannot review.
     assert_eq!(
         refused(verb_call(&ws, args("ni", "suhuynh", "Goal: x\n"))),
-        "same_harness"
+        "same_model"
     );
     assert_eq!(
         refused(verb_call(&ws, args("ni", "tieude", "Goal: x\n"))),
