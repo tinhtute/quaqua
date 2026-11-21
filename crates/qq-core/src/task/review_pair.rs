@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-use crate::authority::{self, Decision};
+use crate::authority;
 use crate::config;
 
 /// Caller recorded on the refusal row (the daemon, not an agent).
@@ -27,7 +27,7 @@ pub fn check(conn: &Connection, builder_kind: &str, reviewer_kind: &str) -> Resu
         b.model.trim()
     );
     match authority::refuse(conn, CALLER, "review", reviewer_kind, &reason) {
-        Ok(Decision::Refused(_)) | Ok(Decision::Allowed) => Err(reason),
+        Ok(_) => Err(reason),
         Err(e) => Err(format!("{reason} (not journaled: {e})")),
     }
 }
