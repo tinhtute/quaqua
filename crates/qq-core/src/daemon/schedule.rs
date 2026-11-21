@@ -204,14 +204,18 @@ fn clock_ms() -> i64 {
 /// and sensors of `runs_dir`'s workspace, the scorer from the setting.
 /// Every error of the pass comes back, none is dropped.
 fn tick(runs_dir: &std::path::Path) -> Vec<String> {
-    tick_inner(runs_dir).unwrap_or_else(|e| vec![e])
+    tick_at(runs_dir, clock_ms())
 }
 
-fn tick_inner(runs_dir: &std::path::Path) -> Result<Vec<String>, String> {
+/// One pass of the daemon loop at `now`; every error of the pass comes back.
+pub fn tick_at(runs_dir: &std::path::Path, now: i64) -> Vec<String> {
+    tick_inner(runs_dir, now).unwrap_or_else(|e| vec![e])
+}
+
+fn tick_inner(runs_dir: &std::path::Path, now: i64) -> Result<Vec<String>, String> {
     let workspace = runs_dir.parent().ok_or("runs dir has no workspace")?;
     let mut conn = crate::db::open(&runs_dir.join(crate::db::path::DB_FILE))
         .map_err(|e| e.to_string())?;
-    let now = clock_ms();
     if !due(&conn, now).map_err(|e| e.to_string())?.is_empty() {
         let inbox = IdeaInbox::new(workspace);
         let sources: [&dyn Source; 2] = [&FailureSource, &inbox];
@@ -225,8 +229,23 @@ fn tick_inner(runs_dir: &std::path::Path) -> Result<Vec<String>, String> {
             static_checks: job::default_static_checks(workspace),
             arch_rules: job::default_arch_rules(),
         };
-        let rubrics = rubric::load_or_default(&rubric::rubrics_path(runs_dir))?;
-        let scorer = configured_scorer(&conn);
+        // A bad rubrics file stops scoring only: pulls and sensors still run, and the
+        // error is reported once per scoring interval, not on every tick.
+        let mut errors = Vec::new();
+        let (rubrics, rubrics_ok) = match rubric::load_or_default(&rubric::rubrics_path(runs_dir)) {
+            Ok(r) => (r, true),
+            Err(e) => {
+                errors.push(format!("scoring: rubrics: {e}"));
+                (Vec::new(), false)
+            }
+        };
+        let scorer = configured_scorer(&conn).filter(|_| rubrics_ok);
+        if !rubrics_ok
+            && (configured_scorer(&conn).is_none()
+                || !due(&conn, now).map_err(|e| e.to_string())?.iter().any(|n| n == SCORE_JOB))
+        {
+            errors.clear();
+        }
         let jobs = Jobs {
             sources: &sources,
             sensors: &sensors,
@@ -234,7 +253,8 @@ fn tick_inner(runs_dir: &std::path::Path) -> Result<Vec<String>, String> {
             scorer: scorer.as_ref().map(|s| s as &dyn Scorer),
             agent: &TemplateAgent,
         };
-        return Ok(run_due(&mut conn, &jobs, now)?.errors);
+        errors.extend(run_due(&mut conn, &jobs, now)?.errors);
+        return Ok(errors);
     }
     Ok(Vec::new())
 }

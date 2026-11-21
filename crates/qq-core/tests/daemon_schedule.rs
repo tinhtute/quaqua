@@ -318,3 +318,26 @@ fn scorer_errors_come_back() {
         ran.errors
     );
 }
+
+#[test]
+fn bad_rubrics_file_stops_scoring_only() {
+    let ws = TestWorkspace::new("sched-badrubric");
+    let conn = seeded(&ws);
+    let runs = ws.runs_dir();
+    let rp = rubric::rubrics_path(&runs);
+    std::fs::create_dir_all(rp.parent().unwrap()).unwrap();
+    std::fs::write(&rp, "this is not [[ toml").unwrap();
+    let inbox = runs.parent().unwrap().join("inbox/ideas");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(inbox.join("a.md"), "An idea\n").unwrap();
+    conn.execute("INSERT INTO setting (key, value_json) VALUES ('limits.supervisor_scorer', '\"/bin/true\"')", []).unwrap();
+    let now = 1_000;
+    schedule::ensure_sources(&conn, 0).unwrap();
+    conn.execute("UPDATE schedule SET next_due_ms = 0", []).unwrap();
+    let before = count(&conn, "SELECT COUNT(*) FROM proposal");
+    let errors = schedule::tick_at(&runs, now);
+    assert!(errors.iter().any(|e| e.contains("rubrics")), "reported: {errors:?}");
+    assert!(count(&conn, "SELECT COUNT(*) FROM proposal") > before, "the idea was still pulled");
+    let due = count(&conn, &format!("SELECT COUNT(*) FROM schedule WHERE next_due_ms <= {now}"));
+    assert_eq!(due, 0, "every row moved, nothing spins");
+}
