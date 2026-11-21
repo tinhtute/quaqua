@@ -1,6 +1,6 @@
 //! The per-task flow (ported from the old `PipelineWorkflow` state machine):
-//! build -> review on another harness/kind -> gate -> merge into the project
-//! integration branch.
+//! build -> review on another model (the same harness is allowed) -> gate ->
+//! merge into the project integration branch.
 //!
 //! What the port drops: the old machine ran each phase as a child workflow
 //! and a second `PipelineState` key=value file mirrored it for the driver.
@@ -72,6 +72,10 @@ pub struct PipelineInput {
     pub pane: String,
     #[serde(default)]
     pub project_id: Option<i64>,
+    /// The task row this flow works on: its parents gate the start and a merge
+    /// verifies it.
+    #[serde(default)]
+    pub task_id: Option<i64>,
     /// The check the merge queue runs after the merge; none merges unchecked.
     #[serde(default)]
     pub check: Option<String>,
