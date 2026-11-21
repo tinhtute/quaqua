@@ -18,8 +18,8 @@ pub fn add(conn: &Connection, name: &str, interval_ms: i64, now_ms: i64) -> rusq
 
 /// Names of the schedules due at `now_ms`, oldest due first.
 pub fn due(conn: &Connection, now_ms: i64) -> rusqlite::Result<Vec<String>> {
-    let mut st =
-        conn.prepare("SELECT name FROM schedule WHERE next_due_ms <= ?1 ORDER BY next_due_ms, name")?;
+    let mut st = conn
+        .prepare("SELECT name FROM schedule WHERE next_due_ms <= ?1 ORDER BY next_due_ms, name")?;
     let rows = st.query_map([now_ms], |r| r.get(0))?;
     rows.collect()
 }
@@ -46,7 +46,9 @@ pub fn pull_due(
             params![name, now_ms],
         )
         .map_err(|e| e.to_string())?;
-        let Some(src) = sources.iter().find(|s| s.name() == name) else { continue };
+        let Some(src) = sources.iter().find(|s| s.name() == name) else {
+            continue;
+        };
         match src.pull(conn) {
             Ok(items) => {
                 for item in &items {

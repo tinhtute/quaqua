@@ -175,7 +175,9 @@ pub const IDEA_SOURCE: &str = "idea-inbox";
 impl IdeaInbox {
     /// `workspace` is the workspace root; ideas live in `inbox/ideas/`.
     pub fn new(workspace: &std::path::Path) -> Self {
-        Self { dir: workspace.join("inbox").join("ideas") }
+        Self {
+            dir: workspace.join("inbox").join("ideas"),
+        }
     }
 }
 
