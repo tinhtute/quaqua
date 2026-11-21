@@ -287,3 +287,34 @@ fn scoring_cursor_new_runs_only() {
     assert_eq!(seen(&fake), [r3]);
     assert_eq!(cursor(&conn), 30);
 }
+
+struct Broken;
+
+impl Scorer for Broken {
+    fn score(&self, _: &Rubric, _: &RunView) -> Result<Verdict, String> {
+        Err("scorer exploded".into())
+    }
+}
+
+#[test]
+fn scorer_errors_come_back() {
+    let ws = TestWorkspace::new("sched-errors");
+    let mut conn = seeded(&ws);
+    finished_run(&conn, "a", 10);
+    conn.execute("UPDATE schedule SET cursor_ms = 5, next_due_ms = 0 WHERE name = ?1", [SCORE_JOB]).unwrap();
+    let sn = sensors(&ws);
+    let set = rubric::defaults();
+    let jobs = Jobs {
+        sources: &[],
+        sensors: &sn,
+        rubrics: &set,
+        scorer: Some(&Broken),
+        agent: &TemplateAgent,
+    };
+    let ran = schedule::run_due(&mut conn, &jobs, 100).unwrap();
+    assert!(
+        ran.errors.iter().any(|e| e.contains("scorer exploded")),
+        "the scorer error is reported: {:?}",
+        ran.errors
+    );
+}

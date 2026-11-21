@@ -202,7 +202,12 @@ fn clock_ms() -> i64 {
 
 /// One pass of the daemon loop against the real workspace: sources, rubrics
 /// and sensors of `runs_dir`'s workspace, the scorer from the setting.
-fn tick(runs_dir: &std::path::Path) -> Result<(), String> {
+/// Every error of the pass comes back, none is dropped.
+fn tick(runs_dir: &std::path::Path) -> Vec<String> {
+    tick_inner(runs_dir).unwrap_or_else(|e| vec![e])
+}
+
+fn tick_inner(runs_dir: &std::path::Path) -> Result<Vec<String>, String> {
     let workspace = runs_dir.parent().ok_or("runs dir has no workspace")?;
     let mut conn = crate::db::open(&runs_dir.join(crate::db::path::DB_FILE))
         .map_err(|e| e.to_string())?;
@@ -229,12 +234,9 @@ fn tick(runs_dir: &std::path::Path) -> Result<(), String> {
             scorer: scorer.as_ref().map(|s| s as &dyn Scorer),
             agent: &TemplateAgent,
         };
-        let ran = run_due(&mut conn, &jobs, now)?;
-        if let Some(e) = ran.errors.first() {
-            return Err(e.clone());
-        }
+        return Ok(run_due(&mut conn, &jobs, now)?.errors);
     }
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// The daemon's schedule thread: until `stop`, it runs the due pulls and
@@ -253,7 +255,9 @@ pub fn spawn_runner(ctx: Weak<Ctx>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
             let Some(c) = ctx.upgrade() else { return };
             let runs_dir = c.runs_dir.clone();
             drop(c);
-            let _ = tick(&runs_dir);
+            for e in tick(&runs_dir) {
+                eprintln!("quaqua daemon: schedule: {e}");
+            }
             let wait = crate::db::open(&runs_dir.join(crate::db::path::DB_FILE))
                 .ok()
                 .and_then(|c| next_deadline(&c).ok().flatten())
