@@ -383,7 +383,8 @@ expect C4 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effor
 stop_after C4
 
 # ---- project fixture (git repo with integration branch and a local bare origin) --------------------------
-PROJ="$T/proj"; ORIGIN="$T/origin.git"
+TREAL=$(cd "$T" && pwd -P)   # the engine canonicalizes repo paths; /tmp is a symlink on macOS
+PROJ="$TREAL/proj"; ORIGIN="$TREAL/origin.git"
 git init -q --bare "$ORIGIN"
 git init -q -b main "$PROJ"
 ( cd "$PROJ" && git config user.email e2e@example.invalid && git config user.name e2e \
@@ -504,7 +505,7 @@ task_id_of() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(s
 # ---- part a: clause (a), a harness added with config set only; export round-trips -----------------------------
 if want a; then
   AKIND=e2e-extra
-  expect A0 "0" "$PI0"   # no pi kind existed before C4's config set; the roster then names pi: $(q "select group_concat(name||'='||harness) from kind")
+  [ "$PI0" = 0 ] && pass A0 "no pi kind before C4's config set; roster after: $(q "select group_concat(name||'='||harness) from kind")" || fail A0 "pi kinds before C4's config set: $PI0"
   as_cos "$QQ" config set "kind.$AKIND" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail A1 "config set rc=$AP_RC: $AP_OUT"
   expect A1 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$AKIND'")"
   expect A2 "$QQ_SUM0" "$(cksum <"$QQ")"
@@ -512,6 +513,10 @@ if want a; then
   printf '%s\n' "$AP_OUT" >"$T/export1.toml"
   grep -qF "[kinds.$AKIND]" "$T/export1.toml" && pass A3 "export holds [kinds.$AKIND] ($(wc -l <"$T/export1.toml" | tr -d ' ') lines)" || fail A3 "export lacks [kinds.$AKIND]"
   as_cos "$QQ" config validate "$T/export1.toml"; [ "$AP_RC" = 0 ] && pass A3v "validate: $AP_OUT" || fail A3v "validate rc=$AP_RC: $AP_OUT"
+  as_cos "$QQ" config import "$T/export1.toml"; [ "$AP_RC" = 0 ] || fail A4 "config import of the dump rc=$AP_RC: $AP_OUT"
+  as_cos "$QQ" config export; [ "$AP_RC" = 0 ] || fail A4 "second config export rc=$AP_RC: $AP_OUT"
+  printf '%s\n' "$AP_OUT" >"$T/export2.toml"
+  expect A4i "$(cksum <"$T/export1.toml")" "$(cksum <"$T/export2.toml")"
   as_cos "$QQ" config diff "$T/export1.toml"; [ "$AP_RC" = 0 ] || fail A4 "config diff rc=$AP_RC: $AP_OUT"
   expect A4 "no differences" "$AP_OUT"
 fi
@@ -532,6 +537,8 @@ if want b; then
   [ "$AP_RC" -ne 0 ] && printf '%s' "$AP_OUT" | grep -q 'parents_unverified' \
     && pass B1 "child task $TC refused while parent $TP is open: $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" \
     || fail B1 "child start was not refused with parents_unverified (rc=$AP_RC): $AP_OUT"
+  NSTART=$(q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal' and json_extract(payload_json,'\$.edge')='start'")
+  [ "$NSTART" -ge 1 ] && pass B1j "refusal on edge start journaled: $(q "select payload_json from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.edge')='start' order by seq desc limit 1" | cut -c1-200)" || fail B1j "no refusal on edge start in the journal"
   as_cos "$QQ" call task.start "$(start_json "$PN" "$TP" "$PPROMPT" "$PREP")"; [ "$AP_RC" = 0 ] || fail B2 "parent start rc=$AP_RC: $AP_OUT"
   wait_for B2 "$TIMEOUT" task_verified "$TP"
   wait_for B2 "$TIMEOUT" run_closed "$TP"
