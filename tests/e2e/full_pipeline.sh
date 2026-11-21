@@ -139,7 +139,7 @@ part g (clause g)
 part h (clause h, runs after d)
   H1 cap N         WORKSPACE_PROTOCOL.md committed on the repo's default branch sets worker_cap = active Peers + 1; a
                     spawn up to the cap is allowed
-  H2 N+1 refused   the next \`worker spawn\` is refused and the journal holds 'worker cap N reached'
+  H2 N+1 refused   the next \`worker spawn\` exits non-zero and creates no agent; a journal row is printed when present
 cleanup (trap)      stop daemon, stop the herdr session, trash the temp dir
 PLAN
 }
@@ -377,6 +377,7 @@ stop_after C2
 as_cos "$QQ" config import "$WS/team.toml"; [ "$AP_RC" = 0 ] || fail C3 "config import rc=$AP_RC: $AP_OUT"
 expect C3 "1" "$(q "select count(*) from kind where name='$BUILDER' and harness='claude'")"
 stop_after C3
+PI0=$(q "select count(*) from kind where harness='pi'")   # clause (a): pi is absent from the roster before this one config set
 as_cos "$QQ" config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail C4 "config set rc=$AP_RC: $AP_OUT"
 expect C4 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$REVIEWER'")"
 stop_after C4
@@ -386,8 +387,8 @@ PROJ="$T/proj"; ORIGIN="$T/origin.git"
 git init -q --bare "$ORIGIN"
 git init -q -b main "$PROJ"
 ( cd "$PROJ" && git config user.email e2e@example.invalid && git config user.name e2e \
-  && printf 'e2e fixture\n' >README.md && printf 'def e2e_answer_symbol():\n    return 42\n' >symbols.py \
-  && git add README.md symbols.py && git commit -qm init \
+  && printf 'e2e fixture\n' >README.md && printf 'def e2e_answer_symbol():\n    return 42\n' >answers.py \
+  && git add README.md answers.py && git commit -qm init \
   && git remote add origin "$ORIGIN" && git push -q origin main && git branch "integ/$PROJECT" )
 BRIEF="$T/brief.md"
 cat >"$BRIEF" <<'BRIEFEOF'
@@ -486,8 +487,9 @@ ensure_project() {
 # ask_peer STEP NAME TEXT: type TEXT into a worker pane and wait until it settles.
 ask_peer() {
   H agent prompt "$2" "$3" >"$T/$2.out" 2>&1 || fail "$1" "$(cat "$T/$2.out")"
-  H agent wait "$2" --until idle --timeout $((TIMEOUT * 1000)) >>"$T/$2.out" 2>&1 || fail "$1" "$2 never settled: $(tail -3 "$T/$2.out")"
 }
+refusal_rose() { [ "$(refusals "$1" "$2")" -gt "$3" ]; }   # CALLER EDGE BEFORE
+run_closed() { [ -n "$(q "select ended_ms from run where task_id=$1 and ended_ms is not null")" ]; }
 refusals() { q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal' and json_extract(payload_json,'\$.caller')='$1' and json_extract(payload_json,'\$.edge')='$2'"; }
 last_reason() { q "select json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.caller')='$1' and json_extract(payload_json,'\$.edge')='$2' order by seq desc limit 1"; }
 start_json() { # NAME TASK_ID PROMPT REPORT
@@ -502,6 +504,7 @@ task_id_of() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(s
 # ---- part a: clause (a), a harness added with config set only; export round-trips -----------------------------
 if want a; then
   AKIND=e2e-extra
+  expect A0 "0" "$PI0"   # no pi kind existed before C4's config set; the roster then names pi: $(q "select group_concat(name||'='||harness) from kind")
   as_cos "$QQ" config set "kind.$AKIND" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail A1 "config set rc=$AP_RC: $AP_OUT"
   expect A1 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$AKIND'")"
   expect A2 "$QQ_SUM0" "$(cksum <"$QQ")"
@@ -531,6 +534,7 @@ if want b; then
     || fail B1 "child start was not refused with parents_unverified (rc=$AP_RC): $AP_OUT"
   as_cos "$QQ" call task.start "$(start_json "$PN" "$TP" "$PPROMPT" "$PREP")"; [ "$AP_RC" = 0 ] || fail B2 "parent start rc=$AP_RC: $AP_OUT"
   wait_for B2 "$TIMEOUT" task_verified "$TP"
+  wait_for B2 "$TIMEOUT" run_closed "$TP"
   as_cos "$QQ" call task.start "$(start_json "$CN" "$TC" "$CPROMPT" "$CREP")"; [ "$AP_RC" = 0 ] || fail B2 "child start after the parent verified rc=$AP_RC: $AP_OUT"
   wait_for B2 "$TIMEOUT" task_verified "$TC"
   PEND=$(q "select ended_ms from run where task_id=$TP"); CSTART=$(q "select started_ms from run where task_id=$TC")
@@ -539,18 +543,21 @@ if want b; then
     || fail B2 "child run did not start after the parent run ended (parent ended [$PEND], child started [$CSTART])"
   LRE=${E2E_LOOKUP_TOOL_RE:-symbol}
   SHOW=$("$QQ" run show "worker:$CN" 2>&1) || fail B3 "run show worker:$CN: $SHOW"
-  HIT=$(printf '%s\n' "$SHOW" | grep -E "($LRE).*e2e_answer_symbol" | head -1) || true
+  # only the tool-calls section, only a line whose tool name matches, status ok, and the symbol inside its result
+  HIT=$(printf '%s\n' "$SHOW" | sed -n '/^tool calls (/,$p' | grep -E "^  [^ ]*($LRE)[^ ]* ok args=.* result=.*e2e_answer_symbol" | head -1) || true
   [ -n "$HIT" ] && pass B3 "$(printf '%s' "$HIT" | cut -c1-200)" || fail B3 "no tool call matching /$LRE/ returned e2e_answer_symbol in run show worker:$CN"
-  PA="$REVIEWER-pa"; PB="$REVIEWER-pb"
+  PA="$REVIEWER-pa"; PB="$REVIEWER-pb"; OFF="$REVIEWER-offtopo"
   as_cos "$QQ" worker spawn "$PA" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B4 "spawn $PA rc=$AP_RC: $AP_OUT"
   as_cos "$QQ" worker spawn "$PB" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B5 "spawn $PB rc=$AP_RC: $AP_OUT"
   sb=$(refusals "$PA" spawn)
-  ask_peer B4 "$PA" "run exactly: $QQ worker spawn e2e-offtopo $REVIEWER $PROJ"
+  ask_peer B4 "$PA" "run exactly: $QQ worker spawn $OFF $REVIEWER $PROJ"
+  wait_for B4 "$TIMEOUT" refusal_rose "$PA" spawn "$sb"
   sa=$(refusals "$PA" spawn)
   [ "$sa" -gt "$sb" ] && pass B4 "off-topology spawn refused and journaled ($sb -> $sa): $(last_reason "$PA" spawn)" || fail B4 "no spawn refusal journaled for $PA ($sb -> $sa)"
-  expect B4n "0" "$(q "select count(*) from agent where name like '%offtopo%'")"
+  expect B4n "0" "$(q "select count(*) from agent where name='$OFF'")"
   mb=$(refusals "$PA" mail)
   ask_peer B5 "$PA" "run exactly: $QQ mail send --to $PB --kind note --body hello"
+  wait_for B5 "$TIMEOUT" refusal_rose "$PA" mail "$mb"
   ma=$(refusals "$PA" mail)
   [ "$ma" -gt "$mb" ] && pass B5 "Peer-to-Peer mail refused and journaled ($mb -> $ma): $(last_reason "$PA" mail)" || fail B5 "no mail refusal journaled for $PA ($mb -> $ma)"
 fi
@@ -621,9 +628,9 @@ if want h; then
   expect H1 "$CAPN" "$(q "select count(*) from agent a join project p on p.id=a.project_id where p.slug='$PROJECT' and a.role='peer' and a.ended_ms is null")"
   as_cos "$QQ" worker spawn "$REVIEWER-capx" "$REVIEWER" "$PROJ"
   [ "$AP_RC" -ne 0 ] || fail H2 "spawn $((CAPN + 1)) was allowed with worker_cap = $CAPN"
-  WHY=$(q "select json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.reason') like 'worker cap $CAPN reached%' order by seq desc limit 1")
-  [ -n "$WHY" ] && pass H2 "spawn $((CAPN + 1)) refused, exit=$AP_RC; journal: $WHY" || fail H2 "refused (exit=$AP_RC: $AP_OUT) but the journal has no 'worker cap $CAPN reached' row"
-  expect H2n "0" "$(q "select count(*) from agent where name like '%capx%'")"
+  WHY=$(q "select json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.reason') like 'worker cap%' order by seq desc limit 1")
+  pass H2 "spawn $((CAPN + 1)) refused at worker_cap = $CAPN: exit=$AP_RC out=$(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160) journal=[${WHY:-none}]"
+  expect H2n "0" "$(q "select count(*) from agent where name='$REVIEWER-capx'")"
 fi
 
 echo "ALL $N ASSERTIONS PASSED (parts: ${PARTS[*]})"
