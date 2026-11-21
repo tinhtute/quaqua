@@ -24,29 +24,28 @@ fn fx(tag: &str) -> Fx {
     .unwrap();
     config::seed(&mut conn, &team).expect("seed");
     conn.execute("INSERT INTO project(slug, created_ms) VALUES ('p', 1)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS events (workflow_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+         ts_ms INTEGER NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         PRIMARY KEY (workflow_id, seq))",
+        [],
+    )
+    .unwrap();
     Fx { conn, dir }
 }
 
-fn failed_run(conn: &Connection, name: &str, outcome: &str) -> i64 {
+fn gate_event(conn: &Connection, wf: &str, seq: i64, kind: &str, reason: &str) {
     conn.execute(
-        "INSERT INTO agent (name, role, kind, project_id, started_ms) VALUES (?1, 'peer', 'ni', 1, 1)",
-        [name],
-    )
-    .unwrap();
-    let agent = conn.last_insert_rowid();
-    let wf = format!("worker:{name}");
-    conn.execute(
-        "INSERT INTO workflow (id, kind, state, started_ms, updated_ms) VALUES (?1, 'worker', 'done', 1, 1)",
-        [&wf],
+        "INSERT OR IGNORE INTO workflow (id, kind, state, project_id, started_ms, updated_ms) \
+         VALUES (?1, 'pipeline', 'paused', 1, 1, 1)",
+        [wf],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO run (agent_id, kind, workflow_id, harness, model, started_ms, ended_ms, outcome, cost_state) \
-         VALUES (?1, 'ni', ?2, 'claude', 'm', 1, 2, ?3, 'unknown')",
-        rusqlite::params![agent, wf, outcome],
+        "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) VALUES (?1, ?2, 1, ?3, ?4)",
+        rusqlite::params![wf, seq, kind, serde_json::json!({ "reason": reason }).to_string()],
     )
     .unwrap();
-    conn.last_insert_rowid()
 }
 
 fn proposals(conn: &Connection) -> i64 {
@@ -56,29 +55,39 @@ fn proposals(conn: &Connection) -> i64 {
 #[test]
 fn loop1_gate_failure_files_proposal() {
     let Fx { mut conn, dir } = fx("l1");
-    failed_run(&conn, "ok", "merged");
-    let run = failed_run(&conn, "bad", "check_failed");
+    // noise: other pauses, another merge refusal, a successful event
+    gate_event(&conn, "wf-ok", 1, "workflow_completed", "blocked 4: check_failed: x");
+    gate_event(&conn, "wf-ok", 2, "pause_for_approval", "the report ends in BLOCKED");
+    gate_event(&conn, "wf-ok", 3, "pause_for_approval", "blocked 4: merge_conflict: a.rs");
+    gate_event(&conn, "wf-bad", 1, "pause_for_approval", "blocked 4: check_failed: cargo test red");
     schedule::add(&conn, FAILURE_SOURCE, 1000, 0).unwrap();
     let src = FailureSource;
     let ids = schedule::pull_due(&mut conn, &[&src], 0).unwrap();
-    assert_eq!(ids.len(), 1, "only the failed run files");
-    let (loop_no, risk, project, obs): (i64, String, Option<i64>, String) = conn
+    assert_eq!(ids.len(), 1, "only the gate failure files");
+    let (loop_no, risk, project, obs, ev): (i64, String, Option<i64>, String, String) = conn
         .query_row(
-            "SELECT loop, risk, project_id, observation FROM proposal WHERE id = ?1",
+            "SELECT loop, risk, project_id, observation, evidence FROM proposal WHERE id = ?1",
             [ids[0]],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .unwrap();
     assert_eq!((loop_no, risk.as_str(), project), (1, "low", Some(1)));
-    assert!(obs.contains(&format!("run {run}")) && obs.contains("check_failed"));
-    // once: the next due pull, and a repeat of the same tick, file nothing more
+    assert!(obs.contains("wf-bad") && obs.contains("check_failed"));
+    assert!(ev.contains("cargo test red"));
+    // once: later pulls file nothing, and the same failure again (a retry) is the same signature
     assert!(schedule::pull_due(&mut conn, &[&src], 0).unwrap().is_empty());
     assert!(schedule::pull_due(&mut conn, &[&src], 5000).unwrap().is_empty());
+    gate_event(&conn, "wf-bad", 2, "pause_for_approval", "blocked 4: check_failed: cargo test red again");
+    assert!(schedule::pull_due(&mut conn, &[&src], 6000).unwrap().is_empty());
     assert_eq!(proposals(&conn), 1);
-    // a new failure files its own proposal
-    failed_run(&conn, "bad2", "gate_failed");
-    assert_eq!(schedule::pull_due(&mut conn, &[&src], 9000).unwrap().len(), 1);
-    assert_eq!(proposals(&conn), 2);
+    // a different failure word, or another workflow, files its own proposal
+    gate_event(&conn, "wf-bad", 3, "pause_for_approval", "blocked 4: base_broken: red on base");
+    gate_event(&conn, "wf-two", 1, "pause_for_approval", "blocked 4: check_failed: lint");
+    assert_eq!(schedule::pull_due(&mut conn, &[&src], 9000).unwrap().len(), 2);
+    assert_eq!(proposals(&conn), 3);
+    // a database with no journal yet pulls nothing
+    let bare = db::open(&dir.join("bare.db")).unwrap();
+    assert!(src.pull(&bare).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -119,7 +128,7 @@ fn loop3_inbox_files_proposal() {
 fn trigger_schedule_pull_only() {
     let Fx { mut conn, dir } = fx("tr");
     let src = FailureSource;
-    failed_run(&conn, "bad", "test_failed");
+    gate_event(&conn, "wf-bad", 1, "pause_for_approval", "blocked 4: check_failed: red");
     // no schedule row: nothing is pulled, whatever the clock says
     assert!(schedule::pull_due(&mut conn, &[&src], i64::MAX / 2).unwrap().is_empty());
     assert_eq!(proposals(&conn), 0);

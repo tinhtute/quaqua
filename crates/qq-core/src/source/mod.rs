@@ -75,11 +75,16 @@ pub fn file_once(
     Ok(Some(id))
 }
 
-/// Run outcomes that count as a farm test or gate failure.
-pub const FAILURE_OUTCOMES: [&str; 3] = ["check_failed", "gate_failed", "test_failed"];
+/// The persisted gate failure: a pipeline that pauses with merge code 4 and
+/// a refused `check_failed` (the project check went red after the merge) or
+/// `base_broken` (it is red on the base too). The reason lands in the
+/// journal as a `pause_for_approval` event, `blocked 4: <word>: <detail>`.
+const GATE_WORDS: [&str; 2] = ["check_failed", "base_broken"];
 
-/// Loop 1: every closed run whose outcome is a test or gate failure files one
-/// bug proposal. A bug fix is reversible and stays inside the run's project.
+/// Loop 1: a gate failure in the journal files one bug proposal. The
+/// signature is the workflow and the failure word, so a retried pipeline that
+/// fails the same way again files nothing more. A bug fix is reversible and
+/// stays inside the workflow's project.
 pub struct FailureSource;
 
 pub const FAILURE_SOURCE: &str = "farm-failures";
@@ -90,36 +95,50 @@ impl Source for FailureSource {
     }
 
     fn pull(&self, conn: &Connection) -> Result<Vec<Item>, String> {
+        let has_journal: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !has_journal {
+            return Ok(vec![]);
+        }
         let mut st = conn
             .prepare(
-                "SELECT r.id, r.outcome, r.workflow_id, r.candidate_sha, r.task_id, \
-                 COALESCE(t.project_id, a.project_id) \
-                 FROM run r JOIN agent a ON a.id = r.agent_id \
-                 LEFT JOIN task t ON t.id = r.task_id \
-                 WHERE r.outcome IN (?1, ?2, ?3) ORDER BY r.id",
+                "SELECT e.workflow_id, e.seq, json_extract(e.payload_json, '$.reason'), \
+                 w.project_id, w.task_id \
+                 FROM events e LEFT JOIN workflow w ON w.id = e.workflow_id \
+                 WHERE e.kind = 'pause_for_approval' \
+                 AND json_extract(e.payload_json, '$.reason') LIKE 'blocked 4: %' \
+                 ORDER BY e.workflow_id, e.seq",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
-            .query_map(
-                params![FAILURE_OUTCOMES[0], FAILURE_OUTCOMES[1], FAILURE_OUTCOMES[2]],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<i64>>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
-                    ))
-                },
-            )
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
+            })
             .map_err(|e| e.to_string())?;
-        let mut items = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
         for row in rows {
-            let (id, outcome, wf, sha, task, project) = row.map_err(|e| e.to_string())?;
-            let wf = wf.unwrap_or_else(|| "unknown".into());
+            let (wf, seq, reason, project, task) = row.map_err(|e| e.to_string())?;
+            let detail = reason.trim_start_matches("blocked 4: ");
+            let Some(word) = GATE_WORDS.iter().find(|w| detail.starts_with(**w)) else {
+                continue;
+            };
+            let key = format!("{wf}:{word}");
+            if items.iter().any(|i| i.key == key) {
+                continue;
+            }
             items.push(Item {
-                key: format!("run:{id}"),
+                key,
                 loop_no: 1,
                 project_id: project,
                 change: Change {
@@ -129,11 +148,10 @@ impl Source for FailureSource {
                     external_effect: false,
                 },
                 text: Text {
-                    observation: Some(format!("run {id} ended with {outcome}")),
+                    observation: Some(format!("the gate of workflow {wf} failed: {word}")),
                     evidence: Some(format!(
-                        "workflow {wf}, task {}, candidate sha {}",
-                        task.map_or("none".into(), |t| t.to_string()),
-                        sha.as_deref().unwrap_or("none")
+                        "journal event {wf}#{seq}, task {}: {detail}",
+                        task.map_or("none".into(), |t| t.to_string())
                     )),
                     recommendation: Some("find the cause of the failure and fix it".into()),
                     ..Text::default()

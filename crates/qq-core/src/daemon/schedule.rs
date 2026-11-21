@@ -31,8 +31,8 @@ pub fn next_deadline(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 
 /// Pulls every source whose schedule is due, files its new items once and moves
 /// the schedule by one interval from `now_ms`. Returns the ids of the proposals
-/// filed. A source that fails keeps its schedule due-moved too, so one broken
-/// source cannot spin; the error comes back after the others ran.
+/// filed. The schedule moves before the pull, so one broken source cannot
+/// spin; its error comes back after the other sources ran.
 pub fn pull_due(
     conn: &mut Connection,
     sources: &[&dyn Source],
@@ -50,8 +50,12 @@ pub fn pull_due(
         match src.pull(conn) {
             Ok(items) => {
                 for item in &items {
-                    if let Some(id) = file_once(conn, &name, item, now_ms)? {
-                        filed.push(id);
+                    match file_once(conn, &name, item, now_ms) {
+                        Ok(Some(id)) => filed.push(id),
+                        Ok(None) => {}
+                        Err(e) => {
+                            first_err.get_or_insert(format!("source {name}: {e}"));
+                        }
                     }
                 }
             }
