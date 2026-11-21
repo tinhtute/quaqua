@@ -32,14 +32,30 @@ fn fx(tag: &str) -> Fx {
         [],
     )
     .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS snapshots (workflow_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+         state_json TEXT NOT NULL, PRIMARY KEY (workflow_id, seq))",
+        [],
+    )
+    .unwrap();
     Fx { conn, dir }
 }
 
 fn gate_event(conn: &Connection, wf: &str, seq: i64, kind: &str, reason: &str) {
+    // As production: the workflow row carries no project or task; the pipeline
+    // input is journaled in the snapshot.
     conn.execute(
-        "INSERT OR IGNORE INTO workflow (id, kind, state, project_id, started_ms, updated_ms) \
-         VALUES (?1, 'pipeline', 'paused', 1, 1, 1)",
+        "INSERT OR IGNORE INTO workflow (id, kind, state, started_ms, updated_ms) \
+         VALUES (?1, 'pipeline', 'running', 1, 1)",
         [wf],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO snapshots (workflow_id, seq, state_json) VALUES (?1, 1, ?2)",
+        rusqlite::params![
+            wf,
+            serde_json::json!({ "input": { "project_id": 1 } }).to_string()
+        ],
     )
     .unwrap();
     conn.execute(
@@ -138,6 +154,33 @@ fn loop1_gate_failure_files_proposal() {
         2
     );
     assert_eq!(proposals(&conn), 3);
+    // a workflow with no snapshot falls back to the task's project
+    conn.execute("INSERT INTO workflow (id, kind, state, started_ms, updated_ms) VALUES ('wf-t', 'pipeline', 'running', 1, 1)", []).unwrap();
+    conn.execute("INSERT INTO events VALUES ('wf-t', 1, 1, 'pause_for_approval', '{\"reason\":\"blocked 4: check_failed: x\"}')", []).unwrap();
+    assert_eq!(
+        src.pull(&conn)
+            .unwrap()
+            .iter()
+            .find(|i| i.key == "wf-t:check_failed")
+            .unwrap()
+            .project_id,
+        None
+    );
+    conn.execute("INSERT INTO task (project_id, title, disposition, state, created_ms) VALUES (1, 't', 'engineer', 'open', 1)", []).unwrap();
+    conn.execute(
+        "INSERT INTO snapshots VALUES ('wf-t', 1, '{\"input\":{\"task_id\":1}}')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        src.pull(&conn)
+            .unwrap()
+            .iter()
+            .find(|i| i.key == "wf-t:check_failed")
+            .unwrap()
+            .project_id,
+        Some(1)
+    );
     // a database with no journal yet pulls nothing
     let bare = db::open(&dir.join("bare.db")).unwrap();
     assert!(src.pull(&bare).unwrap().is_empty());
@@ -183,6 +226,14 @@ fn loop3_inbox_files_proposal() {
         1
     );
     assert_eq!(proposals(&conn), 2);
+    // a long idea is cut, a symlink is not read
+    std::fs::write(ideas.join("long.md"), "x".repeat(50_000)).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc/hosts", ideas.join("link.md")).unwrap();
+    let items = src.pull(&conn).unwrap();
+    let long = items.iter().find(|i| i.key == "long.md").unwrap();
+    assert_eq!(long.text.observation.as_ref().unwrap().len(), 20_000);
+    assert!(items.iter().all(|i| i.key != "link.md"));
     // a missing inbox is an empty inbox
     let none = IdeaInbox::new(&dir.join("nowhere"));
     assert!(none.pull(&conn).unwrap().is_empty());

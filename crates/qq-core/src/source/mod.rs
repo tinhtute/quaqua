@@ -105,16 +105,33 @@ impl Source for FailureSource {
         if !has_journal {
             return Ok(vec![]);
         }
-        let mut st = conn
-            .prepare(
-                "SELECT e.workflow_id, e.seq, json_extract(e.payload_json, '$.reason'), \
-                 w.project_id, w.task_id \
-                 FROM events e LEFT JOIN workflow w ON w.id = e.workflow_id \
-                 WHERE e.kind = 'pause_for_approval' \
-                 AND json_extract(e.payload_json, '$.reason') LIKE 'blocked 4: %' \
-                 ORDER BY e.workflow_id, e.seq",
+        // Production sets no project or task on the workflow row. The pipeline
+        // input (project_id, task_id) is journaled in the latest snapshot, so
+        // read it there, then fall back to the row and to the task's project.
+        let has_snap: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshots')",
+                [],
+                |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
+        let input = if has_snap {
+            "(SELECT s.state_json FROM snapshots s WHERE s.workflow_id = e.workflow_id \
+              ORDER BY s.seq DESC LIMIT 1)"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT e.workflow_id, e.seq, json_extract(e.payload_json, '$.reason'), \
+             COALESCE(json_extract({input}, '$.input.project_id'), w.project_id, t.project_id), \
+             COALESCE(json_extract({input}, '$.input.task_id'), w.task_id) \
+             FROM events e LEFT JOIN workflow w ON w.id = e.workflow_id \
+             LEFT JOIN task t ON t.id = COALESCE(json_extract({input}, '$.input.task_id'), w.task_id) \
+             WHERE e.kind = 'pause_for_approval' \
+             AND json_extract(e.payload_json, '$.reason') LIKE 'blocked 4: %' \
+             ORDER BY e.workflow_id, e.seq"
+        );
+        let mut st = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = st
             .query_map([], |r| {
                 Ok((
@@ -172,6 +189,9 @@ pub struct IdeaInbox {
 
 pub const IDEA_SOURCE: &str = "idea-inbox";
 
+/// An idea longer than this is cut when it becomes the observation.
+const IDEA_MAX_CHARS: usize = 20_000;
+
 impl IdeaInbox {
     /// `workspace` is the workspace root; ideas live in `inbox/ideas/`.
     pub fn new(workspace: &std::path::Path) -> Self {
@@ -194,7 +214,7 @@ impl Source for IdeaInbox {
         };
         let mut names: Vec<String> = rd
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.ends_with(".md") && !n.starts_with('.'))
             .collect();
@@ -203,6 +223,10 @@ impl Source for IdeaInbox {
         for name in names {
             let body = std::fs::read_to_string(self.dir.join(&name))
                 .map_err(|e| format!("{name}: {e}"))?;
+            let body = match body.char_indices().nth(IDEA_MAX_CHARS) {
+                Some((at, _)) => body[..at].to_string(),
+                None => body,
+            };
             if body.trim().is_empty() {
                 continue;
             }
