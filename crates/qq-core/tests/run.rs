@@ -70,7 +70,7 @@ fn open_run(conn: &mut Connection, name: &str, harness: &str, project_id: i64) -
 }
 
 const CLAUDE_SESSION: &str = r#"{"type":"user","timestamp":"2026-11-21T10:00:00.000Z","message":{"role":"user","content":"fix the bug"}}
-{"type":"assistant","timestamp":"2026-11-21T10:00:01.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"looking"}],"usage":{"input_tokens":10,"output_tokens":5}}}
+{"type":"assistant","timestamp":"2026-11-21T10:00:01.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"looking"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100}}}
 {"type":"assistant","timestamp":"2026-11-21T10:00:02.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"output_tokens":5}}}
 {"type":"user","timestamp":"2026-11-21T10:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a.rs","is_error":false}]}}
 {"type":"assistant","timestamp":"2026-11-21T10:00:04.000Z","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":20,"output_tokens":7}}}
@@ -125,7 +125,7 @@ fn run_record_complete_all_drivers() {
         "harness claude",
         "outcome verified",
         &format!("candidate_sha {SHA}"),
-        "tokens in=30 out=12",
+        "tokens in=130 out=12",
         "cost unknown",
         "base main",
         "report runs/x.md",
@@ -145,7 +145,7 @@ fn run_record_complete_all_drivers() {
     let full = show::render(&show::load(&conn, "worker:p1").unwrap().unwrap());
     for want in [
         "harness pi",
-        "tokens in=150 out=13",
+        "tokens in=153 out=13",
         "cost $0.7500",
         "transcript (3)",
         "assistant: finished",
@@ -203,7 +203,7 @@ fn cost_unknown_when_unreported() {
     std::fs::write(&f, CLAUDE_SESSION).unwrap();
     let d = driver(&conn, "claude");
     capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
-    assert_eq!(state(&conn, &wf), ("unknown".into(), None, Some(30)));
+    assert_eq!(state(&conn, &wf), ("unknown".into(), None, Some(130)));
 
     // pi with one assistant message missing its cost: the total is unknown, not partial.
     let wf = open_run(&mut conn, "n2", "pi", 1);
@@ -212,7 +212,7 @@ fn cost_unknown_when_unreported() {
     std::fs::write(&f, partial).unwrap();
     let d = driver(&conn, "pi");
     capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
-    assert_eq!(state(&conn, &wf), ("unknown".into(), None, Some(150)));
+    assert_eq!(state(&conn, &wf), ("unknown".into(), None, Some(153)));
     let shown = show::render(&show::load(&conn, &wf).unwrap().unwrap());
     assert!(shown.contains("cost unknown") && !shown.contains("cost $0"), "{shown}");
 
@@ -221,7 +221,7 @@ fn cost_unknown_when_unreported() {
     std::fs::write(&f, PI_SESSION).unwrap();
     let d = driver(&conn, "pi");
     capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
-    assert_eq!(state(&conn, &wf), ("reported".into(), Some(0.75), Some(150)));
+    assert_eq!(state(&conn, &wf), ("reported".into(), Some(0.75), Some(153)));
 
     // A generic driver never reads a session, even when one is named.
     let wf = open_run(&mut conn, "n4", "opencode", 1);
@@ -229,4 +229,22 @@ fn cost_unknown_when_unreported() {
     let got = capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
     assert!(got.is_none());
     assert_eq!(state(&conn, &wf), ("unknown".into(), None, None));
+}
+
+#[test]
+fn claude_session_found_by_id_and_lost_session_is_an_error() {
+    let ws = TestWorkspace::new("run-lookup");
+    let mut conn = seeded(&ws);
+    let projects = ws.root().join("projects");
+    std::fs::create_dir_all(projects.join("-some-project")).unwrap();
+    std::fs::write(projects.join("-some-project/abc-123.jsonl"), CLAUDE_SESSION).unwrap();
+    let wf = open_run(&mut conn, "l1", "claude", 1);
+    let d = driver(&conn, "claude");
+    let got = capture::capture(&mut conn, &wf, &*d, Some("abc-123"), Some(&projects)).unwrap();
+    assert_eq!(got.unwrap().turns, 3);
+
+    // A native driver whose session is gone is an error, not "no source".
+    let wf = open_run(&mut conn, "l2", "claude", 1);
+    let e = capture::capture(&mut conn, &wf, &*d, Some("missing"), Some(&projects)).unwrap_err();
+    assert!(matches!(e, capture::CaptureError::SessionNotFound(_)), "{e}");
 }

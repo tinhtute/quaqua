@@ -83,6 +83,8 @@ pub struct Captured {
 #[derive(Debug)]
 pub enum CaptureError {
     NoRun(String),
+    /// A native driver was given a session reference that names no file.
+    SessionNotFound(String),
     Io(std::io::Error),
     Sql(rusqlite::Error),
 }
@@ -91,6 +93,7 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureError::NoRun(w) => write!(f, "no run for workflow {w}"),
+            CaptureError::SessionNotFound(s) => write!(f, "no session file for {s}"),
             CaptureError::Io(e) => write!(f, "reading session: {e}"),
             CaptureError::Sql(e) => write!(f, "sqlite: {e}"),
         }
@@ -130,7 +133,10 @@ pub fn resolve_session(format: Format, session: &str, projects: Option<&Path>) -
 
 /// Captures the session of the run of `workflow_id` through `driver`. A driver
 /// with no session source, or no session reference, stores nothing and
-/// returns `None`; the run keeps cost `unknown`.
+/// returns `None`; the run keeps cost `unknown`. A native driver whose session
+/// reference names no file is an error, so a lost transcript is never mistaken
+/// for a driver that has none. `tokens_in` counts every input token, cache
+/// reads and writes included.
 pub fn capture(
     conn: &mut Connection,
     workflow_id: &str,
@@ -141,9 +147,8 @@ pub fn capture(
     let (Some(format), Some(session)) = (Format::of(driver), session) else {
         return Ok(None);
     };
-    let Some(path) = resolve_session(format, session, projects) else {
-        return Ok(None);
-    };
+    let path = resolve_session(format, session, projects)
+        .ok_or_else(|| CaptureError::SessionNotFound(session.to_string()))?;
     let text = std::fs::read_to_string(&path)?;
     store(conn, workflow_id, &parse(format, &text)).map(Some)
 }
@@ -350,7 +355,8 @@ fn claude_entry(
             if let (true, Some(u)) = (fresh, msg.get("usage")) {
                 let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
                 usage.seen = true;
-                usage.input += n("input_tokens");
+                usage.input +=
+                    n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
                 usage.output += n("output_tokens");
                 usage.cost = None; // claude reports no cost
             }
@@ -387,7 +393,7 @@ fn pi_entry(out: &mut Parsed, usage: &mut Usage, msg: &Value, role: &str, ts: u6
             if let Some(u) = msg.get("usage") {
                 let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
                 usage.seen = true;
-                usage.input += n("input");
+                usage.input += n("input") + n("cacheRead") + n("cacheWrite");
                 usage.output += n("output");
                 usage.cost = match (usage.cost, u.pointer("/cost/total").and_then(Value::as_f64)) {
                     (Some(t), Some(c)) => Some(t + c),

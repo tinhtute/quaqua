@@ -99,7 +99,7 @@ pub fn load(conn: &Connection, key: &str) -> rusqlite::Result<Option<Full>> {
 }
 
 /// The whole run as text: header, artifacts, events, transcript and tool calls.
-/// An empty section prints `none`, so a missing capture is visible.
+/// An empty section prints a zero count (`transcript (0)`), so a missing capture is visible.
 pub fn render(f: &Full) -> String {
     let mut o = f.head.clone();
     o.push_str(&format!("\nartifacts ({})", f.artifacts.len()));
