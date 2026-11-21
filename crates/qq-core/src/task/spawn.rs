@@ -50,6 +50,24 @@ pub struct SpawnSpec<'a> {
     pub spawner_id: Option<i64>,
 }
 
+/// The harness a live agent was spawned with: the one pinned on its row at
+/// spawn, so a later profile or kind change does not move it. A row that
+/// predates the pin (no `harness`) falls back to resolving its kind. `None`
+/// when neither resolves (callers fail closed).
+pub fn live_harness(conn: &Connection, agent_id: i64) -> Option<config::Harness> {
+    let (pinned, kind): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT harness, kind FROM agent WHERE id = ?1",
+            [agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    match pinned {
+        Some(h) => config::harness(conn, &h).ok().flatten(),
+        None => config::resolve_spawn(conn, &kind?).ok().map(|t| t.harness),
+    }
+}
+
 /// What a spawn resolved and recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spawned {
@@ -258,8 +276,8 @@ pub fn spawn_with(
         Some((id, ..)) => id,
         None => {
             conn.execute(
-                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms, pane_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO agent (name, role, kind, project_id, spawner_id, started_ms, pane_id, \
+                 harness, model, effort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     spec.name,
                     spec.role.as_str(),
@@ -267,7 +285,10 @@ pub fn spawn_with(
                     spec.project_id,
                     spec.spawner_id,
                     now_ms as i64,
-                    spec.pane
+                    spec.pane,
+                    target.harness.name,
+                    target.model,
+                    target.effort
                 ],
             )
             .map_err(SpawnError::Db)?;

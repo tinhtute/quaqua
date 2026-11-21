@@ -371,11 +371,11 @@ fn end_agent(conn: &Connection, name: &str, now_ms: u64) -> rusqlite::Result<()>
     Ok(())
 }
 
-fn open_agent(conn: &Connection, name: &str) -> Result<(i64, Option<String>), OpsError> {
+fn open_agent(conn: &Connection, name: &str) -> Result<i64, OpsError> {
     conn.query_row(
-        "SELECT id, kind FROM agent WHERE name = ?1 AND ended_ms IS NULL",
+        "SELECT id FROM agent WHERE name = ?1 AND ended_ms IS NULL",
         [name],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )
     .optional()
     .map_err(other)?
@@ -387,12 +387,13 @@ fn open_agent(conn: &Connection, name: &str) -> Result<(i64, Option<String>), Op
 /// ended (`cleanup` does that). A harness without a verified sequence is
 /// refused before anything is sent, even when the agent is idle.
 pub fn stop_worker(conn: &Connection, herdr: &dyn HerdrClient, name: &str) -> Result<(), OpsError> {
-    let (_, kind) = open_agent(conn, name)?;
-    let kind = kind.ok_or_else(|| OpsError::Other(format!("'{name}' has no kind")))?;
-    let target = crate::config::resolve_spawn(conn, &kind).map_err(|e| other(format!("{e:?}")))?;
-    let harness = target.harness.name.clone();
+    let id = open_agent(conn, name)?;
+    // The harness pinned at spawn; a row from before the pin resolves its kind.
+    let h = super::spawn::live_harness(conn, id)
+        .ok_or_else(|| OpsError::Other(format!("cannot resolve the harness of '{name}'")))?;
+    let harness = h.name.clone();
     let keys = crate::driver::Registry::native()
-        .resolve(&target.harness)
+        .resolve(&h)
         .map(|d| d.stop_keys())
         .filter(|k| !k.is_empty())
         .ok_or(OpsError::Unverified(harness))?;
