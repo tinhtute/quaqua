@@ -16,6 +16,7 @@
 //! unfenced driver.
 
 mod gate;
+pub mod protocol;
 pub mod push;
 pub mod tier;
 mod tokenizer;
