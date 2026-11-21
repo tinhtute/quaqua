@@ -11,6 +11,7 @@ pub mod grant;
 pub mod memory_write;
 pub mod pr_merge;
 pub mod push_door;
+pub mod schedule;
 pub mod store;
 pub mod supervisor;
 pub mod watch;
