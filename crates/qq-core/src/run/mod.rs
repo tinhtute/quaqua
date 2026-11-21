@@ -1,16 +1,24 @@
 //! The run record (R19): one row of `run` per worker flow, opened when the
 //! agent is up and closed once with its end state. Cost is `unknown` until a
-//! driver reports one. Both writes converge on repeat.
+//! driver reports one. Both writes converge on repeat. [`capture`] stores a
+//! run's transcript, tool calls and tokens; [`show`] prints and lists runs.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::cli::{Install, Registry};
+use crate::cli::{Command, Install, Registry};
 use crate::daemon::Daemon;
+
+pub mod capture;
+pub mod show;
 
 pub const INSTALL: Install = install;
 
-fn install(_: &mut Registry, _: &mut Daemon) -> Result<(), String> {
-    Ok(())
+fn install(registry: &mut Registry, _: &mut Daemon) -> Result<(), String> {
+    registry.register(Command {
+        name: "run",
+        help: "run show <workflow|id> | run list [--project <slug>]",
+        run: show::run_command,
+    })
 }
 
 /// What opens a run.
