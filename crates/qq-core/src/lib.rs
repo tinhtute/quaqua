@@ -1,5 +1,6 @@
 pub mod auditor;
 pub mod authority;
+pub mod backlog;
 pub mod bus;
 pub mod cli;
 pub mod config;
