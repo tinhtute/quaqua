@@ -346,9 +346,31 @@ fn factory(deps: &Arc<Deps>) -> Factory {
     })
 }
 
-/// The flow plus the task record: when the flow ends in a merge (or finds
-/// nothing to do) its task row becomes `verified`, so the children may start.
-/// The write is idempotent and lives here, never in a replayed step.
+/// The run outcome of the escalation a pause names, when the flow now waits
+/// on a report that ended in REOPEN_REQUEST, DEPENDENCY_REQUEST or BLOCKED
+/// (the pause reason reads `the report ends in <WORD>`).
+fn escalation_of(events: &[crate::engine::journal::EventRecord]) -> Option<&'static str> {
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind.as_str(), "pause_for_approval" | "approval_resolved"))?;
+    if last.kind != "pause_for_approval" {
+        return None;
+    }
+    let reason = serde_json::from_str::<Value>(&last.payload_json).ok()?;
+    let (_, word) = reason.get("reason")?.as_str()?.split_once("the report ends in ")?;
+    match word.trim() {
+        "REOPEN_REQUEST" => Some("reopen_request"),
+        "DEPENDENCY_REQUEST" => Some("dependency_request"),
+        "BLOCKED" | "DISPUTED" => Some("reported_blocked"),
+        _ => None,
+    }
+}
+
+/// The flow plus the task record: a merge (or nothing to do) makes its task
+/// row `verified`, so the children may start; a report that asks to reopen,
+/// to depend or that is blocked leaves the task in that state. The write is
+/// idempotent and lives here, never in a replayed step.
 struct VerifyingMachine {
     inner: Machine<PipelineFlow>,
     id: String,
@@ -363,22 +385,26 @@ impl WorkflowDriver for VerifyingMachine {
         events: Vec<WorkflowEvent>,
     ) -> Result<Progress, String> {
         let progress = self.inner.advance(journal, events)?;
-        if let (Progress::Completed, Some(task)) = (&progress, self.task_id) {
-            let done = journal
-                .load_events(&self.id, 1)
-                .map_err(|e| e.to_string())?
+        let Some(task) = self.task_id else {
+            return Ok(progress);
+        };
+        let all = journal.load_events(&self.id, 1).map_err(|e| e.to_string())?;
+        let outcome = match &progress {
+            Progress::Completed => all
                 .iter()
                 .find(|e| e.kind == "workflow_completed")
-                .and_then(|e| serde_json::from_str::<pipeline::PipelineOutput>(&e.payload_json).ok());
-            let outcome = match done.as_ref().map(|o| o.status.as_str()) {
-                Some("merged") => Some("verified"),
-                Some("no_changes") => Some("no_changes"),
-                _ => None,
-            };
-            if let Some(outcome) = outcome {
-                let conn = crate::db::open(&self.db_path).map_err(|e| e.to_string())?;
-                super::graph::settle(&conn, task, outcome).map_err(|e| e.to_string())?;
-            }
+                .and_then(|e| serde_json::from_str::<pipeline::PipelineOutput>(&e.payload_json).ok())
+                .and_then(|o| match o.status.as_str() {
+                    "merged" => Some("verified"),
+                    "no_changes" => Some("no_changes"),
+                    _ => None,
+                }),
+            Progress::Running => escalation_of(&all),
+            Progress::Failed(_) => None,
+        };
+        if let Some(outcome) = outcome {
+            let conn = crate::db::open(&self.db_path).map_err(|e| e.to_string())?;
+            super::graph::settle(&conn, task, outcome).map_err(|e| e.to_string())?;
         }
         Ok(progress)
     }

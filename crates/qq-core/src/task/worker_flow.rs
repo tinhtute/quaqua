@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 #[path = "spawn_cmd.rs"]
@@ -339,16 +340,23 @@ fn record_end(journal: &dyn Journal, db_path: &Path, id: &str) -> Result<(), Str
         return Ok(());
     };
     let conn = crate::db::open(db_path).map_err(|e| e.to_string())?;
-    crate::run::close(&conn, id, &outcome, sha.as_deref(), now_ms()).map_err(|e| e.to_string())?;
-    // The run's task takes the end state the Lead reads (idempotent: a repeat
-    // writes the same state).
-    let task: Option<i64> = conn
-        .query_row("SELECT task_id FROM run WHERE workflow_id = ?1", [id], |r| r.get(0))
+    // The run closes once and its task takes the end state the Lead reads in
+    // the same transaction: a repeat finds the run closed and writes nothing,
+    // so an old verdict never overwrites a later state.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let closed = crate::run::close(&tx, id, &outcome, sha.as_deref(), now_ms())
         .map_err(|e| e.to_string())?;
-    if let Some(task) = task {
-        super::graph::settle(&conn, task, &outcome).map_err(|e| e.to_string())?;
+    if closed {
+        let task: Option<i64> = tx
+            .query_row("SELECT task_id FROM run WHERE workflow_id = ?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        if let Some(task) = task {
+            super::graph::settle(&tx, task, &outcome).map_err(|e| e.to_string())?;
+        }
     }
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// The inner machine plus the run record: when the workflow ends, the run

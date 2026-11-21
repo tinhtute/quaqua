@@ -1399,6 +1399,18 @@ fn task_dag_order() {
     assert_eq!(refused(call(&ws, None, "task.start", start_args("w-c", c))), "parents_unverified");
     // a repeat of the running flow converges and is not gated again
     assert!(call(&ws, None, "task.start", start_args("w-b", b)).ok);
+
+    // a repeat of a finished start never replays its old verdict: once the
+    // Lead moves a to reopen_request, asking again leaves it there
+    wait_for("a's flow finished", || {
+        call(&ws, None, "task.start", start_args("w-a", a)).result["finished"] == json!(true)
+    });
+    db::open(&ws.db_path())
+        .unwrap()
+        .execute("UPDATE task SET state = ?2 WHERE id = ?1", rusqlite::params![a, graph::REOPEN_REQUEST])
+        .unwrap();
+    assert!(call(&ws, None, "task.start", start_args("w-a", a)).ok);
+    assert_eq!(task_state(&ws, a), graph::REOPEN_REQUEST);
     daemon.stop().unwrap();
 }
 
@@ -1475,5 +1487,31 @@ fn report_escalation_states() {
         "no report edge was asked for: {:?}",
         start_refusals(&ws)
     );
+    daemon.stop().unwrap();
+}
+
+/// The pipeline door writes the task row too: a builder report that asks to
+/// reopen leaves the task in `reopen_request` while the flow waits for the
+/// Lead; after the Lead resumes it, the flow's end verifies the task.
+#[test]
+fn pipeline_task_follows_its_flow() {
+    let (ws, fx, herdr, anchor, daemon) = graph_rig("graph-pipe");
+    let t = new_task(&ws, "t", json!({}));
+    let mut args = verb_args(&fx, "ni", "sude", "Goal: x\n", &anchor);
+    args["task_id"] = json!(t);
+    let r = call(&ws, Some("cos"), "pipeline", args);
+    assert!(r.ok, "{:?}", r.error);
+    wait_for("build prompt", || herdr.prompts().len() == 1);
+
+    publish(&ws, "t1.build.a1", "Outcome: REOPEN_REQUEST\n\n## Changes\nnone\n");
+    wait_for("reopen_request", || task_state(&ws, t) == graph::REOPEN_REQUEST);
+
+    let r = call(&ws, Some("cos"), "pipeline", json!({ "resume": "t1" }));
+    assert!(r.ok, "{:?}", r.error);
+    wait_for("second build prompt", || herdr.prompts().len() == 2);
+    assert_eq!(task_state(&ws, t), graph::REOPEN_REQUEST, "the flow has not ended");
+    let base = git(&fx.repo, &["rev-parse", "integ"]);
+    publish(&ws, "t1.build.a2", &build_report(&base));
+    wait_for("verified", || task_state(&ws, t) == graph::VERIFIED);
     daemon.stop().unwrap();
 }
