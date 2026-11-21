@@ -159,13 +159,71 @@ pub fn score_runs(
     agent: &dyn AgentRunner,
     now_ms: i64,
 ) -> Result<ScoreReport, String> {
+    score_ended_between(conn, rubrics, scorer, agent, now_ms, i64::MIN, i64::MAX)
+}
+
+/// The schedule row that carries the scoring cursor in its `cursor_ms`.
+pub const SCORE_JOB: &str = "supervisor.score";
+
+/// One scheduled scoring pass: only runs that ended after the cursor, up to
+/// the newest end seen now. The cursor moves to that end whether or not the
+/// scorer failed on a run, so a broken scorer never re-spends tokens on the
+/// same runs; the errors come back in the report. A missing cursor starts at
+/// the newest end, so the history is never scored by accident.
+pub fn score_new_runs(
+    conn: &mut Connection,
+    rubrics: &[Rubric],
+    scorer: &dyn Scorer,
+    agent: &dyn AgentRunner,
+    now_ms: i64,
+) -> Result<ScoreReport, String> {
+    let cursor: Option<i64> = conn
+        .query_row("SELECT cursor_ms FROM schedule WHERE name = ?1", [SCORE_JOB], |r| r.get(0))
+        .map_err(sql)?;
+    let newest: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(ended_ms) FROM run WHERE ended_ms IS NOT NULL AND ended_ms > ?1",
+            [cursor.unwrap_or(i64::MAX)],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    let Some(cursor) = cursor else {
+        let start: i64 = conn
+            .query_row("SELECT COALESCE(MAX(ended_ms), 0) FROM run", [], |r| r.get(0))
+            .map_err(sql)?;
+        conn.execute("UPDATE schedule SET cursor_ms = ?1 WHERE name = ?2", params![start, SCORE_JOB])
+            .map_err(sql)?;
+        return Ok(ScoreReport::default());
+    };
+    let Some(newest) = newest else {
+        return Ok(ScoreReport::default());
+    };
+    let report = score_ended_between(conn, rubrics, scorer, agent, now_ms, cursor, newest)?;
+    conn.execute("UPDATE schedule SET cursor_ms = ?1 WHERE name = ?2", params![newest, SCORE_JOB])
+        .map_err(sql)?;
+    Ok(report)
+}
+
+/// Runs that ended in `(after_ms, upto_ms]`.
+fn score_ended_between(
+    conn: &mut Connection,
+    rubrics: &[Rubric],
+    scorer: &dyn Scorer,
+    agent: &dyn AgentRunner,
+    now_ms: i64,
+    after_ms: i64,
+    upto_ms: i64,
+) -> Result<ScoreReport, String> {
     let mut report = ScoreReport::default();
     let ids: Vec<i64> = {
         let mut st = conn
-            .prepare("SELECT id FROM run WHERE ended_ms IS NOT NULL ORDER BY id")
+            .prepare(
+                "SELECT id FROM run WHERE ended_ms IS NOT NULL AND ended_ms > ?1 \
+                 AND ended_ms <= ?2 ORDER BY id",
+            )
             .map_err(sql)?;
         let rows = st
-            .query_map([], |r| r.get(0))
+            .query_map([after_ms, upto_ms], |r| r.get(0))
             .map_err(sql)?
             .collect::<Result<Vec<i64>, _>>()
             .map_err(sql)?;
@@ -487,9 +545,34 @@ pub fn run_outer2(
     agent: &dyn AgentRunner,
     now_ms: i64,
 ) -> Result<Outer2Report, String> {
+    outer2(conn, sensors, Some((rubrics, scorer, agent)), now_ms)
+}
+
+/// The sensors of loop 2 without the inferential ones: the scheduled scoring
+/// job owns scoring (and its cursor and its off switch), so this run never
+/// calls a scorer.
+pub fn run_sensors(
+    conn: &mut Connection,
+    sensors: &Sensors,
+    now_ms: i64,
+) -> Result<Outer2Report, String> {
+    outer2(conn, sensors, None, now_ms)
+}
+
+type Scoring<'a> = (&'a [Rubric], &'a dyn Scorer, &'a dyn AgentRunner);
+
+fn outer2(
+    conn: &mut Connection,
+    sensors: &Sensors,
+    scoring: Option<Scoring<'_>>,
+    now_ms: i64,
+) -> Result<Outer2Report, String> {
     let row = &LOOPS[2];
     let mut rep = Outer2Report::default();
     for (kind, name) in crate::supervisor::sensors::order(row) {
+        if scoring.is_none() && kind == Kind::Inferential {
+            continue;
+        }
         let tag = match kind {
             Kind::Computational => "computational",
             Kind::Inferential => "inferential",
@@ -500,7 +583,9 @@ pub fn run_outer2(
             (Kind::Computational, "architecture check") => architecture_findings(sensors),
             (Kind::Computational, "repeated-rule counter") => repeated_rule_findings(conn)?,
             (Kind::Inferential, "conversation scoring") => {
-                rep.scoring = score_runs(conn, rubrics, scorer, agent, now_ms)?;
+                if let Some((rubrics, scorer, agent)) = scoring {
+                    rep.scoring = score_runs(conn, rubrics, scorer, agent, now_ms)?;
+                }
                 vec![]
             }
             // The agent's question runs inside the scoring step, once per low score.
