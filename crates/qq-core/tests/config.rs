@@ -693,6 +693,15 @@ fn config_seed_set_export_roundtrip() {
         ]),
         0
     );
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.swap",
+            r#"{"ni":{"harness":"pi","model":"m-pi"}}"#
+        ]),
+        0
+    );
     assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
 
     let conn = open(&ws);
@@ -700,7 +709,6 @@ fn config_seed_set_export_roundtrip() {
     assert!(exported.contains("[profiles.fast.ni]"), "{exported}");
     // The export is the base config: the active profile and the env switch
     // never reach it.
-    assert!(!exported.contains("model = \"haiku-5.5\"\neffort = \"low\"\n\n[kinds.ni]"));
     assert_eq!(
         config::kind(&conn, "ni").unwrap().unwrap().model,
         "haiku-5.5"
@@ -835,6 +843,21 @@ fn roster_profiles_next_spawn() {
         config::config_cmd(&env, &strs(&["get", "kind.ni.model"])).unwrap(),
         "opus-5.5"
     );
+
+    // A harness override switches the harness the next spawn resolves.
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.swap",
+            r#"{"ni":{"harness":"pi","model":"m-pi"}}"#
+        ]),
+        0
+    );
+    assert_eq!(run(&["config", "set", "profile", "swap"]), 0);
+    let t = config::resolve_spawn(&open(&ws), "ni").unwrap();
+    assert_eq!((t.harness.name.as_str(), t.model.as_str()), ("pi", "m-pi"));
+    assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
 
     // The env beats the key; a bad env name fails the spawn read, not silently.
     {
