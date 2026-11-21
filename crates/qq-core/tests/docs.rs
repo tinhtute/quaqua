@@ -39,6 +39,7 @@ const ACCEPTED_FLAGS: &[(&str, &str)] = &[
     ("grid", "--tab"),
     ("pipeline", "--resume"),
     ("pipeline", "--rounds"),
+    ("run", "--project"),
 ];
 
 /// Flags documented for a registered command that its owning task adds later.
@@ -248,6 +249,7 @@ const KNOWN_SUBS: &[(&str, &[&str])] = &[
     ("mail", &["send"]),
     ("memory", &["hook"]),
     ("playbook", &["list", "show"]),
+    ("run", &["show", "list"]),
     ("transcripts", &["tail"]),
 ];
 
