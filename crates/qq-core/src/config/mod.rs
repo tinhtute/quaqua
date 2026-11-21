@@ -13,7 +13,9 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+mod export;
 mod verbs;
+pub use export::{diff, export_toml, ENGINE_DEFAULT};
 pub use verbs::{config_cmd, roster_cmd, INSTALL};
 
 /// The four roles a topology edge can join.
@@ -22,7 +24,21 @@ const ROLES: &[&str] = &["cos", "supervisor", "lead", "peer"];
 /// Top-level sections that map to rows (kinds, purposes, roles) or to
 /// `setting` keys. Every other top-level key is an error, except the one in
 /// [`NOT_PORTED`].
-const MAPPED_TOP: &[&str] = &["schema_version", "harnesses", "kinds", "purposes", "roles"];
+const MAPPED_TOP: &[&str] = &[
+    "schema_version",
+    "harnesses",
+    "kinds",
+    "purposes",
+    "roles",
+    "profile",
+    "profiles",
+];
+
+/// The `setting` key that names the active profile (`profile = "name"`).
+const ACTIVE_PROFILE: &str = "profile";
+
+/// The env var that overrides the stored active profile for this process.
+const PROFILE_ENV: &str = "QUAQUA_PROFILE";
 
 /// R15: the removed feature is not ported. Its top-level section and its
 /// `can_spawn` / `can_prompt` target are accepted in a team.toml and skipped
@@ -228,6 +244,15 @@ struct RawKind {
     avoid: Option<String>,
 }
 
+/// What a profile changes on one kind: only the fields it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOverride {
+    harness: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHarness {
@@ -244,6 +269,8 @@ struct Parsed {
     /// Declared harnesses by name; `None` is a stored row with no spec.
     harnesses: BTreeMap<String, Option<HarnessSpec>>,
     kinds: BTreeMap<String, RawKind>,
+    /// Profile name -> kind name -> override.
+    profiles: BTreeMap<String, BTreeMap<String, RawOverride>>,
     purposes: Vec<(String, String)>,
     reviewers: Vec<String>,
     edges: BTreeSet<(String, String, &'static str)>,
@@ -298,6 +325,27 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
         }
     }
 
+    let mut profiles = BTreeMap::new();
+    if let Some(v) = doc.get("profiles") {
+        let t = v
+            .as_table()
+            .ok_or_else(|| bad("[profiles] is not a table".into()))?;
+        for (pname, row) in t {
+            let row = row
+                .as_table()
+                .ok_or_else(|| bad(format!("profiles.{pname} is not a table")))?;
+            let mut per_kind = BTreeMap::new();
+            for (kname, o) in row {
+                let raw: RawOverride = o
+                    .clone()
+                    .try_into()
+                    .map_err(|e: toml::de::Error| bad(format!("profiles.{pname}.{kname}: {e}")))?;
+                per_kind.insert(kname.clone(), raw);
+            }
+            profiles.insert(pname.clone(), per_kind);
+        }
+    }
+
     let mut purposes = Vec::new();
     if let Some(v) = doc.get("purposes") {
         let t = v
@@ -315,6 +363,12 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
     let mut settings = Vec::new();
     if let Some(v) = doc.get("schema_version") {
         settings.push(("schema_version".to_string(), json(v)?));
+    }
+    if let Some(v) = doc.get(ACTIVE_PROFILE) {
+        let name = v
+            .as_str()
+            .ok_or_else(|| bad("profile is not a string".into()))?;
+        settings.push((ACTIVE_PROFILE.to_string(), serde_json::json!(name)));
     }
     for sec in SETTING_SECTIONS {
         let Some(v) = doc.get(*sec) else { continue };
@@ -402,6 +456,7 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
     Ok(Parsed {
         harnesses,
         kinds,
+        profiles,
         purposes,
         reviewers,
         edges,
@@ -540,6 +595,44 @@ fn validate(p: &Parsed) -> Result<(), ConfigError> {
             }
         }
     }
+    for (profile, per_kind) in &p.profiles {
+        for (kname, o) in per_kind {
+            let at = format!("profiles.{profile}.{kname}");
+            let Some(k) = p.kinds.get(kname) else {
+                return Err(ConfigError::UnknownKind {
+                    referrer: at,
+                    kind: kname.clone(),
+                });
+            };
+            let harness = o.harness.as_ref().unwrap_or(&k.harness);
+            if natives.get(harness).is_none() && !p.harnesses.contains_key(harness) {
+                return Err(ConfigError::UnknownHarness {
+                    kind: at,
+                    harness: harness.clone(),
+                });
+            }
+            if o.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!("{at}: empty model")));
+            }
+            if let (Some(e), Some(Some(spec))) = (
+                o.effort.as_ref().or(k.effort.as_ref()),
+                p.harnesses.get(harness),
+            ) {
+                if !spec.efforts.is_empty() && !spec.efforts.contains(e) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{at}: effort '{e}' is not one of harnesses.{harness}.efforts {:?}",
+                        spec.efforts
+                    )));
+                }
+            }
+        }
+    }
+    if let Some((_, v)) = p.settings.iter().find(|(k, _)| k == ACTIVE_PROFILE) {
+        let name = v.as_str().unwrap_or_default();
+        if !p.profiles.contains_key(name) {
+            return Err(ConfigError::Invalid(format!("unknown profile '{name}'")));
+        }
+    }
     for (purpose, kind) in &p.purposes {
         if !p.kinds.contains_key(kind) {
             return Err(ConfigError::UnknownKind {
@@ -606,6 +699,7 @@ pub fn seed(conn: &mut Connection, team_toml_text: &str) -> Result<Seeded, Confi
             )?;
         }
     }
+    write_profiles(&tx, &parsed.profiles)?;
     for (purpose, kind) in &parsed.purposes {
         tx.execute(
             "INSERT INTO purpose (name, kind) VALUES (?1, ?2)",
@@ -632,6 +726,97 @@ pub fn seed(conn: &mut Connection, team_toml_text: &str) -> Result<Seeded, Confi
     }
     tx.commit()?;
     Ok(Seeded::Fresh)
+}
+
+/// Upserts every profile and its per-kind overrides (kinds must exist).
+fn write_profiles(
+    tx: &rusqlite::Transaction<'_>,
+    profiles: &BTreeMap<String, BTreeMap<String, RawOverride>>,
+) -> Result<(), ConfigError> {
+    for (name, per_kind) in profiles {
+        tx.execute("INSERT OR IGNORE INTO profile (name) VALUES (?1)", [name])?;
+        for (kind, o) in per_kind {
+            tx.execute(
+                "INSERT INTO profile_kind (profile, kind, harness, model, effort)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(profile, kind) DO UPDATE SET harness = excluded.harness,
+                   model = excluded.model, effort = excluded.effort",
+                params![name, kind, o.harness, o.model, o.effort],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Every stored profile with its overrides.
+fn stored_profiles(
+    conn: &Connection,
+) -> Result<BTreeMap<String, BTreeMap<String, RawOverride>>, ConfigError> {
+    let mut out: BTreeMap<String, BTreeMap<String, RawOverride>> = BTreeMap::new();
+    let mut st = conn.prepare("SELECT name FROM profile ORDER BY name")?;
+    for n in st.query_map([], |r| r.get::<_, String>(0))? {
+        out.entry(n?).or_default();
+    }
+    let mut st = conn.prepare("SELECT profile, kind, harness, model, effort FROM profile_kind")?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            RawOverride {
+                harness: r.get(2)?,
+                model: r.get(3)?,
+                effort: r.get(4)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (p, k, o) = row?;
+        out.entry(p).or_default().insert(k, o);
+    }
+    Ok(out)
+}
+
+/// The profile spawns resolve through: `QUAQUA_PROFILE` of this process when
+/// set, else the stored `profile` setting. Read at every call, so a switch
+/// reaches the next spawn and no running worker (a worker's harness, model
+/// and effort were fixed when it was launched).
+pub fn active_profile(conn: &Connection) -> Result<Option<String>, ConfigError> {
+    if let Some(v) = std::env::var(PROFILE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(v));
+    }
+    Ok(setting(conn, ACTIVE_PROFILE)?.and_then(|v| v.as_str().map(String::from)))
+}
+
+/// The active profile's overrides by kind; none when no profile is active.
+fn active_overrides(conn: &Connection) -> Result<BTreeMap<String, RawOverride>, ConfigError> {
+    let Some(name) = active_profile(conn)? else {
+        return Ok(BTreeMap::new());
+    };
+    let known: Option<i64> = conn
+        .query_row("SELECT 1 FROM profile WHERE name = ?1", [&name], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if known.is_none() {
+        return Err(ConfigError::Invalid(format!("unknown profile '{name}'")));
+    }
+    Ok(stored_profiles(conn)?.remove(&name).unwrap_or_default())
+}
+
+fn apply(k: &mut Kind, o: &RawOverride) {
+    if let Some(h) = &o.harness {
+        k.harness = h.clone();
+    }
+    if let Some(m) = &o.model {
+        k.model = m.clone();
+    }
+    if let Some(e) = &o.effort {
+        k.effort = Some(e.clone());
+    }
 }
 
 /// Writes the native harness rows (kinds reference them) and every declared
@@ -701,14 +886,38 @@ fn row_kind(r: &rusqlite::Row<'_>) -> rusqlite::Result<Kind> {
 
 const KIND_COLS: &str = "name, harness, model, effort, fallback, can_review, spawn, use_for, avoid";
 
-/// Every kind, ordered by name.
+/// Every kind as the active profile makes it (harness, model, effort),
+/// ordered by name.
 pub fn roster(conn: &Connection) -> Result<Vec<Kind>, ConfigError> {
+    let o = active_overrides(conn)?;
+    let mut kinds = base_roster(conn)?;
+    for k in &mut kinds {
+        if let Some(x) = o.get(&k.name) {
+            apply(k, x);
+        }
+    }
+    Ok(kinds)
+}
+
+/// The stored kind as the active profile makes it.
+pub fn kind(conn: &Connection, name: &str) -> Result<Option<Kind>, ConfigError> {
+    let Some(mut k) = base_kind(conn, name)? else {
+        return Ok(None);
+    };
+    if let Some(x) = active_overrides(conn)?.get(name) {
+        apply(&mut k, x);
+    }
+    Ok(Some(k))
+}
+
+/// Every stored kind, profile ignored: what export, diff and the edit verbs see.
+fn base_roster(conn: &Connection) -> Result<Vec<Kind>, ConfigError> {
     let mut st = conn.prepare(&format!("SELECT {KIND_COLS} FROM kind ORDER BY name"))?;
     let rows = st.query_map([], row_kind)?.collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-pub fn kind(conn: &Connection, name: &str) -> Result<Option<Kind>, ConfigError> {
+fn base_kind(conn: &Connection, name: &str) -> Result<Option<Kind>, ConfigError> {
     Ok(conn
         .query_row(
             &format!("SELECT {KIND_COLS} FROM kind WHERE name = ?1"),
