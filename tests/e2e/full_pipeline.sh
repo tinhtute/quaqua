@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# T46 E2E: the switch signal (part `switch`) and clause (d) (part `d`) on the new binary.
+# T46 E2E: the switch signal (part `switch`) and clause (d) (part `d`) on the new binary; T58 adds the factory
+# clauses (a), (b), (g) and (h) as parts `a`, `b`, `g` and `h`.
 # Spends REAL tokens on two harnesses. Run only with anh iu's approval (T48); use --dry-run to read the plan.
 # shellcheck disable=SC2015  # `A && pass || fail` is intended: fail exits, pass cannot fail
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: switch | d (default: both)
+usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: switch | a | b | g | h | d (default: all)
 
   switch  one real task on the new binary: brief -> fanout to 2 harnesses -> cross-harness
           review bound to a candidate sha -> gate -> merge into the project integration branch;
           every kind/harness/model/effort is checked against qq.db.
+  a       clause (a): a harness is added with `config set` only (no rebuild); `config export` round-trips.
+  b       clause (b): 2 dependent tasks run in DAG order; an off-topology spawn and a Peer-to-Peer mail are
+          refused and journaled; a worker answers a symbol query through the read-only code lookup.
+  g       clause (g): `run list` and `run show` print events, transcript, tool calls, tokens, cost and
+          candidate sha for every worker run of the project (run after b, or after any task.start worker).
+  h       clause (h): the project's WORKSPACE_PROTOCOL.md sets a worker cap of N; spawn N+1 is refused.
   d       a non-claude worker's `git push`, an out-of-band spawn and a Peer's `quaqua push` are all refused.
   --dry-run   print the planned steps; start no herdr, no daemon, no agent, spend nothing.
   --check     resolve every quaqua verb and flag this script calls against the binary (usage probes in a
@@ -19,6 +26,8 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
 env: QQ (binary, default target/debug/quaqua)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
+     E2E_LOOKUP_TOOL_RE (clause b: extended regex a code-lookup tool name must match in `run show`, default
+                     'symbol', which matches find_symbol / find_referencing_symbols of the language-server MCP)
      E2E_STUB=1 (default off, test-only: runs the whole `switch` flow arm -> prompt -> report -> review -> gate ->
                      merge on STUB harnesses: an executable named after each kind's harness, first on PATH of the herdr
                      server, that reads one prompt, commits HELLO.txt (builder) or says `Verdict: clean` (reviewer) and
@@ -37,12 +46,12 @@ for a in "$@"; do
     --dry-run) DRY=1 ;;
     --check) CHECK=1 ;;
     -h | --help) usage; exit 0 ;;
-    switch | d) PARTS+=("$a") ;;
+    switch | a | b | g | h | d) PARTS+=("$a") ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 case "${E2E_STOP_AFTER:-}" in "" | C2 | C3 | C4 | S2b | S2d) ;; *) echo "unknown E2E_STOP_AFTER '${E2E_STOP_AFTER}' (C2 | C3 | C4 | S2b | S2d)" >&2; exit 2 ;; esac
-[ "${#PARTS[@]}" -gt 0 ] || PARTS=(switch d)
+[ "${#PARTS[@]}" -gt 0 ] || PARTS=(switch a b g h d)
 STUB=${E2E_STUB:-0}
 if [ "$STUB" = 1 ]; then PARTS=(switch); fi   # the stub flow never starts a real worker, so part d (real pi worker) is out
 want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
@@ -109,6 +118,28 @@ part d
   D5 quaqua push fence  \`quaqua push\` from a pane with no agent identity is refused; the same \`quaqua push\` run by the pi
                     worker (a Peer) leaves the bare origin without the ref and journals a refusal on edge
                     push/orchestration naming that worker
+part a (clause a)
+  A1 config set    \`config set kind.e2e-extra '{harness:pi,...}'\` writes the kind row to qq.db; the roster names it
+  A2 no rebuild    the binary's checksum is the one read at preflight
+  A3 export        \`config export\` holds [kinds.e2e-extra]; \`config validate\` accepts the dump
+  A4 round trip    \`config import\` of the dump, then \`config export\` again, is byte-identical; \`config diff\` of the dump
+                    prints 'no differences'
+part b (clause b)
+  B1 DAG refusal   \`task create --parent\` makes a child; \`call task.start\` on the child while the parent is open is
+                    refused (parents_unverified) and journaled on edge start
+  B2 DAG order     the parent worker reaches verified, then the child starts and reaches verified; child run
+                    started_ms >= parent run ended_ms
+  B3 symbol query  \`run show\` of the child lists a lookup tool call (E2E_LOOKUP_TOOL_RE) that returned the symbol
+  B4 off topology  a pi Peer told to \`worker spawn\` is refused: a refusal on edge spawn names that Peer
+  B5 peer mail     the same Peer told to \`mail send\` to another Peer is refused: a refusal on edge mail, Peer-to-Peer
+part g (clause g)
+  G1 per run       for every row of \`run list --project\`, \`run show\` prints events, transcript, tool calls, tokens
+                    (numbers or unknown), cost ($ or unknown) and candidate_sha
+  G2 sha           at least one run carries a 40-hex candidate sha
+part h (clause h, runs after d)
+  H1 cap N         WORKSPACE_PROTOCOL.md committed on the repo's default branch sets worker_cap = active Peers + 1; a
+                    spawn up to the cap is allowed
+  H2 N+1 refused   the next \`worker spawn\` is refused and the journal holds 'worker cap N reached'
 cleanup (trap)      stop daemon, stop the herdr session, trash the temp dir
 PLAN
 }
@@ -132,7 +163,10 @@ check_cmds() {
     "worker|spawn --probe|spawn --base --review <name> <kind> <repo-path>"
     "worker|prompt|prompt <name>"
     "pipeline|-|--rounds --resume --cancel --wait"
-    "task|create|task create --kind --disposition --repo"
+    "task|create|task create --kind --disposition --repo --parent"
+    "config|-|export diff validate"
+    "run|-|show list --project"
+    "call|-|call"
     "push|-|push <repo> <remote> <branch>"
     "merge|-|merge"
   )
@@ -153,7 +187,7 @@ check_cmds() {
     else printf 'FOUND   %-9s %s\n' "$verb" "$([ "$tok" = "-" ] && echo "verb in usage list" || echo "tokens ok: $tok")"; fi
   done
   # verbs with a JSON argument: the shape must be refused as bad usage, not as unknown verb
-  for spec in "mail send --to --kind --body-file" "grid reconcile --only --tab" "lead spawn --task"; do
+  for spec in "mail send --to --kind --body-file --body" "grid reconcile --only --tab" "lead spawn --task"; do
     # shellcheck disable=SC2086  # spec words are split on purpose
     set -- $spec
     verb=$1; shift
@@ -186,6 +220,7 @@ done
 [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; exit 1; }
 [ -n "$PI_MODEL" ] || { echo "set E2E_PI_MODEL (model for the pi kind)" >&2; exit 1; }
 check_cmds >/dev/null || { echo "quaqua lacks a verb or flag this script calls; run with --check" >&2; exit 1; }
+QQ_SUM0=$(cksum <"$QQ")   # clause a: the binary must be the same file after `config set` (no rebuild)
 
 # ---- C1 isolate -----------------------------------------------------------------------------------------
 LIVE=$(cd ~/quaqua && pwd -P)
@@ -351,7 +386,8 @@ PROJ="$T/proj"; ORIGIN="$T/origin.git"
 git init -q --bare "$ORIGIN"
 git init -q -b main "$PROJ"
 ( cd "$PROJ" && git config user.email e2e@example.invalid && git config user.name e2e \
-  && printf 'e2e fixture\n' >README.md && git add README.md && git commit -qm init \
+  && printf 'e2e fixture\n' >README.md && printf 'def e2e_answer_symbol():\n    return 42\n' >symbols.py \
+  && git add README.md symbols.py && git commit -qm init \
   && git remote add origin "$ORIGIN" && git push -q origin main && git branch "integ/$PROJECT" )
 BRIEF="$T/brief.md"
 cat >"$BRIEF" <<'BRIEFEOF'
@@ -440,6 +476,105 @@ if want switch; then
   expect S10 "0" "$(q "select count(*) from agent a where a.name in ('$TASK-b','$TASK-r1') and not exists (select 1 from kind k join harness h on h.name=k.harness where k.name=a.kind)")"
 fi
 
+# ---- clauses a, b, g (T58) ---------------------------------------------------------------------------------
+ensure_project() {
+  [ -n "${PROJECT_ID:-}" ] && return 0
+  as_cos "$QQ" task create "$PROJECT" "e2e project anchor" --kind "$BUILDER" --repo "$PROJ"; [ "$AP_RC" = 0 ] || fail "$1" "task create rc=$AP_RC: $AP_OUT"
+  PROJECT_ID=$(q "select id from project where slug='$PROJECT'")
+  [ -n "$PROJECT_ID" ] || fail "$1" "no project row for $PROJECT"
+}
+# ask_peer STEP NAME TEXT: type TEXT into a worker pane and wait until it settles.
+ask_peer() {
+  H agent prompt "$2" "$3" >"$T/$2.out" 2>&1 || fail "$1" "$(cat "$T/$2.out")"
+  H agent wait "$2" --until idle --timeout $((TIMEOUT * 1000)) >>"$T/$2.out" 2>&1 || fail "$1" "$2 never settled: $(tail -3 "$T/$2.out")"
+}
+refusals() { q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal' and json_extract(payload_json,'\$.caller')='$1' and json_extract(payload_json,'\$.edge')='$2'"; }
+last_reason() { q "select json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.caller')='$1' and json_extract(payload_json,'\$.edge')='$2' order by seq desc limit 1"; }
+start_json() { # NAME TASK_ID PROMPT REPORT
+  python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"name":a[1],"kind":a[2],"role":"peer","task_id":int(a[3]),"project_id":int(a[4]),"prompt":a[5],"report":a[6],"timeout_ms":int(a[7])*1000}))' "$1" "$BUILDER" "$2" "$PROJECT_ID" "$3" "$4" "$TIMEOUT"
+}
+probe_prompt() { # GOAL REPORT SHA
+  printf 'Topology: solo - e2e DAG probe\nPlaybook: none, read-only unit\nContext: repo %s\nGoal: %s\nHard constraints: change no file, no commit, no push\nUnknowns: none\nEvidence: the report\n\nWrite your report to %s with exactly this shape, then stop:\nOutcome: COMPLETE\nVerified: unit-test-verified %s\n\n## Findings\n<what you found, one line>\n\n## Blockers\nnone\n\n## Lessons\nnone\n' "$PROJ" "$1" "$2" "$3"
+}
+task_verified() { [ "$(q "select state from task where id=$1")" = verified ]; }
+task_id_of() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["task_id"])'; }
+
+# ---- part a: clause (a), a harness added with config set only; export round-trips -----------------------------
+if want a; then
+  AKIND=e2e-extra
+  as_cos "$QQ" config set "kind.$AKIND" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail A1 "config set rc=$AP_RC: $AP_OUT"
+  expect A1 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$AKIND'")"
+  expect A2 "$QQ_SUM0" "$(cksum <"$QQ")"
+  as_cos "$QQ" config export; [ "$AP_RC" = 0 ] || fail A3 "config export rc=$AP_RC: $AP_OUT"
+  printf '%s\n' "$AP_OUT" >"$T/export1.toml"
+  grep -qF "[kinds.$AKIND]" "$T/export1.toml" && pass A3 "export holds [kinds.$AKIND] ($(wc -l <"$T/export1.toml" | tr -d ' ') lines)" || fail A3 "export lacks [kinds.$AKIND]"
+  as_cos "$QQ" config validate "$T/export1.toml"; [ "$AP_RC" = 0 ] && pass A3v "validate: $AP_OUT" || fail A3v "validate rc=$AP_RC: $AP_OUT"
+  as_cos "$QQ" config diff "$T/export1.toml"; [ "$AP_RC" = 0 ] || fail A4 "config diff rc=$AP_RC: $AP_OUT"
+  expect A4 "no differences" "$AP_OUT"
+fi
+
+# ---- part b: clause (b), DAG order, off-topology refusals, symbol query ----------------------------------------
+if want b; then
+  ensure_project B1
+  PN="$BUILDER-dagp"; CN="$BUILDER-dagc"
+  as_cos "$QQ" task create "$PROJECT" "dag parent" --kind "$BUILDER" --repo "$PROJ"; [ "$AP_RC" = 0 ] || fail B1 "task create parent rc=$AP_RC: $AP_OUT"
+  TP=$(task_id_of "$AP_OUT")
+  as_cos "$QQ" task create "$PROJECT" "dag child" --kind "$BUILDER" --repo "$PROJ" --parent "$TP"; [ "$AP_RC" = 0 ] || fail B1 "task create child rc=$AP_RC: $AP_OUT"
+  TC=$(task_id_of "$AP_OUT")
+  BSHA=$(git -C "$PROJ" rev-parse main)
+  PREP="$WS/runs/e2e-dagp.md"; CREP="$WS/runs/e2e-dagc.md"
+  PPROMPT=$(probe_prompt "report that the repo is readable (parent of a DAG probe)" "$PREP" "$BSHA")
+  CPROMPT=$(probe_prompt "use the read-only code lookup tool (a language-server symbol search) to find where the symbol e2e_answer_symbol is defined; do not read the file with a shell command; put file:line in Findings" "$CREP" "$BSHA")
+  as_cos "$QQ" call task.start "$(start_json "$CN" "$TC" "$CPROMPT" "$CREP")"
+  [ "$AP_RC" -ne 0 ] && printf '%s' "$AP_OUT" | grep -q 'parents_unverified' \
+    && pass B1 "child task $TC refused while parent $TP is open: $(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)" \
+    || fail B1 "child start was not refused with parents_unverified (rc=$AP_RC): $AP_OUT"
+  as_cos "$QQ" call task.start "$(start_json "$PN" "$TP" "$PPROMPT" "$PREP")"; [ "$AP_RC" = 0 ] || fail B2 "parent start rc=$AP_RC: $AP_OUT"
+  wait_for B2 "$TIMEOUT" task_verified "$TP"
+  as_cos "$QQ" call task.start "$(start_json "$CN" "$TC" "$CPROMPT" "$CREP")"; [ "$AP_RC" = 0 ] || fail B2 "child start after the parent verified rc=$AP_RC: $AP_OUT"
+  wait_for B2 "$TIMEOUT" task_verified "$TC"
+  PEND=$(q "select ended_ms from run where task_id=$TP"); CSTART=$(q "select started_ms from run where task_id=$TC")
+  [ -n "$PEND" ] && [ -n "$CSTART" ] && [ "$CSTART" -ge "$PEND" ] \
+    && pass B2 "parent $TP verified (run ended $PEND), then child $TC started (run started $CSTART)" \
+    || fail B2 "child run did not start after the parent run ended (parent ended [$PEND], child started [$CSTART])"
+  LRE=${E2E_LOOKUP_TOOL_RE:-symbol}
+  SHOW=$("$QQ" run show "worker:$CN" 2>&1) || fail B3 "run show worker:$CN: $SHOW"
+  HIT=$(printf '%s\n' "$SHOW" | grep -E "($LRE).*e2e_answer_symbol" | head -1) || true
+  [ -n "$HIT" ] && pass B3 "$(printf '%s' "$HIT" | cut -c1-200)" || fail B3 "no tool call matching /$LRE/ returned e2e_answer_symbol in run show worker:$CN"
+  PA="$REVIEWER-pa"; PB="$REVIEWER-pb"
+  as_cos "$QQ" worker spawn "$PA" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B4 "spawn $PA rc=$AP_RC: $AP_OUT"
+  as_cos "$QQ" worker spawn "$PB" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B5 "spawn $PB rc=$AP_RC: $AP_OUT"
+  sb=$(refusals "$PA" spawn)
+  ask_peer B4 "$PA" "run exactly: $QQ worker spawn e2e-offtopo $REVIEWER $PROJ"
+  sa=$(refusals "$PA" spawn)
+  [ "$sa" -gt "$sb" ] && pass B4 "off-topology spawn refused and journaled ($sb -> $sa): $(last_reason "$PA" spawn)" || fail B4 "no spawn refusal journaled for $PA ($sb -> $sa)"
+  expect B4n "0" "$(q "select count(*) from agent where name like '%offtopo%'")"
+  mb=$(refusals "$PA" mail)
+  ask_peer B5 "$PA" "run exactly: $QQ mail send --to $PB --kind note --body hello"
+  ma=$(refusals "$PA" mail)
+  [ "$ma" -gt "$mb" ] && pass B5 "Peer-to-Peer mail refused and journaled ($mb -> $ma): $(last_reason "$PA" mail)" || fail B5 "no mail refusal journaled for $PA ($mb -> $ma)"
+fi
+
+# ---- part g: clause (g), the CLI prints the whole record of every worker run -------------------------------------
+if want g; then
+  capture_done() { [ "$(q "select count(*) from run where ended_ms is null")" = 0 ]; }
+  wait_for G1 120 capture_done
+  RL=$("$QQ" run list --project "$PROJECT" 2>&1) || fail G1 "run list: $RL"
+  [ -n "$RL" ] || fail G1 "run list --project $PROJECT printed no run (part b starts two task.start workers)"
+  pass G1l "run list: $(printf '%s\n' "$RL" | wc -l | tr -d ' ') run(s)"
+  SHA_RUNS=0
+  while IFS= read -r line; do
+    rid=$(printf '%s' "$line" | awk '{print $1}')
+    S=$("$QQ" run show "$rid" 2>&1) || fail G1 "run show $rid: $S"
+    for pat in '^events \([0-9]+\)' '^transcript \([0-9]+\)' '^tool calls \([0-9]+\)' '^tokens in=([0-9]+|unknown) out=([0-9]+|unknown)' '^cost (\$[0-9.]+|unknown)' '^candidate_sha ([0-9a-f]{40}|none)'; do
+      printf '%s\n' "$S" | grep -Eq "$pat" || fail G1 "run $rid: run show has no line matching $pat"
+    done
+    sha=$(printf '%s\n' "$S" | sed -n 's/^candidate_sha //p'); [ "$sha" != none ] && SHA_RUNS=$((SHA_RUNS + 1))
+    pass G1 "run $rid: $(printf '%s\n' "$S" | grep -E '^(events|transcript|tool calls|tokens|cost|candidate_sha)' | tr '\n' ';' | cut -c1-240)"
+  done <<<"$RL"
+  [ "$SHA_RUNS" -ge 1 ] && pass G2 "$SHA_RUNS run(s) carry a candidate sha" || fail G2 "no run carries a candidate sha"
+fi
+
 # ---- part d ------------------------------------------------------------------------------------------------
 if want d; then
   before=$(q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal'" 2>/dev/null || echo 0)
@@ -472,4 +607,23 @@ if want d; then
   [ "$after" -gt "$before" ] && pass D4 "refusal events $before -> $after: $(q "select group_concat(json_extract(payload_json,'\$.edge'),',') from events where workflow_id='authority:refusals'")" \
     || fail D4 "journal gained no refusal ($before -> $after)"
 fi
+# ---- part h: clause (h), WORKSPACE_PROTOCOL.md sets a worker cap of N; spawn N+1 is refused ---------------------
+# Runs after d so no later spawn of this script meets the cap. N = Peers already active in the project + 1.
+if want h; then
+  ensure_project H1
+  ACTIVE=$(q "select count(*) from agent a join project p on p.id=a.project_id where p.slug='$PROJECT' and a.role='peer' and a.ended_ms is null")
+  CAPN=$((ACTIVE + 1))
+  [ "$CAPN" -le 8 ] || fail H1 "cap would be $CAPN: above the engine ceiling 8 ($ACTIVE Peers already active)"
+  FENCE=$(printf '\140\140\140')
+  printf '# Workspace protocol\n\n%stoml\nworker_cap = %s\n%s\n' "$FENCE" "$CAPN" "$FENCE" >"$PROJ/WORKSPACE_PROTOCOL.md"
+  git -C "$PROJ" add WORKSPACE_PROTOCOL.md && git -C "$PROJ" commit -qm "e2e: worker cap $CAPN" || fail H1 "could not commit the protocol on the default branch"
+  as_cos "$QQ" worker spawn "$REVIEWER-capok" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail H1 "spawn up to the cap ($CAPN) was refused: $AP_OUT"
+  expect H1 "$CAPN" "$(q "select count(*) from agent a join project p on p.id=a.project_id where p.slug='$PROJECT' and a.role='peer' and a.ended_ms is null")"
+  as_cos "$QQ" worker spawn "$REVIEWER-capx" "$REVIEWER" "$PROJ"
+  [ "$AP_RC" -ne 0 ] || fail H2 "spawn $((CAPN + 1)) was allowed with worker_cap = $CAPN"
+  WHY=$(q "select json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.reason') like 'worker cap $CAPN reached%' order by seq desc limit 1")
+  [ -n "$WHY" ] && pass H2 "spawn $((CAPN + 1)) refused, exit=$AP_RC; journal: $WHY" || fail H2 "refused (exit=$AP_RC: $AP_OUT) but the journal has no 'worker cap $CAPN reached' row"
+  expect H2n "0" "$(q "select count(*) from agent where name like '%capx%'")"
+fi
+
 echo "ALL $N ASSERTIONS PASSED (parts: ${PARTS[*]})"
