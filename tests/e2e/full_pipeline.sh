@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # T46 E2E: the switch signal (part `switch`) and clause (d) (part `d`) on the new binary; T58 adds the factory
-# clauses (a), (b), (g) and (h) as parts `a`, `b`, `g` and `h`.
+# clauses (a), (b), (g) and (h) as parts `a`, `b`, `g` and `h`; T64c adds the outer-loop clauses (c), (e) and (f) as
+# parts `c`, `e` and `f`.
 # Spends REAL tokens on two harnesses. Run only with anh iu's approval (T48); use --dry-run to read the plan.
 # shellcheck disable=SC2015  # `A && pass || fail` is intended: fail exits, pass cannot fail
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: switch | a | b | g | h | d (default: all)
+usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: switch | a | b | g | h | d | c | e | f (default: all)
 
   switch  one real task on the new binary: brief -> fanout to 2 harnesses -> cross-harness
           review bound to a candidate sha -> gate -> merge into the project integration branch;
@@ -19,11 +20,19 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
           candidate sha for every worker run of the project (run after b, or after any task.start worker).
   h       clause (h): the project's WORKSPACE_PROTOCOL.md sets a worker cap of N; spawn N+1 is refused.
   d       a non-claude worker's `git push`, an out-of-band spawn and a Peer's `quaqua push` are all refused.
+  c       clause (c): `quaqua supervisor score --scorer $E2E_SCORER` scores the ended runs (run after switch or b); a
+          loop-2 proposal on a rule or skill surface is high risk and `backlog list open` still lists it open.
+  e       clause (e): a pipeline paused on a failing check; `source pull` files a loop-1 bug proposal; the CoS
+          approves it (`backlog decide <id> approve --note --kind`) with a recorded verdict and it becomes a task.
+  f       clause (f): an inbox/ideas/<name>.md file; `source pull` files a loop-3 feature proposal; it is high
+          risk and stays open in `backlog list open`.
   --dry-run   print the planned steps; start no herdr, no daemon, no agent, spend nothing.
   --check     resolve every quaqua verb and flag this script calls against the binary (usage probes in a
               temp workspace); start no herdr, no daemon, no agent, spend nothing. Exit 1 on a miss.
 
-env: QQ (binary, default target/debug/quaqua)  E2E_PI_MODEL (model of the pi kind added with `config set`,
+env: QQ (binary, default target/debug/quaqua)  E2E_SCORER (part c: the scorer program `quaqua supervisor score
+     --scorer` runs, prompt on stdin, JSON {"score":0|1|2,"quote":".."} on stdout; required when part c runs for real,
+     not for --check or --dry-run)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
      E2E_LOOKUP_TOOL_RE (clause b: extended regex a code-lookup tool name must match in `run show`, default
@@ -46,12 +55,12 @@ for a in "$@"; do
     --dry-run) DRY=1 ;;
     --check) CHECK=1 ;;
     -h | --help) usage; exit 0 ;;
-    switch | a | b | g | h | d) PARTS+=("$a") ;;
+    switch | a | b | g | h | d | c | e | f) PARTS+=("$a") ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 case "${E2E_STOP_AFTER:-}" in "" | C2 | C3 | C4 | S2b | S2d) ;; *) echo "unknown E2E_STOP_AFTER '${E2E_STOP_AFTER}' (C2 | C3 | C4 | S2b | S2d)" >&2; exit 2 ;; esac
-[ "${#PARTS[@]}" -gt 0 ] || PARTS=(switch a b g h d)
+[ "${#PARTS[@]}" -gt 0 ] || PARTS=(switch a b g c e f h d)
 STUB=${E2E_STUB:-0}
 if [ "$STUB" = 1 ]; then PARTS=(switch); fi   # the stub flow never starts a real worker, so part d (real pi worker) is out
 want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
@@ -140,6 +149,20 @@ part h (clause h, runs after d)
   H1 cap N         WORKSPACE_PROTOCOL.md committed on the repo's default branch sets worker_cap = active Peers + 1; a
                     spawn up to the cap is allowed
   H2 N+1 refused   the next \`worker spawn\` exits non-zero and creates no agent; a journal row is printed when present
+part c (clause c)
+  C5 score         \`quaqua supervisor score --scorer \$E2E_SCORER\` scores the ended runs: scored N, low >= 1, proposal ids
+  C6 high rule/skill  \`quaqua backlog list open\` lists a loop-2 row, risk high, surface rule or skill, status open; no verdict
+                    is recorded for it (it waits for the owner)
+part e (clause e)
+  E1 failing check a pipeline whose check fails (pipeline check=false: red on the base too) pauses with exit 5 and a journaled
+                    pause_for_approval 'blocked 4: base_broken'
+  E2 pull          \`quaqua source pull\` files a loop-1 bug proposal naming that workflow; \`backlog list open\` shows it, risk low
+  E3 approve       \`quaqua backlog decide <id> approve --note T --kind $BUILDER\` as the CoS: output 'proposal <id> approved,
+                    task <n>'; qq.db has a cos approve decision with the note, and an open task of kind $BUILDER from that proposal
+part f (clause f)
+  F1 idea file     inbox/ideas/<name>.md in the workspace, \`quaqua source pull\` files a loop-3 proposal for it
+  F2 stays open    \`backlog list open\` shows that row with risk high; a second pull files nothing new and the row is still open
+                    with no decision recorded
 cleanup (trap)      stop daemon, stop the herdr session, trash the temp dir
 PLAN
 }
@@ -149,7 +172,8 @@ PLAN
 # A verb is "found" when it is in the usage list; each flag/token must appear in that verb's list line or in
 # the usage text its bad-argument probe prints.
 check_cmds() {
-  local tmp list line probe miss=0 verb tok spec
+  local tmp list line probe miss=0 verb tok spec TMO
+  TMO=$(command -v timeout || command -v gtimeout || true)   # macOS has neither by default: the probes are quick usage errors
   [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; return 1; }
   tmp=$(mktemp -d /tmp/qqchk.XXXXXX)
   list=$(env -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u QQ_AGENT QUAQUA_HOME="$tmp" QUAQUA_ROOT="$tmp" "$QQ" 2>&1 || true)
@@ -169,6 +193,9 @@ check_cmds() {
     "call|-|call"
     "push|-|push <repo> <remote> <branch>"
     "merge|-|merge"
+    "supervisor|score --scorer|score --scorer"
+    "source|-|pull"
+    "backlog|decide|list decide --note --kind"
   )
   for spec in "${specs[@]}"; do
     IFS='|' read -r verb probe tok <<<"$spec"
@@ -177,7 +204,7 @@ check_cmds() {
     local out=""
     if [ "$probe" != "-" ] && [ "$verb" != "daemon" ]; then
       # shellcheck disable=SC2086  # probe words are split on purpose
-      out=$(env -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u QQ_AGENT QUAQUA_HOME="$tmp" QUAQUA_ROOT="$tmp" timeout 10 "$QQ" $verb $probe 2>&1 || true)
+      out=$(env -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u QQ_AGENT QUAQUA_HOME="$tmp" QUAQUA_ROOT="$tmp" ${TMO:+"$TMO" 10} "$QQ" $verb $probe 2>&1 || true)
     fi
     local text="$line"$'\n'"$out" bad=""
     if [ "$tok" != "-" ]; then
@@ -220,6 +247,10 @@ done
 [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; exit 1; }
 [ -n "$PI_MODEL" ] || { echo "set E2E_PI_MODEL (model for the pi kind)" >&2; exit 1; }
 check_cmds >/dev/null || { echo "quaqua lacks a verb or flag this script calls; run with --check" >&2; exit 1; }
+if want c; then   # part c scores with a model: refuse before anything starts when the scorer program is not named
+  [ -n "${E2E_SCORER:-}" ] || { echo "part c needs E2E_SCORER: the scorer program for 'quaqua supervisor score --scorer' (prompt on stdin, JSON {\"score\":0|1|2,\"quote\":\"..\"} on stdout); set it or leave part c out" >&2; exit 1; }
+  [ -x "$E2E_SCORER" ] || { echo "E2E_SCORER=$E2E_SCORER is not an executable file" >&2; exit 1; }
+fi
 QQ_SUM0=$(cksum <"$QQ")   # clause a: the binary must be the same file after `config set` (no rebuild)
 
 # ---- C1 isolate -----------------------------------------------------------------------------------------
@@ -587,6 +618,91 @@ if want g; then
     pass G1 "run $rid: $(printf '%s\n' "$S" | grep -E '^(events|transcript|tool calls|tokens|cost|candidate_sha)' | tr '\n' ';' | cut -c1-240)"
   done <<<"$RL"
   [ "$SHA_RUNS" -ge 1 ] && pass G2 "$SHA_RUNS run(s) carry a candidate sha" || fail G2 "no run carries a candidate sha"
+fi
+
+# ---- backlog helpers (clauses c, e, f) ------------------------------------------------------------------------
+# bl_open STEP: runs `backlog list open` as the CoS (never inside $(...): as_pane counts its calls in this shell); the table
+# is in AP_OUT, columns id loop kind risk surface status task, tab separated. row_of ID picks one row from AP_OUT.
+bl_open() { as_cos "$QQ" backlog list open; [ "$AP_RC" = 0 ] || fail "$1" "backlog list open rc=$AP_RC: $AP_OUT"; }
+row_of() { printf '%s\n' "$AP_OUT" | awk -F'\t' -v id="$1" '$1==id'; }
+decisions_of() { q "select count(*) from decision where proposal_id=$1"; }
+
+# ---- part c: clause (c), the Supervisor scores the runs and files a high-risk rule/skill proposal ----------------
+if want c; then
+  SOUT=$("$QQ" supervisor score --scorer "$E2E_SCORER" 2>&1) || fail C5 "supervisor score rc=$?: $SOUT"
+  SLINE=$(printf '%s\n' "$SOUT" | grep -E '^scored [0-9]+ low [0-9]+ proposals \[' | head -1) || true
+  [ -n "$SLINE" ] || fail C5 "no 'scored N low M proposals [..]' line: $SOUT"
+  SCORED=$(printf '%s' "$SLINE" | awk '{print $2}'); LOW=$(printf '%s' "$SLINE" | awk '{print $4}')
+  [ "$SCORED" -ge 1 ] || fail C5 "scored 0 runs: run part switch or b first (a worker run must have ended): $SOUT"
+  [ "$LOW" -ge 1 ] || fail C5 "the scorer gave no score of 0, so no proposal was filed: $SOUT"
+  pass C5 "$(printf '%s' "$SOUT" | tr '\n' ' ' | cut -c1-200)"
+  SIDS=$(printf '%s' "$SLINE" | sed -E 's/^[^[]*\[([^]]*)\].*/\1/' | tr -d ',')
+  as_cos "$QQ" backlog list open; [ "$AP_RC" = 0 ] || fail C6 "backlog list open rc=$AP_RC: $AP_OUT"
+  CROW=""
+  for sid in $SIDS; do
+    CROW=$(printf '%s\n' "$AP_OUT" | awk -F'\t' -v id="$sid" '$1==id && $2==2 && $4=="high" && ($5=="rule" || $5=="skill") && $6=="open"' | head -1)
+    [ -n "$CROW" ] && break
+  done
+  [ -n "$CROW" ] || fail C6 "no loop-2 high rule/skill open row among the filed proposals [$SIDS]: $(printf '%s' "$AP_OUT" | tr '\n' ';' | cut -c1-300)"
+  CID=$(printf '%s' "$CROW" | cut -f1)
+  expect C6d "0" "$(decisions_of "$CID")"
+  pass C6 "backlog list open row [$(printf '%s' "$CROW" | tr '\t' ' ')] (id loop kind risk surface status task): loop 2, high, rule/skill, open, no verdict yet"
+fi
+
+# ---- part e: clause (e), a failing check becomes a bug proposal; the CoS approves it; it becomes a task ------------
+if want e; then
+  ensure_project E1
+  ET="$BUILDER-e2efail"; EWF="pipeline:$ET"
+  EBRIEF="$T/brief-e.md"; sed 's/HELLO\.txt/CHECKFAIL.txt/g' "$BRIEF" >"$EBRIEF"
+  # check = "false" fails after the merge and on the integration base too: the flow holds (merge code 4, base_broken)
+  # instead of spending a fix round. The pipeline is left paused: that pause is the failure the source reads.
+  EJSON=$(python3 -c 'import json,sys; a=sys.argv; print(json.dumps({"task":a[1],"builder_kind":a[2],"reviewer_kind":a[3],"brief":open(a[4]).read(),"repo":a[5],"branch":"quaqua/"+a[1]+"-b","integ":"integ/"+a[6],"project_id":int(a[8]),"plan":False,"max_rounds":2,"check":"false","timeout_ms":int(a[7])*1000}))' \
+    "$ET" "$BUILDER" "$REVIEWER" "$EBRIEF" "$PROJ" "$PROJECT" "$TIMEOUT" "$PROJECT_ID")
+  EPAUSE="select json_extract(payload_json,'\$.reason') from events where workflow_id='$EWF' and kind='pause_for_approval' order by seq desc limit 1"
+  EP=0
+  as_cos "$QQ" pipeline "$EJSON" --rounds 2 --wait
+  while [ "$AP_RC" = 5 ] && ! printf '%s' "$(q "$EPAUSE")" | grep -q '^blocked 4: base_broken'; do
+    EP=$((EP + 1)); [ "$EP" -le 3 ] || fail E1 "flow paused $EP times without reaching the failing check: $AP_OUT"
+    as_cos "$QQ" pipeline --resume "$ET" --wait
+  done
+  [ "$AP_RC" = 5 ] || fail E1 "pipeline --wait exit=$AP_RC (want 5, paused on the failing check): $AP_OUT"
+  EREASON=$(q "$EPAUSE")
+  case "$EREASON" in "blocked 4: base_broken"*) pass E1 "pipeline $ET paused, exit=5, journal: $(printf '%s' "$EREASON" | tr '\n' ' ' | cut -c1-160)" ;; *) fail E1 "last pause of $EWF is [$EREASON], not blocked 4: base_broken" ;; esac
+  as_cos "$QQ" source pull; [ "$AP_RC" = 0 ] || fail E2 "source pull rc=$AP_RC: $AP_OUT"
+  EID=$(q "select id from proposal where loop=1 and observation like '%$EWF%' order by id desc limit 1")
+  [ -n "$EID" ] || fail E2 "no loop-1 proposal names workflow $EWF after source pull ($AP_OUT)"
+  printf '%s' "$AP_OUT" | grep -Eq "^filed [1-9][0-9]* proposals:.*(^| )$EID( |$)" || fail E2 "source pull did not report proposal $EID as filed: $AP_OUT"
+  EPULL=$AP_OUT
+  bl_open E2; EROW=$(row_of "$EID")
+  printf '%s' "$EROW" | awk -F'\t' '$2==1 && $4=="low" && $6=="open" {ok=1} END {exit !ok}' || fail E2 "row of proposal $EID in backlog list open is [$EROW], want loop 1, risk low, open"
+  pass E2 "$EPULL; backlog list open row [$(printf '%s' "$EROW" | tr '\t' ' ')] (id loop kind risk surface status task)"
+  ENOTE="e2e: fix the failing check"
+  as_cos "$QQ" backlog decide "$EID" approve --note "$ENOTE" --kind "$BUILDER"; [ "$AP_RC" = 0 ] || fail E3 "backlog decide rc=$AP_RC: $AP_OUT"
+  printf '%s' "$AP_OUT" | grep -Eq "^proposal $EID approved, task [0-9]+$" || fail E3 "unexpected decide output: $AP_OUT"
+  ETASK=$(printf '%s' "$AP_OUT" | sed -E 's/.*task ([0-9]+)$/\1/')
+  expect E3d "cos|approve|$ENOTE" "$(q "select decider_role||'|'||verdict||'|'||coalesce(note,'') from decision where proposal_id=$EID")"
+  expect E3t "$BUILDER|open|$EID" "$(q "select kind||'|'||state||'|'||proposal_id from task where id=$ETASK")"
+  as_cos "$QQ" backlog list approved; [ "$AP_RC" = 0 ] || fail E3 "backlog list approved rc=$AP_RC: $AP_OUT"
+  printf '%s\n' "$AP_OUT" | awk -F'\t' -v id="$EID" -v t="$ETASK" '$1==id && $6=="approved" && $7==t {ok=1} END {exit !ok}' || fail E3 "backlog list approved has no row of proposal $EID with task $ETASK"
+  pass E3 "$AP_OUT -> decision cos/approve/[$ENOTE]; task $ETASK kind $BUILDER open from proposal $EID"
+fi
+
+# ---- part f: clause (f), an idea file becomes a high-risk feature proposal that stays open ---------------------------
+if want f; then
+  mkdir -p "$WS/inbox/ideas"
+  FNAME="e2e-idea-$$.md"
+  printf '# E2E idea %s\n\nLet the farm print a one-line status summary.\n' "$$" >"$WS/inbox/ideas/$FNAME"
+  as_cos "$QQ" source pull; [ "$AP_RC" = 0 ] || fail F1 "source pull rc=$AP_RC: $AP_OUT"
+  FID=$(q "select id from proposal where loop=3 and evidence='inbox/ideas/$FNAME'")
+  [ -n "$FID" ] || fail F1 "no loop-3 proposal for inbox/ideas/$FNAME after source pull ($AP_OUT)"
+  printf '%s' "$AP_OUT" | grep -Eq "^filed [1-9][0-9]* proposals:.*(^| )$FID( |$)" || fail F1 "source pull did not report proposal $FID as filed: $AP_OUT"
+  pass F1 "$AP_OUT (proposal $FID is the idea file inbox/ideas/$FNAME)"
+  as_cos "$QQ" source pull; [ "$AP_RC" = 0 ] || fail F2 "second source pull rc=$AP_RC: $AP_OUT"
+  expect F2n "1" "$(q "select count(*) from proposal where loop=3 and evidence='inbox/ideas/$FNAME'")"
+  bl_open F2; FROW=$(row_of "$FID")
+  printf '%s' "$FROW" | awk -F'\t' '$2==3 && $4=="high" && $6=="open" {ok=1} END {exit !ok}' || fail F2 "row of proposal $FID in backlog list open is [$FROW], want loop 3, risk high, open"
+  expect F2d "0" "$(decisions_of "$FID")"
+  pass F2 "backlog list open row [$(printf '%s' "$FROW" | tr '\t' ' ')] (id loop kind risk surface status task): loop 3, high, still open after a second pull, no verdict"
 fi
 
 # ---- part d ------------------------------------------------------------------------------------------------
