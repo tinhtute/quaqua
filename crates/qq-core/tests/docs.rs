@@ -40,6 +40,7 @@ const ACCEPTED_FLAGS: &[(&str, &str)] = &[
     ("pipeline", "--resume"),
     ("pipeline", "--rounds"),
     ("run", "--project"),
+    ("backlog", "--note"),
 ];
 
 /// Flags documented for a registered command that its owning task adds later.
@@ -242,6 +243,9 @@ const SUB_PROBES: &[(&str, Probe)] = &[("config", qq_core::config::config_cmd)];
 /// daemon (or take no probeable args), so they cannot be probed through the
 /// command: their sub-verbs are listed here, as each module's usage text names them.
 const KNOWN_SUBS: &[(&str, &[&str])] = &[
+    ("backlog", &["list", "decide"]),
+    ("source", &["pull"]),
+    ("supervisor", &["score"]),
     ("grid", &["reconcile", "acquire"]),
     ("lead", &["spawn", "cleanup"]),
     ("worker", &["spawn", "prompt", "cleanup"]),
