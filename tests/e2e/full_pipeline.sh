@@ -67,6 +67,14 @@ want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; 
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 QQ=${QQ:-$REPO_ROOT/target/debug/quaqua}
+# every pane call cds to the workspace copy first, so QQ must be absolute: resolve a relative path now, or refuse
+case "$QQ" in
+  /*) ;;
+  */*) qq_dir=$(cd "$(dirname "$QQ")" 2>/dev/null && pwd) || { echo "QQ='$QQ' is relative and its folder does not exist; pass an absolute path, e.g. QQ=\$PWD/$QQ" >&2; exit 2; }
+       QQ=$qq_dir/$(basename "$QQ") ;;
+  *) qq_abs=$(command -v "$QQ") && case "$qq_abs" in /*) QQ=$qq_abs ;; *) qq_abs= ;; esac
+     [ -n "${qq_abs:-}" ] || { echo "QQ='$QQ' is not an absolute path or a command on PATH; pass an absolute path, e.g. QQ=\$PWD/target/release/quaqua" >&2; exit 2; } ;;
+esac
 PI_MODEL=${E2E_PI_MODEL:-}
 [ "$STUB" = 1 ] && [ -z "$PI_MODEL" ] && PI_MODEL=stub
 PI_EFFORT=${E2E_PI_EFFORT:-medium}
@@ -331,9 +339,10 @@ if [ "$(basename "$0")" = claude ]; then
     while IFS= read -r line; do case "$line" in *$'\e[B'*) break ;; esac; done
     : >"$trusted"
     printf '\033[2J\033[H'
-    now() { local t=${EPOCHREALTIME/./}; echo $((t / 1000)); }
-    end=$(( $(now) + ${STUB_BOOT_MS:-1500} ))
-    while [ "$(now)" -lt "$end" ]; do IFS= read -r -t 0.1 _ || true; done   # typed during boot: dropped
+    # bash 3.2 (macOS /bin/bash) has no EPOCHREALTIME and only whole-second read -t: count whole seconds with SECONDS,
+    # rounded up plus one so the window is never shorter than STUB_BOOT_MS
+    end=$(( SECONDS + ${STUB_BOOT_MS:-1500} / 1000 + 2 ))
+    while [ "$SECONDS" -lt "$end" ]; do IFS= read -r -t 1 _ || true; done   # typed during boot: dropped
   fi
 fi
 printf '? for shortcuts\n> '
