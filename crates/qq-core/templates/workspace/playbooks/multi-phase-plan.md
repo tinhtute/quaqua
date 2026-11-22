@@ -16,6 +16,16 @@ You own the plan, not the code. The plan is the deliverable; the coordinator aud
 7. Verification rule, stated in "How to read this" and opening each unit's verify block (the live and perf blocks do not repeat it): Tests alone are not sufficient verification. A unit is verified only when its unit, live, and perf boxes are all checked. The live block drives the real surface (CLI/TUI/API/Web). The perf gate is dual-sided: base and head both produce the named metric. If base lacks the feature, gate the behavior the diff adds and the end state the user waits for, with an absolute budget, instead of a ratio.
 8. Hand back the plan path and a summary, then stop. Execution starts on explicit confirmation under the coordinator or project Lead (`<slug>-lead`).
 
+### Feature work
+
+For a unit that adds or changes behavior, a Peer runs the `feature` playbook. The brief and the plan carry the rest:
+
+1. Define the desired behavior, interfaces, and data contracts in the brief before implementation begins.
+2. Establish the throughput checkpoint across four dimensions: blocking first steps (gates run before fan-out), independent workstreams (disjoint files/layers parallelize; shared writes serialize), shared mutable state (separate before serializing; serialize only for real invariants), and smallest safe decomposition. A dimension that genuinely does not apply keeps its item with `n/a: <reason>` rather than being dropped.
+3. Code-coupled work (one feature, one migration) goes to a single owner with the checkpoint inline; parent-level fan-out is reserved for slices that produce independent artifacts. Rewrite the checkpoint at phase boundaries.
+4. Require tests that validate external behavior and boundary invariants.
+5. Re-run verify checks on the matching surface before integrating or merging. "Inconclusive" or wrong-surface is not a pass (flag it); a green suite shows branch behavior, not bug absence.
+
 ```markdown
 # <Program> plan
 

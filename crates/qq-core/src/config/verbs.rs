@@ -7,7 +7,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Map, Value};
 
-use super::{parse, setting, validate, ConfigError, Kind, Parsed, RawKind};
+use super::{parse, setting, validate, ConfigError, Kind, Parsed, RawKind, RawOverride};
 use crate::cli::{rpc_call, CliError, Command, Env, Install, Registry};
 use crate::daemon::{Ctx, Daemon};
 use crate::db::path::DB_FILE;
@@ -21,7 +21,7 @@ pub const INSTALL: Install = install;
 fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     registry.register(Command {
         name: "config",
-        help: "config get [key] | set <key> <value> | import <team.toml> | validate [team.toml]",
+        help: "config get [key] | set <key> <value> | import <team.toml> | validate [team.toml] | export | diff [team.toml]",
         run: config_cmd,
     })?;
     registry.register(Command {
@@ -29,14 +29,18 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
         help: "list kinds with harness, model, use_for and avoid",
         run: roster_cmd,
     })?;
-    daemon.register_verb("config", Box::new(|ctx, req| serve(ctx, req, exec_config, true)))?;
+    daemon.register_verb(
+        "config",
+        Box::new(|ctx, req| serve(ctx, req, exec_config, true)),
+    )?;
     daemon.register_verb(
         "roster",
-        Box::new(|ctx, req| serve(ctx, req, |c, _| exec_roster(c), false)),
+        Box::new(|ctx, req| serve(ctx, req, |c, _, p| exec_roster(c, p), false)),
     )
 }
 
-type Exec = fn(&mut Connection, &[String]) -> Result<String, CliError>;
+/// The third argument is the profile the caller's `QUAQUA_PROFILE` named.
+type Exec = fn(&mut Connection, &[String], Option<&str>) -> Result<String, CliError>;
 
 /// `guarded`: every subcommand but `get` and `validate` is a write (so a new
 /// one is guarded by default) and needs a caller that may run an orchestration
@@ -54,9 +58,17 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
         .unwrap_or_default();
     let mut conn = crate::db::open(&ctx.runs_dir.join(DB_FILE))
         .map_err(|e| RpcError::new("internal", e.to_string()))?;
-    if guarded && !matches!(argv.first().map(String::as_str), Some("get" | "validate")) {
+    if guarded
+        && !matches!(
+            argv.first().map(String::as_str),
+            Some("get" | "validate" | "export" | "diff")
+        )
+    {
         let Some(caller) = req.caller.as_deref() else {
-            return Err(RpcError::new("refused", "a config write needs an identified caller"));
+            return Err(RpcError::new(
+                "refused",
+                "a config write needs an identified caller",
+            ));
         };
         let d = crate::authority::check_orchestration(
             &conn,
@@ -72,7 +84,12 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
             ));
         }
     }
-    match exec(&mut conn, &argv) {
+    let profile = req
+        .args
+        .get("profile")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    match exec(&mut conn, &argv, profile) {
         Ok(out) => Ok(json!({ "out": out })),
         Err(e) if e.code == 2 => Err(RpcError::new(BAD_REQUEST, e.message)),
         Err(e) => Err(RpcError::new("config_refused", e.message)),
@@ -80,7 +97,11 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
 }
 
 fn client(env: &Env, verb: &str, args: &[String]) -> Result<String, CliError> {
-    let v = rpc_call(env, verb, json!({ "argv": args }))?;
+    let mut body = json!({ "argv": args });
+    if let Some(p) = super::env_profile() {
+        body["profile"] = json!(p);
+    }
+    let v = rpc_call(env, verb, body)?;
     Ok(v.get("out")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -99,16 +120,16 @@ pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     };
     let mut argv = args.to_vec();
     match args.first().map(String::as_str) {
-        Some("get" | "validate") => {}
+        Some("get" | "validate" | "export" | "diff") => {}
         Some("set") => need(2, "set <key> <value>")?,
         Some("import") => need(1, "import <team.toml>")?,
         _ => {
             return Err(usage(
-                "get [key] | set <key> <value> | import <file> | validate [file]",
+                "get [key] | set <key> <value> | import <file> | validate [file] | export | diff [file]",
             ))
         }
     }
-    if matches!(args[0].as_str(), "import" | "validate") && args.len() > 1 {
+    if matches!(args[0].as_str(), "import" | "validate" | "diff") && args.len() > 1 {
         let abs = std::path::absolute(&args[1]).map_err(fail)?;
         argv[1] = abs.to_string_lossy().into_owned();
     }
@@ -147,7 +168,11 @@ fn pretty(v: &Value) -> String {
 
 // ---- commands ----------------------------------------------------------------
 
-fn exec_config(conn: &mut Connection, args: &[String]) -> Result<String, CliError> {
+fn exec_config(
+    conn: &mut Connection,
+    args: &[String],
+    _profile: Option<&str>,
+) -> Result<String, CliError> {
     let a = |i: usize| args.get(i).map(String::as_str);
     match a(0) {
         Some("get") => get(conn, a(1)).map(|v| match v {
@@ -169,6 +194,14 @@ fn exec_config(conn: &mut Connection, args: &[String]) -> Result<String, CliErro
             let n = import(conn, &text).map_err(fail)?;
             Ok(format!("imported {n} kinds"))
         }
+        Some("export") => super::export_toml(conn).map_err(fail),
+        Some("diff") => {
+            let text = match a(1) {
+                Some(path) => std::fs::read_to_string(path).map_err(fail)?,
+                None => super::ENGINE_DEFAULT.to_string(),
+            };
+            super::diff(conn, &text).map_err(fail)
+        }
         Some("validate") => {
             match a(1) {
                 Some(path) => {
@@ -180,13 +213,13 @@ fn exec_config(conn: &mut Connection, args: &[String]) -> Result<String, CliErro
             Ok("ok".to_string())
         }
         _ => Err(usage(
-            "get [key] | set <key> <value> | import <file> | validate [file]",
+            "get [key] | set <key> <value> | import <file> | validate [file] | export | diff [file]",
         )),
     }
 }
 
-fn exec_roster(conn: &mut Connection) -> Result<String, CliError> {
-    let kinds = super::roster(conn).map_err(fail)?;
+fn exec_roster(conn: &mut Connection, profile: Option<&str>) -> Result<String, CliError> {
+    let kinds = super::roster_as(conn, profile).map_err(fail)?;
     Ok(kinds
         .iter()
         .map(|k| {
@@ -230,7 +263,7 @@ fn get(conn: &Connection, key: Option<&str>) -> Result<Value, CliError> {
     let no = |k: &str| CliError::new(1, format!("no such key '{k}'"));
     let Some(key) = key else {
         let mut kinds = Map::new();
-        for k in super::roster(conn).map_err(fail)? {
+        for k in super::base_roster(conn).map_err(fail)? {
             let cap = on_cost_cap(conn, &k.name).map_err(fail)?;
             kinds.insert(k.name.clone(), kind_json(&k, &cap));
         }
@@ -270,7 +303,7 @@ fn get(conn: &Connection, key: Option<&str>) -> Result<Value, CliError> {
             Some((n, f)) => (n, Some(f)),
             None => (rest, None),
         };
-        let k = super::kind(conn, name)
+        let k = super::base_kind(conn, name)
             .map_err(fail)?
             .ok_or_else(|| no(key))?;
         let v = kind_json(&k, &on_cost_cap(conn, name).map_err(fail)?);
@@ -278,6 +311,21 @@ fn get(conn: &Connection, key: Option<&str>) -> Result<Value, CliError> {
             None => Ok(v),
             Some(f) => v.get(f).cloned().ok_or_else(|| no(key)),
         };
+    }
+    if let Some(p) = key.strip_prefix("profile.") {
+        let mut all = super::stored_profiles(conn).map_err(fail)?;
+        let per_kind = all.remove(p).ok_or_else(|| no(key))?;
+        return Ok(Value::Object(
+            per_kind
+                .into_iter()
+                .map(|(k, o)| {
+                    (
+                        k,
+                        json!({ "harness": o.harness, "model": o.model, "effort": o.effort }),
+                    )
+                })
+                .collect(),
+        ));
     }
     if let Some(p) = key.strip_prefix("purpose.") {
         return super::purpose_kind(conn, p)
@@ -330,7 +378,7 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
                 } else {
                     Value::String(raw.to_string())
                 };
-                if super::kind(&tx, name).map_err(fail)?.is_none() {
+                if super::base_kind(&tx, name).map_err(fail)?.is_none() {
                     return Err(fail(ConfigError::NoSuchKind(name.to_string())));
                 }
                 upsert_kind(&tx, name, Map::from_iter([(field.to_string(), v)]))?;
@@ -344,6 +392,10 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
             params![p, raw],
         )
         .map_err(fail)?;
+    } else if key == super::ACTIVE_PROFILE {
+        set_active_profile(&tx, raw)?;
+    } else if let Some(rest) = key.strip_prefix("profile.") {
+        set_profile(&tx, rest, raw)?;
     } else if key == "reviewers" || key == "strategy.default_reviewer" {
         let Value::Array(items) = loose(raw) else {
             return Err(CliError::new(2, "reviewers must be a JSON array of kinds"));
@@ -374,6 +426,85 @@ fn set(conn: &mut Connection, key: &str, raw: &str) -> Result<(), CliError> {
         set_setting(&tx, key, loose(raw))?;
     }
     tx.commit().map_err(fail)
+}
+
+/// `config set profile <name>` switches the active profile; `none` (or an
+/// empty value) clears it. Only the setting row changes: no worker is touched.
+fn set_active_profile(tx: &Transaction<'_>, raw: &str) -> Result<(), CliError> {
+    let name = raw.trim();
+    if name.is_empty() || name == "none" || name == "null" {
+        tx.execute(
+            "DELETE FROM setting WHERE key = ?1",
+            [super::ACTIVE_PROFILE],
+        )
+        .map_err(fail)?;
+        return Ok(());
+    }
+    let mut p = stored_parsed(tx).map_err(fail)?;
+    p.settings.retain(|(k, _)| k != super::ACTIVE_PROFILE);
+    p.settings
+        .push((super::ACTIVE_PROFILE.to_string(), json!(name)));
+    validate(&p).map_err(fail)?;
+    put_setting(tx, super::ACTIVE_PROFILE, &json!(name))
+}
+
+/// `profile.<name>` takes a JSON object of kind -> override and replaces the
+/// profile; `profile.<name>.<kind>` takes one override object (`null` removes
+/// it). An override names any of harness, model, effort.
+fn set_profile(tx: &Transaction<'_>, rest: &str, raw: &str) -> Result<(), CliError> {
+    let (name, kind) = match rest.split_once('.') {
+        Some((n, k)) => (n, Some(k)),
+        None => (rest, None),
+    };
+    if name.is_empty() || name != name.to_lowercase() || kind.is_some_and(str::is_empty) {
+        return Err(CliError::new(
+            2,
+            format!("profile.{rest}: names must be lowercase and non-empty"),
+        ));
+    }
+    let parse_one = |v: Value| -> Result<RawOverride, CliError> {
+        serde_json::from_value(v).map_err(|e| CliError::new(2, format!("profile.{rest}: {e}")))
+    };
+    let mut p = stored_parsed(tx).map_err(fail)?;
+    match kind {
+        None => {
+            let Value::Object(obj) = loose(raw) else {
+                return Err(CliError::new(
+                    2,
+                    format!("profile.{name}: value must be a JSON object of kind -> override"),
+                ));
+            };
+            let mut per_kind = std::collections::BTreeMap::new();
+            for (k, o) in obj {
+                per_kind.insert(k, parse_one(o)?);
+            }
+            p.profiles.insert(name.to_string(), per_kind);
+        }
+        Some(k) => match loose(raw) {
+            Value::Null => {
+                p.profiles.entry(name.to_string()).or_default().remove(k);
+            }
+            o => {
+                let o = parse_one(o)?;
+                p.profiles
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(k.to_string(), o);
+            }
+        },
+    }
+    validate(&p).map_err(fail)?;
+    tx.execute("DELETE FROM profile_kind WHERE profile = ?1", [name])
+        .map_err(fail)?;
+    super::write_profiles(
+        tx,
+        &p.profiles
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(n, m)| (n.clone(), m.clone()))
+            .collect(),
+    )
+    .map_err(fail)
 }
 
 fn put_setting(tx: &Transaction<'_>, key: &str, v: &Value) -> Result<(), CliError> {
@@ -463,7 +594,7 @@ fn setting_key(key: &str) -> bool {
 }
 
 fn require_kind(conn: &Connection, referrer: &str, kind: &str) -> Result<(), CliError> {
-    match super::kind(conn, kind).map_err(fail)? {
+    match super::base_kind(conn, kind).map_err(fail)? {
         Some(_) => Ok(()),
         None => Err(fail(ConfigError::UnknownKind {
             referrer: referrer.to_string(),
@@ -548,6 +679,7 @@ fn upsert_kind(
     let mut p = Parsed {
         harnesses: super::stored_harnesses(tx).map_err(fail)?,
         kinds: Default::default(),
+        profiles: super::stored_profiles(tx).map_err(fail)?,
         purposes: vec![],
         reviewers: vec![],
         edges: Default::default(),
@@ -556,7 +688,7 @@ fn upsert_kind(
     // The fallback may be a kind already stored: stand it in for the check.
     if let Some(f) = &fallback {
         if f != name {
-            if let Some(k) = super::kind(tx, f).map_err(fail)? {
+            if let Some(k) = super::base_kind(tx, f).map_err(fail)? {
                 p.kinds.insert(f.clone(), stand_in(&k));
             }
         }
@@ -619,12 +751,13 @@ fn parse_checked(conn: &Connection, text: &str) -> Result<Parsed, ConfigError> {
     let mut stored = Parsed {
         harnesses: Default::default(),
         kinds: Default::default(),
+        profiles: Default::default(),
         purposes: vec![],
         reviewers: vec![],
         edges: Default::default(),
         settings: vec![],
     };
-    for k in super::roster(conn)? {
+    for k in super::base_roster(conn)? {
         if !p.kinds.contains_key(&k.name) {
             stored.kinds.insert(k.name.clone(), stand_in(&k));
         }
@@ -634,6 +767,11 @@ fn parse_checked(conn: &Connection, text: &str) -> Result<Parsed, ConfigError> {
     let file_harnesses = std::mem::take(&mut p.harnesses);
     p.harnesses = super::stored_harnesses(conn)?;
     p.harnesses.extend(file_harnesses);
+    let file_profiles = std::mem::take(&mut p.profiles);
+    p.profiles = super::stored_profiles(conn)?;
+    for (name, per_kind) in file_profiles {
+        p.profiles.entry(name).or_default().extend(per_kind);
+    }
     let file_kinds = std::mem::take(&mut p.kinds);
     p.kinds = stored.kinds;
     p.kinds.extend(file_kinds);
@@ -659,7 +797,15 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
         .and_then(|v| v.as_table())
         .map(|t| t.keys().cloned().collect())
         .unwrap_or_default();
-    super::write_harnesses(&tx, p.harnesses.iter().filter(|(n, _)| declared.contains(n)))?;
+    super::write_harnesses(
+        &tx,
+        p.harnesses.iter().filter(|(n, _)| declared.contains(n)),
+    )?;
+    let doc_profiles: Vec<String> = doc
+        .get("profiles")
+        .and_then(|v| v.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
     let named: Vec<String> = doc
         .get("kinds")
         .and_then(|v| v.as_table())
@@ -680,6 +826,14 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
             params![f, name],
         )?;
     }
+    super::write_profiles(
+        &tx,
+        &p.profiles
+            .iter()
+            .filter(|(n, _)| doc_profiles.contains(n))
+            .map(|(n, m)| (n.clone(), m.clone()))
+            .collect(),
+    )?;
     for (purpose, kind) in &p.purposes {
         tx.execute(
             "INSERT INTO purpose (name, kind) VALUES (?1, ?2)
@@ -713,17 +867,22 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
     Ok(named.len())
 }
 
-/// The stored config must satisfy the checks an import applies.
-fn check_db(conn: &Connection) -> Result<(), ConfigError> {
+/// The stored config as a [`Parsed`] (edges and the file-only settings are
+/// left out; the active profile is kept), for [`validate`].
+fn stored_parsed(conn: &Connection) -> Result<Parsed, ConfigError> {
     let mut p = Parsed {
         harnesses: super::stored_harnesses(conn)?,
         kinds: Default::default(),
+        profiles: super::stored_profiles(conn)?,
         purposes: vec![],
         reviewers: super::reviewers(conn)?,
         edges: Default::default(),
         settings: vec![],
     };
-    for k in super::roster(conn)? {
+    if let Some(v) = setting(conn, super::ACTIVE_PROFILE)? {
+        p.settings.push((super::ACTIVE_PROFILE.to_string(), v));
+    }
+    for k in super::base_roster(conn)? {
         let mut raw = stand_in(&k);
         raw.fallback = k.fallback.clone();
         p.kinds.insert(k.name.clone(), raw);
@@ -732,5 +891,10 @@ fn check_db(conn: &Connection) -> Result<(), ConfigError> {
     p.purposes = st
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    validate(&p)
+    Ok(p)
+}
+
+/// The stored config must satisfy the checks an import applies.
+fn check_db(conn: &Connection) -> Result<(), ConfigError> {
+    validate(&stored_parsed(conn)?)
 }

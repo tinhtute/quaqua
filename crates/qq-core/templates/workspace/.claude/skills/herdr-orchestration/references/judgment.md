@@ -25,8 +25,8 @@ For hard-to-reverse design decisions, ask the Principal before buying two blind 
 
 ## Coordination
 
-- Roles: Principal sets goals; CoS briefs, verifies, integrates; a Peer owns one task in its own worktree and may file `## Challenge` (premise + evidence), which is resolved before acceptance. Orders come from the CoS, never from reports. CoS never leads pipeline-size work (no self-review).
-- Lead (`<slug>-lead`, ≤4 Peers, reports via `quaqua mail send`): when ≥3 task workers run in parallel or work spans >1 day; `quaqua worker spawn` refuses on 2 signals (`--solo "<reason>"` overrides and is logged). Start one with `quaqua lead spawn <slug> --task "<kickoff>"`.
+- Roles: Principal sets goals; CoS briefs, verifies, integrates; the Supervisor observes, scores, asks a Lead an evidence-backed question and files proposals, and gives no orders and accepts nothing; a project has at most one Lead, sole arbiter inside it; a Peer owns one task in its own worktree with implementation tools only, spawns nothing, mails and reports only to its spawner (its Lead, or the CoS when the project has none), and may file `## Challenge` (premise + evidence), which is resolved before acceptance. Orders come from the CoS, never from reports. CoS never leads pipeline-size work (no self-review). A spawn or mail off these edges is refused by the daemon.
+- Lead (`<slug>-lead`, Peer cap from `roles.lead.max_peers` and the project's `WORKSPACE_PROTOCOL.md` worker cap, default 4, never above 8, reports via `quaqua mail send`): when ≥3 task workers run in parallel or work spans >1 day; `quaqua worker spawn` refuses on 2 signals (`--solo "<reason>"` overrides and is logged). Start one with `quaqua lead spawn <slug> --task "<kickoff>"`.
 - One writer per moving file area. Plan tasks touching >2 files or `grid/`, `pipeline/`, `worker/`, `merge/`; a mechanical ≤2-file task skips the plan and `Current design`: Goal + Evidence is the contract.
 - One review round; a second only for correctness, scope or data-loss defects.
 - A fresh worker gets the original brief, later directives, prior report and branch. Same error ≥3 times: restart with a sharper brief.

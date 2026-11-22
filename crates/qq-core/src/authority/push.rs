@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 
 use super::{check_orchestration, fence_for, refuse, resolve, Decision, Fence, Op};
 use crate::cli::{CliError, Command, Env, Registry};
-use crate::config;
 use crate::daemon::Daemon;
 use crate::rpc::{self, RpcError};
 
@@ -351,17 +350,14 @@ fn push_from_scratch(
     Ok(())
 }
 
-fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
-    let kind: Option<String> = resolve(conn, caller)
+/// The fence of the harness the caller was spawned with (pinned on its row);
+/// a row from before the pin resolves its kind. Unresolvable: unfenced.
+pub fn fence_of(conn: &rusqlite::Connection, caller: &str) -> Fence {
+    resolve(conn, caller)
         .ok()
         .flatten()
-        .and_then(|a| {
-            conn.query_row("SELECT kind FROM agent WHERE id = ?1", [a.id], |r| r.get(0))
-                .ok()
-        })
-        .flatten();
-    kind.and_then(|k| config::resolve_spawn(conn, &k).ok())
-        .map_or(Fence::Unfenced, |t| fence_for(t.harness.driver))
+        .and_then(|a| crate::task::spawn::live_harness(conn, a.id))
+        .map_or(Fence::Unfenced, |h| fence_for(h.driver))
 }
 
 /// Registers `push {repo, remote, branch}` -> `{pushed: true}`.

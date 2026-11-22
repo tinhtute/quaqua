@@ -10,8 +10,7 @@ use rusqlite::Connection;
 use std::sync::Arc;
 
 fn template() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/team.toml");
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml");
     std::fs::read_to_string(p).expect("read template team.toml")
 }
 
@@ -62,10 +61,7 @@ fn unknown_harness_rejected() {
     assert_eq!(count(&conn, "kind"), 0);
 
     // A valid harness is accepted by the same call.
-    assert_eq!(
-        config::seed(&mut conn, &template()).unwrap(),
-        Seeded::Fresh
-    );
+    assert_eq!(config::seed(&mut conn, &template()).unwrap(), Seeded::Fresh);
 
     // The daily verbs refuse the same names and change nothing.
     let env = Env {
@@ -556,9 +552,21 @@ fn harness_declared_in_toml_imports_and_validates() {
     let spec = t.harness.spec.expect("stored spec");
     assert_eq!((spec.herdr_kind.as_str(), spec.args.len()), ("kimi", 2));
     // a stored harness stays usable by later sets and a bare validate
-    assert_eq!(run(&["config", "set", "kind.k2", r#"{"harness":"kimi","model":"m2"}"#]), 0);
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "kind.k2",
+            r#"{"harness":"kimi","model":"m2"}"#
+        ]),
+        0
+    );
     assert_eq!(run(&["config", "validate"]), 0);
-    assert_eq!(run(&["config", "set", "kind.k2.effort", "high"]), 1, "not in efforts");
+    assert_eq!(
+        run(&["config", "set", "kind.k2.effort", "high"]),
+        1,
+        "not in efforts"
+    );
 
     // refused before anything is written
     let refused = |name: &str, body: String| {
@@ -572,14 +580,342 @@ fn harness_declared_in_toml_imports_and_validates() {
     refused("upper.toml", decl("Kimi"));
     refused("nomodel.toml", decl("x").replace("{model}", "m"));
     refused("badph.toml", decl("x").replace("{model}", "{model}{nope}"));
-    refused("prompt.toml", decl("x").replace("{model}", "{model}{prompt}"));
+    refused(
+        "prompt.toml",
+        decl("x").replace("{model}", "{model}{prompt}"),
+    );
     refused(
         "ctrlc.toml",
         decl("x").replace("args =", "stop_keys = [\"ctrl+c\"]\nargs ="),
     );
-    refused("shape.toml", decl("x").replace("args =", "error_shape = \"zzz\"\nargs ="));
+    refused(
+        "shape.toml",
+        decl("x").replace("args =", "error_shape = \"zzz\"\nargs ="),
+    );
     // neither native nor declared: unknown
-    let ghost = file("ghost.toml", "[kinds.g]\nharness = \"nope\"\nmodel = \"m\"\n");
+    let ghost = file(
+        "ghost.toml",
+        "[kinds.g]\nharness = \"nope\"\nmodel = \"m\"\n",
+    );
     assert_eq!(run(&["config", "validate", &ghost]), 1);
+    daemon.stop().unwrap();
+}
+
+// ---- T52: export, diff, profiles --------------------------------------------
+
+const CONFIG_TABLES: &[&str] = &[
+    "harness",
+    "kind",
+    "purpose",
+    "kind_reviewer",
+    "profile",
+    "profile_kind",
+    "topology_edge",
+    "setting",
+    "engine_default",
+];
+
+/// Every row of the given tables as sorted text, to compare whole databases.
+fn dump(conn: &Connection, tables: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in tables {
+        let mut st = conn.prepare(&format!("SELECT * FROM {t}")).unwrap();
+        let n = st.column_count();
+        let mut rows: Vec<String> = st
+            .query_map([], |r| {
+                let mut s = String::new();
+                for i in 0..n {
+                    s.push_str(&format!("{:?}|", r.get_ref(i)?));
+                }
+                Ok(s)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows.sort();
+        out.extend(rows.into_iter().map(|r| format!("{t}: {r}")));
+    }
+    out
+}
+
+/// Clears `QUAQUA_PROFILE` when the test ends, even on a failed assert.
+struct ProfileEnv;
+
+impl ProfileEnv {
+    fn set(v: &str) -> ProfileEnv {
+        std::env::set_var("QUAQUA_PROFILE", v);
+        ProfileEnv
+    }
+}
+
+impl Drop for ProfileEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("QUAQUA_PROFILE");
+    }
+}
+
+fn seeded(name: &str) -> TestWorkspace {
+    let ws = TestWorkspace::new(name);
+    std::fs::write(ws.team_toml(), template()).unwrap();
+    let mut conn = open(&ws);
+    assert_eq!(
+        config::init(&mut conn, &ws.team_toml()).unwrap(),
+        Seeded::Fresh
+    );
+    ws
+}
+
+#[test]
+fn config_seed_set_export_roundtrip() {
+    let ws = seeded("cfg-export");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+
+    // Edits after the seed: a kind, a purpose, settings (one with a dotted
+    // key), a profile and the switch to it.
+    let scout = r#"{"harness":"claude","model":"haiku-5.5","effort":"low","fallback":"ni","use_for":"quick scans","avoid":"edits"}"#;
+    assert_eq!(run(&["config", "set", "kind.scout", scout]), 0);
+    assert_eq!(run(&["config", "set", "purpose.scan", "scout"]), 0);
+    assert_eq!(run(&["config", "set", "limits.depth", "3"]), 0);
+    assert_eq!(
+        run(&["config", "set", "projects.alpha.root", "\"/tmp/a\""]),
+        0
+    );
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.fast",
+            r#"{"ni":{"model":"haiku-5.5","effort":"low"}}"#
+        ]),
+        0
+    );
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.swap",
+            r#"{"ni":{"harness":"pi","model":"m-pi"}}"#
+        ]),
+        0
+    );
+    assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
+
+    let conn = open(&ws);
+    let exported = config::config_cmd(&env, &strs(&["export"])).unwrap();
+    assert!(exported.contains("[profiles.fast.ni]"), "{exported}");
+    // The export is the base config: the active profile and the env switch
+    // never reach it.
+    assert_eq!(
+        config::kind(&conn, "ni").unwrap().unwrap().model,
+        "haiku-5.5"
+    );
+    {
+        let _p = ProfileEnv::set("fast");
+        assert_eq!(config::export_toml(&conn).unwrap(), exported);
+    }
+
+    // Seeding a fresh database from the export gives the same rows, and
+    // exporting that gives the same text.
+    let mut copy = db::open(&ws.runs_dir().join("roundtrip.db")).expect("open copy");
+    assert_eq!(config::seed(&mut copy, &exported).unwrap(), Seeded::Fresh);
+    assert_eq!(dump(&copy, CONFIG_TABLES), dump(&conn, CONFIG_TABLES));
+    assert_eq!(config::export_toml(&copy).unwrap(), exported);
+    let base: String = copy
+        .query_row("SELECT model FROM kind WHERE name = 'ni'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(base, "opus-5.5");
+    assert_eq!(
+        config::kind(&copy, "ni").unwrap().unwrap().model,
+        "haiku-5.5"
+    );
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn config_diff_never_overwrites() {
+    let ws = seeded("cfg-diff");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+
+    // Seeded from the default: nothing differs.
+    let conn = open(&ws);
+    assert_eq!(config::diff(&conn, &template()).unwrap(), "no differences");
+
+    // A local edit and a new engine default for another kind.
+    assert_eq!(run(&["config", "set", "kind.sude.model", "local-model"]), 0);
+    let newer = template().replace("opus-5.5", "opus-6");
+    assert_ne!(newer, template());
+    std::fs::write(ws.team_toml(), &newer).unwrap();
+    let before = dump(&open(&ws), CONFIG_TABLES);
+
+    let out = config::config_cmd(&env, &strs(&["diff", ws.team_toml().to_str().unwrap()])).unwrap();
+    assert!(
+        out.contains("~ kinds.ni.model: stored \"opus-5.5\" -> default \"opus-6\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("kinds.sude.model: stored \"local-model\""),
+        "{out}"
+    );
+
+    // Diff, a re-seed and an import-free reload leave every row as it was.
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+    let mut conn = open(&ws);
+    assert_eq!(
+        config::seed(&mut conn, &newer).unwrap(),
+        Seeded::AlreadySeeded
+    );
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "kind.ni.model"])).unwrap(),
+        "opus-5.5"
+    );
+    // The shipped default is readable the same way.
+    assert_eq!(run(&["config", "diff"]), 0);
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn roster_profiles_next_spawn() {
+    let ws = seeded("cfg-profiles");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let model = |kind: &str| config::resolve_spawn(&open(&ws), kind).map(|t| (t.model, t.effort));
+
+    // A worker is already running; no switch may change its rows.
+    open(&ws)
+        .execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('w1', 'peer', 2)",
+            [],
+        )
+        .unwrap();
+    let live = |c: &Connection| dump(c, &["agent", "run"]);
+    let live_before = live(&open(&ws));
+
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.fast",
+            r#"{"ni":{"model":"haiku-5.5","effort":"low"}}"#
+        ]),
+        0
+    );
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.alt.ni",
+            r#"{"model":"sonnet-5.5"}"#
+        ]),
+        0
+    );
+    // A profile alone changes nothing until it is switched on.
+    assert_eq!(model("ni").unwrap().0, "opus-5.5");
+
+    // The key switch reaches the next spawn read, for that kind only.
+    assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
+    assert_eq!(
+        model("ni").unwrap(),
+        ("haiku-5.5".into(), Some("low".into()))
+    );
+    assert_eq!(
+        model("sude").unwrap().0,
+        config::kind(&open(&ws), "sude").unwrap().unwrap().model
+    );
+    assert_ne!(model("sude").unwrap().0, "haiku-5.5");
+    let line = config::roster_cmd(&env, &[]).unwrap();
+    let ni = line.lines().find(|l| l.starts_with("ni")).unwrap();
+    assert!(ni.contains("haiku-5.5 (low)"), "{ni}");
+    // The stored kind itself is untouched.
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "kind.ni.model"])).unwrap(),
+        "opus-5.5"
+    );
+
+    // A harness override switches the harness the next spawn resolves.
+    assert_eq!(
+        run(&[
+            "config",
+            "set",
+            "profile.swap",
+            r#"{"ni":{"harness":"pi","model":"m-pi"}}"#
+        ]),
+        0
+    );
+    assert_eq!(run(&["config", "set", "profile", "swap"]), 0);
+    let t = config::resolve_spawn(&open(&ws), "ni").unwrap();
+    assert_eq!((t.harness.name.as_str(), t.model.as_str()), ("pi", "m-pi"));
+    assert_eq!(run(&["config", "set", "profile", "fast"]), 0);
+
+    // The roster verb runs in the daemon: it answers with the profile its
+    // client named, and never reads its own env. Key is "fast" here.
+    let rpc_roster = |profile: Option<&str>| {
+        let mut body = serde_json::json!({ "argv": [] });
+        if let Some(p) = profile {
+            body["profile"] = serde_json::json!(p);
+        }
+        qq_core::cli::rpc_call(&env, "roster", body).unwrap()["out"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(rpc_roster(None).contains("haiku-5.5 (low)"));
+    assert!(rpc_roster(Some("alt")).contains("sonnet-5.5"));
+    {
+        // A daemon-side env is not a switch: only the client's argument is.
+        let _p = ProfileEnv::set("alt");
+        assert!(rpc_roster(None).contains("haiku-5.5 (low)"));
+        // The CLI client forwards its own env.
+        assert!(config::roster_cmd(&env, &[])
+            .unwrap()
+            .contains("sonnet-5.5"));
+    }
+    assert_eq!(run(&["config", "set", "profile.none", "{}"]), 1);
+    assert_eq!(
+        run(&["config", "set", "profile.null.ni", r#"{"model":"m"}"#]),
+        1
+    );
+
+    // The env beats the key; a bad env name fails the spawn read, not silently.
+    {
+        let _p = ProfileEnv::set("alt");
+        let base_effort = config::kind(&open(&ws), "ni").unwrap().unwrap().effort;
+        assert_eq!(model("ni").unwrap(), ("sonnet-5.5".into(), base_effort));
+    }
+    {
+        let _p = ProfileEnv::set("ghost");
+        assert!(matches!(
+            config::resolve_spawn(&open(&ws), "ni"),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+    assert_eq!(model("ni").unwrap().0, "haiku-5.5");
+
+    // Refused: an unknown profile, an override naming an unknown harness.
+    assert_eq!(run(&["config", "set", "profile", "ghost"]), 1);
+    assert_eq!(
+        run(&["config", "set", "profile.bad.ni", r#"{"harness":"ghost"}"#]),
+        1
+    );
+    assert_eq!(model("ni").unwrap().0, "haiku-5.5");
+
+    // Back to the base roster.
+    assert_eq!(run(&["config", "set", "profile", "none"]), 0);
+    assert_eq!(model("ni").unwrap().0, "opus-5.5");
+
+    // No switch above touched the running worker.
+    assert_eq!(live(&open(&ws)), live_before);
     daemon.stop().unwrap();
 }

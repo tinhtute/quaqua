@@ -1,6 +1,7 @@
 //! `task.create`: writes one `task` row so a run can carry `run.task_id`.
 //!
-//! `{project: <slug>, title, [kind, disposition, repo]}` -> `{task_id, created}`.
+//! `{project: <slug>, title, [kind, disposition, repo, parents]}` -> `{task_id, created}`.
+//! `parents` is a list of task ids the new task waits for (see `graph`).
 //! A repeat of the same project and title returns the row already there. An
 //! unknown project is refused unless `repo` is given, which creates it the way
 //! a Lead spawn does (slug + repo path). A Peer identity never creates tasks.
@@ -14,10 +15,10 @@ use crate::authority::{self, Decision, Op};
 use crate::cli::{CliError, Command, Env};
 use crate::config;
 use crate::daemon::Daemon;
+use super::graph;
 use crate::rpc::{self, RpcError};
 
 pub const VERB: &str = "task.create";
-const DISPOSITIONS: &[&str] = &["engineer", "architect", "reviewer", "scout"];
 
 fn bad(m: impl Into<String>) -> RpcError {
     RpcError::new(rpc::BAD_REQUEST, m)
@@ -46,10 +47,20 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
             let disposition = a
                 .get("disposition")
                 .and_then(Value::as_str)
-                .unwrap_or("engineer");
-            if !DISPOSITIONS.contains(&disposition) {
-                return Err(bad(format!("disposition must be one of {DISPOSITIONS:?}")));
+                .unwrap_or(graph::DEFAULT_DISPOSITION);
+            if !graph::DISPOSITIONS.contains(&disposition) {
+                return Err(bad(format!(
+                    "disposition must be one of {:?}",
+                    graph::DISPOSITIONS
+                )));
             }
+            let parents = match a.get("parents") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .and_then(|l| l.iter().map(Value::as_i64).collect::<Option<Vec<_>>>())
+                    .ok_or_else(|| bad("parents must be a list of task ids"))?,
+            };
             let repo = a.get("repo").and_then(Value::as_str);
             let mut conn =
                 crate::db::open(&runs_dir.join(crate::db::path::DB_FILE)).map_err(internal)?;
@@ -122,6 +133,10 @@ pub fn register(daemon: &mut Daemon, runs_dir: PathBuf) -> Result<(), String> {
                     (tx.last_insert_rowid(), true)
                 }
             };
+            for parent in &parents {
+                graph::add_parent(&tx, id, *parent)
+                    .map_err(|m| RpcError::new("bad_parent", m))?;
+            }
             tx.commit().map_err(internal)?;
             Ok(json!({ "task_id": id, "project_id": project, "created": created }))
         }),
@@ -136,7 +151,7 @@ fn now_ms() -> i64 {
 }
 
 const USAGE: &str =
-    "usage: quaqua task create <project> <title> [--kind K] [--disposition D] [--repo PATH]";
+    "usage: quaqua task create <project> <title> [--kind K] [--disposition D] [--repo PATH] [--parent ID]...";
 
 fn create_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
     let usage = || CliError::new(2, USAGE);
@@ -145,10 +160,15 @@ fn create_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
         return Err(usage());
     }
     let (mut pos, mut call) = (Vec::new(), serde_json::Map::new());
+    let mut parents = Vec::new();
     while let Some(a) = it.next() {
         match a.as_str() {
             f @ ("--kind" | "--disposition" | "--repo") => {
                 call.insert(f[2..].to_string(), json!(it.next().ok_or_else(usage)?));
+            }
+            "--parent" => {
+                let id: i64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(usage)?;
+                parents.push(json!(id));
             }
             _ => pos.push(a),
         }
@@ -158,6 +178,9 @@ fn create_cli(env: &Env, args: &[String]) -> Result<String, CliError> {
     };
     call.insert("project".into(), json!(project));
     call.insert("title".into(), json!(title));
+    if !parents.is_empty() {
+        call.insert("parents".into(), json!(parents));
+    }
     crate::cli::rpc_call(env, VERB, Value::Object(call))
         .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
 }
@@ -169,7 +192,7 @@ fn install(cli: &mut crate::cli::Registry, daemon: &mut Daemon) -> Result<(), St
     register(daemon, crate::db::path::default_runs_dir())?;
     cli.register(Command {
         name: "task",
-        help: "task create <project> <title> [--kind K] [--disposition D] [--repo PATH]: write a task row",
+        help: "task create <project> <title> [--kind K] [--disposition D] [--repo PATH] [--parent ID]...: write a task row; a task starts once its parents are verified",
         run: create_cli,
     })
 }
