@@ -182,14 +182,14 @@ fn task_create_writes_a_task_row_a_run_can_carry() {
     );
 
     // A run opened with that id satisfies the run.task_id foreign key.
-    let mut c = c;
+    let c = c;
     c.execute(
         "INSERT INTO workflow (id, kind, state, started_ms, updated_ms) VALUES ('worker:w', 'k', 's', 0, 0)",
         [],
     )
     .unwrap();
     let run_id = run::open(
-        &mut c,
+        &c,
         &NewRun {
             workflow_id: "worker:w",
             agent_id: 1,
