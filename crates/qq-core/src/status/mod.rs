@@ -26,10 +26,57 @@ pub struct RunRow {
 pub struct Status {
     pub agents: Vec<AgentRow>,
     pub runs: Vec<RunRow>,
+    /// Reasons the owner should look: nothing is running and nothing has happened.
+    pub needs_you: Vec<String>,
 }
+
+/// Default minutes of silence, with no live worker, before status flags it.
+pub const IDLE_MINUTES: u64 = 10;
+/// Setting key that overrides [`IDLE_MINUTES`].
+pub const IDLE_SETTING: &str = "status.idle_minutes";
 
 /// Open agents and unfinished runs; `all` adds ended agents and finished runs.
 pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    read_at(conn, all, now_ms)
+}
+
+/// Flag when no worker (lead or peer) is live and the last event (mail, run or
+/// agent start/end) is older than the idle threshold. A database with no events
+/// at all is quiet: nothing has happened yet.
+fn idle_reason(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String>> {
+    let live: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent WHERE ended_ms IS NULL AND role IN ('lead', 'peer')",
+        [],
+        |r| r.get(0),
+    )?;
+    if live > 0 {
+        return Ok(None);
+    }
+    let last: Option<i64> = conn.query_row(
+        "SELECT MAX(t) FROM (SELECT MAX(created_ms) t FROM mail \
+         UNION ALL SELECT MAX(started_ms) FROM run UNION ALL SELECT MAX(ended_ms) FROM run \
+         UNION ALL SELECT MAX(started_ms) FROM agent UNION ALL SELECT MAX(ended_ms) FROM agent)",
+        [],
+        |r| r.get(0),
+    )?;
+    let Some(last) = last else { return Ok(None) };
+    let minutes: u64 = conn
+        .query_row("SELECT value_json FROM setting WHERE key = ?1", [IDLE_SETTING], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(IDLE_MINUTES);
+    let idle_s = (now_ms - last).max(0) / 1000;
+    Ok((idle_s >= minutes as i64 * 60)
+        .then(|| format!("no worker live and no event for {} min", idle_s / 60)))
+}
+
+/// [`read`] with an explicit clock, for tests.
+pub fn read_at(conn: &Connection, all: bool, now_ms: i64) -> rusqlite::Result<Status> {
     let mut st = conn.prepare(
         "SELECT a.name, a.role, a.kind, p.slug, a.ended_ms IS NULL FROM agent a \
          LEFT JOIN project p ON p.id = a.project_id \
@@ -64,7 +111,8 @@ pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
             })
         })?
         .collect::<Result<_, _>>()?;
-    Ok(Status { agents, runs })
+    let needs_you: Vec<String> = { let _ = (idle_reason as fn(_, _) -> _, now_ms); Vec::new() };
+    Ok(Status { agents, runs, needs_you })
 }
 
 /// Text for the terminal. `metrics` adds tokens and cost per run; a run whose
@@ -80,6 +128,9 @@ pub fn render(s: &Status, metrics: bool) -> String {
             a.project.as_deref().unwrap_or("-"),
             if a.open { "" } else { " (ended)" }
         ));
+    }
+    for n in &s.needs_you {
+        out.push_str(&format!("needs you: {n}\n"));
     }
     if metrics {
         for r in &s.runs {
@@ -131,4 +182,41 @@ fn install(cli: &mut crate::cli::Registry, _: &mut crate::daemon::Daemon) -> Res
         help: "agents and runs [--all] [--metrics]",
         run: status_command,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::db::migrate::migrate(&mut c).unwrap();
+        c
+    }
+
+    const MIN: i64 = 60_000;
+
+    #[test]
+    fn status_flags_idle_with_no_worker_and_no_event() {
+        let c = db();
+        c.execute("INSERT INTO agent (name, role, started_ms, ended_ms) VALUES ('w', 'lead', 0, 1000)", []).unwrap();
+        let s = read_at(&c, false, 1000 + 11 * MIN).unwrap();
+        assert_eq!(s.needs_you, vec!["no worker live and no event for 11 min".to_string()]);
+        assert!(render(&s, false).contains("needs you: no worker live and no event for 11 min"));
+        c.execute("INSERT INTO setting (key, value_json) VALUES ('status.idle_minutes', '30')", []).unwrap();
+        assert!(read_at(&c, false, 1000 + 11 * MIN).unwrap().needs_you.is_empty());
+    }
+
+    #[test]
+    fn status_quiet_when_worker_live_or_event_recent_or_empty() {
+        let c = db();
+        assert!(read_at(&c, false, 99 * MIN).unwrap().needs_you.is_empty(), "empty db");
+        c.execute("INSERT INTO agent (name, role, started_ms) VALUES ('w', 'lead', 0)", []).unwrap();
+        assert!(read_at(&c, false, 99 * MIN).unwrap().needs_you.is_empty(), "live worker");
+        c.execute("UPDATE agent SET ended_ms = 1000", []).unwrap();
+        c.execute("INSERT INTO mail (sender, recipient, body, created_ms) VALUES ('w', 'cos', 'hi', ?1)", [1000 + 5 * MIN]).unwrap();
+        assert!(read_at(&c, false, 1000 + 12 * MIN).unwrap().needs_you.is_empty(), "recent mail");
+        assert!(render(&read_at(&c, false, 1000 + 12 * MIN).unwrap(), false).find("needs you").is_none());
+    }
 }
