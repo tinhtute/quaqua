@@ -292,10 +292,22 @@ pub fn run_with(
     }
 
     if update {
-        for rel in lock.files.keys() {
-            if !table::TABLE.iter().any(|(r, ..)| r == rel) {
-                log.push(format!("removed upstream {rel} (kept)"));
+        let mut removed: Vec<&str> = lock
+            .files
+            .keys()
+            .filter(|rel| !table::TABLE.iter().any(|(r, ..)| r == *rel))
+            .map(|rel| rel.as_str())
+            .collect();
+        removed.sort_unstable();
+        if !removed.is_empty() {
+            const SHOWN: usize = 5;
+            let n = removed.len();
+            let s = if n == 1 { "" } else { "s" };
+            let mut names = removed[..n.min(SHOWN)].join(", ");
+            if n > SHOWN {
+                names.push_str(&format!(", +{} more", n - SHOWN));
             }
+            log.push(format!("{n} file{s} removed upstream, kept: {names}"));
         }
     }
     if dry {
@@ -609,6 +621,59 @@ mod tests {
             2
         );
         assert!(init_cmd(&env, &a(&[d, "--update", "--accept", "AGENTS.md"])).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Files the lock holds but the template dropped are one count line, not a
+    /// line each, so a dry run's real conflicts stay visible.
+    #[test]
+    fn update_dry_run_counts_removed_upstream_files_in_one_line() {
+        let root = scratch("removed-upstream");
+        run(&root, false, false).unwrap();
+        let p = lock_path(&root);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for n in ["old/a.md", "old/b.md", "old/c.md"] {
+            v["files"][n] = serde_json::json!({"md5": "x", "mode": 420});
+        }
+        std::fs::write(&p, v.to_string()).unwrap();
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        std::fs::write(root.join("AGENTS.md"), "mine\n").unwrap();
+        let (r, c) = run(&root, true, true).unwrap();
+        assert_eq!(c, 1, "{r}");
+        assert!(r.contains("conflict AGENTS.md"), "{r}");
+        assert!(
+            r.contains("3 files removed upstream, kept: old/a.md, old/b.md, old/c.md"),
+            "{r}"
+        );
+        assert!(!r.contains("removed upstream old/"), "{r}");
+        assert_eq!(r.matches("removed upstream").count(), 1, "{r}");
+        for n in ["old/a.md", "old/b.md", "old/c.md"] {
+            assert_eq!(r.matches(n).count(), 1, "{n} once: {r}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// More than five kept files: five names, then "+N more".
+    #[test]
+    fn update_removed_upstream_names_are_capped() {
+        let root = scratch("removed-upstream-cap");
+        run(&root, false, false).unwrap();
+        let p = lock_path(&root);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for i in 1..=7 {
+            v["files"][format!("old/f{i}.md")] = serde_json::json!({"md5": "x", "mode": 420});
+        }
+        std::fs::write(&p, v.to_string()).unwrap();
+        let (r, _) = run(&root, true, true).unwrap();
+        assert!(
+            r.contains(
+                "7 files removed upstream, kept: old/f1.md, old/f2.md, old/f3.md, old/f4.md, old/f5.md, +2 more"
+            ),
+            "{r}"
+        );
+        assert!(!r.contains("old/f6.md"), "{r}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
