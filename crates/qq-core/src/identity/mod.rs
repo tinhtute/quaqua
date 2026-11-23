@@ -50,10 +50,15 @@ impl PaneOps for CliHerdr {
     }
 }
 
+/// The JSON of a herdr reply; an ok reply with an empty body (herdr prints
+/// nothing for `pane report-metadata`) is `Null`, as in grid.
 fn reply_json(r: std::io::Result<Reply>) -> Result<Value, String> {
     let r = r.map_err(|e| e.to_string())?;
     if !r.ok {
         return Err(r.error_code().unwrap_or(r.body));
+    }
+    if r.body.trim().is_empty() {
+        return Ok(Value::Null);
     }
     serde_json::from_str(&r.body).map_err(|e| e.to_string())
 }
