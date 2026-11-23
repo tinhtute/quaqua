@@ -22,7 +22,7 @@ use crate::cli::{CliError, Env};
 use crate::config;
 use crate::driver::Registry as Drivers;
 use crate::herdr::HerdrClient;
-use crate::task::spawn::{spawn, Role, SpawnSpec};
+use crate::task::spawn::{spawn, spawn_rooted, Role, SpawnSpec};
 
 const NAME_MAX: usize = 20;
 const LEAD_NAME_MAX: usize = 32;
@@ -636,7 +636,7 @@ pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
         ],
     )?;
     let pane = place_pane(ctx, &pane, fresh)?;
-    spawn(
+    spawn_rooted(
         ctx.conn,
         ctx.herdr,
         ctx.drivers,
@@ -649,6 +649,7 @@ pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
             spawner_id: p.spawner_id,
         },
         ctx.now_ms,
+        &wt,
     )
     .map_err(|e| fail(e.to_string()))?;
     Ok(WorkerSpawned {

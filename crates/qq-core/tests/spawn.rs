@@ -1267,3 +1267,152 @@ fn a_same_workspace_move_names_no_workspace() {
         "{moves:?}"
     );
 }
+
+// ---- code lookup: a Peer on claude starts with the read-only MCP ------------------------
+
+impl Fx {
+    /// Commits a python file to the repo's main so worktrees and the repo have a language.
+    fn commit_py(&self) {
+        std::fs::write(self.repo.join("answers.py"), "def e2e_answer_symbol():\n    return 42\n").unwrap();
+        git(&self.repo, &["add", "."]);
+        git(&self.repo, &["commit", "-q", "-m", "py"]);
+    }
+
+    fn lookup_home(&self, name: &str) -> PathBuf {
+        self.ws.db_path().parent().unwrap().join("lookup").join(name)
+    }
+
+    fn lookup_events(&self, name: &str) -> Vec<String> {
+        // No skip ever journaled means no events table yet.
+        let Ok(mut st) = self.conn.prepare(
+            "SELECT payload_json FROM events WHERE workflow_id = ?1 AND kind = 'code_lookup_skipped' ORDER BY seq",
+        ) else {
+            return Vec::new();
+        };
+        st.query_map([format!("worker:{name}")], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+}
+
+/// The value after `flag` in a start argv.
+fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+fn mcp_project(mcp_json: &str) -> PathBuf {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(mcp_json).unwrap()).unwrap();
+    let a = v["mcpServers"]["code-lookup"]["args"].as_array().unwrap();
+    let i = a.iter().position(|x| x == "--project").unwrap();
+    PathBuf::from(a[i + 1].as_str().unwrap())
+}
+
+#[test]
+fn peer_spawn_lookup_args_use_worktree_root() {
+    let fx = Fx::new("lookup-wt");
+    fx.commit_py();
+    fx.spawn(&[], "truonglao-a", "truonglao").unwrap();
+    let args = fx.herdr.start_args("truonglao-a");
+    let mcp = arg_after(&args, "--mcp-config").expect("claude peer starts with --mcp-config");
+    assert_eq!(
+        std::fs::canonicalize(mcp).unwrap(),
+        std::fs::canonicalize(fx.lookup_home("truonglao-a").join("mcp.json")).unwrap()
+    );
+    assert_eq!(
+        std::fs::canonicalize(mcp_project(mcp)).unwrap(),
+        std::fs::canonicalize(fx.wt("truonglao-a")).unwrap(),
+        "rooted at the worktree, not the repo"
+    );
+    // The allow-list is the last flag and names every enabled tool.
+    let n = args.len();
+    assert_eq!(args[n - 2], "--allowedTools");
+    let allow: Vec<&str> = args[n - 1].split(',').collect();
+    assert_eq!(allow.len(), 8);
+    assert!(allow.iter().all(|t| t.starts_with("mcp__code-lookup__")));
+    assert!(allow.contains(&"mcp__code-lookup__find_symbol"));
+    assert!(allow.contains(&"mcp__code-lookup__initial_instructions"));
+    assert!(fx.lookup_events("truonglao-a").is_empty());
+}
+
+#[test]
+fn spawn_lookup_leaves_worktree_clean() {
+    let fx = Fx::new("lookup-clean");
+    fx.commit_py();
+    fx.spawn(&[], "truonglao-a", "truonglao").unwrap();
+    let wt = fx.wt("truonglao-a");
+    // Only the gate hook's own (excluded) files may show; no .serena, no lookup home.
+    let status = git(&wt, &["status", "--porcelain", "--ignored"]);
+    eprintln!("porcelain --ignored: {status:?}");
+    assert!(!status.contains("serena") && !status.contains("lookup") && !status.contains("mcp"), "{status}");
+    assert_eq!(git(&wt, &["status", "--porcelain"]), "", "worktree has untracked or changed files");
+    assert!(!wt.join(".serena").exists());
+    assert!(fx.lookup_home("truonglao-a").join("mcp.json").is_file());
+    assert!(!fx.lookup_home("truonglao-a").starts_with(&wt));
+}
+
+#[test]
+fn task_start_peer_lookup_uses_project_repo() {
+    let fx = Fx::new("lookup-repo");
+    fx.project("alpha");
+    fx.commit_py();
+    let id: i64 = fx.conn.query_row("SELECT id FROM project WHERE slug='alpha'", [], |r| r.get(0)).unwrap();
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    let mut spec = peer("truonglao-t", "truonglao", &pane);
+    spec.project_id = Some(id);
+    spawn(&fx.conn, &fx.herdr, &fx.drivers, &spec, 1_000).unwrap();
+    let args = fx.herdr.start_args("truonglao-t");
+    let mcp = arg_after(&args, "--mcp-config").expect("task.start peer gets the lookup");
+    assert_eq!(
+        std::fs::canonicalize(mcp_project(mcp)).unwrap(),
+        std::fs::canonicalize(&fx.repo).unwrap()
+    );
+}
+
+#[test]
+fn lead_spawn_has_no_lookup() {
+    let fx = Fx::new("lookup-lead");
+    fx.project("alpha");
+    fx.commit_py();
+    lead(&fx, &["alpha"]).unwrap();
+    let args = fx.herdr.start_args("alpha-lead");
+    assert!(!args.iter().any(|a| a == "--mcp-config" || a == "--allowedTools"), "{args:?}");
+    assert!(!fx.lookup_home("alpha-lead").exists());
+}
+
+#[test]
+fn lookup_skips_are_journaled_and_never_fail_the_spawn() {
+    // No supported language among tracked files.
+    let fx = Fx::new("lookup-skip");
+    fx.spawn(&[], "truonglao-a", "truonglao").unwrap();
+    assert!(arg_after(&fx.herdr.start_args("truonglao-a"), "--mcp-config").is_none());
+    let ev = fx.lookup_events("truonglao-a");
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].contains("no supported language"), "{ev:?}");
+
+    // A harness with no lookup wiring (pi).
+    fx.spawn(&[], "tieude-a", "tieude").unwrap();
+    assert!(arg_after(&fx.herdr.start_args("tieude-a"), "--mcp-config").is_none());
+    let ev = fx.lookup_events("tieude-a");
+    assert!(ev.len() == 1 && ev[0].contains("no lookup wiring"), "{ev:?}");
+
+    // No worktree and no project: nothing to root the lookup at.
+    let pane = fx.herdr.seed_pane("work", None, &[]);
+    spawn(&fx.conn, &fx.herdr, &fx.drivers, &peer("truonglao-n", "truonglao", &pane), 1_000).unwrap();
+    let ev = fx.lookup_events("truonglao-n");
+    assert!(ev.len() == 1 && ev[0].contains("no worktree and no project repo"), "{ev:?}");
+}
+
+#[test]
+fn lookup_failure_does_not_fail_spawn() {
+    let fx = Fx::new("lookup-fail");
+    fx.commit_py();
+    // The lookup parent is a file, so the home cannot be created.
+    let parent = fx.lookup_home("truonglao-a").parent().unwrap().to_path_buf();
+    std::fs::write(&parent, "in the way").unwrap();
+    fx.spawn(&[], "truonglao-a", "truonglao").expect("a lookup failure never fails the spawn");
+    assert_eq!(fx.agents("truonglao-a"), 1);
+    assert!(arg_after(&fx.herdr.start_args("truonglao-a"), "--mcp-config").is_none());
+    let ev = fx.lookup_events("truonglao-a");
+    assert!(ev.len() == 1 && ev[0].contains("lookup setup failed"), "{ev:?}");
+}

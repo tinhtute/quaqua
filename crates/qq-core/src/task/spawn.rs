@@ -7,6 +7,8 @@
 //! exists. The pane is an input; `task.start` fills a missing one from grid
 //! placement (`worker_flow::place_pane`) before it gets here.
 
+use std::path::Path;
+
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::{self, ConfigError};
@@ -191,6 +193,19 @@ pub fn spawn(
     spawn_with(conn, herdr, drivers, spec, now_ms, &Ready::DEFAULT)
 }
 
+/// [`spawn`] for a worker whose code lives in `code_root` (its worktree):
+/// the code-lookup MCP is rooted there instead of at the project repo.
+pub fn spawn_rooted(
+    conn: &Connection,
+    herdr: &dyn HerdrClient,
+    drivers: &Registry,
+    spec: &SpawnSpec,
+    now_ms: u64,
+    code_root: &Path,
+) -> Result<Spawned, SpawnError> {
+    spawn_inner(conn, herdr, drivers, spec, now_ms, &Ready::DEFAULT, Some(code_root))
+}
+
 pub fn spawn_with(
     conn: &Connection,
     herdr: &dyn HerdrClient,
@@ -198,6 +213,84 @@ pub fn spawn_with(
     spec: &SpawnSpec,
     now_ms: u64,
     ready: &Ready,
+) -> Result<Spawned, SpawnError> {
+    spawn_inner(conn, herdr, drivers, spec, now_ms, ready, None)
+}
+
+/// Journals why a worker started without the code-lookup MCP (stream
+/// `worker:<name>`, which `run show` reads), plus a stderr line. Best effort.
+fn lookup_skipped(conn: &Connection, name: &str, now_ms: u64, reason: &str) {
+    eprintln!("code-lookup skipped for {name}: {reason}");
+    let _ = conn.execute_batch(crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL);
+    let _ = conn.execute(
+        "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) \
+         SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, 'code_lookup_skipped', ?3 \
+         FROM events WHERE workflow_id = ?1",
+        params![
+            format!("worker:{name}"),
+            now_ms as i64,
+            serde_json::json!({ "worker": name, "reason": reason }).to_string()
+        ],
+    );
+}
+
+/// The launch args that start a Peer with the code-lookup MCP, or why not.
+/// Never fails the spawn: every miss is journaled via [`lookup_skipped`].
+fn lookup_launch_args(
+    conn: &Connection,
+    driver: &dyn crate::driver::HarnessDriver,
+    spec: &SpawnSpec,
+    now_ms: u64,
+    code_root: Option<&Path>,
+) -> Vec<String> {
+    if spec.role != Role::Peer {
+        return Vec::new();
+    }
+    let skip = |why: &str| {
+        lookup_skipped(conn, spec.name, now_ms, why);
+        Vec::new()
+    };
+    if driver.harness() != "claude" {
+        return skip(&format!("harness '{}' has no lookup wiring", driver.harness()));
+    }
+    let root = match code_root {
+        Some(r) => r.to_path_buf(),
+        None => {
+            let repo: Option<String> = spec.project_id.and_then(|id| {
+                conn.query_row("SELECT repo_path FROM project WHERE id = ?1", [id], |r| r.get(0))
+                    .optional()
+                    .ok()
+                    .flatten()
+            });
+            match repo {
+                Some(r) => r.into(),
+                None => return skip("no worktree and no project repo to root the lookup"),
+            }
+        }
+    };
+    let Some(db) = conn.path().filter(|p| !p.is_empty()).map(std::path::PathBuf::from) else {
+        return skip("no database path to place the lookup home beside");
+    };
+    let home = db
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("lookup")
+        .join(spec.name);
+    match crate::kb::prepare_code_lookup(&root, &home) {
+        Ok(Some(l)) => crate::driver::lookup_args(driver, &l),
+        Ok(None) => skip(&format!("no supported language among tracked files in {}", root.display())),
+        Err(e) => skip(&format!("lookup setup failed for {}: {e}", root.display())),
+    }
+}
+
+fn spawn_inner(
+    conn: &Connection,
+    herdr: &dyn HerdrClient,
+    drivers: &Registry,
+    spec: &SpawnSpec,
+    now_ms: u64,
+    ready: &Ready,
+    code_root: Option<&Path>,
 ) -> Result<Spawned, SpawnError> {
     let target = config::resolve_spawn(conn, spec.kind).map_err(SpawnError::Config)?;
     let driver = drivers
@@ -237,7 +330,8 @@ pub fn spawn_with(
             spec.pane, spec.name
         )));
     }
-    let args = driver.launch_args(&target.model, target.effort.as_deref());
+    let mut args = driver.launch_args(&target.model, target.effort.as_deref());
+    args.extend(lookup_launch_args(conn, &*driver, spec, now_ms, code_root));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let reply = herdr
         .agent_start(

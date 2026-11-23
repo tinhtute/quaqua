@@ -322,3 +322,37 @@ fn stop_survives_per_sequence_errors() {
     assert!(!stop(&f, &*pi, "w", 10).unwrap());
     assert_eq!(f.keys().len(), 4);
 }
+
+#[test]
+fn claude_lookup_args_mcp_config_and_allowlist_last() {
+    use qq_core::driver::lookup_args;
+    use qq_core::kb::LookupLaunch;
+    let l = LookupLaunch {
+        mcp_json: "/x/mcp.json".into(),
+        allow: vec!["mcp__code-lookup__find_symbol".into(), "mcp__code-lookup__initial_instructions".into()],
+    };
+    let reg = Registry::native();
+    let claude = reg.get("claude").unwrap();
+    let a = lookup_args(&*claude, &l);
+    assert_eq!(
+        a,
+        [
+            "--mcp-config",
+            "/x/mcp.json",
+            "--allowedTools",
+            "mcp__code-lookup__find_symbol,mcp__code-lookup__initial_instructions"
+        ]
+    );
+    // launch_args itself is untouched.
+    assert!(!claude.launch_args("opus-5.5", None).iter().any(|a| a == "--mcp-config"));
+}
+
+#[test]
+fn pi_and_generic_lookup_args_empty() {
+    use qq_core::driver::lookup_args;
+    use qq_core::kb::LookupLaunch;
+    let l = LookupLaunch { mcp_json: "/x/mcp.json".into(), allow: vec!["a".into()] };
+    let reg = Registry::from_config(&[harness("pi", Driver::Native), harness("kimi", Driver::Generic)]);
+    assert!(lookup_args(&*reg.get("pi").unwrap(), &l).is_empty());
+    assert!(lookup_args(&*reg.get("kimi").unwrap(), &l).is_empty());
+}
