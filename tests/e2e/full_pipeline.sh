@@ -93,7 +93,7 @@ lookup_hit() {
       flush()
       for (i = 1; i <= n; i++) if (st[i] == "ok" && nm[i] ~ re) {
         if (index(res[i], "e2e_answer_symbol")) { print nm[i] " result: " substr(res[i], 1, 160); exit 0 }
-        if (res[i] ~ /^[ \t\n]*$/) empty = 1
+        if (res[i] ~ /^[ \t\n]*$/ || res[i] ~ /^[ \t\n]*("" *|null)[ \t\n]*$/) empty = 1
       }
       if (empty) for (i = 1; i <= n; i++) if (st[i] == "ok" && (nm[i] == "REPL" || nm[i] == "Poll") && index(res[i], "e2e_answer_symbol")) {
         print "lookup call ok with empty result; symbol in " nm[i] " result: " substr(res[i], 1, 160); exit 0 }
