@@ -78,7 +78,9 @@ pub fn load(conn: &Connection, key: &str) -> rusqlite::Result<Option<Full>> {
     )? > 0;
     let events = match (&workflow, has_events) {
         (Some(w), true) => conn
-            .prepare("SELECT seq, ts_ms, kind, payload_json FROM events WHERE workflow_id = ?1 ORDER BY seq")?
+            .prepare("SELECT seq, ts_ms, kind, payload_json FROM events WHERE workflow_id = ?1 \
+             OR (?1 LIKE 'worker:%' AND workflow_id = 'lookup:' || substr(?1, 8)) \
+             ORDER BY ts_ms, workflow_id, seq")?
             .query_map([w], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?, r.get(3)?)))?
             .collect::<Result<_, _>>()?,
         _ => Vec::new(),

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use qq_core::kb::{
-    code_lookup_config, enabled_tools, excluded_tools, zbrain_check, zbrain_tools_for, Caller,
+    code_lookup_config, detect_languages, enabled_tools, excluded_tools, prepare_code_lookup,
+    zbrain_check, zbrain_tools_for, Caller,
     SERENA_EDIT_TOOLS, SERENA_MEMORY_TOOLS, ZBRAIN_READ_TOOLS, ZBRAIN_WRITE_TOOLS,
 };
 
@@ -89,7 +90,7 @@ fn serena_live_server_keeps_project_clean() {
     let root = scratch("live");
     let project = root.join("work");
     fs::create_dir_all(&project).unwrap();
-    fs::write(project.join("a.rs"), "fn main() {}\n").unwrap();
+    fs::write(project.join("answers.py"), "def e2e_answer_symbol():\n    return 42\n").unwrap();
     let git = |a: &[&str]| {
         assert!(Command::new("git").args(a).current_dir(&project).status().unwrap().success())
     };
@@ -97,7 +98,7 @@ fn serena_live_server_keeps_project_clean() {
     git(&["add", "-A"]);
     git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"]);
 
-    let cfg = code_lookup_config(&project, &root.join("home"), &["rust"]).unwrap();
+    let cfg = code_lookup_config(&project, &root.join("home"), &["python"]).unwrap();
     let s = &cfg.mcp["mcpServers"]["code-lookup"];
     let args: Vec<&str> = s["args"].as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
     let mut child = Command::new("uvx")
@@ -128,4 +129,78 @@ fn serena_live_server_keeps_project_clean() {
     }
     let porcelain = Command::new("git").args(["status", "--porcelain", "--ignored"]).current_dir(&project).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&porcelain.stdout), "");
+}
+
+fn git_repo(root: &std::path::Path, files: &[&str]) {
+    fs::create_dir_all(root).unwrap();
+    for f in files {
+        fs::write(root.join(f), "x\n").unwrap();
+    }
+    let git = |a: &[&str]| {
+        assert!(Command::new("git").args(a).current_dir(root).status().unwrap().success())
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"]);
+}
+
+#[test]
+fn detect_languages_python_rust_empty() {
+    let d = scratch("lang");
+    git_repo(&d.join("mix"), &["a.py", "b.py", "c.rs", "README.md", "d.go"]);
+    assert_eq!(detect_languages(&d.join("mix")), vec!["python", "go"]);
+    git_repo(&d.join("docs"), &["README.md"]);
+    assert!(detect_languages(&d.join("docs")).is_empty());
+    // Not a git repo: empty, not an error.
+    fs::create_dir_all(d.join("plain")).unwrap();
+    fs::write(d.join("plain/a.py"), "x").unwrap();
+    assert!(detect_languages(&d.join("plain")).is_empty());
+}
+
+#[test]
+fn code_lookup_pins_serena_rev() {
+    let d = scratch("pin");
+    let cfg = code_lookup_config(&d.join("p"), &d.join("h"), &["python"]).unwrap();
+    let args = cfg.mcp["mcpServers"]["code-lookup"]["args"].as_array().unwrap();
+    assert_eq!(
+        args[1].as_str().unwrap(),
+        "git+https://github.com/oraios/serena@7f7d6245bf96b60fdf4e752a779917372fd1ee6e"
+    );
+}
+
+#[test]
+fn prepare_code_lookup_allow_matches_enabled_tools() {
+    let d = scratch("prep");
+    let proj = d.join("proj");
+    git_repo(&proj, &["answers.py"]);
+    let home = d.join("home");
+    let l = prepare_code_lookup(&proj, &home).unwrap().expect("python repo has a lookup");
+    assert_eq!(l.mcp_json, home.join("mcp.json"));
+    let yml = fs::read_to_string(home.join("data/proj/project.yml")).unwrap();
+    let mut want: Vec<String> =
+        enabled_tools(&yml).into_iter().map(|t| format!("mcp__code-lookup__{t}")).collect();
+    let mut got = l.allow.clone();
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+    assert_eq!(got.len(), 8);
+    assert!(got.contains(&"mcp__code-lookup__initial_instructions".to_string()));
+    let mcp: serde_json::Value = serde_json::from_str(&fs::read_to_string(&l.mcp_json).unwrap()).unwrap();
+    assert!(mcp["mcpServers"]["code-lookup"]["args"].as_array().unwrap().iter().any(|a| a == proj.to_str().unwrap()));
+    // Idempotent.
+    assert!(prepare_code_lookup(&proj, &home).unwrap().is_some());
+}
+
+#[test]
+fn prepare_code_lookup_home_outside_root() {
+    let d = scratch("inside");
+    let proj = d.join("proj");
+    git_repo(&proj, &["a.py"]);
+    assert!(prepare_code_lookup(&proj, &proj.join(".lookup")).is_err());
+    assert!(!proj.join(".lookup").exists());
+    // No language: no files written at all.
+    let docs = d.join("docs");
+    git_repo(&docs, &["README.md"]);
+    assert!(prepare_code_lookup(&docs, &d.join("h2")).unwrap().is_none());
+    assert!(!d.join("h2").exists());
 }

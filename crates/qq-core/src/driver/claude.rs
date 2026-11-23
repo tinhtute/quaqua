@@ -1,6 +1,7 @@
 //! The claude driver: `--model claude-<model with dashes> --effort <effort>`.
 
 use super::{exclude_from_git, sh_quote, write_atomic, HarnessDriver, Hook};
+use crate::kb::LookupLaunch;
 use std::io;
 use std::path::Path;
 
@@ -27,6 +28,18 @@ fn model_id(model: &str) -> String {
     } else {
         format!("claude-{}", model.replace('.', "-"))
     }
+}
+
+/// Extra launch args that start claude with the code-lookup MCP: the config
+/// file and an explicit allow-list (without it a default-mode pane denies the
+/// MCP tools). One comma-joined value so the list cannot swallow a later arg.
+pub(super) fn lookup_args(l: &LookupLaunch) -> Vec<String> {
+    vec![
+        "--mcp-config".to_string(),
+        l.mcp_json.to_string_lossy().into_owned(),
+        "--allowedTools".to_string(),
+        l.allow.join(","),
+    ]
 }
 
 impl HarnessDriver for Claude {

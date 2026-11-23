@@ -145,7 +145,12 @@ pub const CODE_LOOKUP_TOOLS: [&str; 8] = [
     "initial_instructions",
 ];
 
-const SERENA_SOURCE: &str = "git+https://github.com/oraios/serena";
+/// Serena is pinned to one revision so a worker's lookup does not move with
+/// upstream (an unpinned start also costs ~5s warm instead of ~1s).
+const SERENA_SOURCE: &str = concat!(
+    "git+https://github.com/oraios/serena@",
+    "7f7d6245bf96b60fdf4e752a779917372fd1ee6e"
+);
 
 /// A generated code-lookup setup: the files written under `home` and the MCP
 /// server entry a worker's harness is given.
@@ -230,6 +235,64 @@ pub fn code_lookup_config(
         }
     });
     Ok(CodeLookup { home: home.to_path_buf(), serena_config, project_yml, mcp })
+}
+
+/// What a harness needs to start with the lookup server: the MCP config file
+/// and the explicit `mcp__code-lookup__<tool>` allow-list.
+#[derive(Clone, Debug)]
+pub struct LookupLaunch {
+    pub mcp_json: PathBuf,
+    pub allow: Vec<String>,
+}
+
+/// The (up to two) most common Serena languages among the files git tracks
+/// under `root`, most common first. Empty when git fails or nothing matches.
+pub fn detect_languages(root: &Path) -> Vec<&'static str> {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for f in String::from_utf8_lossy(&out.stdout).split('\0') {
+        let lang = match f.rsplit_once('.').map(|(_, e)| e) {
+            Some("py") => "python",
+            Some("rs") => "rust",
+            Some("ts" | "tsx" | "js" | "jsx") => "typescript",
+            Some("go") => "go",
+            _ => continue,
+        };
+        match counts.iter_mut().find(|(l, _)| *l == lang) {
+            Some(c) => c.1 += 1,
+            None => counts.push((lang, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    counts.into_iter().take(2).map(|(l, _)| l).collect()
+}
+
+/// Writes the lookup setup for `root` under `home` (outside `root`) plus
+/// `<home>/mcp.json`. `Ok(None)` when `root` has no supported language.
+/// Idempotent: a repeat rewrites the same files.
+pub fn prepare_code_lookup(root: &Path, home: &Path) -> io::Result<Option<LookupLaunch>> {
+    let languages = detect_languages(root);
+    if languages.is_empty() {
+        return Ok(None);
+    }
+    let cfg = code_lookup_config(root, home, &languages)?;
+    let mcp_json = home.join("mcp.json");
+    fs::write(&mcp_json, cfg.mcp.to_string())?;
+    let allow = enabled_tools(&fs::read_to_string(&cfg.project_yml)?)
+        .into_iter()
+        .map(|t| format!("mcp__code-lookup__{t}"))
+        .collect();
+    Ok(Some(LookupLaunch { mcp_json, allow }))
 }
 
 /// The tool names a generated project.yml disables (its `excluded_tools` list).

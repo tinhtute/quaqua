@@ -296,6 +296,27 @@ fn hook_settings_route_mcp_floor() {
     ));
 }
 
+/// The lookup MCP is read-only and allow-listed, so the gate never routes or
+/// asks for it: not in the installed matcher, and Allow from the gate itself
+/// (no rig: with one added, the other rig tests hung when run in parallel).
+#[test]
+fn code_lookup_tools_not_gated() {
+    let ws = TestWorkspace::new("hr-lookup");
+    let wt = ws.root().join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&wt).status().unwrap().success());
+    let (bin, log) = fake_bin(ws.root());
+    let h = Registry::native().get("claude").unwrap().install_hook(&wt, &bin).unwrap().unwrap();
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&h.path).unwrap()).unwrap();
+    for t in qq_core::kb::CODE_LOOKUP_TOOLS {
+        let name = format!("mcp__code-lookup__{t}");
+        let seen = argv_seen(&settings, &name, &bin, &log);
+        assert!(!seen.iter().any(|l| l.trim() == "gate"), "{name} must not reach the gate: {seen:?}");
+        // No approval-list hit, so the verdict needs no workspace or daemon.
+        assert_eq!(gate_evaluate(&mcp(&name).to_string()), GateVerdict::Allow, "{name}");
+    }
+}
+
 // ---- herdr-gate.sh fallback with the binary missing -----------------------
 
 fn fallback_exit(hook: &Value) -> i32 {

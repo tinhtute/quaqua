@@ -76,6 +76,16 @@ pub enum StartError {
     Transport(String),
 }
 
+/// Launch args that give a worker the read-only code-lookup MCP. Only the
+/// claude harness gets any (pi and generic: none yet). A free fn, not a trait
+/// method, so the `HarnessDriver` seam stays as it is.
+pub fn lookup_args(d: &dyn HarnessDriver, l: &crate::kb::LookupLaunch) -> Vec<String> {
+    match d.harness() {
+        "claude" => claude::lookup_args(l),
+        _ => Vec::new(),
+    }
+}
+
 /// Everything the engine asks of one harness. Implementations are small and
 /// stateless; behaviour that differs per harness lives only in them.
 pub trait HarnessDriver: Send + Sync {
