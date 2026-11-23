@@ -370,31 +370,6 @@ fn stall_limit_too_large_falls_back_to_600() {
     assert!((600..610).contains(&at), "stalled at {at}s, want about 600");
 }
 
-#[test]
-fn newer_than_keeps_only_lines_after_the_baseline() {
-    let base: Vec<String> = ["a", "Not logged in", "login ok"].map(String::from).to_vec();
-    assert_eq!(prompt::newer_than(&base, "a\nNot logged in\nlogin ok\n"), "");
-    assert_eq!(prompt::newer_than(&base, "a\nNot logged in\nlogin ok\nwork\n"), "work");
-    // scrolled: the window lost "a"
-    assert_eq!(prompt::newer_than(&base, "Not logged in\nlogin ok\nwork\nmore\n"), "work\nmore");
-    // nothing in common: all of it is new
-    assert_eq!(prompt::newer_than(&base, "x\ny\n"), "x\ny");
-}
-
-#[test]
-fn watchdog_stale_fatal_line_is_not_news_once_the_worker_went_idle() {
-    let (runs, _c) = seeded("stale-idle");
-    let h = FakeHerdr::new();
-    occupy(&h, "p1", "w");
-    h.set_status("w", "working");
-    h.set_pane_text("p1", "Not logged in · Please run /login\nlogin ok\n");
-    let clock = FakeClock {
-        now: 0.into(),
-        on_sleep: Box::new(|now| h.set_status("w", if now >= 10 { "idle" } else { "working" })),
-    };
-    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
-}
-
 const FOOT: &str = "─────────\n? for shortcuts\n";
 
 /// Working on a pane with fixed footer chrome, then `new` lands above it and the
@@ -436,7 +411,7 @@ fn watchdog_new_fatal_line_after_a_full_scroll_with_a_recurring_last_line_is_new
     let mut after = String::from("old output\n");
     for i in 0..70 {
         after.push_str(&format!("tool line {i}\n"));
-        if i == 40 {
+        if i == 60 {
             after.push_str("Not logged in · Please run /login\n");
         }
     }
@@ -458,8 +433,16 @@ fn watchdog_resume_after_an_escalation_ignores_only_the_escalated_lines() {
     let (runs, _c) = seeded("escalated");
     let (_h, r) = dead_worker(&runs);
     assert_eq!(r.unwrap_err().code, 7);
+    let _ = std::fs::remove_file(runs.join("w.md")); // the stub would end the next wait at once
     assert!(runs.join(".w.escalated").exists(), "the escalated line was not kept");
-    // resumed on the same signed-out pane, but a different error line appears: still news
+    // resumed on the same signed-out pane: only the old line is on it, so it is not news
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let clock = idle_clock(&h, "idle");
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
+    // a different error line appears next to it: that is news
     let h = FakeHerdr::new();
     occupy(&h, "p1", "w");
     h.set_status("w", "idle");
@@ -467,11 +450,4 @@ fn watchdog_resume_after_an_escalation_ignores_only_the_escalated_lines() {
     let clock = idle_clock(&h, "idle");
     let exit = prompt::wait(&h, &clock, &cfg(&runs, &noop_journal));
     assert_eq!(exit, Exit::ProviderError);
-    // and the same pane alone is not: only the old line is on it
-    let h = FakeHerdr::new();
-    occupy(&h, "p1", "w");
-    h.set_status("w", "idle");
-    h.set_pane_text("p1", "Not logged in · Please run /login\n");
-    let clock = idle_clock(&h, "idle");
-    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
 }

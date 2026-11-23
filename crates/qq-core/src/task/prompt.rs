@@ -869,28 +869,18 @@ pub fn after_nudge(pane: &str) -> &str {
     cut.map_or("", |i| &pane[i..])
 }
 
-/// The non-empty lines of `body` after the last place the end of `baseline`
-/// shows up in it: the pane text this wait has not seen yet. The longest
-/// matching run of baseline lines wins (the latest one on a tie); no match
-/// (the pane scrolled past the baseline) leaves the whole body.
-pub fn newer_than(baseline: &[String], body: &str) -> String {
-    let lines: Vec<&str> = body.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
-    let mut cut = (0, 0); // (matched baseline lines, body index after them)
-    for k in (1..=baseline.len()).rev() {
-        let want = &baseline[baseline.len() - k..];
-        if let Some(end) = (k..=lines.len()).rev().find(|&e| {
-            lines[e - k..e].iter().zip(want).all(|(a, b)| *a == b.as_str())
-        }) {
-            cut = (k, end);
-            break;
-        }
-    }
-    lines[cut.1..].join("\n")
+/// `body` minus the lines in `ignore` (exact, trailing space aside): what a
+/// resumed wait has not already escalated.
+pub fn without_lines(ignore: &[String], body: &str) -> String {
+    body.lines()
+        .filter(|l| !ignore.iter().any(|i| i == l.trim_end()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// The pane lines a wait compares against, see [`newer_than`].
-fn pane_lines(body: &str) -> Vec<String> {
-    body.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(String::from).collect()
+/// The pane lines an escalation leaves in `runs/.<name>.escalated`.
+fn escalated_lines(text: &str) -> String {
+    text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(|l| format!("{l}\n")).collect()
 }
 
 /// A stalled or blocked turn's verdict. The harness record wins; one older
@@ -898,8 +888,9 @@ fn pane_lines(body: &str) -> Vec<String> {
 /// acts on it (the caller does that), so a working agent leaves it for the
 /// idle poll. While the agent works only a named fatal ends the wait and only
 /// the record is trusted: pane text may be a tool's output or an old line. Else
-/// the pane tail is classified, minus `baseline` text once the agent has
-/// worked in this wait (a line from before it is not news) and before any nudge.
+/// the pane tail is classified, minus the `ignore` lines an earlier wait
+/// escalated (before any nudge; the nudge echo bounds the text after that).
+/// The text classified comes back with the verdict, for the escalation record.
 fn provider_verdict(
     herdr: &dyn HerdrClient,
     cfg: &WaitCfg,
@@ -907,8 +898,8 @@ fn provider_verdict(
     since: u64,
     nudged: bool,
     working: bool,
-    baseline: Option<&[String]>,
-) -> Option<Decision> {
+    ignore: &[String],
+) -> Option<(Decision, String)> {
     let named_fatal = |d: &Decision| matches!(d.error, ProviderError::Fatal(r) if r != "api-error");
     let path = error_path(cfg.runs_dir, cfg.name);
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -921,7 +912,7 @@ fn provider_verdict(
             let _ = std::fs::remove_file(&path);
         } else {
             match parse_error_record(&text) {
-                Some(d) if !working || named_fatal(&d) => return Some(d),
+                Some(d) if !working || named_fatal(&d) => return Some((d, String::new())),
                 Some(_) => {}
                 None => {
                     let _ = std::fs::remove_file(&path);
@@ -934,13 +925,13 @@ fn provider_verdict(
     }
     let r = herdr.pane_read(pane?, 60).ok().filter(|r| r.ok)?;
     // After our `continue` the echo marks what is new; a repeat of an old line
-    // must count then, so the baseline serves only before the first nudge.
-    let text = match (nudged, baseline) {
-        (true, _) => after_nudge(&r.body).to_string(),
-        (false, Some(b)) => newer_than(b, &r.body),
-        (false, None) => r.body.clone(),
+    // must count then, so the ignore list serves only before the first nudge.
+    let text = if nudged {
+        after_nudge(&r.body).to_string()
+    } else {
+        without_lines(ignore, &r.body)
     };
-    classify(cfg.harness, &text)
+    classify(cfg.harness, &text).map(|d| (d, text))
 }
 
 /// Whether the database holds an open agent record for `name`.
@@ -1003,14 +994,12 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
     // `--resume` continues the retry count of the wait it resumes.
     let mut attempt: u32 = read_u64(&retry_f).unwrap_or(0) as u32;
     let stall_sec = stall_limit(runs);
-    // The pane at wait start: text already on it is old once the agent works.
-    let baseline = agent_state(herdr, name)
-        .1
-        .and_then(|p| herdr.pane_read(&p, 60).ok())
-        .filter(|r| r.ok)
-        .map(|r| pane_lines(&r.body))
+    // The pane lines an earlier wait escalated on (a fresh brief clears them):
+    // a resume must not read them again as news.
+    let escalated_f = side(runs, name, "escalated");
+    let mut ignore: Vec<String> = std::fs::read_to_string(&escalated_f)
+        .map(|t| t.lines().map(String::from).collect())
         .unwrap_or_default();
-    let mut seen_working = false;
     loop {
         let now = clock.now_sec();
         let elapsed = now.saturating_sub(start);
@@ -1057,7 +1046,6 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
         // progress (the harness may be retrying on its own), so only a named
         // fatal in the harness record, which no retry clears, ends its wait.
         let working = status.as_deref() == Some("working");
-        seen_working |= working;
         let verdict = provider_verdict(
             herdr,
             cfg,
@@ -1065,7 +1053,7 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
             start,
             attempt > 0,
             working,
-            seen_working.then_some(baseline.as_slice()),
+            &ignore,
         );
         o.provider_error = verdict.is_some();
         if o.report.is_none() && !nudged_f.exists() && elapsed * 100 >= allowance * 80 {
@@ -1104,7 +1092,7 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                 write_atomic(&budget_f, &format!("{allowance}\n"));
             }
             Exit::ProviderError => {
-                let d = verdict.expect("decide sets ProviderError only with a verdict");
+                let (d, text) = verdict.expect("decide sets ProviderError only with a verdict");
                 let _ = std::fs::remove_file(error_path(runs, name));
                 let (reason, retryable) = match d.error {
                     ProviderError::Retryable(r) => (r, true),
@@ -1117,6 +1105,9 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                         json!({"reason": reason, "retryable": retryable, "retries": attempt - 1, "harness_exhausted": d.exhausted}),
                     );
                     let _ = std::fs::remove_file(&retry_f);
+                    if !text.is_empty() {
+                        write_atomic(&escalated_f, &escalated_lines(&text));
+                    }
                     return Exit::ProviderError;
                 }
                 let delay = cfg.retry_base_ms.saturating_mul(1 << (attempt - 1).min(20));
@@ -1125,6 +1116,9 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                     json!({"attempt": attempt, "reason": reason, "delay_ms": delay, "harness_exhausted": d.exhausted}),
                 );
                 write_atomic(&retry_f, &format!("{attempt}\n"));
+                // our nudge echo bounds the text from here on
+                let _ = std::fs::remove_file(&escalated_f);
+                ignore.clear();
                 clock.sleep_ms(delay);
                 let _ = herdr.agent_prompt(name, "continue", None);
                 last_change = clock.now_sec();
@@ -1339,6 +1333,7 @@ pub fn prompt_run(
             "elapsed",
             "provider_retry",
             "error",
+            "escalated",
             "playbook",
         ] {
             let _ = std::fs::remove_file(side(runs, name, ext));
