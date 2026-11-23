@@ -562,6 +562,109 @@ fn lead(
     Ok(())
 }
 
+/// The `worker.cleanup` verb. A worker with no project repo (an orphan: its
+/// worktree gone, its row never linked) has nothing to remove but its pane, so
+/// only that pane is released, found by herdr's exact-name `agent get` (never a
+/// listing): the same scope, shared-pane and still-present checks apply.
+fn worker_cleanup_verb(
+    conn: &Connection,
+    h: &dyn HerdrClient,
+    rd: &Path,
+    name: &str,
+    allow_dirty: bool,
+) -> Result<serde_json::Value, RpcError> {
+    let repo: Option<String> = conn
+        .query_row(
+            "SELECT p.repo_path FROM agent a JOIN project p ON p.id = a.project_id \
+             WHERE a.name = ?1 ORDER BY a.id DESC LIMIT 1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(rpc_err)?
+        .flatten();
+    let scope = Scope::from_runs_dir(rd);
+    let Some(repo) = repo.map(PathBuf::from) else {
+        cleanup_orphan_live(conn, &HerdrPanes(h), h, &scope, rd, name, now_ms()).map_err(|e| {
+            match e {
+                OpsError::NoAgent(_) => {
+                    RpcError::new("no_project", format!("'{name}' has no project repo"))
+                }
+                e => rpc_err(e),
+            }
+        })?;
+        return Ok(json!({
+            "cleaned": name,
+            "journal": null,
+            "raw": null,
+            "journal_skipped": "no project repo",
+        }));
+    };
+    let wt = repo.parent().unwrap_or(&repo).join(".wt").join(name);
+    let target = Target {
+        repo: &repo,
+        worktree: &wt,
+        runs_dir: rd,
+        name,
+        allow_dirty,
+    };
+    cleanup_worker_live(conn, &HerdrPanes(h), h, &scope, &target, now_ms()).map_err(rpc_err)?;
+    let sha = git(&repo, &["rev-parse", "--short", &format!("quaqua/{name}")])
+        .unwrap_or_else(|_| "-".into());
+    let today = crate::memory::journal::today();
+    let j = crate::memory::journal::cleanup(rd, &repo, name, &sha, &today);
+    Ok(json!({
+        "cleaned": name,
+        "journal": j.line,
+        "raw": j.raw,
+        "journal_skipped": j.skipped,
+    }))
+}
+
+/// Releases the pane of a worker that has no project (so no repo, worktree or
+/// branch to remove). Only `name`'s own pane is released (see
+/// [`release_pane`]); when neither herdr nor the row knows a pane it is
+/// `NoAgent`, and the row is ended only once the pane is gone. A name with no
+/// agent row at all is `NoAgent` too: nothing in the DB claims an untagged
+/// pane of that name, so none is touched. Like [`cleanup_worker_live`] it
+/// records a spawned peer's spend (no repo needed) and removes its sidecars.
+pub fn cleanup_orphan_live(
+    conn: &Connection,
+    panes: &dyn PaneOps,
+    live: &dyn HerdrClient,
+    scope: &Scope,
+    runs_dir: &Path,
+    name: &str,
+    now_ms: u64,
+) -> Result<(), OpsError> {
+    let has_row: bool = conn
+        .query_row(
+            "SELECT 1 FROM agent WHERE name = ?1 LIMIT 1",
+            [name],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(other)?
+        .is_some();
+    if !has_row {
+        return Err(OpsError::NoAgent(name.to_string()));
+    }
+    let spend = crate::run::capture::open_spawned(conn, live, name, now_ms).unwrap_or(None);
+    let rel = release_pane(conn, panes, Some(live), scope, name, false)?;
+    if rel.closed.is_none() && rel.unverified.is_none() {
+        return Err(OpsError::NoAgent(name.to_string()));
+    }
+    remove_sidecars(runs_dir, name);
+    let remains = pane_remains(panes, rel)?;
+    if !remains.is_empty() {
+        return Err(OpsError::Remains(remains));
+    }
+    if let Some(wf) = spend {
+        crate::run::close(conn, &wf, "cleaned_up", None, now_ms).map_err(other)?;
+    }
+    end_agent(conn, name, now_ms).map_err(other)
+}
+
 fn rpc_err(e: impl std::fmt::Display) -> RpcError {
     RpcError::new("failed", e.to_string())
 }
@@ -601,48 +704,8 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
         "worker.cleanup",
         Box::new(move |_, req| {
             let conn = o(&p)?;
-            let name = arg(req, "name")?;
-            let repo: Option<String> = conn
-                .query_row(
-                    "SELECT p.repo_path FROM agent a JOIN project p ON p.id = a.project_id \
-                     WHERE a.name = ?1 ORDER BY a.id DESC LIMIT 1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(rpc_err)?
-                .flatten();
-            let repo = std::path::PathBuf::from(repo.ok_or_else(|| {
-                RpcError::new("no_project", format!("'{name}' has no project repo"))
-            })?);
-            let wt = repo.parent().unwrap_or(&repo).join(".wt").join(name);
             let allow_dirty = req.args.get("allow_dirty").and_then(|v| v.as_bool()) == Some(true);
-            let target = Target {
-                repo: &repo,
-                worktree: &wt,
-                runs_dir: &rd,
-                name,
-                allow_dirty,
-            };
-            cleanup_worker_live(
-                &conn,
-                &HerdrPanes(h.as_ref()),
-                h.as_ref(),
-                &Scope::from_runs_dir(&rd),
-                &target,
-                now_ms(),
-            )
-            .map_err(rpc_err)?;
-            let sha = git(&repo, &["rev-parse", "--short", &format!("quaqua/{name}")])
-                .unwrap_or_else(|_| "-".into());
-            let today = crate::memory::journal::today();
-            let j = crate::memory::journal::cleanup(&rd, &repo, name, &sha, &today);
-            Ok(json!({
-                "cleaned": name,
-                "journal": j.line,
-                "raw": j.raw,
-                "journal_skipped": j.skipped,
-            }))
+            worker_cleanup_verb(&conn, h.as_ref(), &rd, arg(req, "name")?, allow_dirty)
         }),
     )?;
 
@@ -690,4 +753,81 @@ pub fn register(daemon: &mut Daemon) -> Result<(), String> {
             Ok(json!({ "pane": pane }))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::FakeHerdr;
+
+    fn conn(tag: &str) -> (PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!("qq-cleanup-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runs")).unwrap();
+        let mut c = crate::db::open(&dir.join("runs").join(crate::db::path::DB_FILE)).unwrap();
+        let team = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
+        )
+        .unwrap();
+        crate::config::seed(&mut c, &team).unwrap();
+        (dir, c)
+    }
+
+    fn row(c: &Connection, name: &str, pane: Option<&str>) {
+        c.execute(
+            "INSERT INTO agent (name, role, kind, project_id, pane_id, started_ms) \
+             VALUES (?1, 'peer', 'sude', NULL, ?2, 1)",
+            params![name, pane],
+        )
+        .unwrap();
+    }
+
+    fn ended(c: &Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT ended_ms IS NOT NULL FROM agent WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// sude-u5: live in herdr, its worktree gone, its agent row has no project.
+    #[test]
+    fn worker_cleanup_closes_an_orphan_pane_with_no_project_and_only_that_one() {
+        let (dir, c) = conn("orphan");
+        let h = FakeHerdr::new();
+        let mine = h.seed_pane("main", None, &[]);
+        let other = h.seed_pane("main", None, &[]);
+        let human = h.seed_pane("main", None, &[]);
+        h.agent_start("sude-u5", "pi", &mine, 1000, &[]).unwrap();
+        h.agent_start("sude-u6", "pi", &other, 1000, &[]).unwrap();
+        row(&c, "sude-u5", Some("p-stale"));
+        row(&c, "sude-u6", Some(&other));
+        let r = worker_cleanup_verb(&c, &h, &dir.join("runs"), "sude-u5", false);
+        assert!(r.is_ok(), "{r:?}");
+        assert!(!h.has_pane(&mine), "the orphan pane is closed");
+        assert!(ended(&c, "sude-u5"));
+        assert!(h.has_pane(&other) && h.has_pane(&human), "nothing widened");
+        assert!(!ended(&c, "sude-u6"));
+    }
+
+    /// No agent row: nothing claims an untagged herdr agent of that name.
+    #[test]
+    fn worker_cleanup_with_no_row_and_a_live_untagged_agent_touches_nothing() {
+        let (dir, c) = conn("norow");
+        let h = FakeHerdr::new();
+        let p = h.seed_pane("main", None, &[]);
+        h.agent_start("stranger", "pi", &p, 1000, &[]).unwrap();
+        let e = worker_cleanup_verb(&c, &h, &dir.join("runs"), "stranger", false).unwrap_err();
+        assert_eq!(e.code, "no_project");
+        assert!(h.has_pane(&p), "the foreign pane is left alone");
+    }
+
+    #[test]
+    fn worker_cleanup_with_no_project_and_no_live_pane_still_says_no_project() {
+        let (dir, c) = conn("nopane");
+        let h = FakeHerdr::new();
+        let e = worker_cleanup_verb(&c, &h, &dir.join("runs"), "ghost", false).unwrap_err();
+        assert_eq!(e.code, "no_project");
+    }
 }
