@@ -823,11 +823,10 @@ fn check_text(conn: &Connection, text: &str) -> Result<(), ConfigError> {
 /// What the import changes is computed from what it writes: the export before
 /// and after, inside the transaction. Without `yes` a changed or removed
 /// stored key rolls the transaction back and refuses, naming every key.
-fn import(
-    conn: &mut Connection,
-    text: &str,
-    yes: bool,
-) -> Result<(usize, Vec<(String, String, String)>), ConfigError> {
+/// Kinds named by an import, plus the keys it changed (key, before, after).
+type ImportOutcome = (usize, Vec<(String, String, String)>);
+
+fn import(conn: &mut Connection, text: &str, yes: bool) -> Result<ImportOutcome, ConfigError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = parse_checked(&tx, text)?;
     let before = super::export::export_table(&tx)?;

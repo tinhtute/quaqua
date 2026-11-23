@@ -1019,10 +1019,7 @@ fn config_import_refuses_to_reset_values_the_file_omits() {
     assert!(e.message.contains("kinds.ni.fallback"), "{}", e.message);
     assert!(e.message.contains("kinds.ni.on_cost_cap"), "{}", e.message);
     assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
-    assert_eq!(
-        config::config_cmd(&env, &strs(&["get", "kind.ni"])).unwrap().contains("kill"),
-        true
-    );
+    assert!(config::config_cmd(&env, &strs(&["get", "kind.ni"])).unwrap().contains("kill"));
 
     // --yes resets them to what the file implies and lists them.
     let out = config::config_cmd(&env, &strs(&["import", toml, "--yes"])).unwrap();
