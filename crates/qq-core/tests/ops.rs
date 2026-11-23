@@ -1429,7 +1429,7 @@ fn prompt_sends_the_brief_once_and_resume_sends_nothing() {
     // a brief that fails the check sends nothing
     let e =
         prompt::prompt_run(&h, &clock, &runs, &args(&["w", "no headers"]), &tuning).unwrap_err();
-    assert_eq!(e.code, 1);
+    assert_eq!(e.code, 64, "a rejected brief is a usage error");
     assert_eq!(h.prompts().len(), 1);
 }
 
@@ -1928,6 +1928,6 @@ fn pilot_budget_blocks_the_prompt_before_anything_is_sent() {
     let brief = BRIEF.replace("Playbook: feature", "Playbook: prototype");
     let args: Vec<String> = vec!["w".into(), brief];
     let e = prompt::prompt_run(&h, &clock, &runs, &args, &tuning).unwrap_err();
-    assert_eq!(e.code, 1);
+    assert_eq!(e.code, 64, "a pilot-budget refusal is a usage error");
     assert!(h.prompts().is_empty());
 }
