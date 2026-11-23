@@ -433,6 +433,7 @@ impl Daemon {
         ctx.rearm_watches().map_err(DaemonError::Store)?;
         watch::state_sweeper(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         schedule::spawn_runner(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
+        let service = service::spawn(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());
@@ -451,6 +452,9 @@ impl Daemon {
         let _ = std::fs::remove_file(&socket);
         ctx.stop_watchers.store(true, Ordering::SeqCst);
         ctx.supervisor.shutdown();
+        if let Some(s) = service {
+            let _ = s.join();
+        }
         // The loops are quiet: the next daemon may own the database now.
         drop(lock);
         let watchers: Vec<_> = ctx
