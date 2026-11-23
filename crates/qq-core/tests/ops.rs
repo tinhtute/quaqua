@@ -1160,7 +1160,7 @@ fn status_metrics_lists_only_recent_finished_runs() {
     let m = status::status_command(&env, &["--metrics".to_string()]).unwrap();
     assert!(m.contains("run - fresh verified"), "{m}");
     assert!(!m.contains("run - old verified"), "--metrics shows only the last 24 h: {m}");
-    let all = status::status_command(&env, &["--all".to_string()]).unwrap();
+    let all = status::status_command(&env, &["--all".to_string(), "--metrics".to_string()]).unwrap();
     assert!(all.contains("run - old verified"), "--all still lists every run: {all}");
 }
 

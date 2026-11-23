@@ -338,6 +338,12 @@ fn worker(
             return Err(OpsError::Dirty(dirty));
         }
     }
+    // A peer from `worker spawn` has no run row; record its spend while its
+    // pane still holds the session. Closed below once the cleanup is whole.
+    let spend = match live {
+        Some(h) => crate::run::capture::open_spawned(conn, h, t.name, now_ms).unwrap_or(None),
+        None => None,
+    };
     let rel = release_pane(conn, panes, live, scope, t.name, false)?;
     if t.worktree.is_dir() && repo_ok {
         if dirty.is_empty() {
@@ -359,6 +365,9 @@ fn worker(
     }
     if !remains.is_empty() {
         return Err(OpsError::Remains(remains));
+    }
+    if let Some(wf) = spend {
+        crate::run::close(conn, &wf, "cleaned_up", None, now_ms).map_err(other)?;
     }
     end_agent(conn, t.name, now_ms).map_err(other)
 }
