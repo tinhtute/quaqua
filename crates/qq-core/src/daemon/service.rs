@@ -15,12 +15,13 @@ fn quote(s: &str) -> String {
     format!("\"{body}\"")
 }
 
-/// Unit text for the daemon, run from `exe` against workspace `home`.
-pub fn render_unit(exe: &Path, home: &Path, _path: &str) -> String {
+/// Unit text for the daemon, run from `exe` against workspace `home`, with `PATH` as given.
+pub fn render_unit(exe: &Path, home: &Path, path: &str) -> String {
     let env = quote(&format!("QUAQUA_HOME={}", home.display()));
+    let path_env = quote(&format!("PATH={path}"));
     format!(
         "[Unit]\nDescription=quaqua farm daemon\n\n\
-         [Service]\nExecStart={} daemon\nEnvironment={env}\nRestart=on-failure\nRestartSec=5\n\n\
+         [Service]\nExecStart={} daemon\nEnvironment={env}\nEnvironment={path_env}\nRestart=on-failure\nRestartSec=5\n\n\
          [Install]\nWantedBy=default.target\n",
         quote(&exe.display().to_string())
     )
@@ -143,7 +144,15 @@ pub fn install(runs_dir: &Path, args: &[String]) -> Result<String, String> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
-    install_at(args, &exe, &workspace, &home, xdg.as_deref(), "")
+    // A systemd user unit gets a bare PATH, so the unit carries the installer's own.
+    let path = std::env::var("PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| {
+            let h = home.display();
+            format!("{h}/.local/bin:{h}/.cargo/bin:/usr/local/bin:/usr/bin:/bin")
+        });
+    install_at(args, &exe, &workspace, &home, xdg.as_deref(), &path)
 }
 
 // --- the daemon side: thin wrappers over the pure parts ---
@@ -343,7 +352,10 @@ mod tests {
             PATH,
         )
         .unwrap();
-        assert_eq!(out, render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH));
+        assert_eq!(
+            out,
+            render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH)
+        );
         assert!(!d.join(".config").exists());
     }
 
