@@ -95,15 +95,14 @@ impl WakeDetector {
 }
 
 /// Body of the mail to cos after a resume.
-pub fn wake_body(slept_ms: u64, agents: &[String]) -> String {
-    let secs = slept_ms / 1000;
-    if agents.is_empty() {
-        return format!("machine resumed from sleep after {secs}s; no open agents");
-    }
-    format!(
-        "machine resumed from sleep after {secs}s; agents that were open and may have been cut: {}",
+/// `None` when there is nothing to report: no open agents, or the store read failed.
+pub fn wake_body(slept_ms: u64, agents: Option<&[String]>) -> Option<String> {
+    let agents = agents.filter(|a| !a.is_empty())?;
+    Some(format!(
+        "machine resumed from sleep after {}s; agents that were open and may have been cut: {}",
+        slept_ms / 1000,
         agents.join(", ")
-    )
+    ))
 }
 
 /// `quaqua daemon install [--dry-run]`: writes the user unit and returns the text to print.
@@ -257,13 +256,9 @@ pub fn spawn(
                     Inhibit::Keep => {}
                 }
                 if let Some(slept) = wake.check(wall(), mono()) {
-                    let _ = crate::bus::daemon_mail(
-                        &ctx,
-                        "cos",
-                        "state",
-                        &wake_body(slept, agents.as_deref().unwrap_or_default()),
-                        None,
-                    );
+                    if let Some(body) = wake_body(slept, agents.as_deref()) {
+                        let _ = crate::bus::daemon_mail(&ctx, "cos", "state", &body, None);
+                    }
                 }
             } else {
                 return;
