@@ -238,7 +238,7 @@ fn daemon_rpc_roundtrip() {
     daemon.stop().expect("clean stop");
     assert!(!sock.exists(), "socket removed on stop");
     let gone = qq(&ws.runs_dir(), &["ping"]);
-    assert_eq!(gone.status.code(), Some(1));
+    assert_eq!(gone.status.code(), Some(69), "daemon unreachable has its own code");
     assert!(String::from_utf8_lossy(&gone.stderr).contains("daemon not running"));
 }
 

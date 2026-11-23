@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn over_budget_swaps_index_for_pointer() {
-        let big = "x".repeat(BUDGET - 400); // the Now section takes its share
+        let big = "x".repeat(BUDGET - 600); // the Now section (NOW_CAP) takes its share
         let d = ws(
             "t6",
             &[

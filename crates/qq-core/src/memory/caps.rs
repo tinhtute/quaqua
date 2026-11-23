@@ -56,7 +56,12 @@ pub const TARGETS: &[Target] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
     /// Over the cap: `chars` Unicode chars against `cap`.
-    OverCap { chars: usize, cap: usize },
+    OverCap {
+        chars: usize,
+        cap: usize,
+        /// The first rule bullets of the file, oldest first.
+        oldest: Vec<String>,
+    },
     /// A secret pattern matched, named for the message.
     Secret(&'static str),
     /// A threat pattern (or invisible codepoint) matched, by id.
@@ -75,8 +80,13 @@ impl Problem {
     /// `scan` refusal, so the wording has one home.
     fn text(&self) -> String {
         match self {
-            Problem::OverCap { chars, cap } => {
-                format!("{chars} chars > {cap} cap — merge or drop entries")
+            Problem::OverCap { chars, cap, oldest } => {
+                let mut msg = format!("{chars} chars > {cap} cap — merge or drop entries");
+                if !oldest.is_empty() {
+                    let list: Vec<String> = oldest.iter().map(|l| format!("\"{l}\"")).collect();
+                    msg.push_str(&format!("; oldest lines: {}", list.join(" | ")));
+                }
+                msg
             }
             Problem::Secret(name) => format!("contains a {name}"),
             Problem::Threat(id) => format!("matches threat pattern {id}"),
@@ -100,7 +110,11 @@ pub fn check_text(rel: &str, text: &str) -> Vec<Violation> {
         if chars > t.cap {
             out.push(Violation {
                 file: rel.to_string(),
-                problem: Problem::OverCap { chars, cap: t.cap },
+                problem: Problem::OverCap {
+                    chars,
+                    cap: t.cap,
+                    oldest: oldest_lines(text),
+                },
             });
         }
     }
@@ -109,6 +123,36 @@ pub fn check_text(rel: &str, text: &str) -> Vec<Violation> {
             file: rel.to_string(),
             problem: Problem::Secret(name),
         });
+    }
+    out
+}
+
+/// How many of the oldest lines an over-cap refusal names.
+const OLDEST_N: usize = 3;
+/// Chars kept of each named line.
+const OLDEST_LEN: usize = 80;
+
+/// The first OLDEST_N rule bullets ("- " lines; preamble prose, headings and
+/// `<!-- -->` blocks skipped), each cut to OLDEST_LEN chars: the entries to
+/// merge or drop first.
+fn oldest_lines(text: &str) -> Vec<String> {
+    let mut in_comment = false;
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if in_comment {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if line.starts_with("<!--") {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if line.starts_with("- ") {
+            out.push(line.chars().take(OLDEST_LEN).collect());
+            if out.len() == OLDEST_N {
+                break;
+            }
+        }
     }
     out
 }
@@ -458,4 +502,44 @@ fn is_token_char(c: char) -> bool {
 
 fn token_run(s: &str) -> usize {
     s.chars().take_while(|c| is_token_char(*c)).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rules.md seed text, read from init/seeds.rs (not edited there).
+    fn seed_rules() -> String {
+        let src = include_str!("../init/seeds.rs");
+        let from = src.find("\"memory/rules.md\"").expect("rules seed");
+        let start = from + src[from..].find("r#\"").expect("raw start") + 3;
+        let end = start + src[start..].find("\"#").expect("raw end");
+        src[start..end].to_string()
+    }
+
+    #[test]
+    fn over_cap_refusal_names_the_oldest_rule_bullets_of_the_seed() {
+        let mut text = seed_rules();
+        text.push_str(&format!("- {}\n", "x".repeat(RULES_CAP)));
+        let v = check_text("memory/rules.md", &text);
+        let line = v[0].line();
+        assert!(line.contains("oldest lines"), "{line}");
+        for kept in ["Advisor workers", "Clean up each worker", "Ownership"] {
+            assert!(line.contains(kept), "{line}");
+        }
+        for skipped in [
+            "Durable lessons",
+            "Pane layout",
+            "Add rules here",
+            "Gardener",
+        ] {
+            assert!(!line.contains(skipped), "{line}");
+        }
+    }
+
+    #[test]
+    fn oldest_lines_skips_comment_block_and_prose() {
+        let t = "# H\nprose\n<!-- a\n- not a rule\n-->\n<!-- one -->\n- r1\n- r2\n";
+        assert_eq!(oldest_lines(t), vec!["- r1", "- r2"]);
+    }
 }

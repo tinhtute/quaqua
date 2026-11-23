@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::herdr::HerdrClient;
 
 use super::cleanup;
-use crate::cli::{CliError, Command, Env, Install, Registry as CliRegistry};
+use crate::cli::{CliError, Command, Env, Install, Registry as CliRegistry, EXIT_USAGE};
 use crate::daemon::Daemon;
 
 pub const DEFAULT_BUDGET_SEC: u64 = 2700;
@@ -402,7 +402,7 @@ impl Allowance {
     }
 }
 
-/// `--extend` must be a positive integer (exit 1 otherwise).
+/// `--extend` must be a positive integer (a usage error, exit 64, otherwise).
 pub fn parse_extend(v: &str) -> Result<u64, String> {
     v.parse::<u64>()
         .ok()
@@ -1036,8 +1036,7 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                     ProviderError::Fatal(r) => (r, false),
                 };
                 attempt += 1;
-                let cap = if d.exhausted { 1 } else { cfg.retry_max };
-                if !retryable || attempt > cap {
+                if attempt > super::watchdog::resume_cap(d.error, d.exhausted, cfg.retry_max) {
                     (cfg.journal)(
                         "provider_escalate",
                         json!({"reason": reason, "retryable": retryable, "retries": attempt - 1, "harness_exhausted": d.exhausted}),
@@ -1190,8 +1189,18 @@ fn lookup(runs: &Path, name: &str) -> (Option<PathBuf>, Option<Shape>) {
     (wt, shape)
 }
 
+/// Whether `name` is a worker this workspace knows: an open agent record,
+/// a live herdr agent (or herdr unreadable), or a report it left behind.
+fn known_worker(herdr: &dyn HerdrClient, runs: &Path, name: &str) -> bool {
+    agent_open(runs, name)
+        || runs.join(format!("{name}.md")).exists()
+        || agent_state(herdr, name).0.as_deref() != Some("gone")
+}
+
 /// `worker prompt <name> "<brief>" [--budget SEC]` sends the brief, then
 /// waits; `worker prompt <name> --resume [--extend SEC]` only waits again.
+/// Flags may stand before or after the name. Exit 64 is a usage error, exit 1
+/// is a brief that did not land.
 pub fn prompt_run(
     herdr: &dyn HerdrClient,
     clock: &dyn Clock,
@@ -1200,29 +1209,38 @@ pub fn prompt_run(
     tuning: &Tuning,
 ) -> Result<String, CliError> {
     let usage = || {
-        CliError::new(1, "usage: worker prompt <name> \"<brief>\" [--budget SEC] | <name> --resume [--extend SEC] | --check-brief <brief>")
+        CliError::new(EXIT_USAGE, "usage: worker prompt <name> \"<brief>\" [--budget SEC] | <name> --resume [--extend SEC] | --check-brief <brief> (flags may come before or after <name>)")
     };
-    let name = args
-        .first()
-        .filter(|n| !n.starts_with("--"))
-        .ok_or_else(usage)?;
-    let (mut brief, mut budget, mut extend, mut resume) = (None, None, None, false);
-    let mut it = args[1..].iter();
-    let num =
-        |v: Option<&String>| parse_extend(v.ok_or_else(usage)?).map_err(|e| CliError::new(1, e));
+    let (mut positional, mut budget, mut extend, mut resume) = (Vec::new(), None, None, false);
+    let mut it = args.iter();
+    let num = |v: Option<&String>| {
+        parse_extend(v.ok_or_else(usage)?).map_err(|e| CliError::new(EXIT_USAGE, e))
+    };
     while let Some(a) = it.next() {
         match a.as_str() {
             "--resume" => resume = true,
             "--budget" => budget = Some(num(it.next())?),
             "--extend" => extend = Some(num(it.next())?),
-            t if !t.starts_with("--") && brief.is_none() => brief = Some(t),
+            t if !t.starts_with("--") && positional.len() < 2 => positional.push(t),
             _ => return Err(usage()),
         }
     }
+    let (name, brief) = match positional[..] {
+        [name] => (name, None),
+        [name, brief] => (name, Some(brief)),
+        _ => return Err(usage()),
+    };
     if brief.is_some() == resume {
         return Err(usage()); // a fresh prompt needs a brief; a resume must not carry one
     }
+    if resume && !known_worker(herdr, runs, name) {
+        return Err(CliError::new(
+            EXIT_USAGE,
+            format!("no worker named '{name}': nothing to resume"),
+        ));
+    }
     let _ = std::fs::create_dir_all(runs);
+    super::watchdog::clear_stub(runs, name);
     let budget_f = side(runs, name, "budget");
     let mut brief_budget = None;
     if let Some(text) = brief {
@@ -1230,9 +1248,9 @@ pub fn prompt_run(
             .ok()
             .and_then(|v| v.parse().ok());
         let ok = check_brief(text, env_budget, playbooks_dir(runs).as_deref())
-            .map_err(|e| CliError::new(1, e))?;
+            .map_err(|e| CliError::new(EXIT_USAGE, e))?;
         check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(runs))
-            .map_err(|e| CliError::new(1, e))?;
+            .map_err(|e| CliError::new(EXIT_USAGE, e))?;
         for w in &ok.warnings {
             eprintln!("{w}");
         }
@@ -1264,7 +1282,7 @@ pub fn prompt_run(
     }
     if let Some(sec) = extend {
         let cur = read_u64(&budget_f)
-            .ok_or_else(|| CliError::new(1, format!("no persisted budget for '{name}'")))?;
+            .ok_or_else(|| CliError::new(EXIT_USAGE, format!("no persisted budget for '{name}'")))?;
         write_atomic(&budget_f, &format!("{}\n", Allowance(cur).extend(sec).0));
         eprintln!("WATCHDOG extend +{sec}s");
     }
@@ -1294,7 +1312,9 @@ pub fn prompt_run(
                     | Exit::ProviderError
                     | Exit::CoreDied
             ) {
-                eprintln!("{}", pane_tail_block(herdr, runs, name));
+                let tail = pane_tail_block(herdr, runs, name);
+                eprintln!("{tail}");
+                super::watchdog::write_death_stub(runs, name, e, &tail);
             }
             let _ = crate::memory::journal::watchdog_case(runs, name, e.code());
             Err(CliError::new(
@@ -1307,7 +1327,7 @@ pub fn prompt_run(
 
 fn worker_command(env: &Env, args: &[String]) -> Result<String, CliError> {
     let usage = || {
-        CliError::new(1, "usage: worker prompt <name> \"<brief>\" | prompt <name> --resume | prompt --check-brief <brief> | worker cleanup <name> [--allow-dirty] | worker stop <name>")
+        CliError::new(EXIT_USAGE, "usage: worker prompt <name> \"<brief>\" | prompt <name> --resume (or --resume <name>) | prompt --check-brief <brief> | worker cleanup <name> [--allow-dirty] | worker stop <name>")
     };
     match args.first().map(String::as_str) {
         Some("prompt") => match args.get(1).map(String::as_str) {

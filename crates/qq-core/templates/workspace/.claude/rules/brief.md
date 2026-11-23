@@ -20,4 +20,5 @@ Cost budget: $<x>
 - "Parity" or "like X" scopes every command of X unless the Principal excludes some.
 - Worktree-relative paths only. No mention of AI.
 - Acceptance conditions go in the review or fix brief, never into a plan file after plan-ready.
+- Literal text containing `${` (e.g. `${QQ`): search with fixed-string and single quotes, `grep -nF '${QQ' f` or `rg -nF '${QQ' f`. Double quotes raise a harness permission prompt; the single-quoted regex form finds nothing (`${` is a quantifier; `rg` errors).
 - UI work: the worker never drives the real display (GUI apps, synthetic input, screenshots, `osascript`, `open`, `screencapture`); it verifies by build, tests and lint unless the brief authorises a headless display.

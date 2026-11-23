@@ -87,6 +87,7 @@ pub enum Verb {
 
 use std::io;
 use std::process::Command;
+use std::time::Duration;
 
 /// One herdr reply: exit success plus stdout (stderr when stdout is empty).
 /// Server errors are JSON `{"error":{"code":..}}` on stderr with status 1.
@@ -253,6 +254,11 @@ fn unsupported(what: &str) -> io::Error {
     )
 }
 
+/// How long a verb with no wait of its own may take before herdr counts as hung.
+const QUICK_LIMIT: Duration = Duration::from_secs(30);
+/// Added to a verb's own `--timeout` to cover herdr's start-up and reply.
+const WAIT_SLACK: Duration = Duration::from_secs(15);
+
 /// The real binary: `HERDR_BIN_PATH` when set and non-empty, else `herdr`.
 #[derive(Debug, Clone)]
 pub struct CliHerdr {
@@ -268,8 +274,19 @@ impl CliHerdr {
         CliHerdr { bin }
     }
 
+    /// An ordinary verb: herdr answers at once, so a quiet one is hung.
     fn run(&self, args: &[String]) -> io::Result<Reply> {
-        let out = Command::new(&self.bin).args(args).output()?;
+        self.run_for(args, QUICK_LIMIT)
+    }
+
+    /// A verb that blocks on purpose for `wait_ms` (`--timeout`): the limit is
+    /// that wait plus [`WAIT_SLACK`], so a legit long `agent wait` is never cut.
+    fn run_waiting(&self, args: &[String], wait_ms: u64) -> io::Result<Reply> {
+        self.run_for(args, Duration::from_millis(wait_ms) + WAIT_SLACK)
+    }
+
+    fn run_for(&self, args: &[String], limit: Duration) -> io::Result<Reply> {
+        let out = crate::proc::output_within(Command::new(&self.bin).args(args), limit)?;
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let body = if stdout.trim().is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -331,7 +348,7 @@ impl HerdrClient for CliHerdr {
             args.push("--".into());
             args.extend(agent_args.iter().map(|a| a.to_string()));
         }
-        self.run(&args)
+        self.run_waiting(&args, u64::from(timeout_ms))
     }
 
     fn agent_get(&self, name: &str) -> io::Result<Reply> {
@@ -345,7 +362,7 @@ impl HerdrClient for CliHerdr {
     fn agent_wait(&self, name: &str, until: &[&str], timeout_ms: u64) -> io::Result<Reply> {
         let mut args = argv(&["agent", "wait", name]);
         wait_args(&mut args, until, timeout_ms);
-        self.run(&args)
+        self.run_waiting(&args, timeout_ms)
     }
 
     fn agent_prompt(
@@ -358,6 +375,7 @@ impl HerdrClient for CliHerdr {
         if let Some((until, timeout_ms)) = wait {
             args.push("--wait".into());
             wait_args(&mut args, until, timeout_ms);
+            return self.run_waiting(&args, timeout_ms);
         }
         self.run(&args)
     }
@@ -489,5 +507,56 @@ impl HerdrClient for CliHerdr {
             args.push(d.into());
         }
         self.run(&args)
+    }
+}
+
+#[cfg(test)]
+mod hang_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn hung_bin(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("qq-herdr-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr-hung.sh");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    /// A herdr that never answers must not block the caller for good.
+    #[test]
+    fn hung_herdr_returns_within_the_limit() {
+        let cli = CliHerdr {
+            bin: hung_bin("hang"),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(cli.run_for(&argv(&["agent", "list"]), Duration::from_millis(500)));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("a call blocked on a hung herdr");
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// `agent wait` is a legit long call: its limit follows its own `--timeout`.
+    #[test]
+    fn wait_limit_follows_its_own_timeout() {
+        let dir = std::env::temp_dir().join(format!("qq-herdr-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr-slow.sh");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 1\necho '{}'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = CliHerdr {
+            bin: bin.to_string_lossy().into_owned(),
+        };
+        // A plain call's short limit cuts it; a wait's own timeout lets it finish.
+        let args = argv(&["agent", "wait", "w"]);
+        let e = cli.run_for(&args, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        let r = cli.agent_wait("w", &["idle"], 5_000).unwrap();
+        assert!(r.ok);
     }
 }
