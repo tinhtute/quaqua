@@ -33,7 +33,7 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
 env: QQ (binary, default target/debug/quaqua)  E2E_SCORER (part c: the scorer program `quaqua supervisor score
      --scorer` runs, prompt on stdin, JSON {"score":0|1|2,"quote":".."} on stdout; required when part c runs for real,
      not for --check or --dry-run)  E2E_PI_MODEL (model of the pi kind added with `config set`,
-     required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900)
+     required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900; 120 under E2E_STUB=1)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
      E2E_LOOKUP_TOOL_RE (clause b: extended regex a code-lookup tool name must match in `run show`, default
                      'symbol', which matches find_symbol / find_referencing_symbols of the language-server MCP)
@@ -80,7 +80,7 @@ esac
 PI_MODEL=${E2E_PI_MODEL:-}
 [ "$STUB" = 1 ] && [ -z "$PI_MODEL" ] && PI_MODEL=stub
 PI_EFFORT=${E2E_PI_EFFORT:-medium}
-TIMEOUT=${E2E_TIMEOUT:-900}
+if [ "$STUB" = 1 ]; then TIMEOUT=${E2E_TIMEOUT:-120}; else TIMEOUT=${E2E_TIMEOUT:-900}; fi   # the stub flow takes about a minute: a stuck wait is not worth 900 s
 BUILDER=${E2E_BUILDER_KIND:-sude}
 REVIEWER=${E2E_REVIEWER_KIND:-pie}
 PROJECT=e2e
@@ -88,6 +88,8 @@ TASK=${E2E_TASK:-$BUILDER-e2e1}   # `worker spawn` names are <kind>-<task>, and 
 N=0
 
 # ---- assertion helpers: one assertion per step, evidence on every pass, first failure exits --------
+# a pipeline pause that says the prompt did not land is a failure, not an approval to resume: resuming only waits again
+fail_if_not_landed() { case "$2" in *"did not land"*) fail "$1" "prompt did not land: $2" ;; esac; }
 pass() { N=$((N + 1)); printf 'PASS %02d %s | %s\n' "$N" "$1" "$2"; }
 fail() { N=$((N + 1)); printf 'FAIL %02d %s | %s\n' "$N" "$1" "$2" >&2; exit 1; }
 # expect STEP WANT GOT: equality assertion; evidence is the observed value.
@@ -492,6 +494,7 @@ if want switch; then
   PAUSES=0
   as_cos "$QQ" pipeline "$PJSON" --rounds 2 --wait
   while [ "$AP_RC" = 5 ]; do
+    fail_if_not_landed S5 "$AP_OUT"
     PAUSES=$((PAUSES + 1)); [ "$PAUSES" -le 3 ] || fail S5 "flow paused $PAUSES times: $AP_OUT"
     printf 'NOTE S5 pause %s: %s\n' "$PAUSES" "$(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160)"
     as_cos "$QQ" pipeline --resume "$TASK" --wait
@@ -675,6 +678,7 @@ if want e; then
   EP=0
   as_cos "$QQ" pipeline "$EJSON" --rounds 2 --wait
   while [ "$AP_RC" = 5 ] && ! printf '%s' "$(q "$EPAUSE")" | grep -q '^blocked 4: base_broken'; do
+    fail_if_not_landed E1 "$AP_OUT"
     EP=$((EP + 1)); [ "$EP" -le 3 ] || fail E1 "flow paused $EP times without reaching the failing check: $AP_OUT"
     as_cos "$QQ" pipeline --resume "$ET" --wait
   done
