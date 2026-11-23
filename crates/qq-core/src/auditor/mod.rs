@@ -333,10 +333,9 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     let ack_path = ack::store_path(&root);
     let store = std::fs::read_to_string(&ack_path).unwrap_or_default();
     let (flags, store) = ack::apply(flags, &store, clock::now_sec());
-    if !opts.dry_run {
-        // Best effort: a failed write only means the finding prints again.
-        let _ = write_atomic(&ack_path, store.as_bytes());
-    }
+    // Best effort: a failed write only means the finding prints again. Dry-run
+    // records too (it only touches reports/), so the printed ack id is ackable.
+    let _ = write_atomic(&ack_path, store.as_bytes());
 
     if opts.dry_run {
         let tagged: Vec<String> = flags.iter().map(|f| tagged(f)).collect();
