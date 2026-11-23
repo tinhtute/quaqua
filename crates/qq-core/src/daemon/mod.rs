@@ -12,6 +12,7 @@ pub mod memory_write;
 pub mod pr_merge;
 pub mod push_door;
 pub mod schedule;
+pub mod service;
 pub mod store;
 pub mod supervisor;
 pub mod watch;
@@ -206,6 +207,8 @@ pub struct Daemon {
     peers: Option<Arc<dyn PeerResolver>>,
     /// Filled by `run` once the `Ctx` exists; see [`Daemon::report_watcher`].
     link: Arc<OnceLock<Weak<Ctx>>>,
+    /// Set only by the CLI daemon command: test daemons stay inert.
+    service: bool,
 }
 
 /// Registers a report watcher in the daemon's own process: `(workflow, path)`.
@@ -228,6 +231,16 @@ fn now_ms() -> u64 {
 }
 
 impl Daemon {
+    /// Turns on the service thread (sleep inhibitor, wake mail). Off by default.
+    pub fn enable_service(&mut self) {
+        self.service = true;
+    }
+
+    /// Whether `run` will start the service thread.
+    pub fn service_enabled(&self) -> bool {
+        self.service
+    }
+
     pub fn new(cfg: Config) -> Self {
         let mut d = Daemon {
             cfg,
@@ -236,6 +249,7 @@ impl Daemon {
             live_hooks: Vec::new(),
             peers: None,
             link: Arc::new(OnceLock::new()),
+            service: false,
         };
         d.register_builtin();
         d
@@ -405,6 +419,7 @@ impl Daemon {
             live_hooks,
             peers,
             link,
+            service: service_on,
         } = self;
         let socket = rpc::socket_path(&cfg.runs_dir);
         std::fs::create_dir_all(&cfg.runs_dir)?;
@@ -432,6 +447,11 @@ impl Daemon {
         ctx.rearm_watches().map_err(DaemonError::Store)?;
         watch::state_sweeper(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         schedule::spawn_runner(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
+        let service = service::spawn(
+            service_on,
+            Arc::downgrade(&ctx),
+            Arc::clone(&ctx.stop_watchers),
+        );
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());
@@ -450,6 +470,9 @@ impl Daemon {
         let _ = std::fs::remove_file(&socket);
         ctx.stop_watchers.store(true, Ordering::SeqCst);
         ctx.supervisor.shutdown();
+        if let Some(s) = service {
+            let _ = s.join();
+        }
         // The loops are quiet: the next daemon may own the database now.
         drop(lock);
         let watchers: Vec<_> = ctx
@@ -688,6 +711,19 @@ fn identify(
 #[cfg(test)]
 mod peer_tests {
     use super::*;
+
+    #[test]
+    fn default_daemon_spawns_no_service() {
+        let cfg = Config {
+            runs_dir: std::env::temp_dir().join("qq-svc-flag"),
+            herdr: Arc::new(crate::herdr::CliHerdr::new()),
+        };
+        let mut d = Daemon::new(cfg);
+        assert!(!d.service_enabled());
+        d.enable_service();
+        assert!(d.service_enabled());
+    }
+
     use crate::identity::peer::{CallerId, PeerCred};
 
     #[test]
