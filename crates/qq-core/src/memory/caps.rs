@@ -56,7 +56,12 @@ pub const TARGETS: &[Target] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
     /// Over the cap: `chars` Unicode chars against `cap`.
-    OverCap { chars: usize, cap: usize },
+    OverCap {
+        chars: usize,
+        cap: usize,
+        /// The first non-heading lines of the file, oldest first.
+        oldest: Vec<String>,
+    },
     /// A secret pattern matched, named for the message.
     Secret(&'static str),
     /// A threat pattern (or invisible codepoint) matched, by id.
@@ -75,8 +80,13 @@ impl Problem {
     /// `scan` refusal, so the wording has one home.
     fn text(&self) -> String {
         match self {
-            Problem::OverCap { chars, cap } => {
-                format!("{chars} chars > {cap} cap — merge or drop entries")
+            Problem::OverCap { chars, cap, oldest } => {
+                let mut msg = format!("{chars} chars > {cap} cap — merge or drop entries");
+                if !oldest.is_empty() {
+                    let list: Vec<String> = oldest.iter().map(|l| format!("\"{l}\"")).collect();
+                    msg.push_str(&format!("; oldest lines: {}", list.join(" | ")));
+                }
+                msg
             }
             Problem::Secret(name) => format!("contains a {name}"),
             Problem::Threat(id) => format!("matches threat pattern {id}"),
@@ -100,7 +110,11 @@ pub fn check_text(rel: &str, text: &str) -> Vec<Violation> {
         if chars > t.cap {
             out.push(Violation {
                 file: rel.to_string(),
-                problem: Problem::OverCap { chars, cap: t.cap },
+                problem: Problem::OverCap {
+                    chars,
+                    cap: t.cap,
+                    oldest: oldest_lines(text),
+                },
             });
         }
     }
@@ -111,6 +125,22 @@ pub fn check_text(rel: &str, text: &str) -> Vec<Violation> {
         });
     }
     out
+}
+
+/// How many of the oldest lines an over-cap refusal names.
+const OLDEST_N: usize = 3;
+/// Chars kept of each named line.
+const OLDEST_LEN: usize = 80;
+
+/// The first OLDEST_N content lines (blank and heading lines skipped), each
+/// cut to OLDEST_LEN chars: the entries to merge or drop first.
+fn oldest_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .take(OLDEST_N)
+        .map(|l| l.chars().take(OLDEST_LEN).collect())
+        .collect()
 }
 
 /// Check the workspace's capped files. A missing file is not a violation.
@@ -466,7 +496,9 @@ mod tests {
 
     #[test]
     fn over_cap_refusal_names_the_oldest_lines() {
-        let mut text = String::from("# Rules\n\n- first old rule\n- second old rule\n- third old rule\n- fourth rule\n");
+        let mut text = String::from(
+            "# Rules\n\n- first old rule\n- second old rule\n- third old rule\n- fourth rule\n",
+        );
         text.push_str(&"x".repeat(RULES_CAP));
         let v = check_text("memory/rules.md", &text);
         let line = v[0].line();
