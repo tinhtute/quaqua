@@ -112,9 +112,9 @@ fn run_record_complete_all_drivers() {
     ] {
         let wf = open_run(&mut conn, name, harness, project);
         let d = driver(&conn, harness);
-        let got = capture::capture(&mut conn, &wf, &*d, session, None).unwrap();
+        let got = capture::capture(&conn, &wf, &*d, session, None).unwrap();
         // A repeat replaces and converges.
-        let again = capture::capture(&mut conn, &wf, &*d, session, None).unwrap();
+        let again = capture::capture(&conn, &wf, &*d, session, None).unwrap();
         assert_eq!(got, again);
         let id: i64 = conn
             .query_row("SELECT id FROM run WHERE workflow_id = ?1", [&wf], |r| r.get(0))
@@ -209,7 +209,7 @@ fn cost_unknown_when_unreported() {
     let f = ws.root().join("c.jsonl");
     std::fs::write(&f, CLAUDE_SESSION).unwrap();
     let d = driver(&conn, "claude");
-    capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
+    capture::capture(&conn, &wf, &*d, f.to_str(), None).unwrap();
     assert_eq!(state(&conn, &wf), ("unknown".into(), None, Some(130)));
 
     // pi with one assistant message missing its cost: the total is unknown, not partial.
@@ -218,7 +218,7 @@ fn cost_unknown_when_unreported() {
     let f = ws.root().join("p.jsonl");
     std::fs::write(&f, partial).unwrap();
     let d = driver(&conn, "pi");
-    capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
+    capture::capture(&conn, &wf, &*d, f.to_str(), None).unwrap();
     assert_eq!(state(&conn, &wf), ("unknown".into(), None, Some(153)));
     let shown = show::render(&show::load(&conn, &wf).unwrap().unwrap());
     assert!(shown.contains("cost unknown") && !shown.contains("cost $0"), "{shown}");
@@ -227,13 +227,13 @@ fn cost_unknown_when_unreported() {
     let wf = open_run(&mut conn, "n3", "pi", 1);
     std::fs::write(&f, PI_SESSION).unwrap();
     let d = driver(&conn, "pi");
-    capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
+    capture::capture(&conn, &wf, &*d, f.to_str(), None).unwrap();
     assert_eq!(state(&conn, &wf), ("reported".into(), Some(0.75), Some(153)));
 
     // A generic driver never reads a session, even when one is named.
     let wf = open_run(&mut conn, "n4", "opencode", 1);
     let d = driver(&conn, "opencode");
-    let got = capture::capture(&mut conn, &wf, &*d, f.to_str(), None).unwrap();
+    let got = capture::capture(&conn, &wf, &*d, f.to_str(), None).unwrap();
     assert!(got.is_none());
     assert_eq!(state(&conn, &wf), ("unknown".into(), None, None));
 }
@@ -247,12 +247,12 @@ fn claude_session_found_by_id_and_lost_session_is_an_error() {
     std::fs::write(projects.join("-some-project/abc-123.jsonl"), CLAUDE_SESSION).unwrap();
     let wf = open_run(&mut conn, "l1", "claude", 1);
     let d = driver(&conn, "claude");
-    let got = capture::capture(&mut conn, &wf, &*d, Some("abc-123"), Some(&projects)).unwrap();
+    let got = capture::capture(&conn, &wf, &*d, Some("abc-123"), Some(&projects)).unwrap();
     assert_eq!(got.unwrap().turns, 3);
 
     // A native driver whose session is gone is an error, not "no source".
     let wf = open_run(&mut conn, "l2", "claude", 1);
-    let e = capture::capture(&mut conn, &wf, &*d, Some("missing"), Some(&projects)).unwrap_err();
+    let e = capture::capture(&conn, &wf, &*d, Some("missing"), Some(&projects)).unwrap_err();
     assert!(matches!(e, capture::CaptureError::SessionNotFound(_)), "{e}");
 }
 

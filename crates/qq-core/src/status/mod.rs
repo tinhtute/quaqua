@@ -1,6 +1,6 @@
 //! `status`: the farm view, read from the database only.
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRow {
@@ -39,11 +39,20 @@ pub const IDLE_SETTING: &str = "timers.status_idle_minutes";
 
 /// Open agents and unfinished runs; `all` adds ended agents and finished runs.
 pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-    read_at(conn, all, now_ms)
+    read_with(conn, all, if all { RunWindow::All } else { RunWindow::Open })
 }
+
+/// Which finished runs `status` lists besides the unfinished ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunWindow {
+    Open,
+    /// Runs that ended at or after this time, ms.
+    Since(u64),
+    All,
+}
+
+/// `status --metrics` keeps a cleaned-up worker's spend for this long.
+const METRICS_WINDOW_MS: u64 = 24 * 3600 * 1000;
 
 /// Flag when no worker (lead or peer) is live and the last event (mail, run or
 /// agent start/end) is older than the idle threshold. Whether a CoS turn is
@@ -81,15 +90,42 @@ fn idle_reason(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String
         .then(|| format!("no worker live and no event for {} min", idle_s / 60)))
 }
 
+/// `all_agents` adds ended agents, `runs` picks the finished runs. A
+/// cleaned-up worker's run row stays in the database, so its spend stays readable.
+pub fn read_with(
+    conn: &Connection,
+    all_agents: bool,
+    runs: RunWindow,
+) -> rusqlite::Result<Status> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    read_with_at(conn, all_agents, runs, now_ms)
+}
+
 /// [`read`] with an explicit clock, for tests.
 pub fn read_at(conn: &Connection, all: bool, now_ms: i64) -> rusqlite::Result<Status> {
+    read_with_at(
+        conn,
+        all,
+        if all { RunWindow::All } else { RunWindow::Open },
+        now_ms,
+    )
+}
+
+fn read_with_at(
+    conn: &Connection,
+    all_agents: bool,
+    runs: RunWindow,
+    now_ms: i64,
+) -> rusqlite::Result<Status> {
     let mut st = conn.prepare(
         "SELECT a.name, a.role, a.kind, p.slug, a.ended_ms IS NULL FROM agent a \
          LEFT JOIN project p ON p.id = a.project_id \
          WHERE (?1 OR a.ended_ms IS NULL) ORDER BY a.id",
     )?;
     let agents = st
-        .query_map([all], |r| {
+        .query_map([all_agents], |r| {
             Ok(AgentRow {
                 name: r.get(0)?,
                 role: r.get(1)?,
@@ -102,10 +138,15 @@ pub fn read_at(conn: &Connection, all: bool, now_ms: i64) -> rusqlite::Result<St
     let mut st = conn.prepare(
         "SELECT r.workflow_id, a.name, r.harness, r.outcome, r.tokens_in, r.tokens_out, r.cost_usd \
          FROM run r JOIN agent a ON a.id = r.agent_id \
-         WHERE (?1 OR r.ended_ms IS NULL) ORDER BY r.id",
+         WHERE (?1 OR r.ended_ms IS NULL OR r.ended_ms >= ?2) ORDER BY r.id",
     )?;
+    let (all_runs, since) = match runs {
+        RunWindow::Open => (false, i64::MAX),
+        RunWindow::Since(ms) => (false, ms as i64),
+        RunWindow::All => (true, 0),
+    };
     let runs = st
-        .query_map([all], |r| {
+        .query_map(params![all_runs, since], |r| {
             Ok(RunRow {
                 workflow: r.get(0)?,
                 agent: r.get(1)?,
@@ -126,7 +167,9 @@ pub fn read_at(conn: &Connection, all: bool, now_ms: i64) -> rusqlite::Result<St
 }
 
 /// Text for the terminal. `metrics` adds tokens and cost per run; a run whose
-/// cost was never reported prints `unknown`, never `0`.
+/// cost was never reported prints `unknown`, never `0`. `status --metrics`
+/// lists the runs that ended in the last 24 h too, so a cleaned-up worker keeps
+/// its spend for a day; `--all` lists every run.
 pub fn render(s: &Status, metrics: bool) -> String {
     let mut out = String::new();
     for a in &s.agents {
@@ -162,7 +205,7 @@ pub fn render(s: &Status, metrics: bool) -> String {
     out
 }
 
-fn status_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate::cli::CliError> {
+pub fn status_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate::cli::CliError> {
     let err = |e: String| crate::cli::CliError::new(1, e);
     let mut all = false;
     let mut metrics = false;
@@ -179,7 +222,15 @@ fn status_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crat
     }
     let conn = crate::db::open(&env.runs_dir.join(crate::db::path::DB_FILE))
         .map_err(|e| err(e.to_string()))?;
-    let s = read(&conn, all).map_err(|e| err(e.to_string()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let runs = match (all, metrics) {
+        (true, _) => RunWindow::All,
+        (false, true) => RunWindow::Since(now.saturating_sub(METRICS_WINDOW_MS)),
+        (false, false) => RunWindow::Open,
+    };
+    let s = read_with(&conn, all, runs).map_err(|e| err(e.to_string()))?;
     Ok(render(&s, metrics).trim_end().to_string())
 }
 

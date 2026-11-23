@@ -53,8 +53,8 @@ pub struct RunRow {
 }
 
 /// Opens the run of `workflow_id`; a repeat returns the run already there.
-pub fn open(conn: &mut Connection, r: &NewRun) -> rusqlite::Result<i64> {
-    let tx = conn.transaction()?;
+pub fn open(conn: &Connection, r: &NewRun) -> rusqlite::Result<i64> {
+    let tx = conn.unchecked_transaction()?;
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM run WHERE workflow_id = ?1",

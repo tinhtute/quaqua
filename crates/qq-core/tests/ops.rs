@@ -1119,6 +1119,128 @@ fn status_reads_db() {
 }
 
 #[test]
+fn status_metrics_keeps_cleaned_up_worker_spend() {
+    let (dir, conn) = seeded("status-metrics");
+    let pid = add_project(&conn, "zimage");
+    add_agent(&conn, "w1", "peer", "tieude", Some(pid));
+    conn.execute(
+        "INSERT INTO run (agent_id, kind, harness, model, started_ms, ended_ms, outcome, tokens_in, tokens_out, cost_usd, cost_state) \
+         SELECT id, 'tieude', 'pi', 'm', 1, CAST(strftime('%s','now') AS INTEGER) * 1000, 'verified', 10, 20, 1.5, 'reported' FROM agent WHERE name = 'w1'",
+        [],
+    )
+    .unwrap();
+    // Cleanup ends the agent; the run row stays.
+    conn.execute("UPDATE agent SET ended_ms = 3 WHERE name = 'w1'", [])
+        .unwrap();
+    let env = qq_core::cli::Env { runs_dir: dir };
+    let plain = status::status_command(&env, &[]).unwrap();
+    assert!(!plain.contains("w1"), "default view hides cleaned-up workers: {plain}");
+    let metrics = status::status_command(&env, &["--metrics".to_string()]).unwrap();
+    assert!(
+        metrics.contains("run - w1 verified in=10 out=20 cost=$1.50"),
+        "--metrics keeps the spend of a cleaned-up worker: {metrics}"
+    );
+}
+
+#[test]
+fn status_metrics_lists_only_recent_finished_runs() {
+    let (dir, conn) = seeded("status-window");
+    for (name, ended) in [("old", "1000"), ("fresh", "CAST(strftime('%s','now') AS INTEGER) * 1000")] {
+        add_agent(&conn, name, "peer", "tieude", None);
+        conn.execute(
+            &format!(
+                "INSERT INTO run (agent_id, kind, harness, model, started_ms, ended_ms, outcome, cost_state) \
+                 SELECT id, 'tieude', 'pi', 'm', 1, {ended}, 'verified', 'unknown' FROM agent WHERE name = ?1"
+            ),
+            [name],
+        )
+        .unwrap();
+    }
+    let env = qq_core::cli::Env { runs_dir: dir };
+    let m = status::status_command(&env, &["--metrics".to_string()]).unwrap();
+    assert!(m.contains("run - fresh verified"), "{m}");
+    assert!(!m.contains("run - old verified"), "--metrics shows only the last 24 h: {m}");
+    let all = status::status_command(&env, &["--all".to_string(), "--metrics".to_string()]).unwrap();
+    assert!(all.contains("run - old verified"), "--all still lists every run: {all}");
+}
+
+const PI_SESSION: &str = r#"{"type":"message","timestamp":"2026-11-21T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"fix the bug"}]}}
+{"type":"message","timestamp":"2026-11-21T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"on it"}],"usage":{"input":100,"output":9,"cost":{"total":0.25}}}}
+{"type":"message","timestamp":"2026-11-21T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"finished"}],"usage":{"input":50,"output":4,"cost":{"total":0.5}}}}
+"#;
+
+/// The user path: `worker spawn` (no task.start), then `worker cleanup`.
+#[test]
+fn spawned_peer_spend_survives_cleanup() {
+    use qq_core::herdr::{Reply, Verb};
+    use qq_core::task::worker_flow::spawn_cmd::{run_worker, Ctx};
+    let (dir, conn) = seeded("spawn-spend");
+    let repo = dir.join("code").join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a"), "a").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    conn.execute(
+        "INSERT INTO project (slug, repo_path, created_ms) VALUES ('alpha', ?1, 1)",
+        [repo.to_string_lossy()],
+    )
+    .unwrap();
+    let herdr = FakeHerdr::new();
+    let anchor = herdr.seed_pane("home", None, &[]);
+    let drivers = Registry::from_config(
+        &config::roster(&conn)
+            .unwrap()
+            .iter()
+            .filter_map(|k| config::harness(&conn, &k.harness).unwrap())
+            .collect::<Vec<_>>(),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let spawned = run_worker(
+        &Ctx {
+            conn: &conn,
+            herdr: &herdr,
+            drivers: &drivers,
+            runs_dir: dir.clone(),
+            caller: None,
+            anchor: Some(&anchor),
+            now_ms: now,
+        },
+        &["tieude-w1".into(), "tieude".into(), repo.to_string_lossy().into_owned()],
+    )
+    .unwrap();
+    // The worker did its work; herdr reports the session of its pane.
+    let session = dir.join("session.jsonl");
+    std::fs::write(&session, PI_SESSION).unwrap();
+    herdr.set_reply(
+        Verb::PaneGet,
+        Reply::ok(
+            serde_json::json!({"result":{"pane":{"pane_id": spawned.pane, "agent_session":{"kind":"path","value":session}}}})
+                .to_string(),
+        ),
+    );
+    let wt = repo.parent().unwrap().join(".wt").join("tieude-w1");
+    let t = cleanup::Target {
+        repo: &repo,
+        worktree: &wt,
+        runs_dir: &dir,
+        name: "tieude-w1",
+        allow_dirty: true,
+    };
+    cleanup::cleanup_worker_live(&conn, &HerdrPanes(&herdr), &herdr, &grid::Scope { owner: None, farm: None }, &t, now).unwrap();
+    assert!(ended(&conn, "tieude-w1"));
+    let env = qq_core::cli::Env { runs_dir: dir };
+    let metrics = status::status_command(&env, &["--metrics".to_string()]).unwrap();
+    assert!(
+        metrics.contains("tieude-w1 cleaned_up in=150 out=13 cost=$0.75"),
+        "--metrics keeps the spend of a spawned, cleaned-up peer: {metrics}"
+    );
+}
+
+#[test]
 fn pane_metadata_merges_and_repeats() {
     let herdr = FakeHerdr::new();
     let pane = HerdrPanes(&herdr).create_tab("t").unwrap().id;

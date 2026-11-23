@@ -138,7 +138,7 @@ pub fn resolve_session(format: Format, session: &str, projects: Option<&Path>) -
 /// for a driver that has none. `tokens_in` counts every input token, cache
 /// reads and writes included.
 pub fn capture(
-    conn: &mut Connection,
+    conn: &Connection,
     workflow_id: &str,
     driver: &dyn HarnessDriver,
     session: Option<&str>,
@@ -155,11 +155,11 @@ pub fn capture(
 
 /// Stores a parsed session on the run of `workflow_id`, replacing an earlier capture.
 pub fn store(
-    conn: &mut Connection,
+    conn: &Connection,
     workflow_id: &str,
     p: &Parsed,
 ) -> Result<Captured, CaptureError> {
-    let tx = conn.transaction()?;
+    let tx = conn.unchecked_transaction()?;
     let run_id: i64 = tx
         .query_row("SELECT id FROM run WHERE workflow_id = ?1", [workflow_id], |r| r.get(0))
         .optional()?
@@ -232,36 +232,113 @@ pub fn capture_closed(
         }
     };
     let go = || -> Result<Option<()>, String> {
-        let mut conn = crate::db::open(db_path).map_err(|e| e.to_string())?;
-        let row: Option<(String, Option<String>)> = conn
-            .query_row(
-                "SELECT r.harness, a.pane_id FROM run r JOIN agent a ON a.id = r.agent_id \
-                 WHERE r.workflow_id = ?1",
-                [workflow_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let Some((harness, pane)) = row else {
-            return Err("no run record".into());
-        };
-        let h = crate::config::harness(&conn, &harness)
-            .map_err(|e| format!("{e:?}"))?
-            .ok_or_else(|| format!("unknown harness {harness}"))?;
-        let driver = drivers.resolve(&h).ok_or_else(|| format!("no driver for {harness}"))?;
-        if Format::of(&*driver).is_none() {
-            return Ok(None);
-        }
-        let pane = pane.ok_or("the agent has no recorded pane")?;
-        let session = pane_session(herdr, &pane).ok_or("herdr reports no agent session")?;
-        capture(&mut conn, workflow_id, &*driver, Some(&session), None)
-            .map_err(|e| e.to_string())?;
-        Ok(Some(()))
+        let conn = crate::db::open(db_path).map_err(|e| e.to_string())?;
+        capture_run(&conn, herdr, drivers, workflow_id)
     };
     if let Err(reason) = go() {
         fail(journal, reason);
     }
 }
+
+/// Reads the agent session of the run's pane and stores it on the run.
+fn capture_run(
+    conn: &Connection,
+    herdr: &dyn crate::herdr::HerdrClient,
+    drivers: &crate::driver::Registry,
+    workflow_id: &str,
+) -> Result<Option<()>, String> {
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT r.harness, a.pane_id FROM run r JOIN agent a ON a.id = r.agent_id \
+             WHERE r.workflow_id = ?1",
+            [workflow_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((harness, pane)) = row else {
+        return Err("no run record".into());
+    };
+    let h = crate::config::harness(conn, &harness)
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or_else(|| format!("unknown harness {harness}"))?;
+    let driver = drivers.resolve(&h).ok_or_else(|| format!("no driver for {harness}"))?;
+    if Format::of(&*driver).is_none() {
+        return Ok(None);
+    }
+    let pane = pane.ok_or("the agent has no recorded pane")?;
+    let session = pane_session(herdr, &pane).ok_or("herdr reports no agent session")?;
+    capture(conn, workflow_id, &*driver, Some(&session), None).map_err(|e| e.to_string())?;
+    Ok(Some(()))
+}
+
+/// Opens the run of an open agent that has none (a `worker spawn` peer; only
+/// `task.start` opens runs otherwise) and captures its spend while its pane
+/// still exists. Returns the run's workflow id, or `None` when the agent is
+/// unknown or a task flow already owns its run. A capture that fails leaves
+/// cost `unknown`. A repeat (a cleanup that was refused) converges. The workflow
+/// row is born `finished`: no flow runs, so the daemon never resumes it.
+pub fn open_spawned(
+    conn: &Connection,
+    herdr: &dyn crate::herdr::HerdrClient,
+    name: &str,
+    now_ms: u64,
+) -> Result<Option<String>, String> {
+    let e = |e: rusqlite::Error| e.to_string();
+    let agent: Option<(i64, Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT id, kind, project_id FROM agent WHERE name = ?1 AND ended_ms IS NULL",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(e)?;
+    let Some((agent_id, Some(kind), project_id)) = agent else {
+        return Ok(None);
+    };
+    let wf = format!("spawn:{name}:{agent_id}");
+    let foreign: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM run WHERE agent_id = ?1 AND workflow_id IS NOT ?2",
+            params![agent_id, wf],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    if foreign > 0 {
+        return Ok(None);
+    }
+    let t = crate::config::resolve_spawn(conn, &kind).map_err(|e| format!("{e:?}"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO workflow (id, kind, state, project_id, started_ms, updated_ms, finished_ms) \
+         VALUES (?1, 'spawn', 'finished', ?2, ?3, ?3, ?3)",
+        params![wf, project_id, now_ms as i64],
+    )
+    .map_err(e)?;
+    crate::run::open(
+        conn,
+        &crate::run::NewRun {
+            workflow_id: &wf,
+            agent_id,
+            task_id: None,
+            kind: &kind,
+            harness: &t.harness.name,
+            model: &t.model,
+            effort: t.effort.as_deref(),
+            base: None,
+            now_ms,
+        },
+    )
+    .map_err(e)?;
+    let harnesses: Vec<_> = crate::config::roster(conn)
+        .map_err(|e| format!("{e:?}"))?
+        .iter()
+        .filter_map(|k| crate::config::harness(conn, &k.harness).ok().flatten())
+        .collect();
+    let drivers = crate::driver::Registry::from_config(&harnesses);
+    let _ = capture_run(conn, herdr, &drivers, &wf);
+    Ok(Some(wf))
+}
+
 
 /// Records one artifact of a run; the same kind, path and sha converge.
 pub fn add_artifact(
