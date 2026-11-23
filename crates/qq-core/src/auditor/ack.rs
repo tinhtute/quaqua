@@ -12,12 +12,31 @@ pub fn store_path(root: &Path) -> PathBuf {
     root.join("reports").join("auditor-acks.tsv")
 }
 
-/// Stable 8-hex id of a finding line (FNV-1a). Digits are stripped first so a
-/// count that moves ("3 unpromoted lessons" -> "4") keeps the same id, ack and clock.
+/// Stable 8-hex id of a finding line (FNV-1a). Only count tokens are dropped (a
+/// standalone digit run followed by a space and a word: "3 unpromoted lessons"),
+/// so a moving count keeps the id, ack and clock while digits inside paths and
+/// names ("pipeline-cmmod2") still tell findings apart.
 pub fn finding_id(line: &str) -> String {
+    let b = line.as_bytes();
     let mut h: u32 = 0x811c_9dc5;
-    for b in line.bytes().filter(|b| !b.is_ascii_digit()) {
-        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            let standalone = start == 0
+                || !(b[start - 1].is_ascii_alphanumeric() || b"-_./#".contains(&b[start - 1]));
+            let counted =
+                b.get(i) == Some(&b' ') && b.get(i + 1).is_some_and(u8::is_ascii_alphabetic);
+            if standalone && counted {
+                continue;
+            }
+            i = start;
+        }
+        h = (h ^ u32::from(b[i])).wrapping_mul(0x0100_0193);
+        i += 1;
     }
     format!("{h:08x}")
 }
