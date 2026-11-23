@@ -1248,9 +1248,9 @@ pub fn prompt_run(
             .ok()
             .and_then(|v| v.parse().ok());
         let ok = check_brief(text, env_budget, playbooks_dir(runs).as_deref())
-            .map_err(|e| CliError::new(1, e))?;
+            .map_err(|e| CliError::new(EXIT_USAGE, e))?;
         check_pilot_budget(text, ok.budget_sec, pilot_budget_sec(runs))
-            .map_err(|e| CliError::new(1, e))?;
+            .map_err(|e| CliError::new(EXIT_USAGE, e))?;
         for w in &ok.warnings {
             eprintln!("{w}");
         }

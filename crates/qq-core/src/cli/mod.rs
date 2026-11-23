@@ -197,7 +197,11 @@ pub fn rpc_call_as(
                 format!("daemon not running (socket {})", socket.display()),
             ))
         }
-        Err(e) => Err(CliError::new(EXIT_UNREACHABLE, format!("rpc failed: {e}"))),
+        // The daemon was reached but the call did not finish (read timeout,
+        // dropped connection): it may be alive and may have acted, so exit 1
+        // and no "start the daemon" advice. The "rpc failed:" prefix is kept
+        // for `memory::inbox::transport_error`.
+        Err(e) => Err(CliError::new(1, format!("rpc failed: {e}"))),
     }
 }
 
