@@ -919,3 +919,75 @@ fn roster_profiles_next_spawn() {
     assert_eq!(live(&open(&ws)), live_before);
     daemon.stop().unwrap();
 }
+
+// ---- U3 (#327 finding 3): import never overwrites a differing value quietly ----
+
+#[test]
+fn config_import_refuses_overwrite_without_yes() {
+    let ws = seeded("cfg-import-yes");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let toml = ws.team_toml();
+    let toml = toml.to_str().unwrap();
+
+    // The owner sets two values with `config set`; the file still says the old ones.
+    assert_eq!(run(&["config", "set", "kind.sude.model", "local-model"]), 0);
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "6"]), 0);
+    let before = dump(&open(&ws), CONFIG_TABLES);
+
+    // No --yes: refused, every differing key is named, nothing is written.
+    let e = config::config_cmd(&env, &strs(&["import", toml])).unwrap_err();
+    assert!(e.message.contains("kinds.sude.model"), "{}", e.message);
+    assert!(e.message.contains("roles.lead.max_peers"), "{}", e.message);
+    assert!(e.message.contains("--yes"), "{}", e.message);
+    assert_eq!(run(&["config", "import", toml]), 1);
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+
+    // Keys that are equal or new still import without --yes.
+    let extra = ws.runs_dir().join("extra.toml");
+    std::fs::write(&extra, "[limits]\ndepth = 3\n").unwrap();
+    assert_eq!(run(&["config", "import", extra.to_str().unwrap()]), 0);
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "limits.depth"])).unwrap(),
+        "3"
+    );
+
+    // --yes overwrites and prints what changed.
+    let out = config::config_cmd(&env, &strs(&["import", toml, "--yes"])).unwrap();
+    assert!(out.contains("kinds.sude.model"), "{out}");
+    assert!(out.contains("roles.lead.max_peers"), "{out}");
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "kind.sude.model"])).unwrap(),
+        template()
+            .lines()
+            .skip_while(|l| !l.starts_with("[kinds.sude]"))
+            .find_map(|l| l.strip_prefix("model = "))
+            .unwrap()
+            .trim_matches('"')
+    );
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn config_validate_reports_drift_from_team_toml() {
+    let ws = seeded("cfg-drift");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+
+    let clean = config::config_cmd(&env, &strs(&["validate"])).unwrap();
+    assert!(!clean.contains("drift"), "{clean}");
+
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "6"]), 0);
+    let before = dump(&open(&ws), CONFIG_TABLES);
+    let out = config::config_cmd(&env, &strs(&["validate"])).unwrap();
+    assert!(out.contains("drift"), "{out}");
+    assert!(out.contains("roles.lead.max_peers"), "{out}");
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before, "validate writes nothing");
+    daemon.stop().unwrap();
+}
