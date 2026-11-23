@@ -116,13 +116,13 @@ pub fn disputes(text: &str) -> bool {
             continue;
         }
         let first = body
-            .split(|c| matches!(c, '.' | '!' | '\n'))
+            .split(['.', '!', '\n'])
             .next()
             .unwrap_or("")
             .trim_matches(|c: char| !c.is_alphanumeric() && c != '/')
             .to_ascii_lowercase();
         let tail = body
-            .find(|c| matches!(c, '.' | '!' | '\n'))
+            .find(['.', '!', '\n'])
             .map_or("", |i| &body[i + 1..]);
         if !NO_DISPUTE.contains(&first.as_str()) || tail_contrasts(tail) {
             return true;
@@ -135,7 +135,7 @@ pub fn disputes(text: &str) -> bool {
 fn is_top_heading(line: &str) -> bool {
     let l = line.trim_start();
     let hashes = l.chars().take_while(|&c| c == '#').count();
-    (1..=2).contains(&hashes) && l[hashes..].chars().next().map_or(true, char::is_whitespace)
+    (1..=2).contains(&hashes) && l[hashes..].chars().next().is_none_or(char::is_whitespace)
 }
 
 fn has_outcome(text: &str) -> bool {
