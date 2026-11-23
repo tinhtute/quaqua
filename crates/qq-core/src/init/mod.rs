@@ -634,9 +634,38 @@ mod tests {
         let (r, c) = run(&root, true, true).unwrap();
         assert_eq!(c, 1, "{r}");
         assert!(r.contains("conflict AGENTS.md"), "{r}");
-        assert!(r.contains("3 files removed upstream, kept"), "{r}");
+        assert!(
+            r.contains("3 files removed upstream, kept: old/a.md, old/b.md, old/c.md"),
+            "{r}"
+        );
         assert!(!r.contains("removed upstream old/"), "{r}");
         assert_eq!(r.matches("removed upstream").count(), 1, "{r}");
+        for n in ["old/a.md", "old/b.md", "old/c.md"] {
+            assert_eq!(r.matches(n).count(), 1, "{n} once: {r}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// More than five kept files: five names, then "+N more".
+    #[test]
+    fn update_removed_upstream_names_are_capped() {
+        let root = scratch("removed-upstream-cap");
+        run(&root, false, false).unwrap();
+        let p = lock_path(&root);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for i in 1..=7 {
+            v["files"][format!("old/f{i}.md")] = serde_json::json!({"md5": "x", "mode": 420});
+        }
+        std::fs::write(&p, v.to_string()).unwrap();
+        let (r, _) = run(&root, true, true).unwrap();
+        assert!(
+            r.contains(
+                "7 files removed upstream, kept: old/f1.md, old/f2.md, old/f3.md, old/f4.md, old/f5.md, +2 more"
+            ),
+            "{r}"
+        );
+        assert!(!r.contains("old/f6.md"), "{r}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
