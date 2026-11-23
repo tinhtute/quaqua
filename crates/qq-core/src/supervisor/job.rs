@@ -1,10 +1,11 @@
 //! The scheduled jobs. [`run_outer2`] runs loop 2 in the order of the sensor
 //! table (computational first); [`score_runs`] is the scoring job alone.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection};
 
@@ -66,7 +67,22 @@ pub struct ExecScorer {
     pub program: PathBuf,
 }
 
-/// How long one scorer run may take before it is killed.
+/// Read a pipe to its end on its own thread.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// How long one scorer run may take before it is killed. A `claude -p` scorer
+/// reading a long transcript takes a few minutes at most; 10 minutes leaves
+/// room for a slow model without letting a hung scorer block the job for good.
 pub const SCORER_LIMIT: Duration = Duration::from_secs(600);
 
 impl Scorer for ExecScorer {
@@ -80,24 +96,59 @@ impl ExecScorer {
         &self,
         rubric: &Rubric,
         run: &RunView,
-        _limit: Duration,
+        limit: Duration,
     ) -> Result<Verdict, String> {
+        let name = self.program.display();
         let mut child = Command::new(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("cannot run {}: {e}", self.program.display()))?;
+            .map_err(|e| format!("cannot run {name}: {e}"))?;
+        // Stdin and both output pipes each get a thread: a scorer that never
+        // reads its prompt, or fills a pipe we are not draining, cannot block us.
         let prompt = scoring_prompt(rubric, run);
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes());
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+            });
         }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!("{} exited {}", self.program.display(), out.status));
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{name} timed out after {}s and was killed",
+                        limit.as_secs_f32()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        // A grandchild can keep a pipe open past the exit: wait briefly, not for good.
+        let grace = Duration::from_secs(2);
+        let out = stdout.recv_timeout(grace).unwrap_or_default();
+        if !status.success() {
+            let err = stderr.recv_timeout(grace).unwrap_or_default();
+            let last = String::from_utf8_lossy(&err)
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(300).collect::<String>());
+            return Err(match last {
+                Some(l) => format!("{name} exited {status}: {l}"),
+                None => format!("{name} exited {status}"),
+            });
         }
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("scorer printed no JSON: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&out).map_err(|e| format!("scorer printed no JSON: {e}"))?;
         let value = v
             .get("score")
             .and_then(|s| s.as_u64())
