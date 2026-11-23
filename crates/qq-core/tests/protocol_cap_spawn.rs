@@ -65,7 +65,10 @@ impl Fx {
         .unwrap();
         conn.execute(
             "INSERT INTO project (slug, repo_path, created_ms) VALUES ('alpha', ?1, 1)",
-            [repo.to_string_lossy().to_string()],
+            [std::fs::canonicalize(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()],
         )
         .unwrap();
         conn.execute(
@@ -94,12 +97,17 @@ impl Fx {
 
     /// Drives the Lead's spawn verb for peer `name`.
     fn spawn(&self, name: &str) -> Result<String, String> {
+        self.spawn_as(Some("alpha-lead"), name)
+    }
+
+    /// Drives the spawn verb as `caller` (None: the CoS).
+    fn spawn_as(&self, caller: Option<&str>, name: &str) -> Result<String, String> {
         let ctx = Ctx {
             conn: &self.conn,
             herdr: &self.herdr,
             drivers: &self.drivers,
             runs_dir: self.ws.runs_dir(),
-            caller: Some("alpha-lead"),
+            caller,
             anchor: Some(&self.anchor),
             now_ms: 1_000,
         };
@@ -109,6 +117,39 @@ impl Fx {
             self.repo.to_string_lossy().to_string(),
         ];
         run_worker(&ctx, &a).map(|s| s.name).map_err(|e| e.message)
+    }
+
+    /// The reasons of every journaled refusal, oldest first.
+    fn refusal_reasons(&self) -> Vec<String> {
+        let has: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if has == 0 {
+            return Vec::new();
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT payload_json FROM events WHERE kind = 'refusal' ORDER BY seq")
+            .unwrap();
+        let rows = st.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|p| {
+            let v: serde_json::Value = serde_json::from_str(&p.unwrap()).unwrap();
+            v["reason"].as_str().unwrap().to_string()
+        })
+        .collect()
+    }
+
+    fn agent_rows(&self, name: &str) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM agent WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
     }
 
     fn refusals(&self) -> i64 {
@@ -161,4 +202,49 @@ fn spawn_verb_default_protocol_cap_is_four() {
     }
     let e = fx.spawn("tieude-e").unwrap_err();
     assert!(e.contains("worker cap 4 reached"), "{e}");
+}
+
+#[test]
+fn worker_cap_applies_to_cos_spawn() {
+    // The CoS (no caller) is held to the project cap too: 2 peers, then refused.
+    let fx = Fx::new("capcos", CAP2, "6");
+    fx.spawn_as(None, "tieude-a").unwrap();
+    fx.spawn_as(None, "tieude-b").unwrap();
+    let e = fx.spawn_as(None, "tieude-c").unwrap_err();
+    assert!(e.contains("worker cap 2 reached"), "{e}");
+    let reasons = fx.refusal_reasons();
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].starts_with("worker cap"), "{reasons:?}");
+    assert_eq!(fx.agent_rows("tieude-c"), 0);
+}
+
+#[test]
+fn worker_cap_counts_peers_across_spawners() {
+    // One Lead peer plus one CoS peer fill a cap of 2, whoever asks next.
+    let fx = Fx::new("capmix", CAP2, "6");
+    fx.spawn("tieude-a").unwrap();
+    fx.spawn_as(None, "tieude-b").unwrap();
+    assert!(fx
+        .spawn_as(None, "tieude-c")
+        .unwrap_err()
+        .contains("worker cap 2"));
+    assert!(fx.spawn("tieude-d").unwrap_err().contains("worker cap 2"));
+}
+
+#[test]
+fn worker_cap_reopen_is_not_a_new_spawn() {
+    let fx = Fx::new("capreopen", CAP2, "6");
+    fx.spawn_as(None, "tieude-a").unwrap();
+    fx.spawn_as(None, "tieude-b").unwrap();
+    // At the cap, reopening an open agent still goes through and journals nothing.
+    fx.spawn_as(None, "tieude-a").unwrap();
+    assert!(fx.refusal_reasons().is_empty());
+}
+
+#[test]
+fn worker_cap_cos_spawn_fails_on_broken_protocol() {
+    // Same as a Lead: a broken protocol block refuses the spawn, no agent row.
+    let fx = Fx::new("capbroken", "```toml\nworker_cap = \"x\"\n```\n", "6");
+    assert!(fx.spawn_as(None, "tieude-a").is_err());
+    assert_eq!(fx.agent_rows("tieude-a"), 0);
 }
