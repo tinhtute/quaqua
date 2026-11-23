@@ -379,11 +379,19 @@ pub fn arrange_filtered(
 /// [`PaneOps`] over any [`HerdrClient`]: the one adapter from herdr replies.
 pub struct HerdrPanes<'a>(pub &'a dyn crate::herdr::HerdrClient);
 
-fn reply_json(r: crate::herdr::Reply) -> std::io::Result<serde_json::Value> {
+/// The JSON of a herdr reply to `call`. An ok reply with an empty body (herdr
+/// prints nothing for `pane report-metadata`) is `Null`; a failed or
+/// malformed reply names the call.
+fn reply_json(call: &str, r: crate::herdr::Reply) -> std::io::Result<serde_json::Value> {
     if !r.ok {
-        return Err(std::io::Error::other(r.error_code().unwrap_or(r.body)));
+        let why = r.error_code().unwrap_or(r.body);
+        return Err(std::io::Error::other(format!("herdr {call}: {why}")));
     }
-    serde_json::from_str(&r.body).map_err(std::io::Error::other)
+    if r.body.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&r.body)
+        .map_err(|e| std::io::Error::other(format!("herdr {call}: malformed reply: {e}")))
 }
 
 fn text<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -421,7 +429,7 @@ fn pane_from(
 
 impl HerdrPanes<'_> {
     fn tab_labels(&self) -> std::io::Result<std::collections::HashMap<String, String>> {
-        let v = reply_json(self.0.tab_list()?)?;
+        let v = reply_json("tab list", self.0.tab_list()?)?;
         let tabs = v
             .pointer("/result/tabs")
             .and_then(|x| x.as_array())
@@ -443,7 +451,7 @@ impl HerdrPanes<'_> {
         let Ok(r) = self.0.workspace_list() else {
             return Default::default();
         };
-        let Ok(v) = reply_json(r) else {
+        let Ok(v) = reply_json("workspace list", r) else {
             return Default::default();
         };
         v.pointer("/result/workspaces")
@@ -470,7 +478,7 @@ impl PaneOps for HerdrPanes<'_> {
     fn panes(&self) -> std::io::Result<Vec<Pane>> {
         let labels = self.tab_labels()?;
         let workspaces = self.workspace_labels();
-        let v = reply_json(self.0.pane_list()?)?;
+        let v = reply_json("pane list", self.0.pane_list()?)?;
         let list = v
             .pointer("/result/panes")
             .and_then(|x| x.as_array())
@@ -485,7 +493,7 @@ impl PaneOps for HerdrPanes<'_> {
     /// or `/result/pane` when the reply carries one, else the one pane
     /// `pane list` shows in that tab (the reply shape is not verified live).
     fn create_tab(&self, label: &str) -> std::io::Result<Pane> {
-        let v = reply_json(self.0.tab_create(label)?)?;
+        let v = reply_json("tab create", self.0.tab_create(label)?)?;
         let direct = ["/result/root_pane/pane_id", "/result/pane/pane_id"]
             .iter()
             .find_map(|p| v.pointer(p)?.as_str().map(String::from));
@@ -498,7 +506,7 @@ impl PaneOps for HerdrPanes<'_> {
                     .ok_or_else(|| {
                         std::io::Error::other("tab create reply has no pane or tab id")
                     })?;
-                let list = reply_json(self.0.pane_list()?)?;
+                let list = reply_json("pane list", self.0.pane_list()?)?;
                 list.pointer("/result/panes")
                     .and_then(|x| x.as_array())
                     .and_then(|a| a.iter().find(|p| text(p, "tab_id") == Some(tab)))
@@ -515,7 +523,7 @@ impl PaneOps for HerdrPanes<'_> {
 
     fn split(&self, anchor: &str, dir: Dir) -> std::io::Result<Pane> {
         let tab = self.find(anchor)?.map(|p| p.tab).unwrap_or_default();
-        let v = reply_json(self.0.pane_split(anchor, dir.as_str())?)?;
+        let v = reply_json("pane split", self.0.pane_split(anchor, dir.as_str())?)?;
         let id = v
             .pointer("/result/pane/pane_id")
             .and_then(|x| x.as_str())
@@ -528,11 +536,11 @@ impl PaneOps for HerdrPanes<'_> {
     }
 
     fn close_pane(&self, id: &str) -> std::io::Result<()> {
-        reply_json(self.0.pane_close(id)?).map(|_| ())
+        reply_json("pane close", self.0.pane_close(id)?).map(|_| ())
     }
 
     fn move_pane(&self, pane: &str, to: &crate::herdr::MoveTo) -> std::io::Result<Option<String>> {
-        let v = reply_json(self.0.pane_move(pane, to)?)?;
+        let v = reply_json("pane move", self.0.pane_move(pane, to)?)?;
         let res = v.pointer("/result/move_result");
         if res.and_then(|r| r.get("changed")).and_then(|c| c.as_bool()) == Some(false) {
             return Ok(None);
@@ -553,7 +561,11 @@ impl PaneOps for HerdrPanes<'_> {
         if let Some(f) = scope.farm.as_deref() {
             tokens.push(("grid_farm", f));
         }
-        reply_json(self.0.pane_report_metadata(pane, "quaqua", &tokens, None)?).map(|_| ())
+        reply_json(
+            "pane report-metadata",
+            self.0.pane_report_metadata(pane, "quaqua", &tokens, None)?,
+        )
+        .map(|_| ())
     }
 }
 
