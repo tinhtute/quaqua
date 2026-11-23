@@ -59,7 +59,7 @@ pub enum Problem {
     OverCap {
         chars: usize,
         cap: usize,
-        /// The first non-heading lines of the file, oldest first.
+        /// The first rule bullets of the file, oldest first.
         oldest: Vec<String>,
     },
     /// A secret pattern matched, named for the message.
@@ -132,15 +132,29 @@ const OLDEST_N: usize = 3;
 /// Chars kept of each named line.
 const OLDEST_LEN: usize = 80;
 
-/// The first OLDEST_N content lines (blank and heading lines skipped), each
-/// cut to OLDEST_LEN chars: the entries to merge or drop first.
+/// The first OLDEST_N rule bullets ("- " lines; preamble prose, headings and
+/// `<!-- -->` blocks skipped), each cut to OLDEST_LEN chars: the entries to
+/// merge or drop first.
 fn oldest_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .take(OLDEST_N)
-        .map(|l| l.chars().take(OLDEST_LEN).collect())
-        .collect()
+    let mut in_comment = false;
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if in_comment {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if line.starts_with("<!--") {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if line.starts_with("- ") {
+            out.push(line.chars().take(OLDEST_LEN).collect());
+            if out.len() == OLDEST_N {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Check the workspace's capped files. A missing file is not a violation.
