@@ -67,6 +67,77 @@ pub(crate) fn verdict_line(text: &str) -> Option<&str> {
         .rfind(|l| l.starts_with(VERDICT_FIELD) || l.starts_with(&lower))
 }
 
+/// The heading under which a report disputes a premise or finding.
+pub(crate) const CHALLENGE_HEADING: &str = "## Challenge";
+/// Opening sentences that say a Challenge section disputes nothing.
+const NO_DISPUTE: [&str; 7] = [
+    "none",
+    "n/a",
+    "nothing",
+    "no challenge",
+    "no challenges",
+    "no dispute",
+    "nothing disputed",
+];
+
+/// Words that turn a "None." opener into a dispute ("None. But the SHA is wrong.").
+/// A tail containing any of them, or any "n't" contraction, is a dispute.
+const CONTRAST: [&str; 14] = [
+    "but", "however", "except", "although", "though", "yet", "wrong", "missing", "not", "no",
+    "false", "fails", "failed", "mismatch",
+];
+
+/// True when a "None." opener's tail carries a contrast or negation marker.
+fn tail_contrasts(tail: &str) -> bool {
+    tail.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(str::to_ascii_lowercase)
+        .any(|w| CONTRAST.contains(&w.as_str()) || w.ends_with("n't"))
+}
+
+/// True when the report disputes something: it has a `## Challenge` section
+/// whose body is not empty and does not open with a no-dispute statement
+/// ("None.", "N/A") followed only by text without a contrast marker. The body
+/// ends at the next heading of level 1 or 2; "###" subheadings and "#123" refs
+/// are body text. Fails closed: any other body, including "None of the
+/// premises hold: ...", is a dispute. Shared by the pipeline and the auditor.
+pub fn disputes(text: &str) -> bool {
+    let mut lines = text.lines();
+    while let Some(l) = lines.next() {
+        if !l.trim_start().starts_with(CHALLENGE_HEADING) {
+            continue;
+        }
+        let body: Vec<&str> = lines
+            .clone()
+            .take_while(|l| !is_top_heading(l))
+            .collect();
+        let body = body.join("\n");
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let first = body
+            .split(['.', '!', '\n'])
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '/')
+            .to_ascii_lowercase();
+        let tail = body
+            .find(['.', '!', '\n'])
+            .map_or("", |i| &body[i + 1..]);
+        if !NO_DISPUTE.contains(&first.as_str()) || tail_contrasts(tail) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A "# " or "## " heading line (the bare "#"/"##" too), not "###" or "#123".
+fn is_top_heading(line: &str) -> bool {
+    let l = line.trim_start();
+    let hashes = l.chars().take_while(|&c| c == '#').count();
+    (1..=2).contains(&hashes) && l[hashes..].chars().next().is_none_or(char::is_whitespace)
+}
+
 fn has_outcome(text: &str) -> bool {
     text.lines().any(|l| l.starts_with(OUTCOME_FIELD))
 }
@@ -118,6 +189,47 @@ mod tests {
         // whatever the ask names, the parser reads
         assert_eq!(parse_verdict("Verdict: clean"), Ok(0));
         assert_eq!(parse_verdict("Verdict: 4 findings"), Ok(4));
+    }
+
+    #[test]
+    fn challenge_that_disputes_nothing_is_ignored() {
+        let t1 = "## Findings\n(none)\n\n## Challenge\nNone. The brief's premises hold.\n\nVerdict: clean";
+        let t2 = "## Challenge\nNone. Premises hold: commit exists on quaqua/sude-e2e1-b and is the HEAD of the review worktree.\n\nVerdict: clean";
+        assert!(!disputes(t1) && !disputes(t2));
+        assert!(!disputes("## Challenge\n\n## Lessons\nx"));
+        assert!(!disputes("## Challenge\n**N/A**\n## Lessons\nx"));
+        assert!(!disputes("no section at all"));
+    }
+
+    #[test]
+    fn real_challenge_disputes() {
+        assert!(disputes(
+            "## Challenge\nNone of the premises hold: no such commit.\nVerdict: clean"
+        ));
+        assert!(disputes("## Challenge\nThe SHA is wrong.\n"));
+        assert!(disputes(
+            "## Challenge\nNone.\n\n## Challenge (again)\nThe branch is missing."
+        ));
+        assert!(disputes("## Challenge\n- premise 1 is false"));
+    }
+
+    #[test]
+    fn challenge_body_ends_only_at_a_same_or_higher_heading() {
+        assert!(disputes("## Challenge\n### Premise 1\nThe SHA is wrong.\n"));
+        assert!(disputes("## Challenge\n#123 is not on this branch.\n"));
+        assert!(!disputes("## Challenge\n## Lessons\n### x\nwrong"));
+    }
+
+    #[test]
+    fn none_with_a_contrast_tail_disputes() {
+        assert!(disputes("## Challenge\nNone. But the SHA is wrong.\n"));
+        assert!(disputes("## Challenge\nNone. The branch doesn't exist.\n"));
+    }
+
+    #[test]
+    fn heading_levels() {
+        assert!(is_top_heading("## Lessons") && is_top_heading("# T") && is_top_heading("##"));
+        assert!(!is_top_heading("### x") && !is_top_heading("#123"));
     }
 
     #[test]

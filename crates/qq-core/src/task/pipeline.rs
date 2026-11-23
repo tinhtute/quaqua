@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::report_contract::{parse_verdict, verdict_ask};
+use super::report_contract::{disputes, parse_verdict, verdict_ask};
 use super::worker_flow::{verified_line_ask, PASSING_LEVELS};
 use crate::engine::activity::{
     GitRequest, GitResult, HerdrRequest, HerdrResult, ReportFileRequest, ReportFileResult,
@@ -334,7 +334,7 @@ fn begin_review(s: &mut PipelineState) -> Decision {
         "Pipeline phase: REVIEW (round {round}) of task '{}'.\nReview exactly commit {sha} on branch {} \
          (repo {}); do not edit code; run the checks the brief names in the foreground.\nBrief:\n{}\n\n\
          Write your report to {report}. Tag each finding under '## Findings' as '- [critical|major|minor|trivial] <finding>'. \
-         {} Dispute a wrong premise under '## Challenge'.",
+         {} Dispute a wrong premise under '## Challenge'; leave the section out when nothing is disputed.",
         i.task, i.branch, i.repo, i.brief, verdict_ask()
     );
     let to = i.reviewer(round);
@@ -452,7 +452,7 @@ pub struct PipelineFlow;
 impl PipelineFlow {
     fn on_report(&self, s: &mut PipelineState, content: &str) -> Decision {
         s.reading = false;
-        if has_challenge(content) {
+        if disputes(content) {
             return done("disputed", s, None);
         }
         let from = s.stage;
@@ -759,10 +759,6 @@ fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-fn has_challenge(text: &str) -> bool {
-    text.lines().any(|l| l.trim().starts_with("## Challenge"))
-}
-
 fn outcome_is_no_changes(text: &str) -> bool {
     let v = field(text, "Outcome:").unwrap_or("");
     v.split_whitespace()
@@ -870,6 +866,47 @@ mod tests {
     use super::*;
 
     const SHA: &str = "0123abc4567def890123abc4567def890123abcd";
+
+    fn review_state() -> PipelineState {
+        let input = input_from(&serde_json::json!({
+            "task": "t", "builder_kind": "a", "reviewer_kind": "b", "brief": "brief",
+            "repo": "/r", "branch": "b", "integ": "main", "runs_dir": "/runs"
+        }))
+        .unwrap();
+        let mut s = PipelineState::new(input);
+        s.stage = Stage::Review;
+        s
+    }
+
+    fn status_of(d: Decision) -> Option<String> {
+        match d {
+            StepDecision::Complete(o) => Some(o.status),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pipeline_clean_review_with_empty_challenge_reaches_the_gate() {
+        for tail in [
+            "## Findings\n(none)\n\n## Challenge\nNone. The brief's premises hold.\n\nVerdict: clean",
+            "## Challenge\nNone. Premises hold: commit exists on quaqua/sude-e2e1-b and is the HEAD of the review worktree.\n\nVerdict: clean",
+        ] {
+            let mut s = review_state();
+            let d = PipelineFlow.on_report(&mut s, tail);
+            assert_eq!(status_of(d), None, "disputed: {tail}");
+            assert_eq!(s.stage, Stage::Gate);
+        }
+    }
+
+    #[test]
+    fn pipeline_real_challenge_still_disputes() {
+        let mut s = review_state();
+        let d = PipelineFlow.on_report(
+            &mut s,
+            "## Challenge\nNone of the premises hold: no such commit.\n\nVerdict: clean",
+        );
+        assert_eq!(status_of(d).as_deref(), Some("disputed"));
+    }
 
     #[test]
     fn verdicts_fail_closed() {
