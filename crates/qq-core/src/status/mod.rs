@@ -101,7 +101,7 @@ pub fn render(s: &Status, metrics: bool) -> String {
     out
 }
 
-fn status_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate::cli::CliError> {
+pub fn status_command(env: &crate::cli::Env, args: &[String]) -> Result<String, crate::cli::CliError> {
     let err = |e: String| crate::cli::CliError::new(1, e);
     let mut all = false;
     let mut metrics = false;

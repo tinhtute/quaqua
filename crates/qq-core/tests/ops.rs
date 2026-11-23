@@ -1119,6 +1119,30 @@ fn status_reads_db() {
 }
 
 #[test]
+fn status_metrics_keeps_cleaned_up_worker_spend() {
+    let (dir, conn) = seeded("status-metrics");
+    let pid = add_project(&conn, "zimage");
+    add_agent(&conn, "w1", "peer", "tieude", Some(pid));
+    conn.execute(
+        "INSERT INTO run (agent_id, kind, harness, model, started_ms, ended_ms, outcome, tokens_in, tokens_out, cost_usd, cost_state) \
+         SELECT id, 'tieude', 'pi', 'm', 1, 2, 'verified', 10, 20, 1.5, 'reported' FROM agent WHERE name = 'w1'",
+        [],
+    )
+    .unwrap();
+    // Cleanup ends the agent; the run row stays.
+    conn.execute("UPDATE agent SET ended_ms = 3 WHERE name = 'w1'", [])
+        .unwrap();
+    let env = qq_core::cli::Env { runs_dir: dir };
+    let plain = status::status_command(&env, &[]).unwrap();
+    assert!(!plain.contains("w1"), "default view hides cleaned-up workers: {plain}");
+    let metrics = status::status_command(&env, &["--metrics".to_string()]).unwrap();
+    assert!(
+        metrics.contains("run - w1 verified in=10 out=20 cost=$1.50"),
+        "--metrics keeps the spend of a cleaned-up worker: {metrics}"
+    );
+}
+
+#[test]
 fn pane_metadata_merges_and_repeats() {
     let herdr = FakeHerdr::new();
     let pane = HerdrPanes(&herdr).create_tab("t").unwrap().id;
