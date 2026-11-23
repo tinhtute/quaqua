@@ -18,6 +18,13 @@ pub struct Env {
     pub runs_dir: PathBuf,
 }
 
+/// Exit status for a usage error: nothing ran, so sending the same thing again
+/// cannot help (sysexits EX_USAGE).
+pub const EXIT_USAGE: i32 = 64;
+/// Exit status when the daemon cannot be reached (sysexits EX_UNAVAILABLE).
+/// Start the daemon; do not resend. Exit 1 keeps its per-command meaning.
+pub const EXIT_UNREACHABLE: i32 = 69;
+
 /// A failed command: the message goes to stderr, `code` is the exit status.
 #[derive(Debug)]
 pub struct CliError {
@@ -186,10 +193,14 @@ pub fn rpc_call_as(
             ) =>
         {
             Err(CliError::new(
-                1,
+                EXIT_UNREACHABLE,
                 format!("daemon not running (socket {})", socket.display()),
             ))
         }
+        // The daemon was reached but the call did not finish (read timeout,
+        // dropped connection): it may be alive and may have acted, so exit 1
+        // and no "start the daemon" advice. The "rpc failed:" prefix is kept
+        // for `memory::inbox::transport_error`.
         Err(e) => Err(CliError::new(1, format!("rpc failed: {e}"))),
     }
 }
@@ -257,4 +268,36 @@ fn core_commands() -> Vec<Command> {
             },
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runs(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qq-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn missing_socket_is_unreachable() {
+        let env = Env { runs_dir: runs("nosock") };
+        let e = rpc_call_as(&env, None, "ping", Value::Null).unwrap_err();
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert!(e.message.starts_with("daemon not running"), "{}", e.message);
+    }
+
+    #[test]
+    fn live_daemon_that_drops_the_call_is_not_unreachable() {
+        let env = Env { runs_dir: runs("eof") };
+        let l = std::os::unix::net::UnixListener::bind(rpc::socket_path(&env.runs_dir)).unwrap();
+        let h = std::thread::spawn(move || drop(l.accept().unwrap()));
+        let e = rpc_call_as(&env, None, "ping", Value::Null).unwrap_err();
+        h.join().unwrap();
+        assert_eq!(e.code, 1, "{}", e.message);
+        assert!(e.message.starts_with("rpc failed:"), "{}", e.message);
+        assert!(!e.message.contains("start the daemon"), "{}", e.message);
+    }
 }

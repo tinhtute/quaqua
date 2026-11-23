@@ -6,11 +6,13 @@ Always look first: `herdr agent get <name>` then `herdr agent read <name> --sour
 |--------|---------|----|
 | `blocked` | approval/question UI on screen | Safe in-worktree choice → `herdr agent send-keys <name> <key>`. Anything on the `AGENTS.md` approval list → ask anh iu. |
 | `timeout` / `agent_prompt_stalled` | prompt may or may not have landed | Never re-prompt blind. Text sitting unsubmitted → `send-keys <name> enter`. Still working → wait again. |
-| `unknown` | herdr can't tell turn end | Wait for a nonempty, byte-stable `runs/<name>.md` via `quaqua worker prompt --resume`; read it and re-run its test before accepting. |
+| `unknown` | herdr can't tell turn end | Wait for a nonempty, byte-stable `runs/<name>.md` via `quaqua worker prompt <name> --resume`; read it and re-run its test before accepting. |
 | `agent_not_ready` at start | startup dialog (e.g. a first-run trust prompt) | `herdr pane read <pane> --source visible`, answer, then `herdr agent wait <name> --until idle`. |
 | `runs/<name>.md` missing but agent idle | worker skipped the handoff | Prompt once: "Write the summary file now; reply only the path." |
 
-Watchdog exits: `2` hard cap (7200 s) · `3` stall · `4` time budget · `5` blocked · `6` malformed report · `7` provider error needing a human · `8` core died (killed, OOM, panic). After any of 3–8 (2 is the absolute cap; `--extend <sec>` cannot pass it): read the pane, act only within the brief's authority, then `quaqua worker prompt --resume <name>` keeps waiting without a fresh task prompt or clock. Text still sitting unsubmitted → `herdr agent send-keys <name> enter`, then resume. A still-working worker needs another wait, not another task.
+`worker prompt` exits: `1` brief not landed (send it again) · `64` usage error or rejected brief (fix the command or brief, never retry as is).
+
+Any daemon verb: `69` daemon unreachable (start it, never retry); `1` with `rpc failed:` means the daemon was reached but the call did not finish (check `quaqua ping`, don't blind-retry). Watchdog exits: `2` hard cap (7200 s) · `3` stall · `4` time budget · `5` blocked · `6` malformed report · `7` provider error needing a human · `8` core died (killed, OOM, panic). After any of 3–8 (2 is the absolute cap; `--extend <sec>` cannot pass it): read the pane, act only within the brief's authority, then `quaqua worker prompt <name> --resume` keeps waiting without a fresh task prompt or clock. Text still sitting unsubmitted → `herdr agent send-keys <name> enter`, then resume. A still-working worker needs another wait, not another task.
 
 For a provider/stream error (`agent_blocked`), inspect the UI first. Raw `herdr pane` input verbs are blocked by the gate for every caller, CoS included. `agent prompt` is rejected while the agent is `blocked`, and `herdr agent` has no `send-text`, so free text cannot reach a blocked agent: use `herdr agent send-keys <name> <key>` for a key-only fix (e.g. `enter`), otherwise escalate to anh iu with the pane read. Still stuck → escalate, never loop retries.
 

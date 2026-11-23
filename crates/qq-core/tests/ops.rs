@@ -1421,13 +1421,75 @@ fn prompt_sends_the_brief_once_and_resume_sends_nothing() {
     // a resume that carries a brief, or a fresh prompt without one, is a usage error
     for bad in [&["w", "--resume", BRIEF][..], &["w"][..]] {
         let e = prompt::prompt_run(&h, &clock, &runs, &args(bad), &tuning).unwrap_err();
-        assert_eq!(e.code, 1);
+        assert_eq!(e.code, 64, "a usage error is not 'the prompt did not land'");
     }
+    let e = prompt::prompt_run(&h, &clock, &runs, &args(&["w", "--resume", "--extend", "0"]), &tuning)
+        .unwrap_err();
+    assert_eq!(e.code, 64);
     // a brief that fails the check sends nothing
     let e =
         prompt::prompt_run(&h, &clock, &runs, &args(&["w", "no headers"]), &tuning).unwrap_err();
-    assert_eq!(e.code, 1);
+    assert_eq!(e.code, 64, "a rejected brief is a usage error");
     assert_eq!(h.prompts().len(), 1);
+}
+
+#[test]
+fn prompt_takes_resume_before_or_after_the_name() {
+    let (runs, _c) = seeded("resumeorder");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    let tuning = Tuning {
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+    };
+    std::fs::write(
+        runs.join("w.md"),
+        "Outcome: COMPLETE\n\n## Blockers\nnone\n\n## Lessons\nnone\n",
+    )
+    .unwrap();
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {}),
+    };
+    for order in [&["w", "--resume"][..], &["--resume", "w"][..]] {
+        let a: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+        let out = prompt::prompt_run(&h, &clock, &runs, &a, &tuning)
+            .unwrap_or_else(|e| panic!("{order:?}: {}", e.message));
+        assert!(out.ends_with("w.md"), "{out}");
+    }
+    assert!(h.prompts().is_empty(), "a resume sends nothing");
+}
+
+#[test]
+fn prompt_resume_of_an_unknown_name_is_refused_before_any_wait_and_writes_nothing() {
+    let root = std::env::temp_dir().join(format!("qq-ops-unknown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (runs, memory) = (root.join("runs"), root.join("memory"));
+    std::fs::create_dir_all(&runs).unwrap();
+    std::fs::create_dir_all(&memory).unwrap();
+    drop(db::open(&runs.join(db::path::DB_FILE)).unwrap());
+    let h = FakeHerdr::new();
+    let sleeps = std::cell::Cell::new(0u32);
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| sleeps.set(sleeps.get() + 1)),
+    };
+    let tuning = Tuning {
+        poll_ms: 5_000,
+        retry_base_ms: 60_000,
+        retry_max: 4,
+    };
+    for order in [&["nosuch-zz", "--resume"][..], &["--resume", "nosuch-zz"][..]] {
+        let a: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+        let e = prompt::prompt_run(&h, &clock, &runs, &a, &tuning).unwrap_err();
+        assert_eq!(e.code, 64, "{order:?}: {}", e.message);
+        assert!(e.message.contains("nosuch-zz"), "{}", e.message);
+    }
+    assert_eq!(sleeps.get(), 0, "refused before the wait starts");
+    assert_eq!(std::fs::read_dir(&memory).unwrap().count(), 0, "day memory untouched");
+    assert!(h.prompts().is_empty());
 }
 
 #[test]
@@ -1866,6 +1928,6 @@ fn pilot_budget_blocks_the_prompt_before_anything_is_sent() {
     let brief = BRIEF.replace("Playbook: feature", "Playbook: prototype");
     let args: Vec<String> = vec!["w".into(), brief];
     let e = prompt::prompt_run(&h, &clock, &runs, &args, &tuning).unwrap_err();
-    assert_eq!(e.code, 1);
+    assert_eq!(e.code, 64, "a pilot-budget refusal is a usage error");
     assert!(h.prompts().is_empty());
 }
