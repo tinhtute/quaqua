@@ -1039,6 +1039,28 @@ pub fn setting(conn: &Connection, key: &str) -> Result<Option<serde_json::Value>
         .transpose()
 }
 
+/// How long a worker may go without a change before it is stalled: `QQ_STALL_SEC`,
+/// else the setting `notify.stall_sec`, else 600 s. One reading for the daemon
+/// sweep and `worker prompt`. A value that is not a finite number >= 0, or too
+/// large for a `Duration`, falls back to the default.
+pub fn stall_sec(conn: &Connection) -> std::time::Duration {
+    let default = std::time::Duration::from_secs(crate::task::prompt::STALL_SEC);
+    let ok = |v: &f64| v.is_finite() && *v >= 0.0;
+    std::env::var("QQ_STALL_SEC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(ok)
+        .or_else(|| {
+            setting(conn, "notify.stall_sec")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_f64())
+                .filter(ok)
+        })
+        .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
+        .unwrap_or(default)
+}
+
 /// Role topology edges, sorted.
 pub fn topology(conn: &Connection) -> Result<Vec<Edge>, ConfigError> {
     let mut st = conn.prepare(

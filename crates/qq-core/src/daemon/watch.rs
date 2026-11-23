@@ -126,7 +126,7 @@ pub fn watch_report(
 
 /// Seconds an agent may stay `working` without a status change before it is
 /// stalled. `QQ_STALL_SEC` or the setting `notify.stall_sec` overrides it.
-pub const STALL_SEC: f64 = 600.0;
+pub const STALL_SEC: f64 = crate::task::prompt::STALL_SEC as f64;
 const SWEEP_MS: u64 = 2_000;
 /// A fresh agent that herdr does not know yet is not "exited" before this.
 const SPAWN_GRACE_MS: u64 = 30_000;
@@ -153,13 +153,9 @@ fn number_setting(ctx: &Ctx, key: &str) -> Option<f64> {
 }
 
 fn stall_after(ctx: &Ctx) -> Duration {
-    let secs = std::env::var("QQ_STALL_SEC")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .or_else(|| number_setting(ctx, "notify.stall_sec"))
-        .unwrap_or(STALL_SEC);
-    secs_or(secs, STALL_SEC)
+    ctx.store
+        .with_conn(|c| Ok::<_, crate::config::ConfigError>(crate::config::stall_sec(c)))
+        .unwrap_or_else(|_| Duration::from_secs_f64(STALL_SEC))
 }
 
 /// `secs` as a Duration; a value too large for one falls back to `default`.

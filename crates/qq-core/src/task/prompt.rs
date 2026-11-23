@@ -15,6 +15,7 @@ use crate::daemon::Daemon;
 
 pub const DEFAULT_BUDGET_SEC: u64 = 2700;
 pub const MAX_SEC: u64 = 7200;
+/// Default stall limit; the setting `notify.stall_sec` overrides it.
 pub const STALL_SEC: u64 = 600;
 pub const IDLE_SEC: u64 = 120;
 const BIG_TIME_MIN: u64 = 240;
@@ -352,8 +353,11 @@ pub struct Observed {
     pub core_died: bool,
     pub since_change_sec: u64,
     pub idle_sec: u64,
-    /// The pane reads as a provider error (consulted only on a stall or block).
+    /// The pane (or the harness's error record) shows a provider error. It ends
+    /// the wait at once, not through the stall clock.
     pub provider_error: bool,
+    /// The stall limit; `None` is the default `STALL_SEC`.
+    pub stall_sec: Option<u64>,
 }
 
 pub use super::report_contract::well_formed as report_well_formed;
@@ -374,11 +378,12 @@ pub fn decide(o: &Observed) -> Option<Exit> {
     if o.elapsed_sec >= MAX_SEC {
         return Some(Exit::HardCap);
     }
-    let stalled = o.agent_gone || o.since_change_sec >= STALL_SEC || o.idle_sec >= IDLE_SEC;
+    if o.provider_error {
+        return Some(Exit::ProviderError);
+    }
+    let stall = o.stall_sec.unwrap_or(STALL_SEC);
+    let stalled = o.agent_gone || o.since_change_sec >= stall || o.idle_sec >= IDLE_SEC;
     if o.blocked || stalled {
-        if o.provider_error {
-            return Some(Exit::ProviderError);
-        }
         return Some(if o.blocked {
             Exit::Blocked
         } else {
@@ -787,6 +792,14 @@ fn write_atomic(path: &Path, text: &str) {
     }
 }
 
+/// The stall limit in whole seconds from `config::stall_sec` (the daemon sweep
+/// reads the same value): rounded up, never under one second.
+fn stall_limit(runs: &Path) -> Option<u64> {
+    let c = crate::db::open(&runs.join(crate::db::path::DB_FILE)).ok()?;
+    let d = crate::config::stall_sec(&c);
+    Some((d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1))
+}
+
 /// A hash of the worktree's uncommitted state, or empty without one.
 fn diff_hash(worktree: &Option<PathBuf>) -> String {
     use std::hash::{Hash, Hasher};
@@ -856,16 +869,39 @@ pub fn after_nudge(pane: &str) -> &str {
     cut.map_or("", |i| &pane[i..])
 }
 
-/// A stalled or blocked turn's verdict: the harness record wins (and is
-/// consumed, one record per decision; one older than `since` is stale), else
-/// the pane tail read through `pane_read` is classified.
+/// `body` minus the lines in `ignore` (exact, trailing space aside): what a
+/// resumed wait has not already escalated.
+pub fn without_lines(ignore: &[String], body: &str) -> String {
+    body.lines()
+        .filter(|l| !ignore.iter().any(|i| i == l.trim_end()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The pane lines an escalation leaves in `runs/.<name>.escalated`.
+fn escalated_lines(text: &str) -> String {
+    text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(|l| format!("{l}\n")).collect()
+}
+
+/// A stalled or blocked turn's verdict. The harness record wins; one older
+/// than `since` is stale and removed. A record is removed only when the wait
+/// acts on it (the caller does that), so a working agent leaves it for the
+/// idle poll. While the agent works only a named fatal ends the wait and only
+/// the record is trusted: pane text may be a tool's output or an old line. Else
+/// the pane tail is classified, minus the `ignore` lines an earlier wait
+/// escalated (before any nudge; the nudge echo bounds the text after that).
+/// The unfiltered pane body comes back with the verdict, for the escalation
+/// record (empty for a harness record).
 fn provider_verdict(
     herdr: &dyn HerdrClient,
     cfg: &WaitCfg,
     pane: Option<&str>,
     since: u64,
     nudged: bool,
-) -> Option<Decision> {
+    working: bool,
+    ignore: &[String],
+) -> Option<(Decision, String)> {
+    let named_fatal = |d: &Decision| matches!(d.error, ProviderError::Fatal(r) if r != "api-error");
     let path = error_path(cfg.runs_dir, cfg.name);
     if let Ok(text) = std::fs::read_to_string(&path) {
         let written = std::fs::metadata(&path)
@@ -873,20 +909,30 @@ fn provider_verdict(
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        let _ = std::fs::remove_file(&path);
-        if !written.is_some_and(|m| m < since) {
-            if let Some(d) = parse_error_record(&text) {
-                return Some(d);
+        if written.is_some_and(|m| m < since) {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            match parse_error_record(&text) {
+                Some(d) if !working || named_fatal(&d) => return Some((d, String::new())),
+                Some(_) => {}
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
     }
+    if working {
+        return None;
+    }
     let r = herdr.pane_read(pane?, 60).ok().filter(|r| r.ok)?;
+    // After our `continue` the echo marks what is new; a repeat of an old line
+    // must count then, so the ignore list serves only before the first nudge.
     let text = if nudged {
-        after_nudge(&r.body)
+        after_nudge(&r.body).to_string()
     } else {
-        &r.body
+        without_lines(ignore, &r.body)
     };
-    classify(cfg.harness, text)
+    classify(cfg.harness, &text).map(|d| (d, r.body))
 }
 
 /// Whether the database holds an open agent record for `name`.
@@ -948,6 +994,13 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
     let mut last_auto_hash = diff_hash(&cfg.worktree);
     // `--resume` continues the retry count of the wait it resumes.
     let mut attempt: u32 = read_u64(&retry_f).unwrap_or(0) as u32;
+    let stall_sec = stall_limit(runs);
+    // The pane lines an earlier wait escalated on (a fresh brief clears them):
+    // a resume must not read them again as news.
+    let escalated_f = side(runs, name, "escalated");
+    let mut ignore: Vec<String> = std::fs::read_to_string(&escalated_f)
+        .map(|t| t.lines().map(String::from).collect())
+        .unwrap_or_default();
     loop {
         let now = clock.now_sec();
         let elapsed = now.saturating_sub(start);
@@ -988,12 +1041,26 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
             since_change_sec: now.saturating_sub(last_change),
             idle_sec: idle_since.map_or(0, |t| now.saturating_sub(t)),
             provider_error: false,
+            stall_sec,
         };
-        let mut verdict = None;
-        if matches!(decide(&o), Some(Exit::Stalled | Exit::Blocked)) {
-            verdict = provider_verdict(herdr, cfg, pane.as_deref(), start, attempt > 0);
-            o.provider_error = verdict.is_some();
+        // A provider error is read on every poll. A working agent is making
+        // progress (the harness may be retrying on its own), so only a named
+        // fatal in the harness record, which no retry clears, ends its wait.
+        let working = status.as_deref() == Some("working");
+        let read = |ignore: &[String]| {
+            provider_verdict(herdr, cfg, pane.as_deref(), start, attempt > 0, working, ignore)
+        };
+        let mut verdict = read(&ignore);
+        // The ignore list only shortens the at-once path. A wait that is about
+        // to stall or block reads the whole pane, so a worker that is still
+        // dead ends in 7 with its stub, not in 3.
+        if verdict.is_none()
+            && !ignore.is_empty()
+            && matches!(decide(&o), Some(Exit::Stalled | Exit::Blocked))
+        {
+            verdict = read(&[]);
         }
+        o.provider_error = verdict.is_some();
         if o.report.is_none() && !nudged_f.exists() && elapsed * 100 >= allowance * 80 {
             let msg = format!(
                 "Time check: you are past 80% of this task's time budget. Wrap up now: finish the current step, commit your work, and write {} (via a temp file + rename) with what is done plus a Blockers section for the rest. Reply only the path.",
@@ -1030,7 +1097,8 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                 write_atomic(&budget_f, &format!("{allowance}\n"));
             }
             Exit::ProviderError => {
-                let d = verdict.expect("decide sets ProviderError only with a verdict");
+                let (d, text) = verdict.expect("decide sets ProviderError only with a verdict");
+                let _ = std::fs::remove_file(error_path(runs, name));
                 let (reason, retryable) = match d.error {
                     ProviderError::Retryable(r) => (r, true),
                     ProviderError::Fatal(r) => (r, false),
@@ -1042,6 +1110,15 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                         json!({"reason": reason, "retryable": retryable, "retries": attempt - 1, "harness_exhausted": d.exhausted}),
                     );
                     let _ = std::fs::remove_file(&retry_f);
+                    if !text.is_empty() {
+                        // cumulative: the set kept so far plus every line of this pane
+                        let mut all = ignore.clone();
+                        all.extend(text.lines().map(|l| l.trim_end().to_string()));
+                        all.retain(|l| !l.trim().is_empty());
+                        let mut seen = std::collections::HashSet::new();
+                        all.retain(|l| seen.insert(l.clone()));
+                        write_atomic(&escalated_f, &escalated_lines(&all.join("\n")));
+                    }
                     return Exit::ProviderError;
                 }
                 let delay = cfg.retry_base_ms.saturating_mul(1 << (attempt - 1).min(20));
@@ -1050,6 +1127,9 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                     json!({"attempt": attempt, "reason": reason, "delay_ms": delay, "harness_exhausted": d.exhausted}),
                 );
                 write_atomic(&retry_f, &format!("{attempt}\n"));
+                // our nudge echo bounds the text from here on
+                let _ = std::fs::remove_file(&escalated_f);
+                ignore.clear();
                 clock.sleep_ms(delay);
                 let _ = herdr.agent_prompt(name, "continue", None);
                 last_change = clock.now_sec();
@@ -1264,6 +1344,7 @@ pub fn prompt_run(
             "elapsed",
             "provider_retry",
             "error",
+            "escalated",
             "playbook",
         ] {
             let _ = std::fs::remove_file(side(runs, name, ext));
