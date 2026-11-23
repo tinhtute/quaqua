@@ -394,3 +394,84 @@ fn watchdog_stale_fatal_line_is_not_news_once_the_worker_went_idle() {
     };
     assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
 }
+
+const FOOT: &str = "─────────\n? for shortcuts\n";
+
+/// Working on a pane with fixed footer chrome, then `new` lands above it and the
+/// worker goes idle: the footer never changes, only the text above it does.
+fn chrome_wait(tag: &str, before: &str, after: String) -> (Exit, Vec<String>) {
+    let (runs, _c) = seeded(tag);
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    h.set_pane_text("p1", before);
+    let events = std::cell::RefCell::new(Vec::<String>::new());
+    let journal = |k: &str, _: serde_json::Value| events.borrow_mut().push(k.to_string());
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now >= 10 {
+                h.set_pane_text("p1", &after);
+                h.set_status("w", "idle");
+            }
+        }),
+    };
+    let exit = prompt::wait(&h, &clock, &cfg(&runs, &journal));
+    let ev = events.borrow().clone();
+    (exit, ev)
+}
+
+#[test]
+fn watchdog_new_fatal_line_above_a_fixed_footer_is_news() {
+    let before = format!("old output\n{FOOT}");
+    let after = format!("old output\nNot logged in · Please run /login\n{FOOT}");
+    let (exit, ev) = chrome_wait("chrome-fatal", &before, after);
+    assert_eq!(exit, Exit::ProviderError);
+    assert_eq!(ev, vec!["provider_escalate".to_string()]);
+}
+
+#[test]
+fn watchdog_new_fatal_line_after_a_full_scroll_with_a_recurring_last_line_is_news() {
+    let before = format!("old output\n{FOOT}");
+    let mut after = String::from("old output\n");
+    for i in 0..70 {
+        after.push_str(&format!("tool line {i}\n"));
+        if i == 40 {
+            after.push_str("Not logged in · Please run /login\n");
+        }
+    }
+    after.push_str(FOOT);
+    let (exit, _ev) = chrome_wait("chrome-scroll", &before, after);
+    assert_eq!(exit, Exit::ProviderError);
+}
+
+#[test]
+fn watchdog_new_retryable_line_above_a_fixed_footer_is_retried() {
+    let before = format!("old output\n{FOOT}");
+    let after = format!("old output\n{SLEEP}\n{FOOT}");
+    let (_exit, ev) = chrome_wait("chrome-retry", &before, after);
+    assert_eq!(ev.first().map(String::as_str), Some("provider_retry"), "{ev:?}");
+}
+
+#[test]
+fn watchdog_resume_after_an_escalation_ignores_only_the_escalated_lines() {
+    let (runs, _c) = seeded("escalated");
+    let (_h, r) = dead_worker(&runs);
+    assert_eq!(r.unwrap_err().code, 7);
+    assert!(runs.join(".w.escalated").exists(), "the escalated line was not kept");
+    // resumed on the same signed-out pane, but a different error line appears: still news
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    h.set_pane_text("p1", "Not logged in · Please run /login\nInvalid API key · Please run /login\n");
+    let clock = idle_clock(&h, "idle");
+    let exit = prompt::wait(&h, &clock, &cfg(&runs, &noop_journal));
+    assert_eq!(exit, Exit::ProviderError);
+    // and the same pane alone is not: only the old line is on it
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let clock = idle_clock(&h, "idle");
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
+}
