@@ -153,13 +153,9 @@ fn number_setting(ctx: &Ctx, key: &str) -> Option<f64> {
 }
 
 fn stall_after(ctx: &Ctx) -> Duration {
-    let secs = std::env::var("QQ_STALL_SEC")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .or_else(|| ctx.store.with_conn(|c| Ok::<_, crate::config::ConfigError>(crate::config::stall_sec(c))).ok().flatten())
-        .unwrap_or(STALL_SEC);
-    secs_or(secs, STALL_SEC)
+    ctx.store
+        .with_conn(|c| Ok::<_, crate::config::ConfigError>(crate::config::stall_sec(c)))
+        .unwrap_or_else(|_| Duration::from_secs_f64(STALL_SEC))
 }
 
 /// `secs` as a Duration; a value too large for one falls back to `default`.

@@ -203,7 +203,7 @@ fn watchdog_reports_a_fatal_provider_error_at_once_on_a_working_pane() {
     let h = FakeHerdr::new();
     occupy(&h, "p1", "w");
     h.set_status("w", "working");
-    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    std::fs::write(prompt::error_path(&runs, "w"), "fatal 401 0\n").unwrap();
     let clock = idle_clock(&h, "working");
     assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ProviderError);
     assert!(clock.now_sec() < 30, "reported after {}s", clock.now_sec());
@@ -368,4 +368,29 @@ fn stall_limit_too_large_falls_back_to_600() {
     let (exit, at) = silent_wait(&runs);
     assert_eq!(exit, Exit::Stalled);
     assert!((600..610).contains(&at), "stalled at {at}s, want about 600");
+}
+
+#[test]
+fn newer_than_keeps_only_lines_after_the_baseline() {
+    let base: Vec<String> = ["a", "Not logged in", "login ok"].map(String::from).to_vec();
+    assert_eq!(prompt::newer_than(&base, "a\nNot logged in\nlogin ok\n"), "");
+    assert_eq!(prompt::newer_than(&base, "a\nNot logged in\nlogin ok\nwork\n"), "work");
+    // scrolled: the window lost "a"
+    assert_eq!(prompt::newer_than(&base, "Not logged in\nlogin ok\nwork\nmore\n"), "work\nmore");
+    // nothing in common: all of it is new
+    assert_eq!(prompt::newer_than(&base, "x\ny\n"), "x\ny");
+}
+
+#[test]
+fn watchdog_stale_fatal_line_is_not_news_once_the_worker_went_idle() {
+    let (runs, _c) = seeded("stale-idle");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    h.set_pane_text("p1", "Not logged in · Please run /login\nlogin ok\n");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| h.set_status("w", if now >= 10 { "idle" } else { "working" })),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
 }
