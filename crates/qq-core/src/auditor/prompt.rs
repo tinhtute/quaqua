@@ -74,3 +74,12 @@ Format: `## Drift`, `## Stale docs`, `## Unhandled`, `## Pipeline`, and `## Work
 sections, each `- file: finding + evidence` (cite path/commit), one line each.
 No findings in a section → write `- none`. End with one line
 `Verdict: clean | N findings`. Terse, technical."#;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn auditor_prompt_states_expiry_clock() {
+        let p = super::PROMPT_TEMPLATE;
+        assert!(p.contains("first seen by the auditor"), "expiry clock origin unstated");
+    }
+}
