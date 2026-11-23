@@ -704,7 +704,7 @@ mod peer_tests {
 
     #[test]
     fn a_polling_verb_that_succeeds_quickly_logs_nothing() {
-        for v in ["status", "ping", "caller", "mail.inbox", "mail.ack"] {
+        for v in ["status", "ping", caller::VERB, "mail.inbox"] {
             let text = traced_log(v, "lead", Ok(Value::Null));
             assert_eq!(text, "", "{v}");
         }
@@ -718,8 +718,18 @@ mod peer_tests {
 
     #[test]
     fn a_mutating_verb_that_succeeds_logs_both_lines() {
-        let text = traced_log("mail.send", "lead", Ok(Value::Null));
-        assert_eq!(text.lines().count(), 2, "{text}");
+        for v in ["mail.send", "mail.ack"] {
+            let text = traced_log(v, "lead", Ok(Value::Null));
+            assert_eq!(text.lines().count(), 2, "{v}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_newline_in_the_verb_cannot_forge_a_line() {
+        let text = traced_log("x\nquaqua daemon: verb caller=root verb=stop ms=0 ok", "lead", Ok(Value::Null));
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+        assert!(text.lines().all(|l| l.starts_with("quaqua daemon: verb")), "{text:?}");
+        assert!(!text.contains("x\nquaqua"), "{text:?}");
     }
 
     #[test]
