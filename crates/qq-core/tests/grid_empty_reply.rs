@@ -61,13 +61,19 @@ fn acquire(stub: &Stub, tag: &str) -> io::Result<String> {
 
 #[test]
 fn grid_acquire_accepts_empty_claim_reply() {
-    let stub = Stub { claim_body: "", tab_create_body: TAB };
+    let stub = Stub {
+        claim_body: "",
+        tab_create_body: TAB,
+    };
     assert_eq!(acquire(&stub, "empty").unwrap(), "w1:p4");
 }
 
 #[test]
 fn grid_malformed_reply_names_the_herdr_call() {
-    let stub = Stub { claim_body: "", tab_create_body: "" };
+    let stub = Stub {
+        claim_body: "",
+        tab_create_body: "",
+    };
     let e = acquire(&stub, "malformed").unwrap_err().to_string();
     assert!(e.contains("tab create"), "error names the call: {e}");
 }
