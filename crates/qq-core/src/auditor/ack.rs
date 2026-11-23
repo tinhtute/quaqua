@@ -12,10 +12,11 @@ pub fn store_path(root: &Path) -> PathBuf {
     root.join("reports").join("auditor-acks.tsv")
 }
 
-/// Stable 8-hex id of a finding line (FNV-1a).
+/// Stable 8-hex id of a finding line (FNV-1a). Digits are stripped first so a
+/// count that moves ("3 unpromoted lessons" -> "4") keeps the same id, ack and clock.
 pub fn finding_id(line: &str) -> String {
     let mut h: u32 = 0x811c_9dc5;
-    for b in line.bytes() {
+    for b in line.bytes().filter(|b| !b.is_ascii_digit()) {
         h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
     }
     format!("{h:08x}")
