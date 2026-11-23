@@ -100,6 +100,18 @@ mod tests {
     }
 
     #[test]
+    fn auditor_ack_id_ignores_counts() {
+        let a = "- runs/: 3 unpromoted lessons (> 7d)";
+        let b = "- runs/: 12 unpromoted lessons (> 7d)";
+        assert_eq!(finding_id(a), finding_id(b));
+        let (_, store) = apply(vec![a.into()], "", 0);
+        let store = ack(&store, &finding_id(a), 1).unwrap();
+        let (kept, store) = apply(vec![b.into()], &store, 5 * DAY);
+        assert!(kept.is_empty(), "count change must not lose the ack");
+        assert!(store.contains("\t0\tack"), "first-seen clock kept: {store}");
+    }
+
+    #[test]
     fn auditor_ack_suppresses_acked_finding() {
         let (kept, store) = apply(vec![RO.into()], "", 1000);
         assert_eq!(kept, vec![RO.to_string()]);
