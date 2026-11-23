@@ -482,7 +482,7 @@ pub fn check_orchestration(
             caller,
             "push",
             op.as_str(),
-            "an unfenced driver never pushes",
+            "an unfenced driver never pushes; ask a fenced Lead, or the owner pushes",
         );
     }
     Ok(Decision::Allowed)
