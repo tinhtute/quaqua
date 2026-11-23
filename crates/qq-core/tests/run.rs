@@ -348,3 +348,25 @@ fn closed_run_without_session_journals_the_failure() {
     assert!(payload.contains("no agent session"), "{payload}");
     daemon.stop().unwrap();
 }
+
+#[test]
+fn run_show_lists_a_lookup_skip_next_to_the_worker_events() {
+    let ws = TestWorkspace::new("run-lookup-skip");
+    let mut conn = seeded(&ws);
+    let wf = open_run(&mut conn, "l1", "claude", 1);
+    for (stream, seq, ts, kind, payload) in [
+        ("lookup:l1", 1, 5, "code_lookup_skipped", "MINE"),
+        (wf.as_str(), 99, 6, "activity_scheduled", "{}"),
+        ("lookup:other", 1, 7, "code_lookup_skipped", "OTHERS"),
+    ] {
+        conn.execute(
+            "INSERT INTO events (workflow_id, seq, ts_ms, kind, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![stream, seq, ts, kind, payload],
+        )
+        .unwrap();
+    }
+    let full = show::render(&show::load(&conn, &wf).unwrap().unwrap());
+    assert!(full.contains("code_lookup_skipped MINE"), "{full}");
+    assert!(full.contains("activity_scheduled"), "{full}");
+    assert!(!full.contains("OTHERS"), "another worker's skip leaked in: {full}");
+}

@@ -298,7 +298,7 @@ fn hook_settings_route_mcp_floor() {
 
 /// The lookup MCP is read-only and allow-listed, so the gate never routes or
 /// asks for it: not in the installed matcher, and Allow from the gate itself
-/// (no rig: a second daemon rig in the same process stalls the other rig tests).
+/// (no rig: with one added, the other rig tests hung when run in parallel).
 #[test]
 fn code_lookup_tools_not_gated() {
     let ws = TestWorkspace::new("hr-lookup");

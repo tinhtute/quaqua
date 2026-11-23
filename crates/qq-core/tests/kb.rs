@@ -90,7 +90,7 @@ fn serena_live_server_keeps_project_clean() {
     let root = scratch("live");
     let project = root.join("work");
     fs::create_dir_all(&project).unwrap();
-    fs::write(project.join("a.rs"), "fn main() {}\n").unwrap();
+    fs::write(project.join("answers.py"), "def e2e_answer_symbol():\n    return 42\n").unwrap();
     let git = |a: &[&str]| {
         assert!(Command::new("git").args(a).current_dir(&project).status().unwrap().success())
     };
@@ -98,7 +98,7 @@ fn serena_live_server_keeps_project_clean() {
     git(&["add", "-A"]);
     git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"]);
 
-    let cfg = code_lookup_config(&project, &root.join("home"), &["rust"]).unwrap();
+    let cfg = code_lookup_config(&project, &root.join("home"), &["python"]).unwrap();
     let s = &cfg.mcp["mcpServers"]["code-lookup"];
     let args: Vec<&str> = s["args"].as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
     let mut child = Command::new("uvx")

@@ -217,8 +217,12 @@ pub fn spawn_with(
     spawn_inner(conn, herdr, drivers, spec, now_ms, ready, None)
 }
 
-/// Journals why a worker started without the code-lookup MCP (stream
-/// `worker:<name>`, which `run show` reads), plus a stderr line. Best effort.
+/// Journals why a worker started without the code-lookup MCP, plus a stderr
+/// line. Best effort. The stream is `lookup:<name>`, not `worker:<name>`:
+/// `task.start` spawns before its workflow (id `worker:<name>`) exists, and
+/// the runner reads any event already in its stream as history to replay, so a
+/// row there would stop the workflow's first step from running. `run show`
+/// reads `lookup:<name>` next to the worker's own events.
 fn lookup_skipped(conn: &Connection, name: &str, now_ms: u64, reason: &str) {
     eprintln!("code-lookup skipped for {name}: {reason}");
     let _ = conn.execute_batch(crate::engine::journal_sqlite::JOURNAL_SCHEMA_SQL);
@@ -227,7 +231,7 @@ fn lookup_skipped(conn: &Connection, name: &str, now_ms: u64, reason: &str) {
          SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, 'code_lookup_skipped', ?3 \
          FROM events WHERE workflow_id = ?1",
         params![
-            format!("worker:{name}"),
+            format!("lookup:{name}"),
             now_ms as i64,
             serde_json::json!({ "worker": name, "reason": reason }).to_string()
         ],

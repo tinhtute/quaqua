@@ -1289,7 +1289,7 @@ impl Fx {
         ) else {
             return Vec::new();
         };
-        st.query_map([format!("worker:{name}")], |r| r.get::<_, String>(0))
+        st.query_map([format!("lookup:{name}")], |r| r.get::<_, String>(0))
             .unwrap()
             .map(Result::unwrap)
             .collect()
