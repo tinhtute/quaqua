@@ -132,6 +132,38 @@ mod tests {
     }
 
     #[test]
+    fn auditor_ack_id_ignores_recurring_failure_count() {
+        let f = |n: u32| format!("- recurring failure ({n}x/14d, no rule): same cause");
+        assert_eq!(finding_id(&f(3)), finding_id(&f(4)));
+        assert_eq!(finding_id(&f(3)), finding_id(&f(12)));
+        assert_ne!(
+            finding_id(&f(3)),
+            finding_id("- recurring failure (3x/14d, no rule): other")
+        );
+        let g = |n: u32, m: u32| {
+            format!("- runs/x.md ({n} runs, first listed): bad; {m} of them blocked")
+        };
+        assert_eq!(finding_id(&g(2, 1)), finding_id(&g(5, 7)));
+    }
+
+    #[test]
+    fn auditor_ack_id_ignores_rule_line_numbers() {
+        for kind in ["expired rule", "malformed expiry"] {
+            let a = format!("- {kind}: rules/a.md:5: keep until 2020-01-01");
+            let b = format!("- {kind}: rules/a.md:41: keep until 2020-01-01");
+            assert_eq!(finding_id(&a), finding_id(&b), "{kind}");
+        }
+        assert_ne!(
+            finding_id("- expired rule: rules/a1.md:5: x"),
+            finding_id("- expired rule: rules/a2.md:5: x")
+        );
+        assert_ne!(
+            finding_id("- expired rule: rules/a.md:5: until 2020-01-01"),
+            finding_id("- expired rule: rules/a.md:5: until 2021-01-01")
+        );
+    }
+
+    #[test]
     fn auditor_ack_id_keeps_path_digits() {
         let a = "- runs/pipeline-cmmod.md: stuck";
         let b = "- runs/pipeline-cmmod2.md: stuck";
