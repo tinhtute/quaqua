@@ -18,7 +18,7 @@ pub mod watch;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, TryLockError};
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -592,22 +592,28 @@ fn serve_conn(
             Err(e) => Response::err(RpcError::new(rpc::BAD_REQUEST, e.to_string())),
             Ok(req) => match identify(req, peers, cred.as_ref(), own_uid) {
                 Err(e) => Response::err(e),
-                Ok(req) => match verbs.get(&req.verb) {
-                    None => Response::err(RpcError::new(
+                Ok(req) => traced(&req, &mut std::io::stderr(), || match verbs.get(&req.verb) {
+                    None => Err(RpcError::new(
                         rpc::UNKNOWN_VERB,
                         format!("no verb '{}'", req.verb),
                     )),
-                    Some(h) => match h(ctx, &req) {
-                        Ok(v) => Response::ok(v),
-                        Err(e) => Response::err(e),
-                    },
-                },
+                    Some(h) => h(ctx, &req),
+                })
+                .map_or_else(Response::err, Response::ok),
             },
         };
         if rpc::write_line(&mut out, &resp).is_err() {
             return;
         }
     }
+}
+
+/// Runs one verb (a stub for now: no trace).
+fn traced<F>(_req: &Request, _log: &mut dyn Write, run: F) -> Result<Value, RpcError>
+where
+    F: FnOnce() -> Result<Value, RpcError>,
+{
+    run()
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
@@ -644,6 +650,23 @@ fn identify(
 mod peer_tests {
     use super::*;
     use crate::identity::peer::{CallerId, PeerCred};
+
+    #[test]
+    fn a_served_verb_leaves_a_start_line_and_a_result_line() {
+        let mut req = Request::new("mail_send", Value::Null);
+        req.caller = Some("quaqua-rs-lead".into());
+        let mut log = Vec::new();
+        let ok = traced(&req, &mut log, || Ok(Value::Null));
+        let bad = traced(&req, &mut log, || Err(internal("boom".into())));
+        assert!(ok.is_ok() && bad.is_err());
+        let text = String::from_utf8(log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines[0], "quaqua daemon: verb start caller=quaqua-rs-lead verb=mail_send");
+        assert!(lines[1].starts_with("quaqua daemon: verb caller=quaqua-rs-lead verb=mail_send ms="));
+        assert!(lines[1].ends_with(" ok"), "{}", lines[1]);
+        assert!(lines[3].ends_with(" err"), "{}", lines[3]);
+    }
 
     struct Fixed(Result<&'static str, ()>);
     impl PeerResolver for Fixed {
