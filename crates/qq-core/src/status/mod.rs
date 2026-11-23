@@ -30,13 +30,23 @@ pub struct Status {
 
 /// Open agents and unfinished runs; `all` adds ended agents and finished runs.
 pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
+    read_with(conn, all, all)
+}
+
+/// `all_agents` adds ended agents, `all_runs` adds finished runs. A cleaned-up
+/// worker's run row stays in the database, so its spend stays readable.
+pub fn read_with(
+    conn: &Connection,
+    all_agents: bool,
+    all_runs: bool,
+) -> rusqlite::Result<Status> {
     let mut st = conn.prepare(
         "SELECT a.name, a.role, a.kind, p.slug, a.ended_ms IS NULL FROM agent a \
          LEFT JOIN project p ON p.id = a.project_id \
          WHERE (?1 OR a.ended_ms IS NULL) ORDER BY a.id",
     )?;
     let agents = st
-        .query_map([all], |r| {
+        .query_map([all_agents], |r| {
             Ok(AgentRow {
                 name: r.get(0)?,
                 role: r.get(1)?,
@@ -52,7 +62,7 @@ pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
          WHERE (?1 OR r.ended_ms IS NULL) ORDER BY r.id",
     )?;
     let runs = st
-        .query_map([all], |r| {
+        .query_map([all_runs], |r| {
             Ok(RunRow {
                 workflow: r.get(0)?,
                 agent: r.get(1)?,
@@ -68,7 +78,8 @@ pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
 }
 
 /// Text for the terminal. `metrics` adds tokens and cost per run; a run whose
-/// cost was never reported prints `unknown`, never `0`.
+/// cost was never reported prints `unknown`, never `0`. `status --metrics`
+/// lists finished runs too, so a cleaned-up worker keeps its spend.
 pub fn render(s: &Status, metrics: bool) -> String {
     let mut out = String::new();
     for a in &s.agents {
@@ -118,7 +129,7 @@ pub fn status_command(env: &crate::cli::Env, args: &[String]) -> Result<String, 
     }
     let conn = crate::db::open(&env.runs_dir.join(crate::db::path::DB_FILE))
         .map_err(|e| err(e.to_string()))?;
-    let s = read(&conn, all).map_err(|e| err(e.to_string()))?;
+    let s = read_with(&conn, all, all || metrics).map_err(|e| err(e.to_string()))?;
     Ok(render(&s, metrics).trim_end().to_string())
 }
 
