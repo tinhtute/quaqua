@@ -21,7 +21,7 @@ use crate::driver::{write_atomic, Registry as Drivers};
 pub use precheck::{run_deterministic_prechecks, run_deterministic_prechecks_at};
 pub use prompt::PROMPT_TEMPLATE;
 
-pub const USAGE: &str = "usage: quaqua auditor run [--dry-run] [--out <path>] [--model <model>] [--kind <kind>] [--repo <path>]";
+pub const USAGE: &str = "usage: quaqua auditor ack <id> | quaqua auditor run [--dry-run] [--out <path>] [--model <model>] [--kind <kind>] [--repo <path>]";
 
 /// The purpose whose kind audits (config `[purposes]`).
 const PURPOSE: &str = "review";
@@ -98,10 +98,27 @@ pub fn parse_args(args: &[String]) -> Result<Option<AuditorRunOptions>, CliError
 }
 
 fn auditor_cmd(_env: &Env, args: &[String]) -> Result<String, CliError> {
+    if args.first().map(String::as_str) == Some("ack") {
+        return match args {
+            [_, id] => ack_finding(&resolve_root(None), id),
+            _ => Err(usage_err("ack takes exactly one finding id")),
+        };
+    }
     match parse_args(args)? {
         None => Ok(USAGE.to_string()),
         Some(opts) => run_auditor(opts).map(|p| p.display().to_string()),
     }
+}
+
+/// `quaqua auditor ack <id>`: stop printing a report-only finding.
+fn ack_finding(root: &Path, id: &str) -> Result<String, CliError> {
+    let path = ack::store_path(root);
+    let store = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = ack::ack(&store, id, clock::now_sec())
+        .ok_or_else(|| CliError::new(1, format!("no recorded finding with id '{id}'")))?;
+    write_atomic(&path, updated.as_bytes())
+        .map_err(|e| CliError::new(1, format!("cannot write {}: {e}", path.display())))?;
+    Ok(format!("acked {id}"))
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -221,6 +238,13 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     let root = resolve_root(opts.repo.as_deref());
     let out = resolve_out(&root, opts.out.as_deref());
     let flags = run_deterministic_prechecks(&root);
+    let ack_path = ack::store_path(&root);
+    let store = std::fs::read_to_string(&ack_path).unwrap_or_default();
+    let (flags, store) = ack::apply(flags, &store, clock::now_sec());
+    if !opts.dry_run {
+        // Best effort: a failed write only means the finding prints again.
+        let _ = write_atomic(&ack_path, store.as_bytes());
+    }
 
     if opts.dry_run {
         write_atomic(&out, dry_run_report(&flags).as_bytes())
@@ -231,7 +255,17 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     let block = if flags.is_empty() {
         "- none".to_string()
     } else {
-        flags.join("\n")
+        flags
+            .iter()
+            .map(|f| {
+                if ack::is_report_only(f) {
+                    format!("{f} [ack id: {}]", ack::finding_id(f))
+                } else {
+                    f.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     let prompt = PROMPT_TEMPLATE.replace("__PRECHECK__", &block);
 

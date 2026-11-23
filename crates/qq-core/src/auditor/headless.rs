@@ -6,6 +6,19 @@
 //! from config via the driver's `launch_args`. Move this match into `driver/`
 //! when the Supervisor (T63) absorbs scheduled audits.
 
+/// Read-only tools the audit may use: file reads plus herdr, git and sqlite
+/// inspection commands. Nothing here mutates workspace, repo, herdr or database state.
+const READ_ONLY_TOOLS: &str = concat!(
+    "Read,Grep,Glob,",
+    "Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),",
+    "Bash(git rev-parse:*),Bash(git rev-list:*),Bash(git branch --list:*),",
+    "Bash(git worktree list:*),Bash(git ls-files:*),Bash(git cat-file:*),",
+    "Bash(herdr status:*),Bash(herdr agent list:*),Bash(herdr agent get:*),",
+    "Bash(herdr agent read:*),Bash(herdr pane list:*),Bash(herdr pane get:*),",
+    "Bash(herdr pane read:*),Bash(herdr tab list:*),Bash(herdr workspace list:*),",
+    "Bash(sqlite3 -readonly:*)"
+);
+
 /// A program and its argv, prompt included.
 pub struct Headless {
     pub program: String,
@@ -25,7 +38,7 @@ pub fn command(herdr_kind: &str, launch_args: Vec<String>, prompt: &str) -> Opti
                     "--setting-sources",
                     "",
                     "--allowedTools",
-                    "Read,Grep,Glob,Bash(git log:*),Bash(git diff:*),Bash(git show:*)",
+                    READ_ONLY_TOOLS,
                     "--disallowedTools",
                     "Bash(git *--output*)",
                     "--",

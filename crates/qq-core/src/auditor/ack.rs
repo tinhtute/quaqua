@@ -14,26 +14,74 @@ pub fn store_path(root: &Path) -> PathBuf {
 
 /// Stable 8-hex id of a finding line (FNV-1a).
 pub fn finding_id(line: &str) -> String {
-    let _ = line;
-    String::new()
+    let mut h: u32 = 0x811c_9dc5;
+    for b in line.bytes() {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
 }
 
 /// Live-state findings are never hidden; only report-only ones may be acked or expire.
 pub fn is_report_only(line: &str) -> bool {
-    let _ = line;
-    true
+    !(line.contains("herdr")
+        || line.contains("live worker")
+        || line.contains("lost momentum")
+        || line.starts_with("- mail #"))
 }
 
-/// Returns the findings still to print and the updated store text.
+fn parse(store: &str) -> Vec<(String, u64, bool)> {
+    store
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split('\t');
+            let id = p.next()?.to_string();
+            let seen = p.next()?.parse().ok()?;
+            Some((id, seen, p.next() == Some("ack")))
+        })
+        .collect()
+}
+
+fn render(rows: &[(String, u64, bool)]) -> String {
+    rows.iter()
+        .map(|(id, seen, a)| format!("{id}\t{seen}\t{}\n", if *a { "ack" } else { "seen" }))
+        .collect()
+}
+
+/// Returns the findings still to print and the updated store text. A report-only
+/// finding is recorded on first sight; it is dropped once acked or older than
+/// `EXPIRY_DAYS`. Store rows for findings no longer raised are forgotten, so a
+/// recurrence after the problem was fixed starts a fresh clock.
 pub fn apply(flags: Vec<String>, store: &str, now_secs: u64) -> (Vec<String>, String) {
-    let _ = (store, now_secs);
-    (flags, String::new())
+    let old = parse(store);
+    let mut rows: Vec<(String, u64, bool)> = Vec::new();
+    let mut kept = Vec::new();
+    for f in flags {
+        if !is_report_only(&f) {
+            kept.push(f);
+            continue;
+        }
+        let id = finding_id(&f);
+        let (seen, acked) = old
+            .iter()
+            .find(|r| r.0 == id)
+            .map(|r| (r.1, r.2))
+            .unwrap_or((now_secs, false));
+        if !rows.iter().any(|r| r.0 == id) {
+            rows.push((id, seen, acked));
+        }
+        if !acked && now_secs.saturating_sub(seen) <= EXPIRY_DAYS * 86_400 {
+            kept.push(f);
+        }
+    }
+    (kept, render(&rows))
 }
 
-/// Marks `id` acked in `store`; `false` when no such finding was ever recorded.
-pub fn ack(store: &str, id: &str, now_secs: u64) -> Option<String> {
-    let _ = (store, id, now_secs);
-    None
+/// Marks `id` acked in `store`; `None` when no such finding is recorded.
+pub fn ack(store: &str, id: &str, _now_secs: u64) -> Option<String> {
+    let mut rows = parse(store);
+    let row = rows.iter_mut().find(|r| r.0 == id)?;
+    row.2 = true;
+    Some(render(&rows))
 }
 
 #[cfg(test)]
