@@ -441,7 +441,9 @@ fn watchdog_resume_after_an_escalation_ignores_only_the_escalated_lines() {
     h.set_status("w", "idle");
     h.set_pane_text("p1", "Not logged in · Please run /login\n");
     let clock = idle_clock(&h, "idle");
-    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::Stalled);
+    // still dead, nothing news on the pane: the stall-time read is unfiltered, so 7 at 120 s
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ProviderError);
+    assert!(clock.now_sec() >= 120, "escalated after {}s, want the 120 s stall", clock.now_sec());
     // a different error line appears next to it: that is news
     let h = FakeHerdr::new();
     occupy(&h, "p1", "w");
@@ -450,4 +452,38 @@ fn watchdog_resume_after_an_escalation_ignores_only_the_escalated_lines() {
     let clock = idle_clock(&h, "idle");
     let exit = prompt::wait(&h, &clock, &cfg(&runs, &noop_journal));
     assert_eq!(exit, Exit::ProviderError);
+}
+
+#[test]
+fn watchdog_resume_working_then_idle_on_the_same_escalated_line_ends_in_7_after_120s() {
+    let (runs, _c) = seeded("escalated-again");
+    let (_h, r) = dead_worker(&runs);
+    assert_eq!(r.unwrap_err().code, 7);
+    let _ = std::fs::remove_file(runs.join("w.md"));
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| h.set_status("w", if now < 30 { "working" } else { "idle" })),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ProviderError);
+    assert!(clock.now_sec() >= 120, "escalated after {}s", clock.now_sec());
+}
+
+#[test]
+fn watchdog_escalated_lines_accumulate_across_resumes() {
+    let (runs, _c) = seeded("escalated-cumulative");
+    let (_h, r) = dead_worker(&runs);
+    assert_eq!(r.unwrap_err().code, 7);
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    h.set_pane_text("p1", "Not logged in · Please run /login\nInvalid API key · Please run /login\n");
+    let clock = idle_clock(&h, "idle");
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ProviderError);
+    let kept = std::fs::read_to_string(runs.join(".w.escalated")).unwrap();
+    assert!(kept.contains("Not logged in"), "the first escalation was dropped: {kept}");
+    assert!(kept.contains("Invalid API key"), "{kept}");
 }

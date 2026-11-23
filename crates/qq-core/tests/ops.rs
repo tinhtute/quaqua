@@ -1947,3 +1947,23 @@ fn pilot_budget_blocks_the_prompt_before_anything_is_sent() {
     assert_eq!(e.code, 64, "a pilot-budget refusal is a usage error");
     assert!(h.prompts().is_empty());
 }
+
+#[test]
+fn prompt_fresh_brief_removes_the_escalated_record() {
+    let (runs, _c) = seeded("escalated-clear");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    let tuning = Tuning { poll_ms: 5_000, retry_base_ms: 60_000, retry_max: 4 };
+    let report = runs.join("w.md");
+    std::fs::write(runs.join(".w.escalated"), "Not logged in · Please run /login\n").unwrap();
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|_| {
+            std::fs::write(&report, "Outcome: COMPLETE\n\n## Blockers\nnone\n\n## Lessons\nnone\n").unwrap();
+        }),
+    };
+    let args = vec!["w".to_string(), BRIEF.to_string()];
+    prompt::prompt_run(&h, &clock, &runs, &args, &tuning).unwrap();
+    assert!(!runs.join(".w.escalated").exists());
+}
