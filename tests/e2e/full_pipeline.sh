@@ -34,6 +34,8 @@ env: QQ (binary, default target/debug/quaqua)  E2E_SCORER (part c: the scorer pr
      --scorer` runs, prompt on stdin, JSON {"score":0|1|2,"quote":".."} on stdout; required when part c runs for real,
      not for --check or --dry-run)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900; 120 under E2E_STUB=1)
+     MISE_GLOBAL_CONFIG_FILE (your mise global config; default ${XDG_CONFIG_HOME:-~/.config}/mise/config.toml when it exists;
+     exported so pane shells still resolve mise shims such as pi and node under the private XDG_CONFIG_HOME)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in model, the harness may match.
                      A reviewer kind already in the roster, e.g. suhuynh, is used as it is and needs no E2E_PI_MODEL
                      when only part switch runs: that is the claude-only run)
@@ -276,6 +278,10 @@ WS=$(cd "$T" && pwd -P)/ws
 case "$WS/" in "$LIVE"/*) echo "refusing: workspace $WS is inside $LIVE" >&2; exit 1 ;; esac
 SESSION="qqe2e-$$-$RANDOM"
 export HERDR_SESSION="$SESSION"   # herdr server, daemon (its pane lookup) and every quaqua call share this session
+# mise reads its global config from XDG_CONFIG_HOME; pin the user's file before the override so pane shells keep their tools
+if [ -z "${MISE_GLOBAL_CONFIG_FILE:-}" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml" ]; then
+  export MISE_GLOBAL_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml"
+fi
 export XDG_CONFIG_HOME="$T/cfg"
 mkdir -p "$XDG_CONFIG_HOME" "$WS" "$T/calls"
 unset HERDR_SOCKET_PATH HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_AGENT QQ_AGENT
