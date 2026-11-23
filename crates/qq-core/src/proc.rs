@@ -3,7 +3,7 @@
 //! hung `herdr`, `gh` or `git` cannot block its caller for good.
 
 use std::io::{self, Read};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,15 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// `TimedOut`. Pipes are drained on threads so a large output cannot stall the
 /// child.
 pub fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<Output> {
+    output_within_polled(cmd, limit, |c| c.try_wait())
+}
+
+/// [`output_within`] with the status poll injectable, so a test can make it fail.
+fn output_within_polled(
+    cmd: &mut Command,
+    limit: Duration,
+    mut poll: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+) -> io::Result<Output> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -37,7 +46,15 @@ pub fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<Output> {
 
     let deadline = Instant::now() + limit;
     let status = loop {
-        match child.try_wait()? {
+        let polled = match poll(&mut child) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        match polled {
             Some(s) => break Some(s),
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             None => {
@@ -97,6 +114,24 @@ mod tests {
         let e = output_within(&mut sh("sleep 60"), Duration::from_millis(300)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_status_poll_kills_and_reaps_the_child() {
+        let pid = std::cell::Cell::new(0u32);
+        let e = output_within_polled(&mut sh("exec sleep 60"), Duration::from_secs(30), |c| {
+            pid.set(c.id());
+            Err(io::Error::other("poll failed"))
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "poll failed");
+        let gone = !std::path::Path::new(&format!("/proc/{}", pid.get())).exists();
+        if !gone {
+            // Do not leak the sleeper from a failing run.
+            let _ = Command::new("kill").arg("-9").arg(pid.get().to_string()).status();
+        }
+        assert!(gone, "child {} still alive or a zombie after the poll error", pid.get());
     }
 
     #[test]

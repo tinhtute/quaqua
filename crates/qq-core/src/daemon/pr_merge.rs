@@ -99,6 +99,7 @@ pub fn diff_paths(diff: &str) -> Vec<String> {
 
 struct Hooks {
     gh: PathBuf,
+    limit: Duration,
     repo: Tier,
     lane: Tier,
 }
@@ -116,7 +117,20 @@ pub fn set_test_hooks(runs_dir: &Path, gh: PathBuf, repo: Tier, lane: Tier) {
     hooks()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(runs_dir.to_path_buf(), Hooks { gh, repo, lane });
+        .insert(runs_dir.to_path_buf(), Hooks { gh, limit: GH_LIMIT, repo, lane });
+}
+
+/// Test seam: a shorter limit for each `gh` call, so a hung `gh` test need not
+/// wait the production minute. Call after [`set_test_hooks`] for the same workspace.
+#[doc(hidden)]
+pub fn set_test_gh_limit(runs_dir: &Path, limit: Duration) {
+    if let Some(h) = hooks()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(runs_dir)
+    {
+        h.limit = limit;
+    }
 }
 
 fn refused(why: impl Into<String>) -> RpcError {
@@ -139,14 +153,26 @@ fn deny(ctx: &Ctx, req: &Request, target: &str, why: &str) -> RpcError {
 /// How long one `gh` call may take before it counts as failed.
 const GH_LIMIT: Duration = Duration::from_secs(60);
 
-fn gh(program: &Path, repo: &str, args: &[&str]) -> std::io::Result<Output> {
+fn gh(program: &Path, limit: Duration, repo: &str, args: &[&str]) -> std::io::Result<Output> {
     crate::proc::output_within(
         Command::new(program)
             .args(args)
             .current_dir(repo)
             .env("GH_PROMPT_DISABLED", "1"),
-        GH_LIMIT,
+        limit,
     )
+}
+
+/// Whether `gh pr view` reports the PR MERGED; `None` when it cannot be read.
+fn pr_state_merged(program: &Path, limit: Duration, repo: &str, pr: &str) -> Option<bool> {
+    let out = ok_stdout(gh(
+        program,
+        limit,
+        repo,
+        &["pr", "view", pr, "--json", "state,mergeCommit"],
+    ))?;
+    let v: Value = serde_json::from_str(&out).ok()?;
+    Some(v.get("state").and_then(Value::as_str) == Some("MERGED"))
 }
 
 fn ok_stdout(o: std::io::Result<Output>) -> Option<String> {
@@ -183,8 +209,8 @@ fn reviewed(ctx: &Ctx, workflow: &str) -> Option<(String, String)> {
     (!repo.is_empty() && crate::merge::is_full_sha(&sha)).then_some((repo, sha))
 }
 
-fn checks_green(program: &Path, repo: &str, pr: &str) -> bool {
-    let Some(out) = ok_stdout(gh(program, repo, &["pr", "checks", pr, "--json", "bucket"])) else {
+fn checks_green(program: &Path, limit: Duration, repo: &str, pr: &str) -> bool {
+    let Some(out) = ok_stdout(gh(program, limit, repo, &["pr", "checks", pr, "--json", "bucket"])) else {
         return false;
     };
     let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(&out) else {
@@ -234,16 +260,18 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     }
 
     let repo_dir = Path::new(&repo);
-    let (program, base) = {
+    let (program, limit, base) = {
         let h = hooks().lock().unwrap_or_else(|p| p.into_inner());
         match h.get(&ctx.runs_dir) {
             // The seam stands in for the rows; a full grant still applies.
             Some(h) => (
                 h.gh.clone(),
+                h.limit,
                 tier::apply_grant(&ctx.runs_dir, repo_dir, true, h.repo.max(h.lane)),
             ),
             None => (
                 PathBuf::from("gh"),
+                GH_LIMIT,
                 tier::effective_context_tier(&ctx.runs_dir, repo_dir, true),
             ),
         }
@@ -259,6 +287,7 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     }
     let head = ok_stdout(gh(
         &program,
+        limit,
         &repo,
         &[
             "pr",
@@ -277,6 +306,7 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
     // An unreadable diff is high.
     let tier = match ok_stdout(gh(
         &program,
+        limit,
         &repo,
         &["pr", "diff", &pr, "--color", "never"],
     )) {
@@ -291,16 +321,31 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
             &format!("tier {tier:?} does not allow the CoS to merge alone"),
         ));
     }
-    if !checks_green(&program, &repo, &pr) {
+    if !checks_green(&program, limit, &repo, &pr) {
         return Err(deny(ctx, req, &target, "checks are not green on the sha"));
     }
 
     let out = gh(
         &program,
+        limit,
         &repo,
         &["pr", "merge", &pr, "--match-head-commit", &sha, "--merge"],
     )
-    .map_err(|e| RpcError::new("merge_failed", e.to_string()))?;
+    ;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // The merge may have landed before gh hung: ask GitHub, do not guess.
+            return match pr_state_merged(&program, limit, &repo, &pr) {
+                Some(true) => Ok(json!({ "merged": true, "pr": pr, "sha": sha })),
+                _ => Err(RpcError::new(
+                    "merge_unknown",
+                    format!("gh pr merge timed out and the PR state is unconfirmed: {e}"),
+                )),
+            };
+        }
+        Err(e) => return Err(RpcError::new("merge_failed", e.to_string())),
+    };
     if !out.status.success() {
         return Err(RpcError::new(
             "merge_failed",
