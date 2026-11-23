@@ -35,7 +35,7 @@ pub trait PaneOps {
 
 impl PaneOps for CliHerdr {
     fn pane_get(&self, pane: &str) -> Result<Value, String> {
-        reply_json(HerdrClient::pane_get(self, pane))
+        pane_get_reply(HerdrClient::pane_get(self, pane))
     }
     fn pane_report_metadata(
         &self,
@@ -43,22 +43,38 @@ impl PaneOps for CliHerdr {
         source: &str,
         tokens: &[(&str, &str)],
     ) -> Result<(), String> {
-        reply_json(HerdrClient::pane_report_metadata(
+        report_metadata_reply(HerdrClient::pane_report_metadata(
             self, pane, source, tokens, None,
         ))
-        .map(|_| ())
     }
 }
 
-/// The JSON of a herdr reply; an ok reply with an empty body (herdr prints
-/// nothing for `pane report-metadata`) is `Null`, as in grid.
+/// `pane get` reply: its JSON is read, so a blank body is an error.
+fn pane_get_reply(r: std::io::Result<Reply>) -> Result<Value, String> {
+    if let Ok(rep) = &r {
+        if rep.ok && rep.body.trim().is_empty() {
+            return Err("herdr pane get: empty reply".into());
+        }
+    }
+    reply_json(r)
+}
+
+/// `pane report-metadata` reply: the value is discarded and herdr prints
+/// nothing, so an ok reply with a blank body is accepted.
+fn report_metadata_reply(r: std::io::Result<Reply>) -> Result<(), String> {
+    if let Ok(rep) = &r {
+        if rep.ok && rep.body.trim().is_empty() {
+            return Ok(());
+        }
+    }
+    reply_json(r).map(|_| ())
+}
+
+/// The JSON of a herdr reply.
 fn reply_json(r: std::io::Result<Reply>) -> Result<Value, String> {
     let r = r.map_err(|e| e.to_string())?;
     if !r.ok {
         return Err(r.error_code().unwrap_or(r.body));
-    }
-    if r.body.trim().is_empty() {
-        return Ok(Value::Null);
     }
     serde_json::from_str(&r.body).map_err(|e| e.to_string())
 }
@@ -298,10 +314,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_ok_herdr_reply_is_null() {
+    fn blank_ok_report_metadata_reply_is_accepted() {
         for body in ["", "\n", "  \n"] {
-            let got = reply_json(Ok(Reply::ok(body)));
-            assert_eq!(got, Ok(Value::Null), "body {body:?}");
+            let got = report_metadata_reply(Ok(Reply::ok(body)));
+            assert_eq!(got, Ok(()), "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn blank_ok_pane_get_reply_is_err() {
+        for body in ["", "\n", "  \n"] {
+            let got = pane_get_reply(Ok(Reply::ok(body)));
+            assert_eq!(got, Err("herdr pane get: empty reply".to_string()), "body {body:?}");
         }
     }
 
@@ -310,5 +334,7 @@ mod tests {
         let got = reply_json(Ok(Reply::ok(r#"{"result":{}}"#)));
         assert_eq!(got, Ok(serde_json::json!({"result": {}})));
         assert!(reply_json(Ok(Reply::ok("not json"))).is_err());
+        assert_eq!(reply_json(Ok(Reply::err("x"))), Err("x".to_string()));
+        assert_eq!(report_metadata_reply(Ok(Reply::err("x"))), Err("x".to_string()));
     }
 }
