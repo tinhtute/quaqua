@@ -2,7 +2,7 @@
 # T46 E2E: the switch signal (part `switch`) and clause (d) (part `d`) on the new binary; T58 adds the factory
 # clauses (a), (b), (g) and (h) as parts `a`, `b`, `g` and `h`; T64c adds the outer-loop clauses (c), (e) and (f) as
 # parts `c`, `e` and `f`.
-# Spends REAL tokens on two harnesses. Run only with anh iu's approval (T48); use --dry-run to read the plan.
+# Spends REAL tokens on two models. Run only with anh iu's approval (T48); use --dry-run to read the plan.
 # shellcheck disable=SC2015  # `A && pass || fail` is intended: fail exits, pass cannot fail
 set -euo pipefail
 
@@ -34,7 +34,9 @@ env: QQ (binary, default target/debug/quaqua)  E2E_SCORER (part c: the scorer pr
      --scorer` runs, prompt on stdin, JSON {"score":0|1|2,"quote":".."} on stdout; required when part c runs for real,
      not for --check or --dry-run)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900; 120 under E2E_STUB=1)
-     E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in harness)
+     E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in model, the harness may match.
+                     A reviewer kind already in the roster, e.g. suhuynh, is used as it is and needs no E2E_PI_MODEL
+                     when only part switch runs: that is the claude-only run)
      E2E_LOOKUP_TOOL_RE (clause b: extended regex a code-lookup tool name must match in `run show`, default
                      'symbol', which matches find_symbol / find_referencing_symbols of the language-server MCP)
      E2E_STUB=1 (default off, test-only: runs the whole `switch` flow arm -> prompt -> report -> review -> gate ->
@@ -112,9 +114,9 @@ common
   C2 session        private herdr session (own XDG_CONFIG_HOME), \`quaqua daemon\` on the copy, \`quaqua ping\`;
                     a pane tagged grid_role=cos is the only door for CoS calls (identity = herdr pane)
   C3 seed           \`quaqua config import team.toml\`; roster has the claude builder kind
-  C4 second harness \`quaqua config set kind.$REVIEWER '{harness:pi,model:\$E2E_PI_MODEL,...}'\` (live roster is claude-only)
+  C4 second harness \`quaqua config set kind.$REVIEWER '{harness:pi,model:\$E2E_PI_MODEL,...}'\` (live roster is claude-only); skipped when $REVIEWER is a roster reviewer kind and no E2E_PI_MODEL is set
 part switch
-  S1 sqlite roster  kind rows for $BUILDER and $REVIEWER in qq.db name two different harnesses
+  S1 sqlite roster  kind rows for $BUILDER and $REVIEWER in qq.db name two different models
   S2 fixture        git repo + local bare origin + integration branch integ/$PROJECT, brief file
   S2b task row      \`quaqua task create $PROJECT '<title>' --kind $BUILDER --repo <repo>\` writes a task row (project, title,
                     kind, state open); the same call again returns that row (created=false)
@@ -123,10 +125,10 @@ part switch
   S2d placement     (E2E_STOP_AFTER=S2d) \`pipeline '<json>'\` with place_only=true from the cos pane (no 'pane' given): the
                     builder has an agent row, its own pane (not the cos pane) and worktree; no flow, no prompt sent
   S3 placement      the pipeline gave its builder and reviewer their own agent rows and panes (nothing is pre-spawned)
-  S4 sqlite spawn   after the pipeline: its run rows name two harnesses, each equal to its kind row (config read from SQLite)
+  S4 sqlite spawn   after the pipeline: its agent rows name two models, each equal to its kind row (config read from SQLite)
   S5 build          \`pipeline '<json>' --wait\` (plan=false) returns exit 0 (merged); exit 5 = paused for approval ->
                     \`pipeline --resume $TASK --wait\` and wait again (at most 3 pauses); builder reports a candidate sha
-  S6 review         reviewer on another harness reviews; its run row carries that same candidate sha
+  S6 review         reviewer on another model reviews; its run row carries that same candidate sha
   S7 sha binding    \`merge '<json>'\` refuses a sha other than the reviewed one, accepts the reviewed sha
   S8 gate           the pipeline workflow finished and its journal reached the merge
   S9 merge          the integration branch contains the candidate sha
@@ -257,7 +259,9 @@ for need in herdr git sqlite3 python3; do
   command -v "$need" >/dev/null 2>&1 || { echo "missing: $need" >&2; exit 1; }
 done
 [ -x "$QQ" ] || { echo "no binary at $QQ (cargo build --locked -p qq-core, or set QQ)" >&2; exit 1; }
-[ -n "$PI_MODEL" ] || { echo "set E2E_PI_MODEL (model for the pi kind)" >&2; exit 1; }
+if [ -z "$PI_MODEL" ] && ! { [ -n "${E2E_REVIEWER_KIND:-}" ] && [ "${PARTS[*]}" = switch ]; }; then
+  echo "set E2E_PI_MODEL (model for the pi kind); a claude-only run needs E2E_REVIEWER_KIND=<roster kind> and part switch only" >&2; exit 1
+fi
 check_cmds >/dev/null || { echo "quaqua lacks a verb or flag this script calls; run with --check" >&2; exit 1; }
 if want c; then   # part c scores with a model: refuse before anything starts when the scorer program is not named
   [ -n "${E2E_SCORER:-}" ] || { echo "part c needs E2E_SCORER: the scorer program for 'quaqua supervisor score --scorer' (prompt on stdin, JSON {\"score\":0|1|2,\"quote\":\"..\"} on stdout); set it or leave part c out" >&2; exit 1; }
@@ -424,8 +428,12 @@ as_cos "$QQ" config import "$WS/team.toml"; [ "$AP_RC" = 0 ] || fail C3 "config 
 expect C3 "1" "$(q "select count(*) from kind where name='$BUILDER' and harness='claude'")"
 stop_after C3
 PI0=$(q "select count(*) from kind where harness='pi'")   # clause (a): pi is absent from the roster before this one config set
-as_cos "$QQ" config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail C4 "config set rc=$AP_RC: $AP_OUT"
-expect C4 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$REVIEWER'")"
+if [ "$(q "select count(*) from kind where name='$REVIEWER' and can_review=1")" = 1 ] && [ -z "$PI_MODEL" ]; then
+  pass C4 "reviewer kind $REVIEWER is in the roster ($(q "select harness||'|'||model from kind where name='$REVIEWER'")); no second harness added"
+else
+  as_cos "$QQ" config set "kind.$REVIEWER" "{\"harness\":\"pi\",\"model\":\"$PI_MODEL\",\"effort\":\"$PI_EFFORT\",\"can_review\":true}"; [ "$AP_RC" = 0 ] || fail C4 "config set rc=$AP_RC: $AP_OUT"
+  expect C4 "pi|$PI_MODEL|$PI_EFFORT" "$(q "select harness||'|'||model||'|'||effort from kind where name='$REVIEWER'")"
+fi
 stop_after C4
 
 # ---- project fixture (git repo with integration branch and a local bare origin) --------------------------
@@ -453,8 +461,8 @@ WF="pipeline:$TASK"
 
 # ---- part switch ------------------------------------------------------------------------------------------
 if want switch; then
-  HB=$(q "select harness from kind where name='$BUILDER'"); HR=$(q "select harness from kind where name='$REVIEWER'")
-  [ -n "$HB" ] && [ "$HB" != "$HR" ] && pass S1 "$BUILDER=$HB $REVIEWER=$HR (from qq.db)" || fail S1 "need two harnesses, got [$HB] [$HR]"
+  MB=$(q "select model from kind where name='$BUILDER'"); MR=$(q "select model from kind where name='$REVIEWER'")
+  [ -n "$MB" ] && [ "$(printf %s "$MB" | tr 'A-Z' 'a-z')" != "$(printf %s "$MR" | tr 'A-Z' 'a-z')" ] && pass S1 "$BUILDER=$MB $REVIEWER=$MR (from qq.db)" || fail S1 "need two models, got [$MB] [$MR]"
   pass S2 "fixture repo=$PROJ origin=$ORIGIN integ=integ/$PROJECT brief=$BRIEF"
 
   # S2b: the task row, made through the daemon's task.create before any worker exists.
@@ -505,8 +513,8 @@ if want switch; then
   expect S5s "merged" "$(q "select json_extract(payload_json,'\$.status') from events where workflow_id='$WF' and kind='workflow_completed'")"
   expect S3 "$BUILDER|$REVIEWER" "$(q "select (select kind from agent where name='$TASK-b')||'|'||(select kind from agent where name='$TASK-r1')")"
   # The pipeline drives its builder and reviewer itself (no `task.start`), so no `run` rows exist for them: the roster
-  # check reads the agent rows (kind -> harness) against the kind table instead.
-  expect S4a "2" "$(q "select count(distinct k.harness) from agent a join kind k on k.name=a.kind where a.name in ('$TASK-b','$TASK-r1')")"
+  # check reads the agent rows (kind -> model) against the kind table instead.
+  expect S4a "2" "$(q "select count(distinct lower(trim(k.model))) from agent a join kind k on k.name=a.kind where a.name in ('$TASK-b','$TASK-r1')")"
   SHA=$(git -C "$PROJ" rev-parse "quaqua/$TASK-b")
   [ -n "$SHA" ] && git -C "$PROJ" cat-file -e "$SHA^{commit}" && pass S5 "builder branch tip (candidate) sha=$SHA" || fail S5 "no builder commit (workflow state=$(q "select state from workflow where id='$WF'"))"
   expect S6 "1" "$(q "select count(*) from workflow where id='$WF' and state like '%complete%'")"
