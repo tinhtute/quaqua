@@ -257,3 +257,115 @@ fn stall_limit_defaults_to_600() {
     assert_eq!(exit, Exit::Stalled);
     assert!((600..610).contains(&at), "stalled at {at}s, want about 600");
 }
+
+const REAL: &str = "Outcome: COMPLETE\n## Changes\nx\n## Verify\nx\n## Risks\nnone\n## Lessons\nnone\n";
+
+#[test]
+fn watchdog_resume_ignores_a_fatal_line_already_on_the_pane_while_working() {
+    let (runs, _c) = seeded("stale-fatal");
+    let (_h, r) = dead_worker(&runs);
+    assert_eq!(r.unwrap_err().code, 7);
+    // the human logged in; the worker works on, but the old line is still on the pane
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let report = runs.join("w.md");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now >= 30 {
+                std::fs::write(&report, REAL).unwrap();
+            }
+        }),
+    };
+    let out = prompt::prompt_run(&h, &clock, &runs, &resume(), &tuning()).unwrap();
+    assert_eq!(out, report.display().to_string());
+    assert!(now_is(&report, REAL));
+}
+
+#[test]
+fn watchdog_a_working_agent_is_not_cut_off_by_pane_text() {
+    let (runs, _c) = seeded("working-pane");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let report = runs.join("w.md");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now >= 30 {
+                std::fs::write(&report, REAL).unwrap();
+            }
+        }),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ReportReady);
+}
+
+#[test]
+fn watchdog_exhausted_record_survives_a_working_poll() {
+    let (runs, _c) = seeded("record-kept");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    let rec = prompt::error_path(&runs, "w");
+    std::fs::write(&rec, "retryable 529 3\n").unwrap();
+    let kept_while_working = std::cell::Cell::new(false);
+    let events = std::cell::RefCell::new(Vec::<(String, serde_json::Value)>::new());
+    let journal = |k: &str, p: serde_json::Value| events.borrow_mut().push((k.to_string(), p));
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now < 20 {
+                kept_while_working.set(rec.exists());
+                h.set_status("w", "working");
+            } else {
+                h.set_status("w", "idle");
+            }
+        }),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &journal)), Exit::Stalled);
+    assert!(kept_while_working.get(), "the record was consumed by a working poll");
+    let ev = events.borrow();
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0].0, "provider_retry");
+    assert_eq!(ev[0].1["harness_exhausted"], true);
+}
+
+#[test]
+fn stall_limit_of_a_fraction_does_not_stall_a_working_worker() {
+    let (runs, c) = seeded("stall-frac-working");
+    set_stall(&c, "0.4");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    let report = runs.join("w.md");
+    let clock = FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(|now| {
+            if now >= 30 {
+                std::fs::write(&report, REAL).unwrap();
+            }
+        }),
+    };
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ReportReady);
+}
+
+#[test]
+fn stall_limit_of_a_fraction_rounds_up_to_a_second() {
+    let (runs, c) = seeded("stall-frac");
+    set_stall(&c, "0.4");
+    let (exit, at) = silent_wait(&runs);
+    assert_eq!(exit, Exit::Stalled);
+    assert!(at >= 1, "stalled at {at}s");
+}
+
+#[test]
+fn stall_limit_too_large_falls_back_to_600() {
+    let (runs, c) = seeded("stall-huge");
+    set_stall(&c, "1e308");
+    let (exit, at) = silent_wait(&runs);
+    assert_eq!(exit, Exit::Stalled);
+    assert!((600..610).contains(&at), "stalled at {at}s, want about 600");
+}
