@@ -292,14 +292,22 @@ pub fn run_with(
     }
 
     if update {
-        let removed = lock
+        let mut removed: Vec<&str> = lock
             .files
             .keys()
             .filter(|rel| !table::TABLE.iter().any(|(r, ..)| r == *rel))
-            .count();
-        if removed > 0 {
-            let s = if removed == 1 { "" } else { "s" };
-            log.push(format!("{removed} file{s} removed upstream, kept"));
+            .map(|rel| rel.as_str())
+            .collect();
+        removed.sort_unstable();
+        if !removed.is_empty() {
+            const SHOWN: usize = 5;
+            let n = removed.len();
+            let s = if n == 1 { "" } else { "s" };
+            let mut names = removed[..n.min(SHOWN)].join(", ");
+            if n > SHOWN {
+                names.push_str(&format!(", +{} more", n - SHOWN));
+            }
+            log.push(format!("{n} file{s} removed upstream, kept: {names}"));
         }
     }
     if dry {
