@@ -18,6 +18,13 @@ pub struct Env {
     pub runs_dir: PathBuf,
 }
 
+/// Exit status for a usage error: nothing ran, so sending the same thing again
+/// cannot help (sysexits EX_USAGE).
+pub const EXIT_USAGE: i32 = 64;
+/// Exit status when the daemon cannot be reached (sysexits EX_UNAVAILABLE).
+/// Start the daemon; do not resend. Exit 1 keeps its per-command meaning.
+pub const EXIT_UNREACHABLE: i32 = 69;
+
 /// A failed command: the message goes to stderr, `code` is the exit status.
 #[derive(Debug)]
 pub struct CliError {
@@ -186,11 +193,11 @@ pub fn rpc_call_as(
             ) =>
         {
             Err(CliError::new(
-                1,
+                EXIT_UNREACHABLE,
                 format!("daemon not running (socket {})", socket.display()),
             ))
         }
-        Err(e) => Err(CliError::new(1, format!("rpc failed: {e}"))),
+        Err(e) => Err(CliError::new(EXIT_UNREACHABLE, format!("rpc failed: {e}"))),
     }
 }
 

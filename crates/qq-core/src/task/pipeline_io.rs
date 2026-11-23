@@ -1010,11 +1010,11 @@ mod tests {
         // A probe error (daemon gone) ends the wait at once, no more polling.
         let mut sleeps = 0;
         let e = wait_finished(
-            &mut || Err(CliError::new(1, "daemon not running")),
+            &mut || Err(CliError::new(crate::cli::EXIT_UNREACHABLE, "daemon not running")),
             &mut || sleeps += 1,
         )
         .unwrap_err();
-        assert_eq!((e.code, sleeps), (1, 0));
+        assert_eq!((e.code, sleeps), (69, 0));
     }
 
     #[test]
