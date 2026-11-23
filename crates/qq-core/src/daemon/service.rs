@@ -299,6 +299,24 @@ mod tests {
         );
     }
 
+    struct Fake(bool);
+    impl Liveness for Fake {
+        fn alive(&mut self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_dead_inhibitor_child_is_dropped_so_the_next_tick_retries() {
+        let mut held = Some(Fake(false));
+        reap(&mut held);
+        assert!(held.is_none());
+        assert_eq!(inhibit_decision(Some(2), held.is_some()), Inhibit::Start);
+        let mut held = Some(Fake(true));
+        reap(&mut held);
+        assert!(held.is_some());
+    }
+
     #[test]
     fn inhibitor_follows_live_workers() {
         assert_eq!(inhibit_decision(1, false), Inhibit::Start);
