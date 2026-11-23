@@ -5,6 +5,7 @@
 //! The only file written is that report. The model comes from `team.toml`
 //! (the `review` purpose's kind) through the driver registry.
 
+mod ack;
 mod clock;
 mod headless;
 mod precheck;

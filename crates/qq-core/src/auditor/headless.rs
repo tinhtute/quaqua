@@ -41,3 +41,38 @@ pub fn command(herdr_kind: &str, launch_args: Vec<String>, prompt: &str) -> Opti
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allowed() -> String {
+        let h = command("claude", vec![], "p").unwrap();
+        let i = h.args.iter().position(|a| a == "--allowedTools").unwrap();
+        h.args[i + 1].clone()
+    }
+
+    #[test]
+    fn auditor_allowlist_has_herdr_git_sqlite_reads() {
+        let a = allowed();
+        for want in [
+            "Bash(herdr agent list:*)",
+            "Bash(herdr pane read:*)",
+            "Bash(herdr status:*)",
+            "Bash(git status:*)",
+            "Bash(git rev-parse:*)",
+            "Bash(git worktree list:*)",
+            "Bash(sqlite3 -readonly:*)",
+        ] {
+            assert!(a.split(',').any(|t| t == want), "missing {want} in {a}");
+        }
+    }
+
+    #[test]
+    fn auditor_allowlist_has_no_mutating_commands() {
+        let a = allowed();
+        for bad in ["herdr pane run", "herdr agent send", "git push", "git commit", "git checkout", "Bash(sqlite3:*)"] {
+            assert!(!a.contains(bad), "{bad} must not be allowed: {a}");
+        }
+    }
+}
