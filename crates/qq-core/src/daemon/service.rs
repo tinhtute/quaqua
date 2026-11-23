@@ -16,7 +16,7 @@ fn quote(s: &str) -> String {
 }
 
 /// Unit text for the daemon, run from `exe` against workspace `home`.
-pub fn render_unit(exe: &Path, home: &Path) -> String {
+pub fn render_unit(exe: &Path, home: &Path, _path: &str) -> String {
     let env = quote(&format!("QUAQUA_HOME={}", home.display()));
     format!(
         "[Unit]\nDescription=quaqua farm daemon\n\n\
@@ -99,6 +99,7 @@ pub fn install_at(
     workspace: &Path,
     home: &Path,
     xdg_config: Option<&Path>,
+    path: &str,
 ) -> Result<String, String> {
     let mut dry = false;
     for a in args.iter().skip(1) {
@@ -116,7 +117,7 @@ pub fn install_at(
             "daemon install supports systemd on Linux only",
         ));
     }
-    let unit = render_unit(exe, workspace);
+    let unit = render_unit(exe, workspace, path);
     if dry {
         return Ok(unit);
     }
@@ -142,7 +143,7 @@ pub fn install(runs_dir: &Path, args: &[String]) -> Result<String, String> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
-    install_at(args, &exe, &workspace, &home, xdg.as_deref())
+    install_at(args, &exe, &workspace, &home, xdg.as_deref(), "")
 }
 
 // --- the daemon side: thin wrappers over the pure parts ---
@@ -250,6 +251,8 @@ pub fn spawn(
 mod tests {
     use super::*;
 
+    const PATH: &str = "/h/.cargo/bin:/usr/bin";
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("qq-service-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -265,10 +268,11 @@ mod tests {
 
     #[test]
     fn unit_runs_daemon_with_home() {
-        let u = render_unit(Path::new("opt/qq bin/quaqua"), Path::new("ws/quaqua"));
+        let u = render_unit(Path::new("opt/qq bin/quaqua"), Path::new("ws/quaqua"), PATH);
         assert!(u.contains("[Service]"));
         assert!(u.contains("ExecStart=\"opt/qq bin/quaqua\" daemon\n"));
         assert!(u.contains("Environment=\"QUAQUA_HOME=ws/quaqua\"\n"));
+        assert!(u.contains("Environment=\"PATH=/h/.cargo/bin:/usr/bin\"\n"));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("WantedBy=default.target"));
     }
@@ -336,9 +340,10 @@ mod tests {
             Path::new("ws"),
             &d,
             None,
+            PATH,
         )
         .unwrap();
-        assert_eq!(out, render_unit(Path::new("bin/quaqua"), Path::new("ws")));
+        assert_eq!(out, render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH));
         assert!(!d.join(".config").exists());
     }
 
@@ -351,12 +356,13 @@ mod tests {
             Path::new("ws"),
             &d,
             None,
+            PATH,
         )
         .unwrap();
         let p = unit_path(&d, None);
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
-            render_unit(Path::new("bin/quaqua"), Path::new("ws"))
+            render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH)
         );
         assert!(out.contains(&p.display().to_string()));
         assert!(out.contains("systemctl --user enable --now quaqua-daemon.service"));
@@ -372,6 +378,7 @@ mod tests {
             Path::new("w"),
             &d,
             None,
+            PATH,
         );
         assert!(e.is_err());
         assert!(!d.join(".config").exists());
