@@ -184,6 +184,28 @@ fn flatten(prefix: &str, t: &Table, out: &mut BTreeMap<String, String>) {
     }
 }
 
+/// Keys the file names whose stored value differs: `(key, stored, file)`. Reads
+/// only. Edges (`can_spawn`, `reports_to`) are left out: an import only adds them.
+pub fn conflicts(
+    conn: &Connection,
+    file_text: &str,
+) -> Result<Vec<(String, String, String)>, ConfigError> {
+    let doc: Table = toml::from_str(file_text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let (mut want, mut have) = (BTreeMap::new(), BTreeMap::new());
+    flatten("", &doc, &mut want);
+    flatten("", &export_table(conn)?, &mut have);
+    Ok(want
+        .into_iter()
+        .filter(|(k, _)| {
+            !(k.starts_with("roles.") && (k.ends_with(".can_spawn") || k.ends_with(".reports_to")))
+        })
+        .filter_map(|(k, f)| match have.get(&k) {
+            Some(s) if *s != f => Some((k, s.clone(), f)),
+            _ => None,
+        })
+        .collect())
+}
+
 /// Compare the stored config with `default_text`: `+ key` only in the default,
 /// `- key` only stored, `~ key` differs. Reads only; the default is seeded into
 /// a scratch in-memory database, so both sides go through the same export.

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 mod export;
 mod verbs;
-pub use export::{diff, export_toml, ENGINE_DEFAULT};
+pub use export::{conflicts, diff, export_toml, ENGINE_DEFAULT};
 pub use verbs::{config_cmd, roster_cmd, INSTALL};
 
 /// The four roles a topology edge can join.

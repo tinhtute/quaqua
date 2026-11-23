@@ -220,8 +220,10 @@ fn config_set_import_roster() {
     assert_eq!(k.fallback.as_deref(), Some("ni"));
 
     // a later import keeps the kind added by set (it never deletes) and
-    // does not undo it: the file's own kinds win, the rest stays.
-    assert_eq!(run(&["config", "import", toml]), 0);
+    // does not undo it: the file's own kinds win, the rest stays. The values
+    // set above differ from the file, so a plain import refuses them (#327).
+    assert_eq!(run(&["config", "import", toml]), 1);
+    assert_eq!(run(&["config", "import", toml, "--yes"]), 0);
     assert!(config::kind(&open(&ws), "scout").unwrap().is_some());
     daemon.stop().unwrap();
 }
@@ -948,11 +950,11 @@ fn config_import_refuses_overwrite_without_yes() {
 
     // Keys that are equal or new still import without --yes.
     let extra = ws.runs_dir().join("extra.toml");
-    std::fs::write(&extra, "[limits]\ndepth = 3\n").unwrap();
+    std::fs::write(&extra, "[limits]\ndepth = 2\n[purposes]\nscan = \"sude\"\n").unwrap();
     assert_eq!(run(&["config", "import", extra.to_str().unwrap()]), 0);
     assert_eq!(
-        config::config_cmd(&env, &strs(&["get", "limits.depth"])).unwrap(),
-        "3"
+        config::purpose_kind(&open(&ws), "scan").unwrap().as_deref(),
+        Some("sude")
     );
 
     // --yes overwrites and prints what changed.
@@ -988,6 +990,10 @@ fn config_validate_reports_drift_from_team_toml() {
     let out = config::config_cmd(&env, &strs(&["validate"])).unwrap();
     assert!(out.contains("drift"), "{out}");
     assert!(out.contains("roles.lead.max_peers"), "{out}");
-    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before, "validate writes nothing");
+    assert_eq!(
+        dump(&open(&ws), CONFIG_TABLES),
+        before,
+        "validate writes nothing"
+    );
     daemon.stop().unwrap();
 }
