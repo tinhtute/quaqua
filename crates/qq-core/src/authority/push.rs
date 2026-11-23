@@ -304,21 +304,18 @@ pub(crate) fn push_checked(repo: &str, urls: &[String], branch: &str) -> Result<
 /// The credential helpers from the user's global config, as `(key, value)`
 /// pairs: `credential.helper` and `credential.<url>.helper`. Nothing else is read.
 fn global_credential_helpers() -> Vec<(String, String)> {
-    let out = |c: &mut Proc| -> Vec<u8> {
-        stdout_within(
-            {
-                let mut p = Proc::new("git");
-                p.args(["config", "--global", "--null"]).args(c.get_args());
-                p.env("GIT_TERMINAL_PROMPT", "0");
-                p
-            },
-            LS_REMOTE_TIMEOUT,
-        )
+    let mut c = Proc::new("git");
+    c.args([
+        "config",
+        "--global",
+        "--null",
+        "--get-regexp",
+        r"^credential\.(.*\.)?helper$",
+    ])
+    .env("GIT_TERMINAL_PROMPT", "0");
+    stdout_within(c, LS_REMOTE_TIMEOUT)
+        .map(|o| parse_helpers(&String::from_utf8_lossy(&o)))
         .unwrap_or_default()
-    };
-    let mut probe = Proc::new("git");
-    probe.args(["--get-regexp", r"^credential\.(.*\.)?helper$"]);
-    parse_helpers(&String::from_utf8_lossy(&out(&mut probe)))
 }
 
 /// Parses `git config --null --get-regexp` output (`key\nvalue\0`).
@@ -340,11 +337,17 @@ fn push_command(
 ) -> Proc {
     let mut c = Proc::new("git");
     c.arg("--git-dir").arg(scratch).current_dir(repo);
+    // An empty first value resets the helper list; each global helper follows.
+    if !helpers.is_empty() {
+        c.args(["-c", "credential.helper="]);
+    }
+    for (k, v) in helpers {
+        c.arg("-c").arg(format!("{k}={v}"));
+    }
     c.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["push", "--", url, refspec]);
-    let _ = helpers;
     c
 }
 
