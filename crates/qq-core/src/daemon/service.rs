@@ -40,6 +40,19 @@ pub enum Inhibit {
     Keep,
 }
 
+/// A held lock that can say whether it still holds.
+trait Liveness {
+    fn alive(&mut self) -> bool;
+}
+
+/// Drops a held lock whose child already exited (logind refused, no D-Bus), so the next
+/// decision sees "not held" and retries.
+fn reap<T: Liveness>(held: &mut Option<T>) {
+    if held.as_mut().is_some_and(|h| !h.alive()) {
+        *held = None;
+    }
+}
+
 /// What to do with the sleep inhibitor given the live worker count and whether it is held.
 pub fn inhibit_decision(live: usize, held: bool) -> Inhibit {
     match (live > 0, held) {
@@ -182,6 +195,12 @@ impl Inhibitor {
     }
 }
 
+impl Liveness for Inhibitor {
+    fn alive(&mut self) -> bool {
+        matches!(self.0.try_wait(), Ok(None))
+    }
+}
+
 impl Drop for Inhibitor {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -229,6 +248,7 @@ pub fn spawn(
         while !stop.load(Ordering::SeqCst) {
             if let Some(ctx) = ctx.upgrade() {
                 let agents = live_agents(&ctx);
+                reap(&mut held);
                 match inhibit_decision(agents.len(), held.is_some()) {
                     Inhibit::Start => held = Inhibitor::acquire(),
                     Inhibit::Stop => held = None,
@@ -311,7 +331,7 @@ mod tests {
         let mut held = Some(Fake(false));
         reap(&mut held);
         assert!(held.is_none());
-        assert_eq!(inhibit_decision(Some(2), held.is_some()), Inhibit::Start);
+        assert_eq!(inhibit_decision(2, held.is_some()), Inhibit::Start);
         let mut held = Some(Fake(true));
         reap(&mut held);
         assert!(held.is_some());
