@@ -113,6 +113,18 @@ mod tests {
     }
 
     #[test]
+    fn auditor_ack_id_keeps_path_digits() {
+        let a = "- runs/pipeline-cmmod.md: stuck";
+        let b = "- runs/pipeline-cmmod2.md: stuck";
+        assert_ne!(finding_id(a), finding_id(b));
+        assert_ne!(finding_id("- v1 x"), finding_id("- v2 x"));
+        assert_eq!(
+            finding_id("- runs/: 3 unpromoted lessons"),
+            finding_id("- runs/: 40 unpromoted lessons")
+        );
+    }
+
+    #[test]
     fn auditor_ack_suppresses_acked_finding() {
         let (kept, store) = apply(vec![RO.into()], "", 1000);
         assert_eq!(kept, vec![RO.to_string()]);

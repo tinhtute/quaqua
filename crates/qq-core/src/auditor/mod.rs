@@ -153,6 +153,36 @@ mod tests {
     }
 
     #[test]
+    fn auditor_ack_after_dry_run_finds_the_id() {
+        let root = std::env::temp_dir().join(format!("qq-ack-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("runs")).unwrap();
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(
+            root.join("runs/pipeline-x.md"),
+            "- started: 2999-01-01\n- status: blocked\n",
+        )
+        .unwrap();
+        let out = root.join("reports/dry.md");
+        run_auditor(AuditorRunOptions {
+            dry_run: true,
+            repo: Some(root.clone()),
+            out: Some(out.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        let id = body
+            .split("[ack id: ")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .expect("dry-run printed an ack id")
+            .to_string();
+        assert_eq!(ack_finding(&root, &id).unwrap(), format!("acked {id}"));
+    }
+
+    #[test]
     fn auditor_ack_reaches_the_repo_store() {
         let root = std::env::temp_dir().join(format!("qq-ack-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
