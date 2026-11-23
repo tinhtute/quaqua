@@ -63,8 +63,28 @@ Audit six things:
    contradicts it, and add any flag the greps missed:
 __PRECHECK__
 
+Findings tagged `[ack id: X]` are report-only; copy the tag into the report line so
+the CoS can run `quaqua auditor ack X`. Acked findings and ones first seen by the auditor
+more than 14 days ago are already removed from the block; do not re-derive them. The
+14-day clock starts when the auditor first saw the finding, not when the problem began;
+say so if a finding's age matters.
+You may inspect live state with read-only `herdr` (agent/pane/tab/workspace list|get|read,
+status), `git` (status, rev-parse, log, worktree list) and `sqlite3 -safe -readonly`.
+
 Write your whole report as the final message — it becomes the report file.
 Format: `## Drift`, `## Stale docs`, `## Unhandled`, `## Pipeline`, and `## Workers`
 sections, each `- file: finding + evidence` (cite path/commit), one line each.
 No findings in a section → write `- none`. End with one line
 `Verdict: clean | N findings`. Terse, technical."#;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn auditor_prompt_states_expiry_clock() {
+        let p = super::PROMPT_TEMPLATE;
+        assert!(
+            p.contains("first seen by the auditor"),
+            "expiry clock origin unstated"
+        );
+    }
+}

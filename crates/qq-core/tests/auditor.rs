@@ -145,6 +145,11 @@ fn auditor_dry_run_has_all_sections_and_flags() {
         ]
     );
     assert!(body.contains("runs/pipeline-x.md"));
+    let line = body.lines().find(|l| l.contains("pipeline-x")).unwrap();
+    assert!(
+        line.contains("[ack id: "),
+        "dry-run line lacks ack tag: {line}"
+    );
     assert!(body.trim_end().ends_with("Verdict: 1 findings"));
 }
 

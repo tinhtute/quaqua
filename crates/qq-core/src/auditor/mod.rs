@@ -5,6 +5,7 @@
 //! The only file written is that report. The model comes from `team.toml`
 //! (the `review` purpose's kind) through the driver registry.
 
+mod ack;
 mod clock;
 mod headless;
 mod precheck;
@@ -20,7 +21,7 @@ use crate::driver::{write_atomic, Registry as Drivers};
 pub use precheck::{run_deterministic_prechecks, run_deterministic_prechecks_at};
 pub use prompt::PROMPT_TEMPLATE;
 
-pub const USAGE: &str = "usage: quaqua auditor run [--dry-run] [--out <path>] [--model <model>] [--kind <kind>] [--repo <path>]";
+pub const USAGE: &str = "usage: quaqua auditor ack <id> [--repo <path>] | quaqua auditor run [--dry-run] [--out <path>] [--model <model>] [--kind <kind>] [--repo <path>]";
 
 /// The purpose whose kind audits (config `[purposes]`).
 const PURPOSE: &str = "review";
@@ -97,10 +98,50 @@ pub fn parse_args(args: &[String]) -> Result<Option<AuditorRunOptions>, CliError
 }
 
 fn auditor_cmd(_env: &Env, args: &[String]) -> Result<String, CliError> {
+    if args.first().map(String::as_str) == Some("ack") {
+        return ack_cmd(args);
+    }
     match parse_args(args)? {
         None => Ok(USAGE.to_string()),
         Some(opts) => run_auditor(opts).map(|p| p.display().to_string()),
     }
+}
+
+/// `ack <id> [--repo <path>]`: the root resolves like a `run --repo`, so both reach one store.
+fn ack_cmd(args: &[String]) -> Result<String, CliError> {
+    let mut id = None;
+    let mut repo = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(v) = a.strip_prefix("--repo=") {
+            repo = Some(PathBuf::from(v));
+        } else if a == "--repo" {
+            i += 1;
+            repo = Some(PathBuf::from(
+                args.get(i)
+                    .ok_or_else(|| usage_err("--repo requires a value"))?,
+            ));
+        } else if a.starts_with("--") || id.is_some() {
+            return Err(usage_err(&format!("unexpected ack argument '{a}'")));
+        } else {
+            id = Some(a);
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| usage_err("ack takes exactly one finding id"))?;
+    ack_finding(&resolve_root(repo.as_deref()), id)
+}
+
+/// `quaqua auditor ack <id>`: stop printing a report-only finding.
+fn ack_finding(root: &Path, id: &str) -> Result<String, CliError> {
+    let path = ack::store_path(root);
+    let store = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = ack::ack(&store, id)
+        .ok_or_else(|| CliError::new(1, format!("no recorded finding with id '{id}'")))?;
+    write_atomic(&path, updated.as_bytes())
+        .map_err(|e| CliError::new(1, format!("cannot write {}: {e}", path.display())))?;
+    Ok(format!("acked {id}"))
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -215,14 +256,30 @@ fn fail(out: &Path, code: i32, what: &str) -> CliError {
     CliError::new(code, what.to_string())
 }
 
+/// A report-only finding with its `[ack id: X]` tag; live-state ones stay bare.
+fn tagged(f: &str) -> String {
+    if ack::is_report_only(f) {
+        format!("{f} [ack id: {}]", ack::finding_id(f))
+    } else {
+        f.to_string()
+    }
+}
+
 /// Runs one audit; returns the report path.
 pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     let root = resolve_root(opts.repo.as_deref());
     let out = resolve_out(&root, opts.out.as_deref());
     let flags = run_deterministic_prechecks(&root);
+    let ack_path = ack::store_path(&root);
+    let store = std::fs::read_to_string(&ack_path).unwrap_or_default();
+    let (flags, store) = ack::apply(flags, &store, clock::now_sec());
+    // Best effort: a failed write only means the finding prints again. Dry-run
+    // records too (it only touches reports/), so the printed ack id is ackable.
+    let _ = write_atomic(&ack_path, store.as_bytes());
 
     if opts.dry_run {
-        write_atomic(&out, dry_run_report(&flags).as_bytes())
+        let tagged: Vec<String> = flags.iter().map(|f| tagged(f)).collect();
+        write_atomic(&out, dry_run_report(&tagged).as_bytes())
             .map_err(|e| CliError::new(1, format!("cannot write {}: {e}", out.display())))?;
         return Ok(out);
     }
@@ -230,7 +287,11 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     let block = if flags.is_empty() {
         "- none".to_string()
     } else {
-        flags.join("\n")
+        flags
+            .iter()
+            .map(|f| tagged(f))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     let prompt = PROMPT_TEMPLATE.replace("__PRECHECK__", &block);
 
@@ -272,4 +333,64 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     write_atomic(&out, &output.stdout)
         .map_err(|e| CliError::new(1, format!("cannot write {}: {e}", out.display())))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn auditor_ack_after_dry_run_finds_the_id() {
+        let root = std::env::temp_dir().join(format!("qq-ack-dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("runs")).unwrap();
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(
+            root.join("runs/pipeline-x.md"),
+            "- started: 2999-01-01\n- status: blocked\n",
+        )
+        .unwrap();
+        let out = root.join("reports/dry.md");
+        run_auditor(AuditorRunOptions {
+            dry_run: true,
+            repo: Some(root.clone()),
+            out: Some(out.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        let id = body
+            .split("[ack id: ")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .expect("dry-run printed an ack id")
+            .to_string();
+        assert_eq!(ack_finding(&root, &id).unwrap(), format!("acked {id}"));
+    }
+
+    #[test]
+    fn auditor_ack_reaches_the_repo_store() {
+        let root = std::env::temp_dir().join(format!("qq-ack-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        let (_, store) = ack::apply(vec!["- x: doc-rot risk".into()], "", 0);
+        std::fs::write(ack::store_path(&root), &store).unwrap();
+        let id = ack::finding_id("- x: doc-rot risk");
+        for args in [
+            s(&["ack", &id, "--repo", root.to_str().unwrap()]),
+            s(&["ack", &id, &format!("--repo={}", root.display())]),
+        ] {
+            assert_eq!(ack_cmd(&args).unwrap(), format!("acked {id}"));
+        }
+        assert!(std::fs::read_to_string(ack::store_path(&root))
+            .unwrap()
+            .contains("\tack"));
+        assert!(ack_cmd(&s(&["ack", &id, "--bogus", "x"])).is_err());
+        assert!(ack_cmd(&s(&["ack"])).is_err());
+    }
 }
