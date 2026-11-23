@@ -4,6 +4,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 
@@ -65,8 +66,22 @@ pub struct ExecScorer {
     pub program: PathBuf,
 }
 
+/// How long one scorer run may take before it is killed.
+pub const SCORER_LIMIT: Duration = Duration::from_secs(600);
+
 impl Scorer for ExecScorer {
     fn score(&self, rubric: &Rubric, run: &RunView) -> Result<Verdict, String> {
+        self.score_within(rubric, run, SCORER_LIMIT)
+    }
+}
+
+impl ExecScorer {
+    pub fn score_within(
+        &self,
+        rubric: &Rubric,
+        run: &RunView,
+        _limit: Duration,
+    ) -> Result<Verdict, String> {
         let mut child = Command::new(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -600,4 +615,103 @@ fn outer2(
         }
     }
     Ok(rep)
+}
+
+#[cfg(test)]
+mod scorer_tests {
+    use super::*;
+    use crate::backlog::Surface;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    struct Dir(PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            let p = std::env::temp_dir().join(format!("qq-scorer-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Dir(p)
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn script(dir: &Dir, body: &str) -> ExecScorer {
+        let p = dir.0.join("scorer.sh");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ExecScorer { program: p }
+    }
+
+    fn rubric() -> Rubric {
+        Rubric {
+            id: "r".into(),
+            criterion: "c".into(),
+            surface: Surface::Rule,
+        }
+    }
+
+    fn view(pad: usize) -> RunView {
+        RunView {
+            run_id: 1,
+            project_id: None,
+            candidate_sha: None,
+            outcome: None,
+            transcript: vec![("user".into(), "x".repeat(pad))],
+            tool_calls: vec![],
+        }
+    }
+
+    /// Run the scorer on a thread so a hang fails the test instead of freezing it.
+    fn score(s: ExecScorer, pad: usize, limit: Duration) -> (Result<Verdict, String>, Duration) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let r = s.score_within(&rubric(), &view(pad), limit);
+            let _ = tx.send((r, t.elapsed()));
+        });
+        rx.recv_timeout(Duration::from_secs(15))
+            .expect("scorer did not return within 15 s")
+    }
+
+    #[test]
+    fn supervisor_scorer_error_carries_last_stderr_line() {
+        let d = Dir::new("t1");
+        let s = script(&d, "echo first >&2; echo 'no API key set' >&2; exit 1");
+        let (r, _) = score(s, 10, Duration::from_secs(5));
+        let e = r.unwrap_err();
+        assert!(e.contains("no API key set"), "{e}");
+        assert!(!e.contains("first"), "{e}");
+    }
+
+    #[test]
+    fn supervisor_scorer_that_sleeps_is_killed_at_the_limit() {
+        let d = Dir::new("t2");
+        let s = script(&d, "exec sleep 30");
+        let (r, took) = score(s, 10, Duration::from_millis(300));
+        assert!(r.unwrap_err().contains("timed out"));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn supervisor_scorer_that_never_reads_a_large_prompt_does_not_deadlock() {
+        let d = Dir::new("t3");
+        let s = script(&d, "exec sleep 30");
+        // 4 MiB is far above the 64 KiB pipe buffer.
+        let (r, took) = score(s, 4 << 20, Duration::from_millis(300));
+        assert!(r.unwrap_err().contains("timed out"));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn supervisor_scorer_that_answers_without_reading_still_scores() {
+        let d = Dir::new("t4");
+        let s = script(&d, r#"echo '{"score": 2, "quote": "ok"}'"#);
+        let (r, _) = score(s, 4 << 20, Duration::from_secs(5));
+        assert_eq!(r.unwrap().value, 2);
+    }
 }
