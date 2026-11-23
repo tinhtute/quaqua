@@ -67,7 +67,7 @@ Findings tagged `[ack id: X]` are report-only; copy the tag into the report line
 the CoS can run `quaqua auditor ack X`. Acked findings and ones first seen more than
 14 days ago are already removed from the block; do not re-derive them.
 You may inspect live state with read-only `herdr` (agent/pane/tab/workspace list|get|read,
-status), `git` (status, rev-parse, log, worktree list) and `sqlite3 -readonly`.
+status), `git` (status, rev-parse, log, worktree list) and `sqlite3 -safe -readonly`.
 
 Write your whole report as the final message — it becomes the report file.
 Format: `## Drift`, `## Stale docs`, `## Unhandled`, `## Pipeline`, and `## Workers`

@@ -8,6 +8,7 @@
 
 /// Read-only tools the audit may use: file reads plus herdr, git and sqlite
 /// inspection commands. Nothing here mutates workspace, repo, herdr or database state.
+/// sqlite3 needs `-safe`: `-readonly` alone still runs `.shell`/`.system`/`.output`.
 const READ_ONLY_TOOLS: &str = concat!(
     "Read,Grep,Glob,",
     "Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),",
@@ -16,7 +17,7 @@ const READ_ONLY_TOOLS: &str = concat!(
     "Bash(herdr status:*),Bash(herdr agent list:*),Bash(herdr agent get:*),",
     "Bash(herdr agent read:*),Bash(herdr pane list:*),Bash(herdr pane get:*),",
     "Bash(herdr pane read:*),Bash(herdr tab list:*),Bash(herdr workspace list:*),",
-    "Bash(sqlite3 -readonly:*)"
+    "Bash(sqlite3 -safe -readonly:*)"
 );
 
 /// A program and its argv, prompt included.
