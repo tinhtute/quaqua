@@ -20,7 +20,7 @@ usage: full_pipeline.sh [--dry-run] [--check] [-h|--help] [part...]      parts: 
           candidate sha for every worker run of the project (run after b, or after any task.start worker).
   h       clause (h): the project's WORKSPACE_PROTOCOL.md sets a worker cap of N; spawn N+1 is refused.
   d       a non-claude worker's `git push`, an out-of-band spawn and a Peer's `quaqua push` are all refused.
-  c       clause (c): `quaqua supervisor score --scorer $E2E_SCORER` scores the ended runs (run after switch or b); a
+  c       clause (c): `quaqua supervisor score --scorer $E2E_SCORER` scores the ended runs (run after b); a
           loop-2 proposal on a rule or skill surface is high risk and `backlog list open` still lists it open.
   e       clause (e): a pipeline paused on a failing check; `source pull` files a loop-1 bug proposal; the CoS
           approves it (`backlog decide <id> approve --note --kind`) with a recorded verdict and it becomes a task.
@@ -34,6 +34,8 @@ env: QQ (binary, default target/debug/quaqua)  E2E_SCORER (part c: the scorer pr
      --scorer` runs, prompt on stdin, JSON {"score":0|1|2,"quote":".."} on stdout; required when part c runs for real,
      not for --check or --dry-run)  E2E_PI_MODEL (model of the pi kind added with `config set`,
      required for a real run)  E2E_PI_EFFORT (default medium)  E2E_TIMEOUT (seconds per wait, default 900; 120 under E2E_STUB=1)
+     MISE_GLOBAL_CONFIG_FILE (your mise global config; default ${XDG_CONFIG_HOME:-~/.config}/mise/config.toml when it exists;
+     exported so pane shells still resolve mise shims such as pi and node under the private XDG_CONFIG_HOME)
      E2E_BUILDER_KIND / E2E_REVIEWER_KIND (default sude / pie; must differ in model, the harness may match.
                      A reviewer kind already in the roster, e.g. suhuynh, is used as it is and needs no E2E_PI_MODEL
                      when only part switch runs: that is the claude-only run)
@@ -68,6 +70,36 @@ case "${E2E_STOP_AFTER:-}" in "" | C2 | C3 | C4 | S2b | S2d) ;; *) echo "unknown
 STUB=${E2E_STUB:-0}
 if [ "$STUB" = 1 ]; then PARTS=(switch); fi   # the stub flow never starts a real worker, so part d (real pi worker) is out
 want() { local p; for p in "${PARTS[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
+# lookup_hit RE: stdin is `run show` text. Tool-call lines look like "  <tool> ok|error|no result args=<json>[ result=<text>]" (a result
+# with newlines continues on the following lines). Pass (0) when an ok call whose name matches RE has e2e_answer_symbol in its
+# result; or, when such a call's result is empty (the worker called MCP from inside REPL, so capture has no nested result), when an
+# ok REPL or Poll call has the symbol in its result (text after " result=", never the args). Prints the evidence line.
+lookup_hit() {
+  awk -v re="$1" '
+    function flush(   r, p) {
+      if (name == "") return
+      p = index(body, " result="); r = (p ? substr(body, p + 8) : "")
+      n++; nm[n] = name; st[n] = status; res[n] = r
+      name = ""
+    }
+    /^tool calls \(/ { insec = 1; next }
+    !insec { next }
+    match($0, /^  [^ ]+ (ok|error|no result) args=/) {
+      flush(); split(substr($0, 3), w, " "); name = w[1]
+      status = ($0 ~ /^  [^ ]+ ok args=/) ? "ok" : "bad"; body = substr($0, RSTART + RLENGTH - 5); next
+    }
+    name != "" { body = body "\n" $0 }
+    END {
+      flush()
+      for (i = 1; i <= n; i++) if (st[i] == "ok" && nm[i] ~ re) {
+        if (index(res[i], "e2e_answer_symbol")) { print nm[i] " result: " substr(res[i], 1, 160); exit 0 }
+        if (res[i] ~ /^[ \t\n]*$/ || res[i] ~ /^[ \t\n]*("" *|null)[ \t\n]*$/) empty = 1
+      }
+      if (empty) for (i = 1; i <= n; i++) if (st[i] == "ok" && (nm[i] == "REPL" || nm[i] == "Poll") && index(res[i], "e2e_answer_symbol")) {
+        print "lookup call ok with empty result; symbol in " nm[i] " result: " substr(res[i], 1, 160); exit 0 }
+      exit 1
+    }'
+}
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 QQ=${QQ:-$REPO_ROOT/target/debug/quaqua}
@@ -152,7 +184,7 @@ part b (clause b)
                     refused (parents_unverified) and journaled on edge start
   B2 DAG order     the parent worker reaches verified, then the child starts and reaches verified; child run
                     started_ms >= parent run ended_ms
-  B3 symbol query  \`run show\` of the child lists a lookup tool call (E2E_LOOKUP_TOOL_RE) that returned the symbol
+  B3 symbol query  \`run show\` of the child lists a lookup tool call (E2E_LOOKUP_TOOL_RE) that returned the symbol, or whose empty nested result is backed by a REPL/Poll result holding it
   B4 off topology  a pi Peer told to \`worker spawn\` is refused: a refusal on edge spawn names that Peer
   B5 peer mail     the same Peer told to \`mail send\` to another Peer is refused: a refusal on edge mail, Peer-to-Peer
 part g (clause g)
@@ -276,6 +308,10 @@ WS=$(cd "$T" && pwd -P)/ws
 case "$WS/" in "$LIVE"/*) echo "refusing: workspace $WS is inside $LIVE" >&2; exit 1 ;; esac
 SESSION="qqe2e-$$-$RANDOM"
 export HERDR_SESSION="$SESSION"   # herdr server, daemon (its pane lookup) and every quaqua call share this session
+# mise reads its global config from XDG_CONFIG_HOME; pin the user's file before the override so pane shells keep their tools
+if [ -z "${MISE_GLOBAL_CONFIG_FILE:-}" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml" ]; then
+  export MISE_GLOBAL_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml"
+fi
 export XDG_CONFIG_HOME="$T/cfg"
 mkdir -p "$XDG_CONFIG_HOME" "$WS" "$T/calls"
 unset HERDR_SOCKET_PATH HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_AGENT QQ_AGENT
@@ -605,9 +641,9 @@ if want b; then
     || fail B2 "child run did not start after the parent run ended (parent ended [$PEND], child started [$CSTART])"
   LRE=${E2E_LOOKUP_TOOL_RE:-symbol}
   SHOW=$("$QQ" run show "worker:$CN" 2>&1) || fail B3 "run show worker:$CN: $SHOW"
-  # only the tool-calls section, only a line whose tool name matches, status ok, and the symbol inside its result
-  HIT=$(printf '%s\n' "$SHOW" | sed -n '/^tool calls (/,$p' | grep -E "^  [^ ]*($LRE)[^ ]* ok args=.* result=.*e2e_answer_symbol" | head -1) || true
-  [ -n "$HIT" ] && pass B3 "$(printf '%s' "$HIT" | cut -c1-200)" || fail B3 "no tool call matching /$LRE/ returned e2e_answer_symbol in run show worker:$CN"
+  # lookup_hit: an ok lookup call has the symbol in its result, or (nested MCP call, empty result) a REPL/Poll result has it
+  HIT=$(printf '%s\n' "$SHOW" | lookup_hit "$LRE") || true
+  [ -n "$HIT" ] && pass B3 "$(printf '%s' "$HIT" | cut -c1-200)" || fail B3 "no ok tool call matching /$LRE/ returned e2e_answer_symbol (directly or via a REPL/Poll result) in run show worker:$CN"
   PA="$REVIEWER-pa"; PB="$REVIEWER-pb"; OFF="$REVIEWER-offtopo"
   as_cos "$QQ" worker spawn "$PA" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B4 "spawn $PA rc=$AP_RC: $AP_OUT"
   as_cos "$QQ" worker spawn "$PB" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B5 "spawn $PB rc=$AP_RC: $AP_OUT"
@@ -657,7 +693,7 @@ if want c; then
   SLINE=$(printf '%s\n' "$SOUT" | grep -E '^scored [0-9]+ low [0-9]+ proposals \[' | head -1) || true
   [ -n "$SLINE" ] || fail C5 "no 'scored N low M proposals [..]' line: $SOUT"
   SCORED=$(printf '%s' "$SLINE" | awk '{print $2}'); LOW=$(printf '%s' "$SLINE" | awk '{print $4}')
-  [ "$SCORED" -ge 1 ] || fail C5 "scored 0 runs: run part switch or b first (a worker run must have ended): $SOUT"
+  [ "$SCORED" -ge 1 ] || fail C5 "scored 0 runs: run part b first: only its task.start runs end; a pipeline (switch) leaves its agents open: $SOUT"
   [ "$LOW" -ge 1 ] || fail C5 "the scorer gave no score of 0, so no proposal was filed: $SOUT"
   pass C5 "$(printf '%s' "$SOUT" | tr '\n' ' ' | cut -c1-200)"
   SIDS=$(printf '%s' "$SLINE" | sed -E 's/^[^[]*\[([^]]*)\].*/\1/' | tr -d ',')
