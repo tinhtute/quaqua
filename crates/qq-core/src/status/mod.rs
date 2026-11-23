@@ -261,4 +261,46 @@ mod tests {
             .find("needs you")
             .is_none());
     }
+
+    #[test]
+    fn idle_setting_is_a_valid_config_key_and_honoured() {
+        let c = db();
+        c.execute(
+            "INSERT INTO agent (name, role, started_ms, ended_ms) VALUES ('w', 'lead', 0, 1000)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO setting (key, value_json) VALUES (?1, '30')",
+            [IDLE_SETTING],
+        )
+        .unwrap();
+        // config's export refuses a setting whose section is not in SETTING_SECTIONS.
+        let toml = crate::config::export_toml(&c)
+            .unwrap_or_else(|e| panic!("{IDLE_SETTING} is not a config key: {e}"));
+        assert!(toml.contains("status_idle_minutes = 30"), "{toml}");
+        assert!(IDLE_SETTING.starts_with("timers."));
+        assert!(read_at(&c, false, 1000 + 11 * MIN).unwrap().needs_you.is_empty());
+        assert_eq!(read_at(&c, false, 1000 + 31 * MIN).unwrap().needs_you.len(), 1);
+    }
+
+    #[test]
+    fn idle_setting_zero_is_clamped_and_junk_falls_back() {
+        let c = db();
+        c.execute(
+            "INSERT INTO agent (name, role, started_ms, ended_ms) VALUES ('w', 'lead', 0, 1000)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO setting (key, value_json) VALUES (?1, '0')",
+            [IDLE_SETTING],
+        )
+        .unwrap();
+        assert!(read_at(&c, false, 1000 + 30_000).unwrap().needs_you.is_empty(), "0 clamps to 1 min");
+        assert_eq!(read_at(&c, false, 1000 + MIN).unwrap().needs_you.len(), 1);
+        c.execute("UPDATE setting SET value_json = '\"soon\"'", []).unwrap();
+        assert!(read_at(&c, false, 1000 + 9 * MIN).unwrap().needs_you.is_empty(), "junk -> 10");
+        assert_eq!(read_at(&c, false, 1000 + 10 * MIN).unwrap().needs_you.len(), 1);
+    }
 }
