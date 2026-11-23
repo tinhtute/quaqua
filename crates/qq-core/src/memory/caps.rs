@@ -494,18 +494,38 @@ fn token_run(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// The rules.md seed text, read from init/seeds.rs (not edited there).
+    fn seed_rules() -> String {
+        let src = include_str!("../init/seeds.rs");
+        let from = src.find("\"memory/rules.md\"").expect("rules seed");
+        let start = from + src[from..].find("r#\"").expect("raw start") + 3;
+        let end = start + src[start..].find("\"#").expect("raw end");
+        src[start..end].to_string()
+    }
+
     #[test]
-    fn over_cap_refusal_names_the_oldest_lines() {
-        let mut text = String::from(
-            "# Rules\n\n- first old rule\n- second old rule\n- third old rule\n- fourth rule\n",
-        );
-        text.push_str(&"x".repeat(RULES_CAP));
+    fn over_cap_refusal_names_the_oldest_rule_bullets_of_the_seed() {
+        let mut text = seed_rules();
+        text.push_str(&format!("- {}\n", "x".repeat(RULES_CAP)));
         let v = check_text("memory/rules.md", &text);
         let line = v[0].line();
         assert!(line.contains("oldest lines"), "{line}");
-        for kept in ["first old rule", "second old rule", "third old rule"] {
+        for kept in ["Advisor workers", "Clean up each worker", "Ownership"] {
             assert!(line.contains(kept), "{line}");
         }
-        assert!(!line.contains("fourth rule"), "{line}");
+        for skipped in [
+            "Durable lessons",
+            "Pane layout",
+            "Add rules here",
+            "Gardener",
+        ] {
+            assert!(!line.contains(skipped), "{line}");
+        }
+    }
+
+    #[test]
+    fn oldest_lines_skips_comment_block_and_prose() {
+        let t = "# H\nprose\n<!-- a\n- not a rule\n-->\n<!-- one -->\n- r1\n- r2\n";
+        assert_eq!(oldest_lines(t), vec!["- r1", "- r2"]);
     }
 }
