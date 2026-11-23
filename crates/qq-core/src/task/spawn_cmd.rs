@@ -419,6 +419,27 @@ fn parse_worker(args: &[String]) -> R<WorkerArgs> {
     Ok(out)
 }
 
+/// `--review`: the builder is the agent behind `--base quaqua/<name>`; a
+/// reviewer on its model is refused (and journaled) like the pipeline's. With
+/// no such base or agent there is no builder to compare, so nothing refuses.
+fn check_review_model(conn: &Connection, base: Option<&str>, reviewer: &str) -> R<()> {
+    let Some(builder) = base.and_then(|b| b.strip_prefix("quaqua/")) else {
+        return Ok(());
+    };
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM agent WHERE name = ?1 AND kind IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [builder],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db)?;
+    match kind {
+        Some(k) => crate::task::review_pair::check(conn, &k, reviewer).map_err(fail),
+        None => Ok(()),
+    }
+}
+
 pub fn run_worker(ctx: &Ctx, args: &[String]) -> R<WorkerSpawned> {
     let a = parse_worker(args)?;
     if let Some(reason) = &a.solo {
@@ -469,6 +490,9 @@ pub fn run_worker(ctx: &Ctx, args: &[String]) -> R<WorkerSpawned> {
         return Err(fail(format!(
             "--review needs a kind with can_review = true ('{kind}' has none)"
         )));
+    }
+    if a.review {
+        check_review_model(ctx.conn, a.base.as_deref(), &kind)?;
     }
     let repo = std::fs::canonicalize(repo_arg)
         .map_err(|e| fail(format!("repo path '{repo_arg}': {e}")))?;
@@ -1113,4 +1137,54 @@ pub fn lead_spawn_cli(env: &Env, args: &[String]) -> R<String> {
             None => body,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        let tag = std::thread::current()
+            .name()
+            .unwrap_or("t")
+            .replace("::", "-");
+        let dir =
+            std::env::temp_dir().join(format!("qq-spawn-cmd-review-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = crate::db::open(&dir.join(crate::db::path::DB_FILE)).unwrap();
+        let team = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/team.toml"),
+        )
+        .unwrap();
+        config::seed(&mut c, &team).unwrap();
+        c.execute(
+            "INSERT INTO agent (name, role, kind, started_ms) VALUES ('b1', 'peer', 'ni', 1)",
+            [],
+        )
+        .unwrap();
+        c
+    }
+
+    #[test]
+    fn review_spawn_refuses_the_builders_model_and_journals_it() {
+        let c = conn();
+        let e = check_review_model(&c, Some("quaqua/b1"), "suhuynh").unwrap_err();
+        assert!(
+            e.message.contains("'ni'") && e.message.contains("'suhuynh'"),
+            "{}",
+            e.message
+        );
+        assert_eq!(authority::refusals(&c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn review_spawn_allows_another_model_and_an_unknown_builder() {
+        let c = conn();
+        check_review_model(&c, Some("quaqua/b1"), "sude").unwrap();
+        check_review_model(&c, Some("quaqua/nobody"), "ni").unwrap();
+        check_review_model(&c, Some("main"), "ni").unwrap();
+        check_review_model(&c, None, "ni").unwrap();
+        assert!(authority::refusals(&c).unwrap().is_empty());
+    }
 }

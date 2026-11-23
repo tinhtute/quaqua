@@ -17,6 +17,16 @@ pub(crate) const VERDICT_FIELD: &str = "Verdict:";
 pub(crate) const OUTCOME_FIELD: &str = "Outcome:";
 /// The heading of a plan or lessons-only report.
 pub(crate) const LESSONS_HEADING: &str = "Lessons";
+/// Every `Outcome:` value the engine parses in a builder report
+/// (`worker_flow::judge`, `pipeline::unfinished`); the skeleton lists exactly these.
+pub(crate) const OUTCOME_VALUES: [&str; 6] = [
+    "COMPLETE",
+    "NO_CHANGES",
+    "BLOCKED",
+    "DISPUTED",
+    "REOPEN_REQUEST",
+    "DEPENDENCY_REQUEST",
+];
 /// The two verdict values the reviewer may write.
 pub(crate) const VERDICT_CLEAN: &str = "clean";
 pub(crate) const VERDICT_FINDINGS: &str = "findings";
@@ -32,11 +42,12 @@ pub(crate) fn verdict_ask() -> String {
 /// gate (`well_formed`) checks, so the ask and the check cannot drift.
 pub(crate) fn report_skeleton() -> String {
     format!(
-        "{OUTCOME_FIELD} COMPLETE | NO_CHANGES | BLOCKED   (first line, column 1)\n\
+        "{OUTCOME_FIELD} {}   (first line, column 1)\n\
          ## Changes\n<what changed>\n\
          ## Verify\n<test command + result>\n\
          ## Risks\n<risks, or none>\n\
-         ## {LESSONS_HEADING}\n<at most 2 lines, or none>   (last heading)"
+         ## {LESSONS_HEADING}\n<at most 2 lines, or none>   (last heading)",
+        OUTCOME_VALUES.join(" | ")
     )
 }
 
@@ -107,5 +118,29 @@ mod tests {
         // whatever the ask names, the parser reads
         assert_eq!(parse_verdict("Verdict: clean"), Ok(0));
         assert_eq!(parse_verdict("Verdict: 4 findings"), Ok(4));
+    }
+
+    #[test]
+    fn skeleton_lists_every_outcome_the_engine_parses() {
+        let sk = report_skeleton();
+        let first = sk.lines().next().unwrap();
+        let listed: Vec<&str> = first
+            .trim_start_matches(OUTCOME_FIELD)
+            .split("   (")
+            .next()
+            .unwrap()
+            .split('|')
+            .map(str::trim)
+            .collect();
+        assert_eq!(listed, OUTCOME_VALUES);
+        // each value is a literal the worker judge matches on, so a value
+        // dropped from (or added to) the parser fails here
+        let judge = include_str!("worker_flow.rs");
+        for v in OUTCOME_VALUES {
+            assert!(
+                judge.contains(&format!("\"{v}\"")),
+                "{v} not parsed by worker_flow"
+            );
+        }
     }
 }
