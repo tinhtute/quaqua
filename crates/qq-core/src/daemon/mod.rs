@@ -677,6 +677,42 @@ mod peer_tests {
         assert!(lines[3].ends_with(" err"), "{}", lines[3]);
     }
 
+    fn traced_log(verb: &str, caller: &str, res: Result<Value, RpcError>) -> String {
+        let mut req = Request::new(verb, Value::Null);
+        req.caller = Some(caller.into());
+        let mut log = Vec::new();
+        let _ = traced(&req, &mut log, || res);
+        String::from_utf8(log).unwrap()
+    }
+
+    #[test]
+    fn a_polling_verb_that_succeeds_quickly_logs_nothing() {
+        for v in ["status", "ping", "caller", "mail.inbox", "mail.ack"] {
+            let text = traced_log(v, "lead", Ok(Value::Null));
+            assert_eq!(text, "", "{v}");
+        }
+    }
+
+    #[test]
+    fn a_polling_verb_that_fails_logs_its_result() {
+        let text = traced_log("status", "lead", Err(internal("boom".into())));
+        assert!(text.contains("verb=status") && text.trim_end().ends_with(" err"), "{text}");
+    }
+
+    #[test]
+    fn a_mutating_verb_that_succeeds_logs_both_lines() {
+        let text = traced_log("mail.send", "lead", Ok(Value::Null));
+        assert_eq!(text.lines().count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_newline_in_the_caller_cannot_forge_a_line() {
+        let text = traced_log("mail.send", "x\nquaqua daemon: verb caller=root verb=stop ms=0 ok", Ok(Value::Null));
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+        assert!(text.lines().all(|l| l.starts_with("quaqua daemon: verb")), "{text:?}");
+        assert!(!text.contains("x\nquaqua"), "{text:?}");
+    }
+
     struct Fixed(Result<&'static str, ()>);
     impl PeerResolver for Fixed {
         fn resolve(&self, _: peer::PeerCred) -> Result<CallerId, RpcError> {
