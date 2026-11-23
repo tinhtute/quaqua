@@ -530,17 +530,16 @@ pub fn run_worker(ctx: &Ctx, args: &[String]) -> R<WorkerSpawned> {
 
     if !reopening {
         check_cap(ctx.conn, caller.as_ref(), &owner, &kind)?;
-        if let (Some(c), Some(pid)) = (caller.as_ref(), project_id) {
-            if c.role == authority::Role::Lead {
-                // The protocol cap sits beside roles.lead.max_peers: both run,
-                // so the stricter one refuses.
-                let proto = authority::protocol::read(&repo).map_err(|e| fail(e.to_string()))?;
-                if let Decision::Refused(r) =
-                    authority::protocol::check_worker_cap(ctx.conn, &c.name, pid, &proto)
-                        .map_err(|e| fail(e.to_string()))?
-                {
-                    return Err(fail(format!("refused: {}", r.reason)));
-                }
+        if let Some(pid) = project_id {
+            // The project's protocol cap binds every spawner (CoS and Lead),
+            // counted per project; a Lead also obeys roles.lead.max_peers above,
+            // so the stricter one refuses.
+            let proto = authority::protocol::read(&repo).map_err(|e| fail(e.to_string()))?;
+            if let Decision::Refused(r) =
+                authority::protocol::check_worker_cap(ctx.conn, &owner, pid, &proto)
+                    .map_err(|e| fail(e.to_string()))?
+            {
+                return Err(fail(format!("refused: {}", r.reason)));
             }
         }
         if caller.is_none() {
