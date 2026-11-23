@@ -220,8 +220,10 @@ fn config_set_import_roster() {
     assert_eq!(k.fallback.as_deref(), Some("ni"));
 
     // a later import keeps the kind added by set (it never deletes) and
-    // does not undo it: the file's own kinds win, the rest stays.
-    assert_eq!(run(&["config", "import", toml]), 0);
+    // does not undo it: the file's own kinds win, the rest stays. The values
+    // set above differ from the file, so a plain import refuses them (#327).
+    assert_eq!(run(&["config", "import", toml]), 1);
+    assert_eq!(run(&["config", "import", toml, "--yes"]), 0);
     assert!(config::kind(&open(&ws), "scout").unwrap().is_some());
     daemon.stop().unwrap();
 }
@@ -917,5 +919,114 @@ fn roster_profiles_next_spawn() {
 
     // No switch above touched the running worker.
     assert_eq!(live(&open(&ws)), live_before);
+    daemon.stop().unwrap();
+}
+
+// ---- U3 (#327 finding 3): import never overwrites a differing value quietly ----
+
+#[test]
+fn config_import_refuses_overwrite_without_yes() {
+    let ws = seeded("cfg-import-yes");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let toml = ws.team_toml();
+    let toml = toml.to_str().unwrap();
+
+    // The owner sets two values with `config set`; the file still says the old ones.
+    assert_eq!(run(&["config", "set", "kind.sude.model", "local-model"]), 0);
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "6"]), 0);
+    let before = dump(&open(&ws), CONFIG_TABLES);
+
+    // No --yes: refused, every differing key is named, nothing is written.
+    let e = config::config_cmd(&env, &strs(&["import", toml])).unwrap_err();
+    assert!(e.message.contains("kinds.sude.model"), "{}", e.message);
+    assert!(e.message.contains("roles.lead.max_peers"), "{}", e.message);
+    assert!(e.message.contains("--yes"), "{}", e.message);
+    assert_eq!(run(&["config", "import", toml]), 1);
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+
+    // Keys that are equal or new still import without --yes.
+    let extra = ws.runs_dir().join("extra.toml");
+    std::fs::write(&extra, "[limits]\ndepth = 2\n[purposes]\nscan = \"sude\"\n").unwrap();
+    assert_eq!(run(&["config", "import", extra.to_str().unwrap()]), 0);
+    assert_eq!(
+        config::purpose_kind(&open(&ws), "scan").unwrap().as_deref(),
+        Some("sude")
+    );
+
+    // --yes overwrites and prints what changed.
+    let out = config::config_cmd(&env, &strs(&["import", toml, "--yes"])).unwrap();
+    assert!(out.contains("kinds.sude.model"), "{out}");
+    assert!(out.contains("roles.lead.max_peers"), "{out}");
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "kind.sude.model"])).unwrap(),
+        template()
+            .lines()
+            .skip_while(|l| !l.starts_with("[kinds.sude]"))
+            .find_map(|l| l.strip_prefix("model = "))
+            .unwrap()
+            .trim_matches('"')
+    );
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn config_validate_reports_drift_from_team_toml() {
+    let ws = seeded("cfg-drift");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+
+    let clean = config::config_cmd(&env, &strs(&["validate"])).unwrap();
+    assert!(!clean.contains("drift"), "{clean}");
+
+    assert_eq!(run(&["config", "set", "roles.lead.max_peers", "6"]), 0);
+    let before = dump(&open(&ws), CONFIG_TABLES);
+    let out = config::config_cmd(&env, &strs(&["validate"])).unwrap();
+    assert!(out.contains("drift"), "{out}");
+    assert!(out.contains("roles.lead.max_peers"), "{out}");
+    assert_eq!(
+        dump(&open(&ws), CONFIG_TABLES),
+        before,
+        "validate writes nothing"
+    );
+    daemon.stop().unwrap();
+}
+
+#[test]
+fn config_import_refuses_to_reset_values_the_file_omits() {
+    let ws = seeded("cfg-import-omit");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let toml = ws.team_toml();
+    let toml = toml.to_str().unwrap();
+
+    // The fixture's [kinds.ni] has no fallback and no on_cost_cap.
+    assert_eq!(run(&["config", "set", "kind.ni.fallback", "sude"]), 0);
+    assert_eq!(run(&["config", "set", "kind.ni.on_cost_cap", "kill"]), 0);
+    let before = dump(&open(&ws), CONFIG_TABLES);
+
+    // Plain import: refused, both omitted keys named, nothing written.
+    let e = config::config_cmd(&env, &strs(&["import", toml])).unwrap_err();
+    assert!(e.message.contains("kinds.ni.fallback"), "{}", e.message);
+    assert!(e.message.contains("kinds.ni.on_cost_cap"), "{}", e.message);
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+    assert!(config::config_cmd(&env, &strs(&["get", "kind.ni"])).unwrap().contains("kill"));
+
+    // --yes resets them to what the file implies and lists them.
+    let out = config::config_cmd(&env, &strs(&["import", toml, "--yes"])).unwrap();
+    assert!(out.contains("kinds.ni.fallback"), "{out}");
+    assert_ne!(dump(&open(&ws), CONFIG_TABLES), before);
+
+    // Extra positional args are an error, not ignored.
+    assert_eq!(run(&["config", "import", toml, "extra.toml"]), 1);
     daemon.stop().unwrap();
 }

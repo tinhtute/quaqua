@@ -122,16 +122,18 @@ pub fn config_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
     match args.first().map(String::as_str) {
         Some("get" | "validate" | "export" | "diff") => {}
         Some("set") => need(2, "set <key> <value>")?,
-        Some("import") => need(1, "import <team.toml>")?,
+        Some("import") => need(1, "import <team.toml> [--yes]")?,
         _ => {
             return Err(usage(
                 "get [key] | set <key> <value> | import <file> | validate [file] | export | diff [file]",
             ))
         }
     }
-    if matches!(args[0].as_str(), "import" | "validate" | "diff") && args.len() > 1 {
-        let abs = std::path::absolute(&args[1]).map_err(fail)?;
-        argv[1] = abs.to_string_lossy().into_owned();
+    if matches!(args[0].as_str(), "import" | "validate" | "diff") {
+        if let Some(i) = (1..args.len()).find(|&i| args[i] != "--yes") {
+            let abs = std::path::absolute(&args[i]).map_err(fail)?;
+            argv[i] = abs.to_string_lossy().into_owned();
+        }
     }
     client(env, "config", &argv)
 }
@@ -162,6 +164,13 @@ fn fail(e: impl std::fmt::Display) -> CliError {
     CliError::new(1, e.to_string())
 }
 
+fn drift_lines(d: &[(String, String, String)], file: &str) -> String {
+    d.iter()
+        .map(|(k, stored, f)| format!("  ~ {k}: stored {stored}, {file} {f}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
@@ -187,12 +196,18 @@ fn exec_config(
             Ok(format!("set {key}"))
         }
         Some("import") => {
-            let Some(path) = a(1) else {
-                return Err(usage("import <team.toml>"));
+            let yes = args[1..].iter().any(|s| s == "--yes");
+            let paths: Vec<&String> = args[1..].iter().filter(|s| *s != "--yes").collect();
+            let [path] = paths.as_slice() else {
+                return Err(usage("import <team.toml> [--yes]"));
             };
             let text = std::fs::read_to_string(path).map_err(fail)?;
-            let n = import(conn, &text).map_err(fail)?;
-            Ok(format!("imported {n} kinds"))
+            let (n, changed) = import(conn, &text, yes).map_err(fail)?;
+            let mut out = format!("imported {n} kinds");
+            if !changed.is_empty() {
+                out.push_str(&format!("\noverwrote:\n{}", drift_lines(&changed, "import writes")));
+            }
+            Ok(out)
         }
         Some("export") => super::export_toml(conn).map_err(fail),
         Some("diff") => {
@@ -210,7 +225,25 @@ fn exec_config(
                 }
                 None => check_db(conn).map_err(fail)?,
             }
-            Ok("ok".to_string())
+            let mut out = "ok".to_string();
+            // `config set` writes the DB only, so a value can drift from the
+            // workspace team.toml, which the next `config import` would reset.
+            if a(1).is_none() {
+                let team = conn
+                    .path()
+                    .and_then(|p| std::path::Path::new(p).parent()?.parent().map(|r| r.join("team.toml")));
+                if let Some(text) = team.and_then(|t| std::fs::read_to_string(t).ok()) {
+                    let drift = super::conflicts(conn, &text).map_err(fail)?;
+                    if !drift.is_empty() {
+                        out.push_str(&format!(
+                            "\ndrift: {} stored value(s) differ from team.toml (a plain import refuses them; --yes resets them to the file):\n{}",
+                            drift.len(),
+                            drift_lines(&drift, "team.toml")
+                        ));
+                    }
+                }
+            }
+            Ok(out)
         }
         _ => Err(usage(
             "get [key] | set <key> <value> | import <file> | validate [file] | export | diff [file]",
@@ -786,9 +819,17 @@ fn check_text(conn: &Connection, text: &str) -> Result<(), ConfigError> {
 /// Merge a team.toml into the database in one transaction. Kinds, purposes and
 /// settings are upserted, edges added; the reviewer list is replaced when the
 /// file names one. Nothing the file omits is deleted. Returns the kinds named.
-fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
+///
+/// What the import changes is computed from what it writes: the export before
+/// and after, inside the transaction. Without `yes` a changed or removed
+/// stored key rolls the transaction back and refuses, naming every key.
+/// Kinds named by an import, plus the keys it changed (key, before, after).
+type ImportOutcome = (usize, Vec<(String, String, String)>);
+
+fn import(conn: &mut Connection, text: &str, yes: bool) -> Result<ImportOutcome, ConfigError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = parse_checked(&tx, text)?;
+    let before = super::export::export_table(&tx)?;
     // Only the file's own kinds and harnesses are written; the stored
     // stand-ins are skipped.
     let doc: toml::Table = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -863,8 +904,17 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
             params![key, value.to_string()],
         )?;
     }
+    let changed = super::changed_keys(&before, &super::export::export_table(&tx)?);
+    if !changed.is_empty() && !yes {
+        drop(tx); // rolls back
+        return Err(ConfigError::Invalid(format!(
+            "import would overwrite {} stored value(s); nothing written, rerun with --yes to overwrite:\n{}",
+            changed.len(),
+            drift_lines(&changed, "import writes")
+        )));
+    }
     tx.commit()?;
-    Ok(named.len())
+    Ok((named.len(), changed))
 }
 
 /// The stored config as a [`Parsed`] (edges and the file-only settings are
