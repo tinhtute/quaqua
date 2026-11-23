@@ -496,3 +496,29 @@ pub fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), Strin
 
 /// The entry `cli::MODULES` lists.
 pub const INSTALL: Install = install;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfenced_push_refusal_names_the_next_step() {
+        let dir = std::env::temp_dir().join(format!("qq-auth-push-{}", std::process::id()));
+        let conn = crate::db::open(&dir.join("qq.db")).unwrap();
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms, pane_id) VALUES ('cos', 'cos', 1, 'p0')",
+            [],
+        )
+        .unwrap();
+        let d = check_orchestration(&conn, "cos", Op::Push, Fence::Unfenced).unwrap();
+        let Decision::Refused(r) = d else {
+            panic!("an unfenced push must be refused");
+        };
+        assert!(
+            r.reason.contains("ask a fenced Lead, or the owner pushes"),
+            "no next step in: {}",
+            r.reason
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
