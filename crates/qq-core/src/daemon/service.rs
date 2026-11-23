@@ -54,10 +54,11 @@ fn reap<T: Liveness>(held: &mut Option<T>) {
 }
 
 /// What to do with the sleep inhibitor given the live worker count and whether it is held.
-pub fn inhibit_decision(live: usize, held: bool) -> Inhibit {
-    match (live > 0, held) {
-        (true, false) => Inhibit::Start,
-        (false, true) => Inhibit::Stop,
+/// `None` is a failed store read: workers may be live, so keep the current state.
+pub fn inhibit_decision(live: Option<usize>, held: bool) -> Inhibit {
+    match (live.map(|n| n > 0), held) {
+        (Some(true), false) => Inhibit::Start,
+        (Some(false), true) => Inhibit::Stop,
         _ => Inhibit::Keep,
     }
 }
@@ -211,7 +212,8 @@ impl Drop for Inhibitor {
 const TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Names of the open Lead and Peer agents: the live workers.
-fn live_agents(ctx: &super::Ctx) -> Vec<String> {
+/// `None` when the store read fails.
+fn live_agents(ctx: &super::Ctx) -> Option<Vec<String>> {
     ctx.store
         .with_conn(|c| {
             let mut st = c.prepare(
@@ -220,7 +222,7 @@ fn live_agents(ctx: &super::Ctx) -> Vec<String> {
             let rows = st.query_map([], |r| r.get(0))?;
             rows.collect::<Result<Vec<String>, _>>()
         })
-        .unwrap_or_default()
+        .ok()
 }
 
 /// Holds a sleep inhibitor while any worker is live and mails cos after a resume from
@@ -249,7 +251,7 @@ pub fn spawn(
             if let Some(ctx) = ctx.upgrade() {
                 let agents = live_agents(&ctx);
                 reap(&mut held);
-                match inhibit_decision(agents.len(), held.is_some()) {
+                match inhibit_decision(agents.as_ref().map(Vec::len), held.is_some()) {
                     Inhibit::Start => held = Inhibitor::acquire(),
                     Inhibit::Stop => held = None,
                     Inhibit::Keep => {}
@@ -259,7 +261,7 @@ pub fn spawn(
                         &ctx,
                         "cos",
                         "state",
-                        &wake_body(slept, &agents),
+                        &wake_body(slept, agents.as_deref().unwrap_or_default()),
                         None,
                     );
                 }
