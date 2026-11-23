@@ -287,3 +287,23 @@ pub fn identity_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
         actions.join("\n")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_ok_herdr_reply_is_null() {
+        for body in ["", "\n", "  \n"] {
+            let got = reply_json(Ok(Reply::ok(body)));
+            assert_eq!(got, Ok(Value::Null), "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn json_and_failed_replies_are_unchanged() {
+        let got = reply_json(Ok(Reply::ok(r#"{"result":{}}"#)));
+        assert_eq!(got, Ok(serde_json::json!({"result": {}})));
+        assert!(reply_json(Ok(Reply::ok("not json"))).is_err());
+    }
+}
