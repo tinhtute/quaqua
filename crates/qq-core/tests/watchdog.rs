@@ -477,6 +477,7 @@ fn watchdog_escalated_lines_accumulate_across_resumes() {
     let (runs, _c) = seeded("escalated-cumulative");
     let (_h, r) = dead_worker(&runs);
     assert_eq!(r.unwrap_err().code, 7);
+    let _ = std::fs::remove_file(runs.join("w.md")); // the stub would end the next wait at once
     let h = FakeHerdr::new();
     occupy(&h, "p1", "w");
     h.set_status("w", "idle");

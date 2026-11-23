@@ -890,7 +890,8 @@ fn escalated_lines(text: &str) -> String {
 /// the record is trusted: pane text may be a tool's output or an old line. Else
 /// the pane tail is classified, minus the `ignore` lines an earlier wait
 /// escalated (before any nudge; the nudge echo bounds the text after that).
-/// The text classified comes back with the verdict, for the escalation record.
+/// The unfiltered pane body comes back with the verdict, for the escalation
+/// record (empty for a harness record).
 fn provider_verdict(
     herdr: &dyn HerdrClient,
     cfg: &WaitCfg,
@@ -931,7 +932,7 @@ fn provider_verdict(
     } else {
         without_lines(ignore, &r.body)
     };
-    classify(cfg.harness, &text).map(|d| (d, text))
+    classify(cfg.harness, &text).map(|d| (d, r.body))
 }
 
 /// Whether the database holds an open agent record for `name`.
@@ -1046,15 +1047,19 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
         // progress (the harness may be retrying on its own), so only a named
         // fatal in the harness record, which no retry clears, ends its wait.
         let working = status.as_deref() == Some("working");
-        let verdict = provider_verdict(
-            herdr,
-            cfg,
-            pane.as_deref(),
-            start,
-            attempt > 0,
-            working,
-            &ignore,
-        );
+        let read = |ignore: &[String]| {
+            provider_verdict(herdr, cfg, pane.as_deref(), start, attempt > 0, working, ignore)
+        };
+        let mut verdict = read(&ignore);
+        // The ignore list only shortens the at-once path. A wait that is about
+        // to stall or block reads the whole pane, so a worker that is still
+        // dead ends in 7 with its stub, not in 3.
+        if verdict.is_none()
+            && !ignore.is_empty()
+            && matches!(decide(&o), Some(Exit::Stalled | Exit::Blocked))
+        {
+            verdict = read(&[]);
+        }
         o.provider_error = verdict.is_some();
         if o.report.is_none() && !nudged_f.exists() && elapsed * 100 >= allowance * 80 {
             let msg = format!(
@@ -1106,7 +1111,13 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                     );
                     let _ = std::fs::remove_file(&retry_f);
                     if !text.is_empty() {
-                        write_atomic(&escalated_f, &escalated_lines(&text));
+                        // cumulative: the set kept so far plus every line of this pane
+                        let mut all = ignore.clone();
+                        all.extend(text.lines().map(|l| l.trim_end().to_string()));
+                        all.retain(|l| !l.trim().is_empty());
+                        let mut seen = std::collections::HashSet::new();
+                        all.retain(|l| seen.insert(l.clone()));
+                        write_atomic(&escalated_f, &escalated_lines(&all.join("\n")));
                     }
                     return Exit::ProviderError;
                 }
