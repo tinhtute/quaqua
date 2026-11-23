@@ -210,12 +210,14 @@ fn core_commands() -> Vec<Command> {
     vec![
         Command {
             name: "daemon",
-            help: "run the farm daemon in the foreground",
+            help: "run the farm daemon in the foreground, or 'install' its systemd unit",
             run: |env, args| {
                 if args.first().map(String::as_str) == Some("install") {
-                    return crate::daemon::service::install(&env.runs_dir, args).map_err(|e| CliError::new(2, e));
+                    return crate::daemon::service::install(&env.runs_dir, args)
+                        .map_err(|e| CliError::new(2, e));
                 }
-                let (_, daemon) = assemble(env).map_err(|e| CliError::new(1, e))?;
+                let (_, mut daemon) = assemble(env).map_err(|e| CliError::new(1, e))?;
+                daemon.enable_service();
                 daemon
                     .serve()
                     .map(|_| String::new())

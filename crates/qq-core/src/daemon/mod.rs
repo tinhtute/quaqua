@@ -207,6 +207,8 @@ pub struct Daemon {
     peers: Option<Arc<dyn PeerResolver>>,
     /// Filled by `run` once the `Ctx` exists; see [`Daemon::report_watcher`].
     link: Arc<OnceLock<Weak<Ctx>>>,
+    /// Set only by the CLI daemon command: test daemons stay inert.
+    service: bool,
 }
 
 /// Registers a report watcher in the daemon's own process: `(workflow, path)`.
@@ -230,11 +232,13 @@ fn now_ms() -> u64 {
 
 impl Daemon {
     /// Turns on the service thread (sleep inhibitor, wake mail). Off by default.
-    pub fn enable_service(&mut self) {}
+    pub fn enable_service(&mut self) {
+        self.service = true;
+    }
 
     /// Whether `run` will start the service thread.
     pub fn service_enabled(&self) -> bool {
-        true
+        self.service
     }
 
     pub fn new(cfg: Config) -> Self {
@@ -245,6 +249,7 @@ impl Daemon {
             live_hooks: Vec::new(),
             peers: None,
             link: Arc::new(OnceLock::new()),
+            service: false,
         };
         d.register_builtin();
         d
@@ -414,6 +419,7 @@ impl Daemon {
             live_hooks,
             peers,
             link,
+            service: service_on,
         } = self;
         let socket = rpc::socket_path(&cfg.runs_dir);
         std::fs::create_dir_all(&cfg.runs_dir)?;
@@ -441,7 +447,11 @@ impl Daemon {
         ctx.rearm_watches().map_err(DaemonError::Store)?;
         watch::state_sweeper(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         schedule::spawn_runner(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
-        let service = service::spawn(true, Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
+        let service = service::spawn(
+            service_on,
+            Arc::downgrade(&ctx),
+            Arc::clone(&ctx.stop_watchers),
+        );
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());

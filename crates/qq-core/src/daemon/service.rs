@@ -195,14 +195,15 @@ fn live_agents(ctx: &super::Ctx) -> Vec<String> {
 }
 
 /// Holds a sleep inhibitor while any worker is live and mails cos after a resume from
-/// sleep. One cheap query per tick. Linux only; `QQ_INHIBIT=0` turns it off.
+/// sleep. One cheap query per tick. Opt-in (`enabled`): only the CLI daemon command asks for it.
+/// Linux only; `QQ_INHIBIT=0` turns it off.
 pub fn spawn(
-    _enabled: bool,
+    enabled: bool,
     ctx: std::sync::Weak<super::Ctx>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     use std::sync::atomic::Ordering;
-    if !cfg!(target_os = "linux") || std::env::var("QQ_INHIBIT").as_deref() == Ok("0") {
+    if !enabled || !cfg!(target_os = "linux") || std::env::var("QQ_INHIBIT").as_deref() == Ok("0") {
         return None;
     }
     Some(std::thread::spawn(move || {
