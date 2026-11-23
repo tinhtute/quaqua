@@ -380,10 +380,15 @@ mod tests {
 
     #[test]
     fn wake_body_names_the_agents() {
-        let b = wake_body(90_000, &["lead-a".into(), "peer-b".into()]);
+        let b = wake_body(90_000, Some(&["lead-a".into(), "peer-b".into()])).unwrap();
         assert!(b.contains("lead-a") && b.contains("peer-b"));
         assert!(b.contains("90s"));
-        assert!(wake_body(90_000, &[]).contains("no open agents"));
+    }
+
+    #[test]
+    fn no_open_agents_or_a_store_error_sends_no_wake_mail() {
+        assert_eq!(wake_body(90_000, Some(&[])), None);
+        assert_eq!(wake_body(90_000, None), None);
     }
 
     #[test]
