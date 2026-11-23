@@ -41,6 +41,8 @@ env: QQ (binary, default target/debug/quaqua)  E2E_SCORER (part c: the scorer pr
                      merge on STUB harnesses: an executable named after each kind's harness, first on PATH of the herdr
                      server, that reads one prompt, commits HELLO.txt (builder) or says `Verdict: clean` (reviewer) and
                      writes the report. No model, no tokens; E2E_PI_MODEL is not needed; part `d` is skipped.)
+     E2E_STUB_NOLAND=1 (with E2E_STUB=1, test-only: the stub never reads a prompt, so none lands; the repro for a wait that
+                     ends without a landed prompt)
      E2E_STOP_AFTER (C2 | C3 | C4 | S2b: end cleanly after that step; starts no agent, spends no tokens.
                      S2d: the pipeline places the builder (pane, worktree, agent row; starts ONE real builder-kind
                      agent, sends it NO prompt, starts no flow), asserts that, and ends; needs E2E_PI_MODEL)
@@ -346,6 +348,7 @@ if [ "$(basename "$0")" = claude ]; then
   fi
 fi
 printf '? for shortcuts\n> '
+[ -z "${STUB_NOLAND:-}" ] || sleep 3600   # E2E_STUB_NOLAND=1: draws the prompt, never reads one, so no prompt lands
 prompt=""
 while IFS= read -r line; do
   prompt="$prompt$line"$'\n'
@@ -371,6 +374,7 @@ STUBEOF
   chmod +x "$T/stubbin/stub"
   for h in claude pi; do ln -sf stub "$T/stubbin/$h"; done
   export PATH="$T/stubbin:$PATH"
+  export STUB_NOLAND=${E2E_STUB_NOLAND:-}
   mkdir -p "$T/stubtrust"; export STUB_TRUST_DIR="$T/stubtrust"
   # A pane shell that sources the user's rc puts the real CLIs back first on PATH; an empty ZDOTDIR keeps it as is.
   mkdir -p "$T/zdot"; echo "# empty: no user rc" >"$T/zdot/.zshrc"; export ZDOTDIR="$T/zdot"
