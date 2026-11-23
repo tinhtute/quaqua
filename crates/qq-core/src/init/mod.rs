@@ -292,10 +292,14 @@ pub fn run_with(
     }
 
     if update {
-        for rel in lock.files.keys() {
-            if !table::TABLE.iter().any(|(r, ..)| r == rel) {
-                log.push(format!("removed upstream {rel} (kept)"));
-            }
+        let removed = lock
+            .files
+            .keys()
+            .filter(|rel| !table::TABLE.iter().any(|(r, ..)| r == *rel))
+            .count();
+        if removed > 0 {
+            let s = if removed == 1 { "" } else { "s" };
+            log.push(format!("{removed} file{s} removed upstream, kept"));
         }
     }
     if dry {
