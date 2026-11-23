@@ -175,3 +175,85 @@ fn watchdog_never_overwrites_a_report_the_worker_wrote() {
     assert_eq!(r.unwrap_err().code, 6);
     assert_eq!(std::fs::read_to_string(runs.join("w.md")).unwrap(), "prose only, no outcome\n");
 }
+
+fn noop_journal(_: &str, _: serde_json::Value) {}
+
+fn idle_clock<'a>(h: &'a FakeHerdr, status: &'static str) -> FakeClock<'a> {
+    FakeClock {
+        now: 0.into(),
+        on_sleep: Box::new(move |_| h.set_status("w", status)),
+    }
+}
+
+#[test]
+fn watchdog_reports_a_fatal_provider_error_at_once_on_an_idle_pane() {
+    let (runs, _c) = seeded("atonce-idle");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "idle");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let clock = idle_clock(&h, "idle");
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ProviderError);
+    assert!(clock.now_sec() < 30, "reported after {}s, not via the idle/stall clock", clock.now_sec());
+}
+
+#[test]
+fn watchdog_reports_a_fatal_provider_error_at_once_on_a_working_pane() {
+    let (runs, _c) = seeded("atonce-working");
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "working");
+    h.set_pane_text("p1", "Not logged in · Please run /login\n");
+    let clock = idle_clock(&h, "working");
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::ProviderError);
+    assert!(clock.now_sec() < 30, "reported after {}s", clock.now_sec());
+}
+
+#[test]
+fn watchdog_reports_a_dead_agent_at_once() {
+    let (runs, c) = seeded("atonce-dead");
+    c.execute(
+        "INSERT INTO agent (name, role, kind, started_ms) VALUES ('w', 'peer', 'tieude', 1)",
+        [],
+    )
+    .unwrap();
+    let h = FakeHerdr::new(); // herdr has no such agent
+    let clock = FakeClock { now: 0.into(), on_sleep: Box::new(|_| {}) };
+    assert_eq!(prompt::wait(&h, &clock, &cfg(&runs, &noop_journal)), Exit::CoreDied);
+    assert!(clock.now_sec() < 30, "reported after {}s", clock.now_sec());
+}
+
+fn set_stall(c: &Connection, v: &str) {
+    c.execute(
+        "INSERT OR REPLACE INTO setting (key, value_json) VALUES ('notify.stall_sec', ?1)",
+        [v],
+    )
+    .unwrap();
+}
+
+fn silent_wait(runs: &Path) -> (Exit, u64) {
+    let h = FakeHerdr::new();
+    occupy(&h, "p1", "w");
+    h.set_status("w", "waiting");
+    h.set_pane_text("p1", "nothing new\n");
+    let clock = FakeClock { now: 0.into(), on_sleep: Box::new(|_| {}) };
+    let exit = prompt::wait(&h, &clock, &cfg(runs, &noop_journal));
+    (exit, clock.now_sec())
+}
+
+#[test]
+fn stall_limit_comes_from_the_setting() {
+    let (runs, c) = seeded("stall-set");
+    set_stall(&c, "30");
+    let (exit, at) = silent_wait(&runs);
+    assert_eq!(exit, Exit::Stalled);
+    assert!((30..40).contains(&at), "stalled at {at}s, want about 30");
+}
+
+#[test]
+fn stall_limit_defaults_to_600() {
+    let (runs, _c) = seeded("stall-default");
+    let (exit, at) = silent_wait(&runs);
+    assert_eq!(exit, Exit::Stalled);
+    assert!((600..610).contains(&at), "stalled at {at}s, want about 600");
+}
