@@ -13,8 +13,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -135,13 +136,17 @@ fn deny(ctx: &Ctx, req: &Request, target: &str, why: &str) -> RpcError {
     refused(format!("{who} -> {target}: {why}"))
 }
 
+/// How long one `gh` call may take before it counts as failed.
+const GH_LIMIT: Duration = Duration::from_secs(60);
+
 fn gh(program: &Path, repo: &str, args: &[&str]) -> std::io::Result<Output> {
-    Command::new(program)
-        .args(args)
-        .current_dir(repo)
-        .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
-        .output()
+    crate::proc::output_within(
+        Command::new(program)
+            .args(args)
+            .current_dir(repo)
+            .env("GH_PROMPT_DISABLED", "1"),
+        GH_LIMIT,
+    )
 }
 
 fn ok_stdout(o: std::io::Result<Output>) -> Option<String> {
