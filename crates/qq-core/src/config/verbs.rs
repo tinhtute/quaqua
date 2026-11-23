@@ -197,23 +197,15 @@ fn exec_config(
         }
         Some("import") => {
             let yes = args[1..].iter().any(|s| s == "--yes");
-            let Some(path) = args[1..].iter().find(|s| *s != "--yes") else {
+            let paths: Vec<&String> = args[1..].iter().filter(|s| *s != "--yes").collect();
+            let [path] = paths.as_slice() else {
                 return Err(usage("import <team.toml> [--yes]"));
             };
             let text = std::fs::read_to_string(path).map_err(fail)?;
-            check_text(conn, &text).map_err(fail)?;
-            let changed = super::conflicts(conn, &text).map_err(fail)?;
-            if !changed.is_empty() && !yes {
-                return Err(fail(format!(
-                    "import would overwrite {} stored value(s); nothing written, rerun with --yes to overwrite:\n{}",
-                    changed.len(),
-                    drift_lines(&changed, "file")
-                )));
-            }
-            let n = import(conn, &text).map_err(fail)?;
+            let (n, changed) = import(conn, &text, yes).map_err(fail)?;
             let mut out = format!("imported {n} kinds");
             if !changed.is_empty() {
-                out.push_str(&format!("\noverwrote:\n{}", drift_lines(&changed, "file")));
+                out.push_str(&format!("\noverwrote:\n{}", drift_lines(&changed, "import writes")));
             }
             Ok(out)
         }
@@ -827,9 +819,18 @@ fn check_text(conn: &Connection, text: &str) -> Result<(), ConfigError> {
 /// Merge a team.toml into the database in one transaction. Kinds, purposes and
 /// settings are upserted, edges added; the reviewer list is replaced when the
 /// file names one. Nothing the file omits is deleted. Returns the kinds named.
-fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
+///
+/// What the import changes is computed from what it writes: the export before
+/// and after, inside the transaction. Without `yes` a changed or removed
+/// stored key rolls the transaction back and refuses, naming every key.
+fn import(
+    conn: &mut Connection,
+    text: &str,
+    yes: bool,
+) -> Result<(usize, Vec<(String, String, String)>), ConfigError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let p = parse_checked(&tx, text)?;
+    let before = super::export::export_table(&tx)?;
     // Only the file's own kinds and harnesses are written; the stored
     // stand-ins are skipped.
     let doc: toml::Table = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -904,8 +905,17 @@ fn import(conn: &mut Connection, text: &str) -> Result<usize, ConfigError> {
             params![key, value.to_string()],
         )?;
     }
+    let changed = super::changed_keys(&before, &super::export::export_table(&tx)?);
+    if !changed.is_empty() && !yes {
+        drop(tx); // rolls back
+        return Err(ConfigError::Invalid(format!(
+            "import would overwrite {} stored value(s); nothing written, rerun with --yes to overwrite:\n{}",
+            changed.len(),
+            drift_lines(&changed, "import writes")
+        )));
+    }
     tx.commit()?;
-    Ok(named.len())
+    Ok((named.len(), changed))
 }
 
 /// The stored config as a [`Parsed`] (edges and the file-only settings are

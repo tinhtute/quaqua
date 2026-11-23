@@ -31,7 +31,7 @@ fn bad(m: String) -> ConfigError {
     ConfigError::Invalid(format!("export: {m}"))
 }
 
-fn export_table(conn: &Connection) -> Result<Table, ConfigError> {
+pub(super) fn export_table(conn: &Connection) -> Result<Table, ConfigError> {
     let mut doc = Table::new();
 
     for (name, spec) in stored_harnesses(conn)? {
@@ -182,6 +182,24 @@ fn flatten(prefix: &str, t: &Table, out: &mut BTreeMap<String, String>) {
             }
         }
     }
+}
+
+/// Keys stored before and changed or removed after: `(key, before, after)`.
+/// Edges are left out: an import only adds them.
+pub fn changed_keys(before: &Table, after: &Table) -> Vec<(String, String, String)> {
+    let (mut b, mut a) = (BTreeMap::new(), BTreeMap::new());
+    flatten("", before, &mut b);
+    flatten("", after, &mut a);
+    b.into_iter()
+        .filter(|(k, _)| {
+            !(k.starts_with("roles.") && (k.ends_with(".can_spawn") || k.ends_with(".reports_to")))
+        })
+        .filter_map(|(k, s)| match a.get(&k) {
+            Some(n) if *n == s => None,
+            Some(n) => Some((k, s, n.clone())),
+            None => Some((k, s, "(unset)".to_string())),
+        })
+        .collect()
 }
 
 /// Keys the file names whose stored value differs: `(key, stored, file)`. Reads

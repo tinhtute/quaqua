@@ -1030,6 +1030,6 @@ fn config_import_refuses_to_reset_values_the_file_omits() {
     assert_ne!(dump(&open(&ws), CONFIG_TABLES), before);
 
     // Extra positional args are an error, not ignored.
-    assert_eq!(run(&["config", "import", toml, "extra.toml"]), 2);
+    assert_eq!(run(&["config", "import", toml, "extra.toml"]), 1);
     daemon.stop().unwrap();
 }
