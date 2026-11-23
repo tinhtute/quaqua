@@ -75,10 +75,19 @@ mod tests {
             "Bash(git status:*)",
             "Bash(git rev-parse:*)",
             "Bash(git worktree list:*)",
-            "Bash(sqlite3 -readonly:*)",
+            "Bash(sqlite3 -safe -readonly:*)",
         ] {
             assert!(a.split(',').any(|t| t == want), "missing {want} in {a}");
         }
+    }
+
+    #[test]
+    fn auditor_sqlite_is_safe_mode_only() {
+        // `-readonly` alone still runs .shell/.system/.output dot-commands.
+        for t in allowed().split(',').filter(|t| t.contains("sqlite3")) {
+            assert!(t.starts_with("Bash(sqlite3 -safe -readonly"), "unsafe sqlite3 rule {t}");
+        }
+        assert!(crate::auditor::prompt::PROMPT_TEMPLATE.contains("sqlite3 -safe -readonly"));
     }
 
     #[test]
