@@ -13,8 +13,9 @@ pub fn store_path(root: &Path) -> PathBuf {
 }
 
 /// Stable 8-hex id of a finding line (FNV-1a). Only count tokens are dropped (a
-/// standalone digit run followed by a space and a word: "3 unpromoted lessons"),
-/// so a moving count keeps the id, ack and clock while digits inside paths and
+/// standalone digit run followed by a space and a word, "3 unpromoted lessons",
+/// or by "x/", "3x/14d") plus the line number of "<file>:<line>:" (a rule moving
+/// down a file keeps its ack; the rule text still tells findings apart), so a moving count keeps the id, ack and clock while digits inside paths and
 /// names ("pipeline-cmmod2") still tell findings apart.
 pub fn finding_id(line: &str) -> String {
     let b = line.as_bytes();
@@ -28,9 +29,12 @@ pub fn finding_id(line: &str) -> String {
             }
             let standalone = start == 0
                 || !(b[start - 1].is_ascii_alphanumeric() || b"-_./#".contains(&b[start - 1]));
-            let counted =
-                b.get(i) == Some(&b' ') && b.get(i + 1).is_some_and(u8::is_ascii_alphabetic);
-            if standalone && counted {
+            let counted = (b.get(i) == Some(&b' ')
+                && b.get(i + 1).is_some_and(u8::is_ascii_alphabetic))
+                || b[i..].starts_with(b"x/");
+            // "<file>:<line>:" in expired-rule / malformed-expiry lines.
+            let line_no = start > 0 && b[start - 1] == b':' && b.get(i) == Some(&b':');
+            if (standalone && counted) || line_no {
                 continue;
             }
             i = start;
