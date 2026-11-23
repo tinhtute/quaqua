@@ -67,6 +67,51 @@ pub(crate) fn verdict_line(text: &str) -> Option<&str> {
         .rfind(|l| l.starts_with(VERDICT_FIELD) || l.starts_with(&lower))
 }
 
+/// The heading under which a report disputes a premise or finding.
+pub(crate) const CHALLENGE_HEADING: &str = "## Challenge";
+/// Opening sentences that say a Challenge section disputes nothing.
+const NO_DISPUTE: [&str; 7] = [
+    "none",
+    "n/a",
+    "nothing",
+    "no challenge",
+    "no challenges",
+    "no dispute",
+    "nothing disputed",
+];
+
+/// True when the report disputes something: it has a `## Challenge` section
+/// whose body is not empty and does not open with a no-dispute statement
+/// ("None.", "N/A"). Fails closed: any other body, including "None of the
+/// premises hold: ...", is a dispute. Shared by the pipeline and the auditor.
+pub fn disputes(text: &str) -> bool {
+    let mut lines = text.lines();
+    while let Some(l) = lines.next() {
+        if !l.trim_start().starts_with(CHALLENGE_HEADING) {
+            continue;
+        }
+        let body: Vec<&str> = lines
+            .clone()
+            .take_while(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        let body = body.join("\n");
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let first = body
+            .split(|c| matches!(c, '.' | '!' | '\n'))
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '/')
+            .to_ascii_lowercase();
+        if !NO_DISPUTE.contains(&first.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn has_outcome(text: &str) -> bool {
     text.lines().any(|l| l.starts_with(OUTCOME_FIELD))
 }
@@ -118,6 +163,28 @@ mod tests {
         // whatever the ask names, the parser reads
         assert_eq!(parse_verdict("Verdict: clean"), Ok(0));
         assert_eq!(parse_verdict("Verdict: 4 findings"), Ok(4));
+    }
+
+    #[test]
+    fn challenge_that_disputes_nothing_is_ignored() {
+        let t1 = "## Findings\n(none)\n\n## Challenge\nNone. The brief's premises hold.\n\nVerdict: clean";
+        let t2 = "## Challenge\nNone. Premises hold: commit exists on quaqua/sude-e2e1-b and is the HEAD of the review worktree.\n\nVerdict: clean";
+        assert!(!disputes(t1) && !disputes(t2));
+        assert!(!disputes("## Challenge\n\n## Lessons\nx"));
+        assert!(!disputes("## Challenge\n**N/A**\n## Lessons\nx"));
+        assert!(!disputes("no section at all"));
+    }
+
+    #[test]
+    fn real_challenge_disputes() {
+        assert!(disputes(
+            "## Challenge\nNone of the premises hold: no such commit.\nVerdict: clean"
+        ));
+        assert!(disputes("## Challenge\nThe SHA is wrong.\n"));
+        assert!(disputes(
+            "## Challenge\nNone.\n\n## Challenge (again)\nThe branch is missing."
+        ));
+        assert!(disputes("## Challenge\n- premise 1 is false"));
     }
 
     #[test]

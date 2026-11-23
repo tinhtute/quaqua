@@ -419,7 +419,7 @@ pub fn run_deterministic_prechecks_at(
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if !content.lines().any(|l| l.starts_with("## Challenge")) {
+            if !crate::task::report_contract::disputes(&content) {
                 continue;
             }
             let base = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -817,5 +817,48 @@ fn mail_checks(root: &Path, runs_dir: &Path, now_secs: u64, flags: &mut Vec<Stri
                 live.join(", ")
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags_for(tag: &str, report: &str) -> Vec<String> {
+        let root = std::env::temp_dir().join(format!("qq-precheck-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("runs")).unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("runs/w1.md"), report).unwrap();
+        let flags = run_deterministic_prechecks_at(&root, (2026, 11, 23), 1_790_000_000);
+        let _ = std::fs::remove_dir_all(&root);
+        flags
+    }
+
+    #[test]
+    fn precheck_ignores_a_challenge_that_disputes_nothing() {
+        for (i, r) in [
+            "## Findings\n(none)\n\n## Challenge\nNone. The brief's premises hold.\n\nVerdict: clean",
+            "## Challenge\nNone. Premises hold: commit exists on quaqua/sude-e2e1-b and is the HEAD of the review worktree.\n\nVerdict: clean",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let f = flags_for(&format!("none{i}"), r);
+            assert!(!f.iter().any(|l| l.contains("'## Challenge'")), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn precheck_flags_a_real_challenge() {
+        let f = flags_for(
+            "real",
+            "## Challenge\nNone of the premises hold: no such commit.\n",
+        );
+        assert!(
+            f.iter()
+                .any(|l| l.contains("runs/w1.md: '## Challenge' unresolved")),
+            "{f:?}"
+        );
     }
 }
