@@ -137,7 +137,7 @@ fn ack_cmd(args: &[String]) -> Result<String, CliError> {
 fn ack_finding(root: &Path, id: &str) -> Result<String, CliError> {
     let path = ack::store_path(root);
     let store = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = ack::ack(&store, id, clock::now_sec())
+    let updated = ack::ack(&store, id)
         .ok_or_else(|| CliError::new(1, format!("no recorded finding with id '{id}'")))?;
     write_atomic(&path, updated.as_bytes())
         .map_err(|e| CliError::new(1, format!("cannot write {}: {e}", path.display())))?;

@@ -97,7 +97,7 @@ pub fn apply(flags: Vec<String>, store: &str, now_secs: u64) -> (Vec<String>, St
 }
 
 /// Marks `id` acked in `store`; `None` when no such finding is recorded.
-pub fn ack(store: &str, id: &str, _now_secs: u64) -> Option<String> {
+pub fn ack(store: &str, id: &str) -> Option<String> {
     let mut rows = parse(store);
     let row = rows.iter_mut().find(|r| r.0 == id)?;
     row.2 = true;
@@ -125,7 +125,7 @@ mod tests {
         let b = "- runs/: 12 unpromoted lessons (> 7d)";
         assert_eq!(finding_id(a), finding_id(b));
         let (_, store) = apply(vec![a.into()], "", 0);
-        let store = ack(&store, &finding_id(a), 1).unwrap();
+        let store = ack(&store, &finding_id(a)).unwrap();
         let (kept, store) = apply(vec![b.into()], &store, 5 * DAY);
         assert!(kept.is_empty(), "count change must not lose the ack");
         assert!(store.contains("\t0\tack"), "first-seen clock kept: {store}");
@@ -147,10 +147,10 @@ mod tests {
     fn auditor_ack_suppresses_acked_finding() {
         let (kept, store) = apply(vec![RO.into()], "", 1000);
         assert_eq!(kept, vec![RO.to_string()]);
-        let store = ack(&store, &finding_id(RO), 1100).expect("known id");
+        let store = ack(&store, &finding_id(RO)).expect("known id");
         let (kept, _) = apply(vec![RO.into()], &store, 1200);
         assert!(kept.is_empty());
-        assert!(ack(&store, "deadbeef", 1).is_none());
+        assert!(ack(&store, "deadbeef").is_none());
     }
 
     #[test]
