@@ -997,3 +997,39 @@ fn config_validate_reports_drift_from_team_toml() {
     );
     daemon.stop().unwrap();
 }
+
+#[test]
+fn config_import_refuses_to_reset_values_the_file_omits() {
+    let ws = seeded("cfg-import-omit");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let toml = ws.team_toml();
+    let toml = toml.to_str().unwrap();
+
+    // The fixture's [kinds.ni] has no fallback and no on_cost_cap.
+    assert_eq!(run(&["config", "set", "kind.ni.fallback", "sude"]), 0);
+    assert_eq!(run(&["config", "set", "kind.ni.on_cost_cap", "kill"]), 0);
+    let before = dump(&open(&ws), CONFIG_TABLES);
+
+    // Plain import: refused, both omitted keys named, nothing written.
+    let e = config::config_cmd(&env, &strs(&["import", toml])).unwrap_err();
+    assert!(e.message.contains("kinds.ni.fallback"), "{}", e.message);
+    assert!(e.message.contains("kinds.ni.on_cost_cap"), "{}", e.message);
+    assert_eq!(dump(&open(&ws), CONFIG_TABLES), before);
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "kind.ni"])).unwrap().contains("kill"),
+        true
+    );
+
+    // --yes resets them to what the file implies and lists them.
+    let out = config::config_cmd(&env, &strs(&["import", toml, "--yes"])).unwrap();
+    assert!(out.contains("kinds.ni.fallback"), "{out}");
+    assert_ne!(dump(&open(&ws), CONFIG_TABLES), before);
+
+    // Extra positional args are an error, not ignored.
+    assert_eq!(run(&["config", "import", toml, "extra.toml"]), 2);
+    daemon.stop().unwrap();
+}
