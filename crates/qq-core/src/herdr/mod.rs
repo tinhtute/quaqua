@@ -491,3 +491,35 @@ impl HerdrClient for CliHerdr {
         self.run(&args)
     }
 }
+
+#[cfg(test)]
+mod hang_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn hung_bin(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("qq-herdr-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr-hung.sh");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    /// A herdr that never answers must not block the caller for good.
+    #[test]
+    fn hung_herdr_returns_within_the_limit() {
+        let cli = CliHerdr {
+            bin: hung_bin("hang"),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(cli.agent_list());
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("agent_list blocked on a hung herdr");
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+}
