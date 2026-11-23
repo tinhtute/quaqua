@@ -16,6 +16,6 @@ herdr agent list; herdr pane close <pane_id>
 
 `prompt --wait` can return idle before the reply renders: read again and verify the report, not the lifecycle state. Read `recovery.md` before sending input after a failure; a blocked agent takes only `herdr agent send-keys <name> enter`.
 
-Watchdog exit codes: `recovery.md`; resume a stalled worker with `quaqua worker prompt --resume <name>`. Accept a report only after rerunning its exact test, then clean up at once and close only panes you created. Never `herdr server stop`.
+Watchdog exit codes: `recovery.md`; resume a stalled worker with `quaqua worker prompt <name> --resume`. Accept a report only after rerunning its exact test, then clean up at once and close only panes you created. Never `herdr server stop`.
 
 Before wide fan-out, check scopes and shared resources; never split writers that share files. Each writer has its own worktree; one shared-resource test lane at a time. UI checks follow the UI line of `.claude/rules/brief.md`.
