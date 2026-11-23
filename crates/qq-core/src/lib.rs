@@ -16,6 +16,7 @@ pub mod kb;
 pub mod memory;
 pub mod merge;
 pub mod playbook;
+pub mod proc;
 pub mod rpc;
 pub mod run;
 pub mod skills;

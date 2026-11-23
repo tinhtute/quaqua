@@ -18,7 +18,7 @@ pub mod watch;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, TryLockError};
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -592,22 +592,67 @@ fn serve_conn(
             Err(e) => Response::err(RpcError::new(rpc::BAD_REQUEST, e.to_string())),
             Ok(req) => match identify(req, peers, cred.as_ref(), own_uid) {
                 Err(e) => Response::err(e),
-                Ok(req) => match verbs.get(&req.verb) {
-                    None => Response::err(RpcError::new(
+                Ok(req) => traced(&req, &mut std::io::stderr(), || match verbs.get(&req.verb) {
+                    None => Err(RpcError::new(
                         rpc::UNKNOWN_VERB,
                         format!("no verb '{}'", req.verb),
                     )),
-                    Some(h) => match h(ctx, &req) {
-                        Ok(v) => Response::ok(v),
-                        Err(e) => Response::err(e),
-                    },
-                },
+                    Some(h) => h(ctx, &req),
+                })
+                .map_or_else(Response::err, Response::ok),
             },
         };
         if rpc::write_line(&mut out, &resp).is_err() {
             return;
         }
     }
+}
+
+/// Read-only verbs that clients poll (pipeline --wait calls `status` every
+/// 500 ms): they log only an err or a call that took `SLOW_POLL_MS` or more.
+const POLLING_VERBS: [&str; 4] = ["status", "ping", caller::VERB, "mail.inbox"];
+const SLOW_POLL_MS: u128 = 1000;
+
+/// Runs one verb and writes a "start" line before it and a result line after
+/// it (caller, verb, duration in ms, ok/err), so a hung verb is visible while
+/// it runs and a failed one leaves a trace. Polling verbs write one line, only
+/// on err or a slow call (no start line). A write error is ignored.
+fn traced<F>(req: &Request, log: &mut dyn Write, run: F) -> Result<Value, RpcError>
+where
+    F: FnOnce() -> Result<Value, RpcError>,
+{
+    traced_with(req, log, SLOW_POLL_MS, run)
+}
+
+/// `traced` with the slow-poll threshold as a parameter (a test seam).
+fn traced_with<F>(
+    req: &Request,
+    log: &mut dyn Write,
+    slow_ms: u128,
+    run: F,
+) -> Result<Value, RpcError>
+where
+    F: FnOnce() -> Result<Value, RpcError>,
+{
+    let polling = POLLING_VERBS.contains(&req.verb.as_str());
+    // The claim is unverified without a resolver: {:?} keeps a newline in it
+    // from forging a log line.
+    let who = req.caller.as_deref().unwrap_or("-");
+    if !polling {
+        let _ = writeln!(log, "quaqua daemon: verb start caller={who:?} verb={:?}", req.verb);
+    }
+    let t0 = std::time::Instant::now();
+    let res = run();
+    let ms = t0.elapsed().as_millis();
+    if !polling || res.is_err() || ms >= slow_ms {
+        let outcome = if res.is_ok() { "ok" } else { "err" };
+        let _ = writeln!(
+            log,
+            "quaqua daemon: verb caller={who:?} verb={:?} ms={ms} {outcome}",
+            req.verb
+        );
+    }
+    res
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
@@ -644,6 +689,83 @@ fn identify(
 mod peer_tests {
     use super::*;
     use crate::identity::peer::{CallerId, PeerCred};
+
+    #[test]
+    fn a_served_verb_leaves_a_start_line_and_a_result_line() {
+        let mut req = Request::new("mail_send", Value::Null);
+        req.caller = Some("quaqua-rs-lead".into());
+        let mut log = Vec::new();
+        let ok = traced(&req, &mut log, || Ok(Value::Null));
+        let bad = traced(&req, &mut log, || Err(internal("boom".into())));
+        assert!(ok.is_ok() && bad.is_err());
+        let text = String::from_utf8(log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines[0], "quaqua daemon: verb start caller=\"quaqua-rs-lead\" verb=\"mail_send\"");
+        assert!(lines[1].starts_with("quaqua daemon: verb caller=\"quaqua-rs-lead\" verb=\"mail_send\" ms="));
+        assert!(lines[1].ends_with(" ok"), "{}", lines[1]);
+        assert!(lines[3].ends_with(" err"), "{}", lines[3]);
+    }
+
+    fn traced_log(verb: &str, caller: &str, res: Result<Value, RpcError>) -> String {
+        let mut req = Request::new(verb, Value::Null);
+        req.caller = Some(caller.into());
+        let mut log = Vec::new();
+        let _ = traced(&req, &mut log, || res);
+        String::from_utf8(log).unwrap()
+    }
+
+    #[test]
+    fn a_polling_verb_that_succeeds_quickly_logs_nothing() {
+        for v in ["status", "ping", caller::VERB, "mail.inbox"] {
+            let text = traced_log(v, "lead", Ok(Value::Null));
+            assert_eq!(text, "", "{v}");
+        }
+    }
+
+    #[test]
+    fn a_slow_polling_verb_logs_one_result_line() {
+        let mut req = Request::new("status", Value::Null);
+        req.caller = Some("lead".into());
+        let mut log = Vec::new();
+        let _ = traced_with(&req, &mut log, 0, || Ok(Value::Null));
+        let text = String::from_utf8(log).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("verb=\"status\"") && text.trim_end().ends_with(" ok"), "{text}");
+        let mut log = Vec::new();
+        let _ = traced_with(&req, &mut log, u128::MAX, || Ok(Value::Null));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn a_polling_verb_that_fails_logs_its_result() {
+        let text = traced_log("status", "lead", Err(internal("boom".into())));
+        assert!(text.contains("verb=\"status\"") && text.trim_end().ends_with(" err"), "{text}");
+    }
+
+    #[test]
+    fn a_mutating_verb_that_succeeds_logs_both_lines() {
+        for v in ["mail.send", "mail.ack"] {
+            let text = traced_log(v, "lead", Ok(Value::Null));
+            assert_eq!(text.lines().count(), 2, "{v}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_newline_in_the_verb_cannot_forge_a_line() {
+        let text = traced_log("x\nquaqua daemon: verb caller=root verb=stop ms=0 ok", "lead", Ok(Value::Null));
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+        assert!(text.lines().all(|l| l.starts_with("quaqua daemon: verb")), "{text:?}");
+        assert!(!text.contains("x\nquaqua"), "{text:?}");
+    }
+
+    #[test]
+    fn a_newline_in_the_caller_cannot_forge_a_line() {
+        let text = traced_log("mail.send", "x\nquaqua daemon: verb caller=root verb=stop ms=0 ok", Ok(Value::Null));
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+        assert!(text.lines().all(|l| l.starts_with("quaqua daemon: verb")), "{text:?}");
+        assert!(!text.contains("x\nquaqua"), "{text:?}");
+    }
 
     struct Fixed(Result<&'static str, ()>);
     impl PeerResolver for Fixed {

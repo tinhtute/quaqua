@@ -952,6 +952,49 @@ mod pr_merge_door {
         assert!(!log.contains("--admin") && !log.contains("--auto"), "{log}");
     }
 
+    /// Rewrites the fake gh so `pr merge` hangs and `pr view --json state,...`
+    /// answers `view_state`; a 400 ms limit stands in for the production minute.
+    fn hang_merge(d: &Door, view_state: &str) {
+        let gh = d.r.ws.root().join("fake-gh");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
+             'pr diff') {diff} ;;\n\
+             'pr view') case \"$*\" in *state*) {view_state} ;; *) echo {SHA} ;; esac ;;\n\
+             'pr checks') echo '[{{\"bucket\":\"pass\"}}]' ;;\n\
+             'pr merge') exec sleep 30 ;;\n\
+             *) exit 9 ;;\nesac\n",
+            log = d.log.display(),
+            diff = names("src/lib.rs"),
+        );
+        std::fs::write(&gh, script).unwrap();
+        pr_merge::set_test_gh_limit(&d.r.ws.runs_dir(), std::time::Duration::from_millis(400));
+    }
+
+    #[test]
+    fn pr_merge_timeout_with_the_pr_merged_reports_merged() {
+        let d = green("prm-to-merged", Who::Cos, Tier::Medium);
+        hang_merge(&d, "echo '{\"state\":\"MERGED\",\"mergeCommit\":{\"oid\":\"abc\"}}'");
+        let v = merge(&d, SHA).unwrap();
+        assert_eq!(v["merged"], true, "{v}");
+        assert!(gh_log(&d).contains("state,mergeCommit"), "{}", gh_log(&d));
+    }
+
+    #[test]
+    fn pr_merge_timeout_with_the_pr_open_is_merge_unknown() {
+        let d = green("prm-to-open", Who::Cos, Tier::Medium);
+        hang_merge(&d, "echo '{\"state\":\"OPEN\",\"mergeCommit\":null}'");
+        let e = merge(&d, SHA).unwrap_err();
+        assert_eq!(e.code, "merge_unknown", "{}", e.message);
+    }
+
+    #[test]
+    fn pr_merge_timeout_with_an_unreadable_recheck_is_merge_unknown() {
+        let d = green("prm-to-unread", Who::Cos, Tier::Medium);
+        hang_merge(&d, "exit 1");
+        let e = merge(&d, SHA).unwrap_err();
+        assert_eq!(e.code, "merge_unknown", "{}", e.message);
+    }
+
     #[test]
     fn pr_merge_never_runs_a_request_string_through_a_shell() {
         let d = green("prm-inject", Who::Cos, Tier::Medium);

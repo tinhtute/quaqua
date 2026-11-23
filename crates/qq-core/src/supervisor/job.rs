@@ -1,9 +1,11 @@
 //! The scheduled jobs. [`run_outer2`] runs loop 2 in the order of the sensor
 //! table (computational first); [`score_runs`] is the scoring job alone.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection};
 
@@ -65,24 +67,88 @@ pub struct ExecScorer {
     pub program: PathBuf,
 }
 
+/// Read a pipe to its end on its own thread.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// How long one scorer run may take before it is killed. A `claude -p` scorer
+/// reading a long transcript takes a few minutes at most; 10 minutes leaves
+/// room for a slow model without letting a hung scorer block the job for good.
+pub const SCORER_LIMIT: Duration = Duration::from_secs(600);
+
 impl Scorer for ExecScorer {
     fn score(&self, rubric: &Rubric, run: &RunView) -> Result<Verdict, String> {
+        self.score_within(rubric, run, SCORER_LIMIT)
+    }
+}
+
+impl ExecScorer {
+    pub fn score_within(
+        &self,
+        rubric: &Rubric,
+        run: &RunView,
+        limit: Duration,
+    ) -> Result<Verdict, String> {
+        let name = self.program.display();
         let mut child = Command::new(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("cannot run {}: {e}", self.program.display()))?;
+            .map_err(|e| format!("cannot run {name}: {e}"))?;
+        // Stdin and both output pipes each get a thread: a scorer that never
+        // reads its prompt, or fills a pipe we are not draining, cannot block us.
         let prompt = scoring_prompt(rubric, run);
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes());
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+            });
         }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!("{} exited {}", self.program.display(), out.status));
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{name} timed out after {}s and was killed",
+                        limit.as_secs_f32()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        // A grandchild can keep a pipe open past the exit: wait briefly, not for good.
+        let grace = Duration::from_secs(2);
+        let out = stdout.recv_timeout(grace).unwrap_or_default();
+        if !status.success() {
+            let err = stderr.recv_timeout(grace).unwrap_or_default();
+            let last = String::from_utf8_lossy(&err)
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(300).collect::<String>());
+            return Err(match last {
+                Some(l) => format!("{name} exited {status}: {l}"),
+                None => format!("{name} exited {status}"),
+            });
         }
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("scorer printed no JSON: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&out).map_err(|e| format!("scorer printed no JSON: {e}"))?;
         let value = v
             .get("score")
             .and_then(|s| s.as_u64())
@@ -600,4 +666,103 @@ fn outer2(
         }
     }
     Ok(rep)
+}
+
+#[cfg(test)]
+mod scorer_tests {
+    use super::*;
+    use crate::backlog::Surface;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    struct Dir(PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            let p = std::env::temp_dir().join(format!("qq-scorer-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Dir(p)
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn script(dir: &Dir, body: &str) -> ExecScorer {
+        let p = dir.0.join("scorer.sh");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ExecScorer { program: p }
+    }
+
+    fn rubric() -> Rubric {
+        Rubric {
+            id: "r".into(),
+            criterion: "c".into(),
+            surface: Surface::Rule,
+        }
+    }
+
+    fn view(pad: usize) -> RunView {
+        RunView {
+            run_id: 1,
+            project_id: None,
+            candidate_sha: None,
+            outcome: None,
+            transcript: vec![("user".into(), "x".repeat(pad))],
+            tool_calls: vec![],
+        }
+    }
+
+    /// Run the scorer on a thread so a hang fails the test instead of freezing it.
+    fn score(s: ExecScorer, pad: usize, limit: Duration) -> (Result<Verdict, String>, Duration) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let r = s.score_within(&rubric(), &view(pad), limit);
+            let _ = tx.send((r, t.elapsed()));
+        });
+        rx.recv_timeout(Duration::from_secs(15))
+            .expect("scorer did not return within 15 s")
+    }
+
+    #[test]
+    fn supervisor_scorer_error_carries_last_stderr_line() {
+        let d = Dir::new("t1");
+        let s = script(&d, "echo first >&2; echo 'no API key set' >&2; exit 1");
+        let (r, _) = score(s, 10, Duration::from_secs(5));
+        let e = r.unwrap_err();
+        assert!(e.contains("no API key set"), "{e}");
+        assert!(!e.contains("first"), "{e}");
+    }
+
+    #[test]
+    fn supervisor_scorer_that_sleeps_is_killed_at_the_limit() {
+        let d = Dir::new("t2");
+        let s = script(&d, "exec sleep 30");
+        let (r, took) = score(s, 10, Duration::from_millis(300));
+        assert!(r.unwrap_err().contains("timed out"));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn supervisor_scorer_that_never_reads_a_large_prompt_does_not_deadlock() {
+        let d = Dir::new("t3");
+        let s = script(&d, "exec sleep 30");
+        // 4 MiB is far above the 64 KiB pipe buffer.
+        let (r, took) = score(s, 4 << 20, Duration::from_millis(300));
+        assert!(r.unwrap_err().contains("timed out"));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn supervisor_scorer_that_answers_without_reading_still_scores() {
+        let d = Dir::new("t4");
+        let s = script(&d, r#"echo '{"score": 2, "quote": "ok"}'"#);
+        let (r, _) = score(s, 4 << 20, Duration::from_secs(5));
+        assert_eq!(r.unwrap().value, 2);
+    }
 }
