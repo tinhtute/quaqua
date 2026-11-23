@@ -148,6 +148,7 @@ common
   C3 seed           \`quaqua config import team.toml\`; roster has the claude builder kind
   C4 second harness \`quaqua config set kind.$REVIEWER '{harness:pi,model:\$E2E_PI_MODEL,...}'\` (live roster is claude-only); skipped when $REVIEWER is a roster reviewer kind and no E2E_PI_MODEL is set
 part switch
+  S11 cleanup      \`worker cleanup\` of the pipeline's builder and reviewer after the merge; each agent row ends
   S1 sqlite roster  kind rows for $BUILDER and $REVIEWER in qq.db name two different models
   S2 fixture        git repo + local bare origin + integration branch integ/$PROJECT, brief file
   S2b task row      \`quaqua task create $PROJECT '<title>' --kind $BUILDER --repo <repo>\` writes a task row (project, title,
@@ -187,6 +188,7 @@ part b (clause b)
   B3 symbol query  \`run show\` of the child lists a lookup tool call (E2E_LOOKUP_TOOL_RE) that returned the symbol, or whose empty nested result is backed by a REPL/Poll result holding it
   B4 off topology  a pi Peer told to \`worker spawn\` is refused: a refusal on edge spawn names that Peer
   B5 peer mail     the same Peer told to \`mail send\` to another Peer is refused: a refusal on edge mail, Peer-to-Peer
+  B3c/B6 cleanup   \`worker cleanup\` of the two DAG workers (before the Peers spawn) and of the two Peers; each agent row ends
 part g (clause g)
   G1 per run       for every row of \`run list --project\`, \`run show\` prints events, transcript, tool calls, tokens
                     (numbers or unknown), cost ($ or unknown) and candidate_sha
@@ -200,6 +202,7 @@ part c (clause c)
   C6 high rule/skill  \`quaqua backlog list open\` lists a loop-2 row, risk high, surface rule or skill, status open; no verdict
                     is recorded for it (it waits for the owner)
 part e (clause e)
+  E4 cleanup      \`worker cleanup\` of the paused pipeline's agents; each agent row ends (D6 after d: the push Peer; H3 after h: the cap Peer)
   E1 failing check a pipeline whose check fails (pipeline check=false: red on the base too) pauses with exit 5 and a journaled
                     pause_for_approval 'blocked 4: base_broken'
   E2 pull          \`quaqua source pull\` files a loop-1 bug proposal naming that workflow; \`backlog list open\` shows it, risk low
@@ -232,6 +235,7 @@ check_cmds() {
     "config|set|import set"
     "worker|spawn --probe|spawn --base --review <name> <kind> <repo-path>"
     "worker|prompt|prompt <name>"
+    "worker|prompt|cleanup <name>"
     "pipeline|-|--rounds --resume --cancel --wait"
     "task|create|task create --kind --disposition --repo --parent"
     "config|-|export diff validate"
@@ -445,6 +449,16 @@ as_pane() {
 as_cos() { as_pane "$COS_PANE" "$@"; }
 # stop_after STEP: E2E_STOP_AFTER=STEP ends the run cleanly after that step (before any agent or token spend).
 stop_after() { [ "${E2E_STOP_AFTER:-}" = "$1" ] || return 0; echo "STOP after $1 (E2E_STOP_AFTER): $N assertions passed, no prompt sent"; exit 0; }
+# cleanup_workers STEP NAME...: `worker cleanup` as the CoS, as it does after a verified outcome; each agent row must then
+# be ended. A cleanup that fails fails STEP, named; nothing is ignored. open_named PREFIX lists the open agents "PREFIX*".
+cleanup_workers() {
+  local s=$1 n; shift
+  for n in "$@"; do
+    as_cos "$QQ" worker cleanup "$n"; [ "$AP_RC" = 0 ] || fail "$s" "worker cleanup $n rc=$AP_RC: $AP_OUT"
+    expect "$s" "0" "$(q "select count(*) from agent where name='$n' and ended_ms is null")"
+  done
+}
+open_named() { q "select name from agent where name like '$1%' and ended_ms is null order by id"; }
 
 # The daemon refuses an unmapped peer for every verb (ping included), so readiness is a ping run inside the cos pane.
 i=0
@@ -567,6 +581,8 @@ if want switch; then
   expect_ok S9 "integ/$PROJECT contains $SHA" git -C "$PROJ" merge-base --is-ancestor "$SHA" "integ/$PROJECT"
 
   expect S10 "0" "$(q "select count(*) from agent a where a.name in ('$TASK-b','$TASK-r1') and not exists (select 1 from kind k join harness h on h.name=k.harness where k.name=a.kind)")"
+  # the pipeline merged: its builder and reviewer (no run rows, so cleanup records their spend in a spawn run) are finished
+  cleanup_workers S11 $(open_named "$TASK-")
 fi
 
 # ---- clauses a, b, g (T58) ---------------------------------------------------------------------------------
@@ -644,6 +660,9 @@ if want b; then
   # lookup_hit: an ok lookup call has the symbol in its result, or (nested MCP call, empty result) a REPL/Poll result has it
   HIT=$(printf '%s\n' "$SHOW" | lookup_hit "$LRE") || true
   [ -n "$HIT" ] && pass B3 "$(printf '%s' "$HIT" | cut -c1-200)" || fail B3 "no ok tool call matching /$LRE/ returned e2e_answer_symbol (directly or via a REPL/Poll result) in run show worker:$CN"
+  # both DAG workers are verified and their runs closed (run show/list of them read the DB, which cleanup keeps): free their slots
+  wait_for B3c "$TIMEOUT" run_closed "$TC"
+  cleanup_workers B3c "$PN" "$CN"
   PA="$REVIEWER-pa"; PB="$REVIEWER-pb"; OFF="$REVIEWER-offtopo"
   as_cos "$QQ" worker spawn "$PA" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B4 "spawn $PA rc=$AP_RC: $AP_OUT"
   as_cos "$QQ" worker spawn "$PB" "$REVIEWER" "$PROJ"; [ "$AP_RC" = 0 ] || fail B5 "spawn $PB rc=$AP_RC: $AP_OUT"
@@ -658,6 +677,7 @@ if want b; then
   wait_for B5 "$TIMEOUT" refusal_rose "$PA" mail "$mb"
   ma=$(refusals "$PA" mail)
   [ "$ma" -gt "$mb" ] && pass B5 "Peer-to-Peer mail refused and journaled ($mb -> $ma): $(last_reason "$PA" mail)" || fail B5 "no mail refusal journaled for $PA ($mb -> $ma)"
+  cleanup_workers B6 "$PA" "$PB"   # the two pi Peers are done
 fi
 
 # ---- part g: clause (g), the CLI prints the whole record of every worker run -------------------------------------
@@ -746,6 +766,7 @@ if want e; then
   as_cos "$QQ" backlog list approved; [ "$AP_RC" = 0 ] || fail E3 "backlog list approved rc=$AP_RC: $AP_OUT"
   printf '%s\n' "$AP_OUT" | awk -F'\t' -v id="$EID" -v t="$ETASK" '$1==id && $6=="approved" && $7==t {ok=1} END {exit !ok}' || fail E3 "backlog list approved has no row of proposal $EID with task $ETASK"
   pass E3 "$AP_OUT -> decision cos/approve/[$ENOTE]; task $ETASK kind $BUILDER open from proposal $EID"
+  cleanup_workers E4 $(open_named "$ET-")   # the paused pipeline's builder/reviewer: the failure was read, nothing later needs them
 fi
 
 # ---- part f: clause (f), an idea file becomes a high-risk feature proposal that stays open ---------------------------
@@ -797,6 +818,7 @@ if want d; then
   after=$(q "select count(*) from events where workflow_id='authority:refusals' and kind='refusal'")
   [ "$after" -gt "$before" ] && pass D4 "refusal events $before -> $after: $(q "select group_concat(json_extract(payload_json,'\$.edge'),',') from events where workflow_id='authority:refusals'")" \
     || fail D4 "journal gained no refusal ($before -> $after)"
+  cleanup_workers D6 "$PUSHY"
 fi
 # ---- part h: clause (h), WORKSPACE_PROTOCOL.md sets a worker cap of N; spawn N+1 is refused ---------------------
 # Runs after d so no later spawn of this script meets the cap. N = Peers already active in the project + 1.
@@ -815,6 +837,7 @@ if want h; then
   WHY=$(q "select json_extract(payload_json,'\$.reason') from events where workflow_id='authority:refusals' and json_extract(payload_json,'\$.reason') like 'worker cap%' order by seq desc limit 1")
   pass H2 "spawn $((CAPN + 1)) refused at worker_cap = $CAPN: exit=$AP_RC out=$(printf '%s' "$AP_OUT" | tr '\n' ' ' | cut -c1-160) journal=[${WHY:-none}]"
   expect H2n "0" "$(q "select count(*) from agent where name='$REVIEWER-capx'")"
+  cleanup_workers H3 "$REVIEWER-capok"
 fi
 
 echo "ALL $N ASSERTIONS PASSED (parts: ${PARTS[*]})"
