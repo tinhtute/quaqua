@@ -611,4 +611,28 @@ mod tests {
         assert!(init_cmd(&env, &a(&[d, "--update", "--accept", "AGENTS.md"])).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Files the lock holds but the template dropped are one count line, not a
+    /// line each, so a dry run's real conflicts stay visible.
+    #[test]
+    fn update_dry_run_counts_removed_upstream_files_in_one_line() {
+        let root = scratch("removed-upstream");
+        run(&root, false, false).unwrap();
+        let p = lock_path(&root);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        for n in ["old/a.md", "old/b.md", "old/c.md"] {
+            v["files"][n] = serde_json::json!({"md5": "x", "mode": 420});
+        }
+        std::fs::write(&p, v.to_string()).unwrap();
+        set_lock_md5(&root, "AGENTS.md", &md5_hex(b"older template\n"));
+        std::fs::write(root.join("AGENTS.md"), "mine\n").unwrap();
+        let (r, c) = run(&root, true, true).unwrap();
+        assert_eq!(c, 1, "{r}");
+        assert!(r.contains("conflict AGENTS.md"), "{r}");
+        assert!(r.contains("3 files removed upstream, kept"), "{r}");
+        assert!(!r.contains("removed upstream old/"), "{r}");
+        assert_eq!(r.matches("removed upstream").count(), 1, "{r}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
