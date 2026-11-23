@@ -331,7 +331,7 @@ mod tests {
         let mut held = Some(Fake(false));
         reap(&mut held);
         assert!(held.is_none());
-        assert_eq!(inhibit_decision(2, held.is_some()), Inhibit::Start);
+        assert_eq!(inhibit_decision(Some(2), held.is_some()), Inhibit::Start);
         let mut held = Some(Fake(true));
         reap(&mut held);
         assert!(held.is_some());
@@ -339,10 +339,16 @@ mod tests {
 
     #[test]
     fn inhibitor_follows_live_workers() {
-        assert_eq!(inhibit_decision(1, false), Inhibit::Start);
-        assert_eq!(inhibit_decision(3, true), Inhibit::Keep);
-        assert_eq!(inhibit_decision(0, true), Inhibit::Stop);
-        assert_eq!(inhibit_decision(0, false), Inhibit::Keep);
+        assert_eq!(inhibit_decision(Some(1), false), Inhibit::Start);
+        assert_eq!(inhibit_decision(Some(3), true), Inhibit::Keep);
+        assert_eq!(inhibit_decision(Some(0), true), Inhibit::Stop);
+        assert_eq!(inhibit_decision(Some(0), false), Inhibit::Keep);
+    }
+
+    #[test]
+    fn a_store_error_keeps_the_current_state() {
+        assert_eq!(inhibit_decision(None, true), Inhibit::Keep);
+        assert_eq!(inhibit_decision(None, false), Inhibit::Keep);
     }
 
     #[test]
