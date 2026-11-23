@@ -386,7 +386,7 @@ fn push_from_scratch(
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     let helpers = global_credential_helpers();
     for u in urls {
-        run({ push_command(scratch, repo, u, &refspec, &helpers) })?;
+        run(push_command(scratch, repo, u, &refspec, &helpers))?;
     }
     Ok(())
 }
