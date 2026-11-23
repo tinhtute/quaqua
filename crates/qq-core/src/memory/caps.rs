@@ -459,3 +459,21 @@ fn is_token_char(c: char) -> bool {
 fn token_run(s: &str) -> usize {
     s.chars().take_while(|c| is_token_char(*c)).count()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_cap_refusal_names_the_oldest_lines() {
+        let mut text = String::from("# Rules\n\n- first old rule\n- second old rule\n- third old rule\n- fourth rule\n");
+        text.push_str(&"x".repeat(RULES_CAP));
+        let v = check_text("memory/rules.md", &text);
+        let line = v[0].line();
+        assert!(line.contains("oldest lines"), "{line}");
+        for kept in ["first old rule", "second old rule", "third old rule"] {
+            assert!(line.contains(kept), "{line}");
+        }
+        assert!(!line.contains("fourth rule"), "{line}");
+    }
+}

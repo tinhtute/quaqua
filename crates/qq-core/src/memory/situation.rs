@@ -426,4 +426,17 @@ mod tests {
         assert!(render_block(&hi)
             .contains("USER.md [97% · 97/100 chars] → consolidate with memory_batch"));
     }
+    #[test]
+    fn fill_above_90_is_an_explicit_todo_line() {
+        let hi = Fill { rel: "memory/rules.md", used: 2163, cap: 2200 };
+        let lo = Fill { rel: "memory/rules.md", used: 1850, cap: 2200 };
+        let block = |f: Fill| render_block(&Situation { fills: vec![f], ..Default::default() });
+        let b = block(hi);
+        assert!(b.contains("TO-DO: memory/rules.md [98% · 2163/2200 chars]"), "{b}");
+        assert!(b.contains("memory_batch"), "{b}");
+        let b = block(lo);
+        assert!(!b.contains("TO-DO"), "{b}");
+        assert!(b.contains("consolidate with memory_batch"), "{b}");
+    }
 }
+
