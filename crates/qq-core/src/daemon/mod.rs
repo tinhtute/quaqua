@@ -229,6 +229,14 @@ fn now_ms() -> u64 {
 }
 
 impl Daemon {
+    /// Turns on the service thread (sleep inhibitor, wake mail). Off by default.
+    pub fn enable_service(&mut self) {}
+
+    /// Whether `run` will start the service thread.
+    pub fn service_enabled(&self) -> bool {
+        true
+    }
+
     pub fn new(cfg: Config) -> Self {
         let mut d = Daemon {
             cfg,
@@ -433,7 +441,7 @@ impl Daemon {
         ctx.rearm_watches().map_err(DaemonError::Store)?;
         watch::state_sweeper(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         schedule::spawn_runner(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
-        let service = service::spawn(Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
+        let service = service::spawn(true, Arc::downgrade(&ctx), Arc::clone(&ctx.stop_watchers));
         let verbs = Arc::new(verbs);
         if let Some(tx) = ready {
             let _ = tx.send(());
@@ -648,6 +656,19 @@ fn identify(
 #[cfg(test)]
 mod peer_tests {
     use super::*;
+
+    #[test]
+    fn default_daemon_spawns_no_service() {
+        let cfg = Config {
+            runs_dir: std::env::temp_dir().join("qq-svc-flag"),
+            herdr: Arc::new(crate::herdr::CliHerdr::new()),
+        };
+        let mut d = Daemon::new(cfg);
+        assert!(!d.service_enabled());
+        d.enable_service();
+        assert!(d.service_enabled());
+    }
+
     use crate::identity::peer::{CallerId, PeerCred};
 
     struct Fixed(Result<&'static str, ()>);

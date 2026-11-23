@@ -197,6 +197,7 @@ fn live_agents(ctx: &super::Ctx) -> Vec<String> {
 /// Holds a sleep inhibitor while any worker is live and mails cos after a resume from
 /// sleep. One cheap query per tick. Linux only; `QQ_INHIBIT=0` turns it off.
 pub fn spawn(
+    _enabled: bool,
     ctx: std::sync::Weak<super::Ctx>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
@@ -253,6 +254,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn service_is_inert_unless_enabled() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(spawn(false, std::sync::Weak::new(), stop).is_none());
     }
 
     #[test]
