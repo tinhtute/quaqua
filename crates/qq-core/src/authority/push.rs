@@ -301,6 +301,53 @@ pub(crate) fn push_checked(repo: &str, urls: &[String], branch: &str) -> Result<
     result
 }
 
+/// The credential helpers from the user's global config, as `(key, value)`
+/// pairs: `credential.helper` and `credential.<url>.helper`. Nothing else is read.
+fn global_credential_helpers() -> Vec<(String, String)> {
+    let out = |c: &mut Proc| -> Vec<u8> {
+        stdout_within(
+            {
+                let mut p = Proc::new("git");
+                p.args(["config", "--global", "--null"]).args(c.get_args());
+                p.env("GIT_TERMINAL_PROMPT", "0");
+                p
+            },
+            LS_REMOTE_TIMEOUT,
+        )
+        .unwrap_or_default()
+    };
+    let mut probe = Proc::new("git");
+    probe.args(["--get-regexp", r"^credential\.(.*\.)?helper$"]);
+    parse_helpers(&String::from_utf8_lossy(&out(&mut probe)))
+}
+
+/// Parses `git config --null --get-regexp` output (`key\nvalue\0`).
+fn parse_helpers(text: &str) -> Vec<(String, String)> {
+    text.split('\0')
+        .filter_map(|e| e.split_once('\n'))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// The `git push` for one URL from the scratch repo: system and global config
+/// stay out, and only the given credential helpers come in, as `-c` args.
+fn push_command(
+    scratch: &std::path::Path,
+    repo: &str,
+    url: &str,
+    refspec: &str,
+    helpers: &[(String, String)],
+) -> Proc {
+    let mut c = Proc::new("git");
+    c.arg("--git-dir").arg(scratch).current_dir(repo);
+    c.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["push", "--", url, refspec]);
+    let _ = helpers;
+    c
+}
+
 fn push_from_scratch(
     repo: &str,
     scratch: &std::path::Path,
@@ -334,18 +381,9 @@ fn push_from_scratch(
         c
     })?;
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let helpers = global_credential_helpers();
     for u in urls {
-        run({
-            let mut c = Proc::new("git");
-            c.arg("--git-dir")
-                .arg(scratch)
-                .current_dir(repo)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .args(["push", "--", u, &refspec]);
-            c
-        })?;
+        run({ push_command(scratch, repo, u, &refspec, &helpers) })?;
     }
     Ok(())
 }
@@ -472,5 +510,45 @@ mod tests {
             stdout_within(fast, Duration::from_secs(5)).unwrap(),
             b"hi\n"
         );
+    }
+
+    fn argv(c: &Proc) -> Vec<String> {
+        c.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn push_carries_global_helpers_and_keeps_config_isolated() {
+        let h = parse_helpers(
+            "credential.helper\n!/usr/bin/gh auth git-credential\0credential.https://github.com.helper\nstore\0",
+        );
+        let c = push_command(
+            std::path::Path::new("/s"),
+            "/r",
+            "https://github.com/o/r",
+            "a:b",
+            &h,
+        );
+        let a = argv(&c);
+        let i = a.iter().position(|x| x == "push").unwrap();
+        assert_eq!(
+            a[..i],
+            [
+                "--git-dir",
+                "/s",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.helper=!/usr/bin/gh auth git-credential",
+                "-c",
+                "credential.https://github.com.helper=store",
+            ]
+        );
+        assert_eq!(a[i..], ["push", "--", "https://github.com/o/r", "a:b"]);
+        let env: Vec<_> = c.get_envs().collect();
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).and_then(|(_, v)| *v);
+        assert_eq!(get("GIT_CONFIG_GLOBAL").unwrap(), "/dev/null");
+        assert_eq!(get("GIT_CONFIG_NOSYSTEM").unwrap(), "1");
     }
 }
