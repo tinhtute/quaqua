@@ -1036,8 +1036,7 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
                     ProviderError::Fatal(r) => (r, false),
                 };
                 attempt += 1;
-                let cap = if d.exhausted { 1 } else { cfg.retry_max };
-                if !retryable || attempt > cap {
+                if attempt > super::watchdog::resume_cap(d.error, d.exhausted, cfg.retry_max) {
                     (cfg.journal)(
                         "provider_escalate",
                         json!({"reason": reason, "retryable": retryable, "retries": attempt - 1, "harness_exhausted": d.exhausted}),
@@ -1241,6 +1240,7 @@ pub fn prompt_run(
         ));
     }
     let _ = std::fs::create_dir_all(runs);
+    super::watchdog::clear_stub(runs, name);
     let budget_f = side(runs, name, "budget");
     let mut brief_budget = None;
     if let Some(text) = brief {
@@ -1312,7 +1312,9 @@ pub fn prompt_run(
                     | Exit::ProviderError
                     | Exit::CoreDied
             ) {
-                eprintln!("{}", pane_tail_block(herdr, runs, name));
+                let tail = pane_tail_block(herdr, runs, name);
+                eprintln!("{tail}");
+                super::watchdog::write_death_stub(runs, name, e, &tail);
             }
             let _ = crate::memory::journal::watchdog_case(runs, name, e.code());
             Err(CliError::new(
