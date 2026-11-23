@@ -1039,6 +1039,17 @@ pub fn setting(conn: &Connection, key: &str) -> Result<Option<serde_json::Value>
         .transpose()
 }
 
+/// `notify.stall_sec`: seconds a worker may go without a change before it is
+/// stalled. One key for the daemon sweep and `worker prompt`; `None` when
+/// unset or not a finite number >= 0.
+pub fn stall_sec(conn: &Connection) -> Option<f64> {
+    setting(conn, "notify.stall_sec")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
 /// Role topology edges, sorted.
 pub fn topology(conn: &Connection) -> Result<Vec<Edge>, ConfigError> {
     let mut st = conn.prepare(

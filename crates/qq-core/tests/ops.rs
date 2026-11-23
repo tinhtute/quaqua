@@ -245,10 +245,26 @@ fn prompt_check_brief_and_resume() {
         }),
         Some(8)
     );
-    // a worker that is not blocked and not stalled is never a provider error
+    // a provider error ends the wait at once, stalled or not
     assert_eq!(
         code(Observed {
             provider_error: true,
+            ..base.clone()
+        }),
+        Some(7)
+    );
+    // the stall limit is the setting's, else 600
+    assert_eq!(
+        code(Observed {
+            since_change_sec: 30,
+            stall_sec: Some(30),
+            ..base.clone()
+        }),
+        Some(3)
+    );
+    assert_eq!(
+        code(Observed {
+            since_change_sec: 30,
             ..base.clone()
         }),
         None

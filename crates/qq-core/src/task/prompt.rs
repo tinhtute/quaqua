@@ -15,6 +15,7 @@ use crate::daemon::Daemon;
 
 pub const DEFAULT_BUDGET_SEC: u64 = 2700;
 pub const MAX_SEC: u64 = 7200;
+/// Default stall limit; the setting `notify.stall_sec` overrides it.
 pub const STALL_SEC: u64 = 600;
 pub const IDLE_SEC: u64 = 120;
 const BIG_TIME_MIN: u64 = 240;
@@ -352,8 +353,11 @@ pub struct Observed {
     pub core_died: bool,
     pub since_change_sec: u64,
     pub idle_sec: u64,
-    /// The pane reads as a provider error (consulted only on a stall or block).
+    /// The pane (or the harness's error record) shows a provider error. It ends
+    /// the wait at once, not through the stall clock.
     pub provider_error: bool,
+    /// The stall limit; `None` is the default `STALL_SEC`.
+    pub stall_sec: Option<u64>,
 }
 
 pub use super::report_contract::well_formed as report_well_formed;
@@ -374,11 +378,12 @@ pub fn decide(o: &Observed) -> Option<Exit> {
     if o.elapsed_sec >= MAX_SEC {
         return Some(Exit::HardCap);
     }
-    let stalled = o.agent_gone || o.since_change_sec >= STALL_SEC || o.idle_sec >= IDLE_SEC;
+    if o.provider_error {
+        return Some(Exit::ProviderError);
+    }
+    let stall = o.stall_sec.unwrap_or(STALL_SEC);
+    let stalled = o.agent_gone || o.since_change_sec >= stall || o.idle_sec >= IDLE_SEC;
     if o.blocked || stalled {
-        if o.provider_error {
-            return Some(Exit::ProviderError);
-        }
         return Some(if o.blocked {
             Exit::Blocked
         } else {
@@ -787,6 +792,12 @@ fn write_atomic(path: &Path, text: &str) {
     }
 }
 
+/// The stall limit from `notify.stall_sec`, if set (the daemon sweep reads the same key).
+fn stall_limit(runs: &Path) -> Option<u64> {
+    let c = crate::db::open(&runs.join(crate::db::path::DB_FILE)).ok()?;
+    crate::config::stall_sec(&c).map(|s| s as u64)
+}
+
 /// A hash of the worktree's uncommitted state, or empty without one.
 fn diff_hash(worktree: &Option<PathBuf>) -> String {
     use std::hash::{Hash, Hasher};
@@ -948,6 +959,7 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
     let mut last_auto_hash = diff_hash(&cfg.worktree);
     // `--resume` continues the retry count of the wait it resumes.
     let mut attempt: u32 = read_u64(&retry_f).unwrap_or(0) as u32;
+    let stall_sec = stall_limit(runs);
     loop {
         let now = clock.now_sec();
         let elapsed = now.saturating_sub(start);
@@ -988,12 +1000,15 @@ pub fn wait(herdr: &dyn HerdrClient, clock: &dyn Clock, cfg: &WaitCfg) -> Exit {
             since_change_sec: now.saturating_sub(last_change),
             idle_sec: idle_since.map_or(0, |t| now.saturating_sub(t)),
             provider_error: false,
+            stall_sec,
         };
-        let mut verdict = None;
-        if matches!(decide(&o), Some(Exit::Stalled | Exit::Blocked)) {
-            verdict = provider_verdict(herdr, cfg, pane.as_deref(), start, attempt > 0);
-            o.provider_error = verdict.is_some();
-        }
+        // A provider error is read on every poll. A working agent is making
+        // progress (the harness may be retrying on its own), so only a named
+        // fatal, which no retry clears, ends its wait.
+        let working = status.as_deref() == Some("working");
+        let verdict = provider_verdict(herdr, cfg, pane.as_deref(), start, attempt > 0)
+            .filter(|d| !working || matches!(d.error, ProviderError::Fatal(r) if r != "api-error"));
+        o.provider_error = verdict.is_some();
         if o.report.is_none() && !nudged_f.exists() && elapsed * 100 >= allowance * 80 {
             let msg = format!(
                 "Time check: you are past 80% of this task's time budget. Wrap up now: finish the current step, commit your work, and write {} (via a temp file + rename) with what is done plus a Blockers section for the rest. Reply only the path.",
