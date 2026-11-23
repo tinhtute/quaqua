@@ -99,15 +99,38 @@ pub fn parse_args(args: &[String]) -> Result<Option<AuditorRunOptions>, CliError
 
 fn auditor_cmd(_env: &Env, args: &[String]) -> Result<String, CliError> {
     if args.first().map(String::as_str) == Some("ack") {
-        return match args {
-            [_, id] => ack_finding(&resolve_root(None), id),
-            _ => Err(usage_err("ack takes exactly one finding id")),
-        };
+        return ack_cmd(args);
     }
     match parse_args(args)? {
         None => Ok(USAGE.to_string()),
         Some(opts) => run_auditor(opts).map(|p| p.display().to_string()),
     }
+}
+
+/// `ack <id> [--repo <path>]`: the root resolves like a `run --repo`, so both reach one store.
+fn ack_cmd(args: &[String]) -> Result<String, CliError> {
+    let mut id = None;
+    let mut repo = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(v) = a.strip_prefix("--repo=") {
+            repo = Some(PathBuf::from(v));
+        } else if a == "--repo" {
+            i += 1;
+            repo = Some(PathBuf::from(
+                args.get(i)
+                    .ok_or_else(|| usage_err("--repo requires a value"))?,
+            ));
+        } else if a.starts_with("--") || id.is_some() {
+            return Err(usage_err(&format!("unexpected ack argument '{a}'")));
+        } else {
+            id = Some(a);
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| usage_err("ack takes exactly one finding id"))?;
+    ack_finding(&resolve_root(repo.as_deref()), id)
 }
 
 /// `quaqua auditor ack <id>`: stop printing a report-only finding.
@@ -143,7 +166,9 @@ mod tests {
         ] {
             assert_eq!(ack_cmd(&args).unwrap(), format!("acked {id}"));
         }
-        assert!(std::fs::read_to_string(ack::store_path(&root)).unwrap().contains("\tack"));
+        assert!(std::fs::read_to_string(ack::store_path(&root))
+            .unwrap()
+            .contains("\tack"));
         assert!(ack_cmd(&s(&["ack", &id, "--bogus", "x"])).is_err());
         assert!(ack_cmd(&s(&["ack"])).is_err());
     }
@@ -261,6 +286,15 @@ fn fail(out: &Path, code: i32, what: &str) -> CliError {
     CliError::new(code, what.to_string())
 }
 
+/// A report-only finding with its `[ack id: X]` tag; live-state ones stay bare.
+fn tagged(f: &str) -> String {
+    if ack::is_report_only(f) {
+        format!("{f} [ack id: {}]", ack::finding_id(f))
+    } else {
+        f.to_string()
+    }
+}
+
 /// Runs one audit; returns the report path.
 pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     let root = resolve_root(opts.repo.as_deref());
@@ -275,7 +309,8 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     }
 
     if opts.dry_run {
-        write_atomic(&out, dry_run_report(&flags).as_bytes())
+        let tagged: Vec<String> = flags.iter().map(|f| tagged(f)).collect();
+        write_atomic(&out, dry_run_report(&tagged).as_bytes())
             .map_err(|e| CliError::new(1, format!("cannot write {}: {e}", out.display())))?;
         return Ok(out);
     }
@@ -285,13 +320,7 @@ pub fn run_auditor(opts: AuditorRunOptions) -> Result<PathBuf, CliError> {
     } else {
         flags
             .iter()
-            .map(|f| {
-                if ack::is_report_only(f) {
-                    format!("{f} [ack id: {}]", ack::finding_id(f))
-                } else {
-                    f.clone()
-                }
-            })
+            .map(|f| tagged(f))
             .collect::<Vec<_>>()
             .join("\n")
     };

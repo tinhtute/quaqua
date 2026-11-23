@@ -86,7 +86,10 @@ mod tests {
     fn auditor_sqlite_is_safe_mode_only() {
         // `-readonly` alone still runs .shell/.system/.output dot-commands.
         for t in allowed().split(',').filter(|t| t.contains("sqlite3")) {
-            assert!(t.starts_with("Bash(sqlite3 -safe -readonly"), "unsafe sqlite3 rule {t}");
+            assert!(
+                t.starts_with("Bash(sqlite3 -safe -readonly"),
+                "unsafe sqlite3 rule {t}"
+            );
         }
         assert!(crate::auditor::prompt::PROMPT_TEMPLATE.contains("sqlite3 -safe -readonly"));
     }
@@ -94,7 +97,14 @@ mod tests {
     #[test]
     fn auditor_allowlist_has_no_mutating_commands() {
         let a = allowed();
-        for bad in ["herdr pane run", "herdr agent send", "git push", "git commit", "git checkout", "Bash(sqlite3:*)"] {
+        for bad in [
+            "herdr pane run",
+            "herdr agent send",
+            "git push",
+            "git commit",
+            "git checkout",
+            "Bash(sqlite3:*)",
+        ] {
             assert!(!a.contains(bad), "{bad} must not be allowed: {a}");
         }
     }
