@@ -608,12 +608,21 @@ fn serve_conn(
     }
 }
 
-/// Runs one verb (a stub for now: no trace).
-fn traced<F>(_req: &Request, _log: &mut dyn Write, run: F) -> Result<Value, RpcError>
+/// Runs one verb and writes a "start" line before it and a result line after
+/// it (caller, verb, duration in ms, ok/err), so a hung verb is visible while
+/// it runs and a failed one leaves a trace. A write error is ignored.
+fn traced<F>(req: &Request, log: &mut dyn Write, run: F) -> Result<Value, RpcError>
 where
     F: FnOnce() -> Result<Value, RpcError>,
 {
-    run()
+    let who = req.caller.as_deref().unwrap_or("-");
+    let _ = writeln!(log, "quaqua daemon: verb start caller={who} verb={}", req.verb);
+    let t0 = std::time::Instant::now();
+    let res = run();
+    let ms = t0.elapsed().as_millis();
+    let outcome = if res.is_ok() { "ok" } else { "err" };
+    let _ = writeln!(log, "quaqua daemon: verb caller={who} verb={} ms={ms} {outcome}", req.verb);
+    res
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
