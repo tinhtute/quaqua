@@ -32,8 +32,10 @@ pub struct Status {
 
 /// Default minutes of silence, with no live worker, before status flags it.
 pub const IDLE_MINUTES: u64 = 10;
-/// Setting key that overrides [`IDLE_MINUTES`].
-pub const IDLE_SETTING: &str = "status.idle_minutes";
+/// Setting key that overrides [`IDLE_MINUTES`]. It lives in the existing
+/// `timers` section, so `config set` and a `[timers]` table accept it. A value
+/// that is not a whole number falls back to the default; `0` is raised to 1.
+pub const IDLE_SETTING: &str = "timers.status_idle_minutes";
 
 /// Open agents and unfinished runs; `all` adds ended agents and finished runs.
 pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
@@ -44,7 +46,8 @@ pub fn read(conn: &Connection, all: bool) -> rusqlite::Result<Status> {
 }
 
 /// Flag when no worker (lead or peer) is live and the last event (mail, run or
-/// agent start/end) is older than the idle threshold. A database with no events
+/// agent start/end) is older than the idle threshold. Whether a CoS turn is
+/// open is not checked: there is no per-turn signal in the database. A database with no events
 /// at all is quiet: nothing has happened yet.
 fn idle_reason(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String>> {
     let live: i64 = conn.query_row(
@@ -70,8 +73,9 @@ fn idle_reason(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String
             |r| r.get::<_, String>(0),
         )
         .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(IDLE_MINUTES);
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(IDLE_MINUTES)
+        .max(1);
     let idle_s = (now_ms - last).max(0) / 1000;
     Ok((idle_s >= minutes as i64 * 60)
         .then(|| format!("no worker live and no event for {} min", idle_s / 60)))
@@ -218,7 +222,7 @@ mod tests {
         );
         assert!(render(&s, false).contains("needs you: no worker live and no event for 11 min"));
         c.execute(
-            "INSERT INTO setting (key, value_json) VALUES ('status.idle_minutes', '30')",
+            "INSERT INTO setting (key, value_json) VALUES ('timers.status_idle_minutes', '30')",
             [],
         )
         .unwrap();
@@ -280,8 +284,14 @@ mod tests {
             .unwrap_or_else(|e| panic!("{IDLE_SETTING} is not a config key: {e}"));
         assert!(toml.contains("status_idle_minutes = 30"), "{toml}");
         assert!(IDLE_SETTING.starts_with("timers."));
-        assert!(read_at(&c, false, 1000 + 11 * MIN).unwrap().needs_you.is_empty());
-        assert_eq!(read_at(&c, false, 1000 + 31 * MIN).unwrap().needs_you.len(), 1);
+        assert!(read_at(&c, false, 1000 + 11 * MIN)
+            .unwrap()
+            .needs_you
+            .is_empty());
+        assert_eq!(
+            read_at(&c, false, 1000 + 31 * MIN).unwrap().needs_you.len(),
+            1
+        );
     }
 
     #[test]
@@ -297,10 +307,26 @@ mod tests {
             [IDLE_SETTING],
         )
         .unwrap();
-        assert!(read_at(&c, false, 1000 + 30_000).unwrap().needs_you.is_empty(), "0 clamps to 1 min");
+        assert!(
+            read_at(&c, false, 1000 + 30_000)
+                .unwrap()
+                .needs_you
+                .is_empty(),
+            "0 clamps to 1 min"
+        );
         assert_eq!(read_at(&c, false, 1000 + MIN).unwrap().needs_you.len(), 1);
-        c.execute("UPDATE setting SET value_json = '\"soon\"'", []).unwrap();
-        assert!(read_at(&c, false, 1000 + 9 * MIN).unwrap().needs_you.is_empty(), "junk -> 10");
-        assert_eq!(read_at(&c, false, 1000 + 10 * MIN).unwrap().needs_you.len(), 1);
+        c.execute("UPDATE setting SET value_json = '\"soon\"'", [])
+            .unwrap();
+        assert!(
+            read_at(&c, false, 1000 + 9 * MIN)
+                .unwrap()
+                .needs_you
+                .is_empty(),
+            "junk -> 10"
+        );
+        assert_eq!(
+            read_at(&c, false, 1000 + 10 * MIN).unwrap().needs_you.len(),
+            1
+        );
     }
 }
