@@ -47,14 +47,14 @@ Rewrite release: one Rust crate, `qq-core`, now builds the single `quaqua` binar
 - `quaqua status`: the idle override key is `timers.status_idle_minutes` (clamped to at least 1); `--metrics` lists the last 24 h and keeps a peer's spend (#329, #337).
 - Child processes (herdr, gh) run under a time limit; a timed-out merge is confirmed with `gh pr view` (#336, #341).
 - Grid: panes placed by token; empty herdr success replies accepted (#283, #351, #352).
-- Report: a Challenge section that disputes nothing no longer ends the pipeline disputed (#350).
+- Report: an empty Challenge section no longer counts as a dispute, so it no longer ends the pipeline disputed (#350); a non-empty "no dispute" section still counts (#357).
 
 ### Known issues
 - Three `daemon::service` install tests fail on macOS (#363).
 - A non-empty "no dispute" Challenge section counts as a dispute (#357); Challenge parsing has fail-open edges (#365).
 - Pipeline builder and reviewer agents hold worker-cap slots until cleanup (#360).
 - Run capture keeps an empty result for tool calls made inside the REPL tool (#361).
-- A blank ok herdr reply on pane-get-like readers is not read as Null (#362); code lookup is unchecked against the allow-list (#364).
+- Grid reads a blank ok herdr reply as Null on pane-get-like readers, where it should be an error (#362); code lookup is unchecked against the allow-list (#364).
 - E2E: part d before h fails H1 (#359); the pi Peer may refuse `quaqua push` in D5 (#358).
 
 ## [2.7.0] - 2026-11-16
