@@ -64,9 +64,11 @@ fn idle_reason(conn: &Connection, now_ms: i64) -> rusqlite::Result<Option<String
     )?;
     let Some(last) = last else { return Ok(None) };
     let minutes: u64 = conn
-        .query_row("SELECT value_json FROM setting WHERE key = ?1", [IDLE_SETTING], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value_json FROM setting WHERE key = ?1",
+            [IDLE_SETTING],
+            |r| r.get::<_, String>(0),
+        )
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(IDLE_MINUTES);
@@ -111,8 +113,12 @@ pub fn read_at(conn: &Connection, all: bool, now_ms: i64) -> rusqlite::Result<St
             })
         })?
         .collect::<Result<_, _>>()?;
-    let needs_you: Vec<String> = { let _ = (idle_reason as fn(_, _) -> _, now_ms); Vec::new() };
-    Ok(Status { agents, runs, needs_you })
+    let needs_you = idle_reason(conn, now_ms)?.into_iter().collect();
+    Ok(Status {
+        agents,
+        runs,
+        needs_you,
+    })
 }
 
 /// Text for the terminal. `metrics` adds tokens and cost per run; a run whose
@@ -200,23 +206,59 @@ mod tests {
     #[test]
     fn status_flags_idle_with_no_worker_and_no_event() {
         let c = db();
-        c.execute("INSERT INTO agent (name, role, started_ms, ended_ms) VALUES ('w', 'lead', 0, 1000)", []).unwrap();
+        c.execute(
+            "INSERT INTO agent (name, role, started_ms, ended_ms) VALUES ('w', 'lead', 0, 1000)",
+            [],
+        )
+        .unwrap();
         let s = read_at(&c, false, 1000 + 11 * MIN).unwrap();
-        assert_eq!(s.needs_you, vec!["no worker live and no event for 11 min".to_string()]);
+        assert_eq!(
+            s.needs_you,
+            vec!["no worker live and no event for 11 min".to_string()]
+        );
         assert!(render(&s, false).contains("needs you: no worker live and no event for 11 min"));
-        c.execute("INSERT INTO setting (key, value_json) VALUES ('status.idle_minutes', '30')", []).unwrap();
-        assert!(read_at(&c, false, 1000 + 11 * MIN).unwrap().needs_you.is_empty());
+        c.execute(
+            "INSERT INTO setting (key, value_json) VALUES ('status.idle_minutes', '30')",
+            [],
+        )
+        .unwrap();
+        assert!(read_at(&c, false, 1000 + 11 * MIN)
+            .unwrap()
+            .needs_you
+            .is_empty());
     }
 
     #[test]
     fn status_quiet_when_worker_live_or_event_recent_or_empty() {
         let c = db();
-        assert!(read_at(&c, false, 99 * MIN).unwrap().needs_you.is_empty(), "empty db");
-        c.execute("INSERT INTO agent (name, role, started_ms) VALUES ('w', 'lead', 0)", []).unwrap();
-        assert!(read_at(&c, false, 99 * MIN).unwrap().needs_you.is_empty(), "live worker");
+        assert!(
+            read_at(&c, false, 99 * MIN).unwrap().needs_you.is_empty(),
+            "empty db"
+        );
+        c.execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('w', 'lead', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            read_at(&c, false, 99 * MIN).unwrap().needs_you.is_empty(),
+            "live worker"
+        );
         c.execute("UPDATE agent SET ended_ms = 1000", []).unwrap();
-        c.execute("INSERT INTO mail (sender, recipient, body, created_ms) VALUES ('w', 'cos', 'hi', ?1)", [1000 + 5 * MIN]).unwrap();
-        assert!(read_at(&c, false, 1000 + 12 * MIN).unwrap().needs_you.is_empty(), "recent mail");
-        assert!(render(&read_at(&c, false, 1000 + 12 * MIN).unwrap(), false).find("needs you").is_none());
+        c.execute(
+            "INSERT INTO mail (sender, recipient, body, created_ms) VALUES ('w', 'cos', 'hi', ?1)",
+            [1000 + 5 * MIN],
+        )
+        .unwrap();
+        assert!(
+            read_at(&c, false, 1000 + 12 * MIN)
+                .unwrap()
+                .needs_you
+                .is_empty(),
+            "recent mail"
+        );
+        assert!(render(&read_at(&c, false, 1000 + 12 * MIN).unwrap(), false)
+            .find("needs you")
+            .is_none());
     }
 }
