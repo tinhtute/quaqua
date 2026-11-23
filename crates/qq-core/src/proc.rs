@@ -46,7 +46,15 @@ fn output_within_polled(
 
     let deadline = Instant::now() + limit;
     let status = loop {
-        match poll(&mut child)? {
+        let polled = match poll(&mut child) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        match polled {
             Some(s) => break Some(s),
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             None => {

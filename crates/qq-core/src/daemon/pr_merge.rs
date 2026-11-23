@@ -163,6 +163,18 @@ fn gh(program: &Path, limit: Duration, repo: &str, args: &[&str]) -> std::io::Re
     )
 }
 
+/// Whether `gh pr view` reports the PR MERGED; `None` when it cannot be read.
+fn pr_state_merged(program: &Path, limit: Duration, repo: &str, pr: &str) -> Option<bool> {
+    let out = ok_stdout(gh(
+        program,
+        limit,
+        repo,
+        &["pr", "view", pr, "--json", "state,mergeCommit"],
+    ))?;
+    let v: Value = serde_json::from_str(&out).ok()?;
+    Some(v.get("state").and_then(Value::as_str) == Some("MERGED"))
+}
+
 fn ok_stdout(o: std::io::Result<Output>) -> Option<String> {
     let o = o.ok().filter(|o| o.status.success())?;
     Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -319,7 +331,21 @@ fn handle(ctx: &Ctx, req: &Request) -> Result<Value, RpcError> {
         &repo,
         &["pr", "merge", &pr, "--match-head-commit", &sha, "--merge"],
     )
-    .map_err(|e| RpcError::new("merge_failed", e.to_string()))?;
+    ;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // The merge may have landed before gh hung: ask GitHub, do not guess.
+            return match pr_state_merged(&program, limit, &repo, &pr) {
+                Some(true) => Ok(json!({ "merged": true, "pr": pr, "sha": sha })),
+                _ => Err(RpcError::new(
+                    "merge_unknown",
+                    format!("gh pr merge timed out and the PR state is unconfirmed: {e}"),
+                )),
+            };
+        }
+        Err(e) => return Err(RpcError::new("merge_failed", e.to_string())),
+    };
     if !out.status.success() {
         return Err(RpcError::new(
             "merge_failed",
