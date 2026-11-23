@@ -15,13 +15,53 @@ fn quote(s: &str) -> String {
     format!("\"{body}\"")
 }
 
-/// Unit text for the daemon, run from `exe` against workspace `home`, with `PATH` as given.
-pub fn render_unit(exe: &Path, home: &Path, path: &str) -> String {
+/// The herdr session the daemon must reach, taken from the installing environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrEnv {
+    pub session: String,
+    pub socket: String,
+}
+
+impl HerdrEnv {
+    /// Both `HERDR_SESSION` and `HERDR_SOCKET_PATH` must be set and non-empty:
+    /// a daemon without them cannot reach herdr, so install refuses and names the missing ones.
+    pub fn from_vars(session: Option<String>, socket: Option<String>) -> Result<Self, String> {
+        let session = session.filter(|s| !s.is_empty());
+        let socket = socket.filter(|s| !s.is_empty());
+        match (session, socket) {
+            (Some(session), Some(socket)) => Ok(HerdrEnv { session, socket }),
+            (s, p) => {
+                let missing: Vec<&str> = [
+                    ("HERDR_SESSION", s.is_none()),
+                    ("HERDR_SOCKET_PATH", p.is_none()),
+                ]
+                .into_iter()
+                .filter_map(|(n, m)| m.then_some(n))
+                .collect();
+                Err(format!(
+                    "{} not set: run `daemon install` from inside the herdr session the daemon should use",
+                    missing.join(" and ")
+                ))
+            }
+        }
+    }
+
+    fn from_process() -> Result<Self, String> {
+        let var = |k| std::env::var(k).ok();
+        Self::from_vars(var("HERDR_SESSION"), var("HERDR_SOCKET_PATH"))
+    }
+}
+
+/// Unit text for the daemon, run from `exe` against workspace `home`, with `PATH` and the
+/// herdr session as given.
+pub fn render_unit(exe: &Path, home: &Path, path: &str, herdr: &HerdrEnv) -> String {
     let env = quote(&format!("QUAQUA_HOME={}", home.display()));
     let path_env = quote(&format!("PATH={path}"));
+    let session_env = quote(&format!("HERDR_SESSION={}", herdr.session));
+    let socket_env = quote(&format!("HERDR_SOCKET_PATH={}", herdr.socket));
     format!(
         "[Unit]\nDescription=quaqua farm daemon\n\n\
-         [Service]\nExecStart={} daemon\nEnvironment={env}\nEnvironment={path_env}\nRestart=on-failure\nRestartSec=5\n\n\
+         [Service]\nExecStart={} daemon\nEnvironment={env}\nEnvironment={path_env}\nEnvironment={session_env}\nEnvironment={socket_env}\nRestart=on-failure\nRestartSec=5\n\n\
          [Install]\nWantedBy=default.target\n",
         quote(&exe.display().to_string())
     )
@@ -31,6 +71,24 @@ pub fn render_unit(exe: &Path, home: &Path, path: &str) -> String {
 pub fn unit_path(home: &Path, xdg_config: Option<&Path>) -> PathBuf {
     let base = xdg_config.map_or_else(|| home.join(".config"), Path::to_path_buf);
     base.join("systemd/user").join(UNIT_NAME)
+}
+
+/// Legacy `quaqua-auditor*` timer or service files in a user unit dir. The daemon's Supervisor
+/// job owns the auditor now (#316), so these are duplicates. Reported, never deleted.
+pub fn legacy_auditor_units(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with("quaqua-auditor")
+                    && (n.ends_with(".timer") || n.ends_with(".service"))
+            })
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +172,7 @@ pub fn install_at(
     home: &Path,
     xdg_config: Option<&Path>,
     path: &str,
+    herdr: &HerdrEnv,
 ) -> Result<String, String> {
     let mut dry = false;
     for a in args.iter().skip(1) {
@@ -131,7 +190,7 @@ pub fn install_at(
             "daemon install supports systemd on Linux only",
         ));
     }
-    let unit = render_unit(exe, workspace, path);
+    let unit = render_unit(exe, workspace, path, herdr);
     if dry {
         return Ok(unit);
     }
@@ -139,10 +198,17 @@ pub fn install_at(
     let dir = path.parent().ok_or("unit path has no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     std::fs::write(&path, unit).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(format!(
+    let mut out = format!(
         "wrote {}\nenable it with: systemctl --user enable --now {UNIT_NAME}\n",
         path.display()
-    ))
+    );
+    for legacy in legacy_auditor_units(dir) {
+        out.push_str(&format!(
+            "duplicate: {} is a legacy auditor unit; the daemon now runs the auditor. Disable and remove it yourself (not deleted)\n",
+            legacy.display()
+        ));
+    }
+    Ok(out)
 }
 
 /// `quaqua daemon install` for the running process: exe from `current_exe`, home from `HOME`,
@@ -165,7 +231,8 @@ pub fn install(runs_dir: &Path, args: &[String]) -> Result<String, String> {
             let h = home.display();
             format!("{h}/.local/bin:{h}/.cargo/bin:/usr/local/bin:/usr/bin:/bin")
         });
-    install_at(args, &exe, &workspace, &home, xdg.as_deref(), &path)
+    let herdr = HerdrEnv::from_process()?;
+    install_at(args, &exe, &workspace, &home, xdg.as_deref(), &path, &herdr)
 }
 
 // --- the daemon side: thin wrappers over the pure parts ---
@@ -279,6 +346,13 @@ mod tests {
 
     const PATH: &str = "/h/.cargo/bin:/usr/bin";
 
+    fn herdr() -> HerdrEnv {
+        HerdrEnv {
+            session: "s1".into(),
+            socket: "/h/.config/herdr/sessions/s1/herdr.sock".into(),
+        }
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("qq-service-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -294,11 +368,20 @@ mod tests {
 
     #[test]
     fn unit_runs_daemon_with_home() {
-        let u = render_unit(Path::new("opt/qq bin/quaqua"), Path::new("ws/quaqua"), PATH);
+        let u = render_unit(
+            Path::new("opt/qq bin/quaqua"),
+            Path::new("ws/quaqua"),
+            PATH,
+            &herdr(),
+        );
         assert!(u.contains("[Service]"));
         assert!(u.contains("ExecStart=\"opt/qq bin/quaqua\" daemon\n"));
         assert!(u.contains("Environment=\"QUAQUA_HOME=ws/quaqua\"\n"));
         assert!(u.contains("Environment=\"PATH=/h/.cargo/bin:/usr/bin\"\n"));
+        assert!(u.contains("Environment=\"HERDR_SESSION=s1\"\n"));
+        assert!(u.contains(
+            "Environment=\"HERDR_SOCKET_PATH=/h/.config/herdr/sessions/s1/herdr.sock\"\n"
+        ));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("WantedBy=default.target"));
     }
@@ -396,11 +479,12 @@ mod tests {
             &d,
             None,
             PATH,
+            &herdr(),
         )
         .unwrap();
         assert_eq!(
             out,
-            render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH)
+            render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH, &herdr())
         );
         assert!(!d.join(".config").exists());
     }
@@ -415,12 +499,13 @@ mod tests {
             &d,
             None,
             PATH,
+            &herdr(),
         )
         .unwrap();
         let p = unit_path(&d, None);
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
-            render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH)
+            render_unit(Path::new("bin/quaqua"), Path::new("ws"), PATH, &herdr())
         );
         assert!(out.contains(&p.display().to_string()));
         assert!(out.contains("systemctl --user enable --now quaqua-daemon.service"));
@@ -437,8 +522,53 @@ mod tests {
             &d,
             None,
             PATH,
+            &herdr(),
         );
         assert!(e.is_err());
         assert!(!d.join(".config").exists());
+    }
+
+    #[test]
+    fn herdr_env_names_what_is_missing() {
+        let e = HerdrEnv::from_vars(None, Some(String::new())).unwrap_err();
+        assert!(e.contains("HERDR_SESSION") && e.contains("HERDR_SOCKET_PATH"));
+        let e = HerdrEnv::from_vars(Some("s".into()), None).unwrap_err();
+        assert!(!e.contains("HERDR_SESSION") && e.contains("HERDR_SOCKET_PATH"));
+        assert_eq!(
+            HerdrEnv::from_vars(Some("s".into()), Some("/p".into())).unwrap(),
+            HerdrEnv {
+                session: "s".into(),
+                socket: "/p".into()
+            }
+        );
+    }
+
+    #[test]
+    fn install_names_legacy_auditor_units_and_keeps_them() {
+        let d = scratch("legacy");
+        let dir = unit_path(&d, None).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [
+            "quaqua-auditor.timer",
+            "quaqua-auditor.service",
+            "quaqua-backup.timer",
+        ] {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+        let out = install_at(
+            &["install".into()],
+            Path::new("bin/quaqua"),
+            Path::new("ws"),
+            &d,
+            None,
+            PATH,
+            &herdr(),
+        )
+        .unwrap();
+        assert!(out.contains("duplicate:") && out.contains("quaqua-auditor.timer"));
+        assert!(out.contains("quaqua-auditor.service") && !out.contains("quaqua-backup"));
+        assert!(dir.join("quaqua-auditor.timer").exists());
+        assert!(dir.join("quaqua-auditor.service").exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

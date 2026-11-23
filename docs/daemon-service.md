@@ -8,6 +8,14 @@ Linux (systemd) is supported. macOS (a launchd agent plus a sleep guard such as 
   because a systemd user unit starts with a bare one; re-run install after changing it) and prints the path and the enable command
   `systemctl --user enable --now quaqua-daemon.service`. It never enables or starts the unit.
   `--dry-run` prints the unit text only and writes nothing.
+- The unit also carries `HERDR_SESSION` and `HERDR_SOCKET_PATH`, copied from the installing environment, so the daemon
+  reaches herdr (a systemd user unit starts with neither). Install refuses, naming the missing variable, when either is unset or empty:
+  run it from inside the herdr session the daemon should use. The socket path is
+  `~/.config/herdr/sessions/<session>/herdr.sock`; it is keyed by session name, so it stays the same across reboots, but
+  re-run install if you move the daemon to another session.
+- The daemon's Supervisor job owns the auditor (#316). If `systemd/user/` still holds a legacy `quaqua-auditor*.timer` or
+  `.service`, install prints each as a `duplicate:` and leaves it alone; disable and remove it yourself
+  (`systemctl --user disable --now quaqua-auditor.timer`). There is no `quaqua doctor` in the engine, so install is where this is checked.
 - While any Lead or Peer agent is open, the daemon holds a `systemd-inhibit --what=sleep` lock and
   drops it when none is open. The lock process exits with the daemon (`tail --pid`).
   `QQ_INHIBIT=0` turns this and wake detection off. A missing `systemd-inhibit` is silently skipped; a lock child that exits at once (logind refuses,
