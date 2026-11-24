@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-23
+
+Rewrite release: one Rust crate, `qq-core`, now builds the single `quaqua` binary. 479 commits since 2.7.0.
+
+### Breaking
+- **One binary, no bash wrappers**: the old `crates/quaqua` crate and the bash wrappers are gone. Build with `cargo build --release -p qq-core`; the binary is still `quaqua` (#279, #324).
+- **Config lives in `team.toml` and the config database**: they are the single config source. Move any setting you kept elsewhere into `team.toml`, or set it with `quaqua config`. `config import` shows a before/after diff and refuses any changed or reset key without `--yes` (#335).
+- **Harnesses are declared in `team.toml`** under `[harnesses.<name>]` (`herdr_kind`, an args template with a required `{model}`, efforts, stop keys). The `omp` harness is removed and is rejected as unknown; declare `agy` in `team.toml` (#280, #281).
+- **Review pair rule**: a review is refused when builder and reviewer share a *model*, not only a harness. A same-model pair such as `ni` + `suhuynh` no longer runs; `worker spawn --review` refuses the builder's model (#324, #349).
+- **Push and merge go through doors**: `quaqua push` refuses `main`, `master` and the remote default branch; push and merge are checked against the caller, and an authority gate with grants guards them (#292, #294, #309).
+- **Workspace templates reshaped**: one persona file, a short CoS `AGENTS.md`, `rules/_all` removed. Run `quaqua init --update`; settle a hand-resolved conflict with `--update --accept <path>` (#291, #319, #320, #321).
+- **Exit codes**: a rejected brief exits 64; only a connection failure exits 69 (#334).
+
+### Outer Loop
+- **Backlog**: proposals with a risk split; `quaqua backlog list|decide` (#324).
+- **Sources and idea inbox**: `quaqua source pull`; the daemon runs due pulls and Supervisor jobs (#324).
+- **Supervisor**: `quaqua supervisor score` scores runs against 17 rubrics; a low score files a high-risk proposal. Scheduled scoring stays off until `limits.supervisor_scorer` is set (#324, #325, #331).
+
+### Factory Core
+- **Config surface**: `config export`, `config diff`, named profiles by key or `QUAQUA_PROFILE`, effective at the next spawn (#324).
+- **Agent pin**: harness, model and effort are pinned on the agent row at spawn; stop and the push fence read the pinned values (#324).
+- **Task graph and run capture**: a task DAG, `run show`, `run list --project` (#324).
+- **Worker cap**: the protocol block of `WORKSPACE_PROTOCOL.md` sets the cap (default 4, ceiling 8) and it binds every spawner (#324, #353).
+- **Role skill sets** are injected per driver; worker writes to zbrain are refused; claude Peers start with the read-only code-lookup MCP (#324, #354).
+- **Auditor** ported into `qq-core`, with stable finding ids and acks across runs (#284, #343).
+
+### Daemon, Bus & Watchdog
+- **Daemon**: one-daemon flock on `runs/` (fixes macOS "database is locked"), systemd user unit, sleep inhibitor while workers are live, wake mail, and `HERDR_SESSION`/`HERDR_SOCKET_PATH` carried into the service (#288, #344, #347).
+- **Notifications**: the daemon mails the CoS a state line per agent transition; one "daemon down" line per session; every unshown notification leaves a bounded trace mail (#299, #300, #301, #303).
+- **Watchdog**: stall limit from `notify.stall_sec`, provider errors end the wait at once, one resume for an unnamed API error, and a stub report when a worker dies (#332, #346).
+- **Prompt and cleanup**: a new report is awaited, not the archived one; cleanup reports done only when pane, worktree and agent row are gone, and closes orphan panes (#282, #295, #296, #348).
+
+### Memory & CoS
+- Engine-computed Now block and standing block at SessionStart, a threat scan for standing load and memory writes, batched cos-memory writes, and a CoS code fence that asks before editing code or worktrees (#286, #293, #298, #306).
+- `--check-brief` lints budgets, home paths, Unknowns/Evidence, test filters and `pgrep -f` (#302, #307).
+
+### Fixes
+- `quaqua status`: the idle override key is `timers.status_idle_minutes` (clamped to at least 1); `--metrics` lists the last 24 h and keeps a peer's spend (#329, #337).
+- Child processes (herdr, gh) run under a time limit; a timed-out merge is confirmed with `gh pr view` (#336, #341).
+- Grid: panes placed by token; empty herdr success replies accepted (#283, #351, #352).
+- Report: an empty Challenge section no longer counts as a dispute, so it no longer ends the pipeline disputed (#350); a non-empty "no dispute" section still counts (#357).
+
+### Known issues
+- Three `daemon::service` install tests fail on macOS (#363).
+- A non-empty "no dispute" Challenge section counts as a dispute (#357); Challenge parsing has fail-open edges (#365).
+- Pipeline builder and reviewer agents hold worker-cap slots until cleanup (#360).
+- Run capture keeps an empty result for tool calls made inside the REPL tool (#361).
+- Grid reads a blank ok herdr reply as Null on pane-get-like readers, where it should be an error (#362); code lookup is unchecked against the allow-list (#364).
+- E2E: part d before h fails H1 (#359); the pi Peer may refuse `quaqua push` in D5 (#358).
+
 ## [2.7.0] - 2026-11-16
 
 ### Superagent Bus
