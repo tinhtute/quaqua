@@ -5,7 +5,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: native_probe.sh [--kind pi|agy|both] [--timeout-ms N] [--temp-home] [--yes] [-h|--help]
+usage: native_probe.sh [--kind pi|agy|both] [--timeout-ms N] [--startup-only] [--cwd DIR] [--temp-home] [--yes] [-h|--help]
 
   Per kind, in an isolated `herdr --session` (temp XDG config dir, removed on exit):
     1 start   `herdr agent start --kind K` reaches ready
@@ -16,11 +16,18 @@ usage: native_probe.sh [--kind pi|agy|both] [--timeout-ms N] [--temp-home] [--ye
 
   --kind        pi | agy | both (default both)
   --timeout-ms  readiness / idle timeout per step (default 60000)
+  --startup-only  run step 1 only (no prompt, no model call, no cost confirmation); on a
+                failed start the table prints the pane's screen text as the blocker
+  --cwd DIR     pane working directory (default: the temp dir). agy asks "trust this folder?" for a
+                new dir and answering would write trust state under ~/.gemini, which this script
+                never does; pass a dir agy already trusts to get past it
   --temp-home   also swap HOME for an empty dir (CLIs will be signed out; default keeps
                 your real HOME so pi/agy find their credentials)
   --yes         skip the typed cost confirmation (do not use unless you mean it)
 
   Never touches the default herdr session. Needs herdr 0.9.5, python3, a signed-in pi/agy.
+  XDG_CONFIG_HOME is isolated for herdr; mise's global config (which provides the pi shim)
+  is pinned via MISE_GLOBAL_CONFIG_FILE to your real one so panes still resolve pi.
 EOF
 }
 
@@ -28,6 +35,8 @@ KINDS="pi agy"
 TIMEOUT_MS=60000
 TEMP_HOME=0
 ASSUME_YES=0
+STARTUP_ONLY=0
+PANE_CWD=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --kind)
@@ -43,6 +52,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { usage >&2; exit 2; }
       case "$2" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
       TIMEOUT_MS="$2"; shift 2 ;;
+    --startup-only) STARTUP_ONLY=1; shift ;;
+    --cwd)
+      [ $# -ge 2 ] && [ -d "$2" ] || { usage >&2; exit 2; }
+      PANE_CWD=$(cd "$2" && pwd); shift 2 ;;
     --temp-home) TEMP_HOME=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -58,12 +71,16 @@ for k in $KINDS; do
 done
 
 # ---- cost warning: nothing below this line starts a pane or an agent ----------------
-cat <<EOF
+if [ "$STARTUP_ONLY" -eq 1 ]; then
+  echo "startup-only: starting $KINDS in an isolated herdr session; no prompt is sent."
+else
+  cat <<EOF
 WARNING: this script starts REAL pi/agy sessions and sends each one a real prompt.
-  kinds: $KINDS   -> about $(echo "$KINDS" | wc -w) model call(s) plus a few slash commands; costs tokens.
+  kinds: $KINDS   -> about $(echo "$KINDS" | wc -w | tr -d ' ') model call(s) plus a few slash commands; costs tokens.
   It runs in its own herdr session (not your default one) and stops everything on exit.
 EOF
-if [ "$ASSUME_YES" -ne 1 ]; then
+fi
+if [ "$STARTUP_ONLY" -eq 0 ] && [ "$ASSUME_YES" -ne 1 ]; then
   printf 'Type yes to continue: '
   read -r answer || answer=""
   [ "$answer" = "yes" ] || { echo "aborted (nothing started)"; exit 1; }
@@ -76,6 +93,11 @@ SESSION="t39probe-$$-$RANDOM"
 RESULTS="$T/native_probe_results.txt"
 KEEP="${TMPDIR:-/tmp}/native_probe_results.$(date +%Y%m%d-%H%M%S).txt"
 REAL_HOME="$HOME"
+# The XDG override hides mise's global config (pi is a mise shim), so pin it first.
+if [ -z "${MISE_GLOBAL_CONFIG_FILE:-}" ]; then
+  _mise_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml"
+  [ -f "$_mise_cfg" ] && export MISE_GLOBAL_CONFIG_FILE="$_mise_cfg"
+fi
 export XDG_CONFIG_HOME="$T/cfg"
 mkdir -p "$XDG_CONFIG_HOME"
 if [ "$TEMP_HOME" -eq 1 ]; then
@@ -172,6 +194,9 @@ step_start() { # kind pane -> ready|not_ready|error
     case "$st" in idle|done) echo ready ;; *) echo "ready_but_status_${st:-none}" ;; esac
   else
     printf '%s\n' "$out" >"$T/$kind.start.out"
+    # Grab the screen now, while the blocked pane is still open (visible + scrollback).
+    { screen "$pane" 40; printf '\n--- visible ---\n'
+      H pane read "$pane" --source visible 2>&1 || true; } >"$T/$kind.start.screen"
     case "$out" in *agent_not_ready*|*timeout*) echo not_ready ;; *) echo error ;; esac
   fi
 }
@@ -239,7 +264,7 @@ probe_kind() {
   local kind="$1" ws_json ws pane s_start s_prompt s_stop
   local stop_attempts
   stop_attempts=$(printf '"%s" ' "${STOP_SEQS[@]}")
-  ws_json=$(H workspace create --cwd "$T" --label "probe-$kind" --no-focus 2>&1) || {
+  ws_json=$(H workspace create --cwd "${PANE_CWD:-$T}" --label "probe-$kind" --no-focus 2>&1) || {
     log "[$kind] workspace create failed: $ws_json"; return 0; }
   ws=$(printf '%s' "$ws_json" | json_find workspace_id)
   WS_IDS="$WS_IDS $ws"
@@ -253,7 +278,9 @@ except Exception:
 
   s_start=$(step_start "$kind" "$pane")
   s_prompt="skipped"; s_stop="skipped"; STOP_WORKED="n/a"; TOKENS_WHERE="n/a"; TOKENS_LINE=""
-  case "$s_start" in
+  if [ "$STARTUP_ONLY" -eq 1 ]; then
+    s_prompt="not run (startup-only)"; s_stop="not run (startup-only)"
+  else case "$s_start" in
     ready*)
       s_prompt=$(step_prompt "$pane")
       s_stop=$(step_stop "$kind" "$pane")
@@ -261,7 +288,7 @@ except Exception:
       # let the turn settle, then look for tokens (only meaningful once idle)
       if [ "$s_stop" = idle ] || [ "$(agent_status "$pane")" = idle ]; then step_tokens "$kind" "$pane"
       else TOKENS_WHERE="not checked (pane not idle)"; fi ;;
-  esac
+  esac; fi
 
   {
     echo
@@ -276,6 +303,10 @@ except Exception:
     echo "stop sequences tried in order: $stop_attempts"
     [ -n "$TOKENS_LINE" ] && echo "tokens evidence: $TOKENS_LINE"
     echo "agent start output: $(head -c 300 "$T/$kind.start.out" 2>/dev/null | tr '\n' ' ')"
+    if [ -s "$T/$kind.start.screen" ]; then
+      echo "BLOCKER screen at failed start (scrollback, then visible):"
+      sed 's/^/  | /' "$T/$kind.start.screen"
+    fi
     echo "final screen tail:"
     screen "$pane" 12 | sed 's/^/  | /'
   } | tee -a "$RESULTS"
