@@ -65,6 +65,37 @@ Exit codes, so a launcher can branch: `quaqua ping` exits `69` when the daemon i
 Herdr outage that leaves the daemon unable to ask which panes exist (`unmapped_peer`) while the
 daemon itself is up — and `0` when it answered.
 
+## Bring the farm up
+
+`quaqua up` is the one command a launcher runs: it starts the Herdr session if it is
+stopped, makes sure the farm daemon answers, finds — or creates — the workspace labelled
+after the farm root and puts the CoS in that workspace's root pane, then focuses it and,
+outside Herdr, attaches the TUI. Inside Herdr it focuses and returns.
+
+The CoS is launched from `[roles.cos]`, and nothing is defaulted:
+
+```toml
+[roles.cos]
+harness = "claude"
+model = "opus-5.5"
+effort = "low"
+```
+
+A missing key makes `up` exit non-zero with the missing key list and one
+`quaqua config set roles.cos.<key> <value>` line per key. Those writes run from a Herdr pane
+only, so `up` starts the session *before* it reads the launch: the pane it names is the pane
+you then use.
+
+When the workspace exists and the CoS has exited, `up` resumes the `agent_session` recorded
+in `runs/cos.identity.json` through that harness's own resume flag (`claude --resume <id>`);
+no record, a harness without a verified flag, or a refused resume prints one line and starts
+a fresh CoS, so `up` never leaves the farm without one.
+
+Outside Herdr, `up` passes the session and socket of the session it started or found to every
+Herdr call and exports them, so installing the daemon unit (it asks `y/N` when there is no
+`quaqua-daemon.service`) works from a plain terminal. The start it waits for is bounded by
+`notify.daemon_start_sec` (default 90 s).
+
 ## Files
 
 | File | Role |

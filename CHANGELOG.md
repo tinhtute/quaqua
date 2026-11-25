@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`quaqua up`**: one command brings the farm up — the Herdr session (started when stopped), the daemon (installed from the `y/N` prompt when no unit and a terminal), the workspace labelled after the farm root, the CoS in its root pane, focus, and the TUI only outside Herdr. A CoS that has exited is resumed from `runs/cos.identity.json` through the harness's own resume flag (`claude --resume`, `pi --session`); no record or a refused resume prints one line and starts a fresh CoS.
+- **The CoS launch is config**: `[roles.cos]` takes `harness`, `model` and `effort` (seeded `claude` / `opus-5.5` / `low`), so `quaqua config set roles.cos.model …` moves the CoS. A missing key makes `up` exit non-zero with the missing keys and the exact `config set` lines to run; the Herdr session is started first, because those writes need a pane.
+- **`notify.daemon_start_sec`**: how long `up` gives a daemon start (default 90 s, well under the 600 s stall). `up`'s wait reads it instead of the stall knob.
+
 ### Fixed
 - **The owner's terminal can read the farm**: a same-uid caller in no Herdr pane is the Principal (`owner`) instead of being refused with `unmapped_peer`, and it **reads only** — `quaqua ping`, `status`, `roster`, `caller.lookup` and `config get|export|diff|validate` work from a plain terminal. Everything that changes the farm runs from a Herdr pane: `stop`, `config set`, `config import` and every agent verb are refused with a message naming the pane to run them from. A pane that hosts no agent is still refused, and so is another uid (`foreign_uid`) (#368).
 - **Caller refusals have their own exit code**: the daemon answering and refusing the caller exits `77` (`EXIT_REFUSED`), distinct from `69` for a daemon that is not running, so `quaqua ping || start-the-daemon` no longer starts a second daemon (#368).
