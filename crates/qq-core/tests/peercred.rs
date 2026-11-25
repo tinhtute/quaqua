@@ -155,6 +155,26 @@ fn herdr_failure_fails_closed() {
     stop(r);
 }
 
+/// Review finding 1, end to end: a pane the daemon cannot describe may be the
+/// pane the peer is in, so it is a refusal — the worker in it gets neither
+/// `config` (a write, unchecked for the Principal) nor `stop`.
+#[test]
+fn a_pane_process_info_failure_refuses_config_and_stop() {
+    let r = rig("peer-procinfo-fault");
+    let pane = r.herdr.seed_pane("w", None, &[]);
+    r.herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
+    r.herdr.set_pane_pids(&pane, me(), &[]);
+    r.herdr
+        .set_fault(qq_core::herdr::Verb::PaneProcessInfo, std::io::ErrorKind::BrokenPipe);
+    for v in ["config", "stop"] {
+        assert_eq!(call(&r, v, None).unwrap_err().code, "unmapped_peer", "{v}");
+    }
+    // The refused stop left the daemon up, and a describable herdr still maps.
+    r.herdr.clear(qq_core::herdr::Verb::PaneProcessInfo);
+    assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
+    stop(r);
+}
+
 /// A peer outside every pane, as a human shell is.
 fn unmapped(r: &Rig) {
     let pane = r.herdr.seed_pane("w", None, &[]);

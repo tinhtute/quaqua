@@ -175,11 +175,51 @@ pub fn parent_pid(pid: i32) -> Option<i32> {
     (ppid > 0).then_some(ppid)
 }
 
+/// The session `pid` belongs to, as the pid of its leader, where the OS reports
+/// it. Linux reads field 6 of `/proc/<pid>/stat`; macOS has no such read here,
+/// so `None` means "not known" and the resolver falls back to ancestry alone.
+#[cfg(target_os = "linux")]
+pub fn session_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) S ppid pgrp session ...`: cut at the last ')' as the ancestry
+    // walk does, then count from the state field.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn session_of(_pid: i32) -> Option<i32> {
+    None
+}
+
+/// What the resolver reads about a pid from the OS: the ancestry walk and the
+/// session the pid belongs to. One seam, so a test can fake both without a real
+/// process tree.
+pub trait ProcScan: Send + Sync {
+    /// The parent of `pid`, or `None` when it is gone or is init's parent.
+    fn parent(&self, pid: i32) -> Option<i32>;
+    /// The leader of `pid`'s session, or `None` where it cannot be read.
+    fn session(&self, pid: i32) -> Option<i32>;
+}
+
+/// The real scan: `/proc` on Linux, `ps` on macOS, session Linux-only.
+pub struct OsScan;
+
+impl ProcScan for OsScan {
+    fn parent(&self, pid: i32) -> Option<i32> {
+        parent_pid(pid)
+    }
+
+    fn session(&self, pid: i32) -> Option<i32> {
+        session_of(pid)
+    }
+}
+
 /// `pid` and its ancestors, nearest first.
-fn ancestry(pid: i32) -> Vec<i32> {
+fn ancestry(scan: &dyn ProcScan, pid: i32) -> Vec<i32> {
     let mut chain = vec![pid];
     while chain.len() < MAX_DEPTH {
-        match parent_pid(*chain.last().unwrap_or(&pid)) {
+        match scan.parent(*chain.last().unwrap_or(&pid)) {
             Some(p) if p > 1 && !chain.contains(&p) => chain.push(p),
             _ => break,
         }
@@ -191,6 +231,8 @@ fn ancestry(pid: i32) -> Vec<i32> {
 /// agent hosted by that pane.
 pub struct HerdrPeers {
     herdr: Arc<dyn HerdrClient>,
+    /// The OS reads the ancestry walk and the session guard use.
+    scan: Arc<dyn ProcScan>,
     /// Workspace `runs/` whose database gets the CoS agent row on the first
     /// call from a `grid_role=cos` pane; `None` seeds nothing.
     cos_runs: Option<std::path::PathBuf>,
@@ -200,6 +242,17 @@ impl HerdrPeers {
     pub fn new(herdr: Arc<dyn HerdrClient>) -> Self {
         HerdrPeers {
             herdr,
+            scan: Arc::new(OsScan),
+            cos_runs: None,
+        }
+    }
+
+    /// [`HerdrPeers::new`] with the OS reads injected: a test fakes the ancestry
+    /// walk and the session id, so it needs no real process tree.
+    pub fn with_scan(herdr: Arc<dyn HerdrClient>, scan: Arc<dyn ProcScan>) -> Self {
+        HerdrPeers {
+            herdr,
+            scan,
             cos_runs: None,
         }
     }
@@ -211,6 +264,7 @@ impl HerdrPeers {
     pub fn with_cos_bootstrap(herdr: Arc<dyn HerdrClient>, runs_dir: std::path::PathBuf) -> Self {
         HerdrPeers {
             herdr,
+            scan: Arc::new(OsScan),
             cos_runs: Some(runs_dir),
         }
     }
@@ -261,7 +315,7 @@ impl PeerResolver for HerdrPeers {
     }
 
     fn resolve_pane(&self, cred: PeerCred) -> Result<(CallerId, Option<String>), RpcError> {
-        let chain = ancestry(cred.pid);
+        let chain = ancestry(self.scan.as_ref(), cred.pid);
         let panes = json(self.herdr.pane_list(), "pane list")?;
         let panes = panes
             .pointer("/result/panes")
@@ -326,10 +380,54 @@ impl PeerResolver for HerdrPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::{FakeHerdr, HerdrClient};
+    use crate::herdr::{FakeHerdr, HerdrClient, Reply, Verb};
 
     fn resolver(herdr: &Arc<FakeHerdr>) -> HerdrPeers {
         HerdrPeers::new(Arc::clone(herdr) as Arc<dyn HerdrClient>)
+    }
+
+    /// A process tree a test controls: the pid's ancestry and its session.
+    struct Scripted {
+        parents: Vec<(i32, i32)>,
+        session: Option<i32>,
+    }
+
+    impl Scripted {
+        fn new(pid: i32, session: Option<i32>) -> Self {
+            Scripted {
+                parents: vec![(pid, 0)],
+                session,
+            }
+        }
+
+        fn in_session(session: i32) -> Self {
+            Scripted::new(4242, Some(session))
+        }
+    }
+
+    impl ProcScan for Scripted {
+        fn parent(&self, pid: i32) -> Option<i32> {
+            self.parents
+                .iter()
+                .find(|(child, _)| *child == pid)
+                .map(|(_, parent)| *parent)
+                .filter(|parent| *parent > 0)
+        }
+
+        fn session(&self, _: i32) -> Option<i32> {
+            self.session
+        }
+    }
+
+    fn scripted_resolver(herdr: &Arc<FakeHerdr>, scan: Scripted) -> HerdrPeers {
+        HerdrPeers::with_scan(Arc::clone(herdr) as Arc<dyn HerdrClient>, Arc::new(scan))
+    }
+
+    fn outside_every_pane() -> PeerCred {
+        PeerCred {
+            pid: 4242,
+            uid: own_uid(),
+        }
     }
 
     /// A pane herdr knows, run by some other process tree, with an agent in it.
@@ -381,6 +479,62 @@ mod tests {
         herdr.set_pane_pids(&pane, std::process::id(), &[]);
         let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
         assert_eq!(e.code, UNMAPPED_PEER);
+        assert!(e.message.contains("hosts no known agent"), "{}", e.message);
+    }
+
+    /// Review finding 1: a pane whose process info the daemon cannot read may be
+    /// the pane the peer is in, so it is a refusal — never the Principal, which
+    /// would carry config write and stop.
+    #[test]
+    fn a_pane_whose_process_info_fails_never_makes_the_peer_the_principal() {
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        herdr.set_pane_pids(&pane, std::process::id(), &[]);
+        herdr.set_fault(Verb::PaneProcessInfo, io::ErrorKind::BrokenPipe);
+        let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
+        assert_eq!(e.code, UNMAPPED_PEER, "{e:?}");
+        assert!(e.message.contains("could not describe"), "{}", e.message);
+    }
+
+    /// Review finding 1: the same hole from the other side — a pane entry with no
+    /// `pane_id` is skipped today, so its agent would fall through to the
+    /// Principal.
+    #[test]
+    fn a_pane_entry_without_an_id_never_makes_the_peer_the_principal() {
+        let herdr = Arc::new(FakeHerdr::new());
+        herdr.set_reply(
+            Verb::PaneList,
+            Reply::ok(r#"{"result":{"panes":[{"tab_id":"t1"},{"tab_id":"t2"}]}}"#),
+        );
+        let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
+        assert_eq!(e.code, UNMAPPED_PEER, "{e:?}");
+    }
+
+    /// Review finding 2: an orphan that keeps its pane shell's session (`(cmd &)`,
+    /// `nohup … & disown`, a double fork) reaches no pane by descent but is still
+    /// that pane's process: it speaks as the pane's agent, never as the Principal.
+    #[test]
+    fn a_peer_whose_session_a_pane_shell_leads_is_that_panes_agent() {
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        herdr.agent_start("w-9", "claude", &pane, 0, &[]).unwrap();
+        herdr.set_pane_pids(&pane, 777, &[]);
+        let r = scripted_resolver(&herdr, Scripted::in_session(777));
+        let (who, mapped) = r.resolve_pane(outside_every_pane()).expect("the pane's agent");
+        assert_eq!(who.as_str(), "w-9");
+        assert_eq!(mapped.as_deref(), Some(pane.as_str()));
+    }
+
+    /// The same escape into a pane that hosts no agent: refused, not the
+    /// Principal, so an orphan of a human's shell gets no admin verbs.
+    #[test]
+    fn a_pane_shells_session_with_no_agent_is_refused_not_the_principal() {
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("h", Some("zsh"), &[]);
+        herdr.set_pane_pids(&pane, 777, &[]);
+        let r = scripted_resolver(&herdr, Scripted::in_session(777));
+        let e = r.resolve_pane(outside_every_pane()).unwrap_err();
+        assert_eq!(e.code, UNMAPPED_PEER, "{e:?}");
         assert!(e.message.contains("hosts no known agent"), "{}", e.message);
     }
 }
