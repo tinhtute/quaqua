@@ -39,6 +39,14 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     )
 }
 
+/// The config subcommands the Principal may run, sorted. An allowlist like the
+/// daemon's verb one: a subcommand added later is closed to the Principal until
+/// someone adds it here on purpose, so a future write that touches authority
+/// does not open to the owner's terminal by accident. These are the subcommands
+/// `config_cmd` accepts: read the config, write a key or a kind, or take a
+/// `team.toml` file in and out.
+pub const PRINCIPAL_CONFIG: [&str; 6] = ["diff", "export", "get", "import", "set", "validate"];
+
 /// The third argument is the profile the caller's `QUAQUA_PROFILE` named.
 type Exec = fn(&mut Connection, &[String], Option<&str>) -> Result<String, CliError>;
 
@@ -1012,6 +1020,72 @@ mod tests {
         assert!(e.message.contains("Peer"), "{e:?}");
         let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
         assert_eq!(got["out"], "90", "a refused write changes nothing: {got}");
+        handle.stop().unwrap();
+    }
+
+    /// Review finding 3: the Principal's config subcommands, spelled out. A new
+    /// subcommand does not open to the Principal until it is added here.
+    #[test]
+    fn the_principal_may_run_exactly_these_config_subcommands() {
+        assert_eq!(
+            PRINCIPAL_CONFIG,
+            ["diff", "export", "get", "import", "set", "validate"]
+        );
+    }
+
+    /// The same list at the door: a name off it is refused before `exec`, so a
+    /// subcommand nobody decided on never runs for the Principal.
+    #[test]
+    fn the_principal_may_not_run_a_config_subcommand_off_the_list() {
+        let ws = TestWorkspace::new("config-subcommands");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        // Another process tree: this process is the Principal.
+        herdr.set_pane_pids(&pane, 1, &[]);
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        d.require_peer(Arc::new(HerdrPeers::new(
+            Arc::clone(&herdr) as Arc<dyn HerdrClient>
+        )));
+        let handle = d.spawn().unwrap();
+        for argv in [
+            &["topology", "peer", "lead"][..],
+            &["reset"][..],
+            &["kind.peer.can_review", "true"][..],
+        ] {
+            let e = config_call(&handle.socket, argv).unwrap_err();
+            assert_eq!(e.code, "agent_only", "{argv:?}: {e:?}");
+        }
+        // A listed subcommand still runs.
+        config_call(&handle.socket, &["set", "timers.stall_sec", "90"]).expect("listed");
+        handle.stop().unwrap();
+    }
+
+    /// Review finding 4: the shortcut belongs to the peer gate, not to the name.
+    /// A daemon with no resolver trusts every claim, but `owner` is still not an
+    /// agent, so a config write keeps the authority check it always had.
+    #[test]
+    fn a_claimed_owner_on_a_daemon_with_no_resolver_gets_no_config_write() {
+        let ws = TestWorkspace::new("config-noclaim");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        let handle = d.spawn().unwrap();
+        let mut req = Request::new("config", json!({ "argv": ["set", "timers.stall_sec", "90"] }));
+        req.caller = Some(crate::identity::peer::PRINCIPAL.to_string());
+        let e = rpc::call(&handle.socket, &req)
+            .unwrap()
+            .into_result()
+            .unwrap_err();
+        assert_eq!(e.code, "refused", "{e:?}");
         handle.stop().unwrap();
     }
 }

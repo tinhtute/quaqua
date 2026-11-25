@@ -909,6 +909,16 @@ mod peer_tests {
         }
     }
 
+    /// Review finding 4: the name alone is not the Principal. Only the gate sets
+    /// it, so a daemon with no resolver (a claim the daemon trusts) cannot reach
+    /// the Principal's config-write shortcut through `QQ_AGENT=owner`.
+    #[test]
+    fn a_claim_of_the_principal_name_is_not_the_principal() {
+        let mut req = Request::new("config", Value::Null);
+        req.caller = Some(PRINCIPAL.into());
+        assert!(!is_principal(&req), "a claim is not the gate's verdict");
+    }
+
     /// A pane-hosted agent that happens to be called `owner` keeps agent
     /// rights only: the Principal is never a name a pane can hand out.
     #[test]
