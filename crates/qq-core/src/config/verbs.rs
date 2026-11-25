@@ -643,7 +643,9 @@ fn setting_key(key: &str) -> bool {
             !rest.iter().any(|p| p.is_empty())
         }
         ["roles", role, k] => {
-            super::ROLES.contains(role) && matches!(*k, "can_prompt" | "reports_to" | "max_peers")
+            super::ROLES.contains(role)
+                && (matches!(*k, "can_prompt" | "reports_to" | "max_peers")
+                    || (*role == super::COS_ROLE && super::COS_KEYS.contains(k)))
         }
         _ => false,
     }
@@ -954,6 +956,14 @@ fn stored_parsed(conn: &Connection) -> Result<Parsed, ConfigError> {
     };
     if let Some(v) = setting(conn, super::ACTIVE_PROFILE)? {
         p.settings.push((super::ACTIVE_PROFILE.to_string(), v));
+    }
+    // The CoS launch keys are settings too, so `config validate` judges the
+    // harness `up` would start (R2).
+    for key in super::COS_KEYS {
+        let path = format!("roles.{}.{key}", super::COS_ROLE);
+        if let Some(v) = setting(conn, &path)? {
+            p.settings.push((path, v));
+        }
     }
     for k in super::base_roster(conn)? {
         let mut raw = stand_in(&k);

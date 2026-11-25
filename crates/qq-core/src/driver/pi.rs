@@ -56,6 +56,11 @@ impl HarnessDriver for Pi {
         out
     }
 
+    /// `pi --session <path|id>` opens the session herdr recorded (pi reports a path).
+    fn resume_args(&self, session: &str) -> Option<Vec<String>> {
+        Some(vec!["--session".to_string(), session.to_string()])
+    }
+
     fn stop_sequences(&self) -> Vec<Vec<String>> {
         [
             &["esc"][..],

@@ -68,6 +68,11 @@ impl HarnessDriver for Claude {
         out
     }
 
+    /// `claude --resume <session-id>` continues that session where it stopped.
+    fn resume_args(&self, session: &str) -> Option<Vec<String>> {
+        Some(vec!["--resume".to_string(), session.to_string()])
+    }
+
     /// Merges a `PreToolUse` hook ([`GATE_MATCHER`]) running `<gate> gate` into
     /// `<worktree>/.claude/settings.local.json` (untracked, and excluded via
     /// the repo's `info/exclude`). Our entry is found by [`MARKER`] and

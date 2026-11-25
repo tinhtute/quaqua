@@ -129,6 +129,7 @@ pub const MODULES: &[Install] = &[
     crate::backlog::INSTALL,
     crate::source::INSTALL,
     crate::supervisor::INSTALL,
+    crate::up::INSTALL,
 ];
 
 /// The CLI registry and the daemon, both filled from the core and [`MODULES`].
