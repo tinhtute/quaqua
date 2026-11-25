@@ -46,10 +46,19 @@ walks its ancestry to the Herdr pane whose shell or foreground process it is, an
 agent is the caller. A same-uid process in **no** pane is the **Principal** (caller `owner`) —
 the owner at a plain terminal — and may run only `ping`, `status`, `stop`, `config`, `roster`
 and `caller.lookup` (whose handler still names no agent, so the hook gate keeps reading
-`unmapped_peer`). Every agent verb (`task.*`, `mail.*`, `push`, `merge`, `pipeline`,
+`unmapped_peer`), with `config` itself limited to `get`, `validate`, `export`, `diff`, `set`
+and `import`. Every agent verb (`task.*`, `mail.*`, `push`, `merge`, `pipeline`,
 `memory.write`, `signal`, `watch.*`, `workflow.start`, `pr.merge`) stays closed to it, and an
-allowlist means a verb added later is closed until someone opens it. A process in a pane that
-hosts no agent is still refused, and so is another uid (`foreign_uid`).
+allowlist means a verb or subcommand added later is closed until someone opens it.
+
+Two things never become the Principal. A process that left a pane's ancestry but kept its
+session (`(cmd &)`, `nohup … & disown`, a double fork reparented to systemd) belongs to the
+pane whose shell leads that session — on Linux the peer's session id is read from
+`/proc/<pid>/stat` and matched against each pane's `shell_pid` — and speaks as that pane's
+agent, or is refused when the pane hosts none. And a pane herdr cannot describe (its
+`process-info` fails, or its entry has no `pane_id`) may be the peer's own, so the daemon
+refuses with `unmapped_peer` instead of guessing. A process in a pane that hosts no agent is
+refused, and so is another uid (`foreign_uid`).
 
 Exit codes, so a launcher can branch: `quaqua ping` exits `69` when the daemon is not running
 (start it), `77` when the daemon answered and refused this caller (starting it cannot help),

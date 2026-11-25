@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **The owner's own terminal can reach the daemon again**: a same-uid caller in no Herdr pane is the Principal (`owner`) instead of being refused with `unmapped_peer`, so `quaqua ping`, `status`, `stop` and `config set` work from a plain terminal; every agent verb stays closed to it, a pane with no agent is still refused, and another uid is still `foreign_uid` (#368).
 - **Caller refusals have their own exit code**: the daemon answering and refusing the caller exits `77` (`EXIT_REFUSED`), distinct from `69` for a daemon that is not running, so `quaqua ping || start-the-daemon` no longer starts a second daemon (#368).
+- **Leaving a pane no longer looks like the owner**: a peer whose session a pane's shell leads — an orphan (`(cmd &)`), `nohup … & disown`, a double fork — speaks as that pane's agent or is refused, never as the Principal; and a pane herdr cannot describe (a failing `process-info`, a pane entry with no `pane_id`) is refused with `unmapped_peer` instead of being taken for "in no pane" (#368).
+- **The Principal's reach is an allowlist twice over**: six verbs, and inside `config` only `get`, `validate`, `export`, `diff`, `set` and `import`; the shortcut is the peer gate's verdict (an unforgeable request field), so a `QQ_AGENT=owner` claim on a daemon with no resolver keeps the ordinary authority check (#368).
 
 ## [3.0.0] - 2026-11-23
 
