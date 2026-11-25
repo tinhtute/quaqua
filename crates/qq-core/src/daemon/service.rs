@@ -46,7 +46,7 @@ impl HerdrEnv {
         }
     }
 
-    fn from_process() -> Result<Self, String> {
+    pub fn from_process() -> Result<Self, String> {
         let var = |k| std::env::var(k).ok();
         Self::from_vars(var("HERDR_SESSION"), var("HERDR_SOCKET_PATH"))
     }
@@ -570,10 +570,22 @@ pub fn install_at(svc: &Service, args: &[String], spec: &Spec) -> Result<String,
 /// `quaqua daemon install` for the running process: exe from `current_exe`, home from `HOME`,
 /// the workspace is the parent of `runs_dir`.
 pub fn install(runs_dir: &Path, args: &[String]) -> Result<String, String> {
+    let svc = Service::for_process(runs_dir)?;
+    let herdr = HerdrEnv::from_process()?;
+    install_with(&svc, runs_dir, args, &herdr)
+}
+
+/// [`install_at`] on a given service and herdr session, the rest of the spec (exe, PATH,
+/// workspace, log) from the process: what `up` runs through its own [`Service`].
+pub fn install_with(
+    svc: &Service,
+    runs_dir: &Path,
+    args: &[String],
+    herdr: &HerdrEnv,
+) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own executable: {e}"))?;
     let workspace = runs_dir.parent().unwrap_or(runs_dir);
     let workspace = std::path::absolute(workspace).map_err(|e| e.to_string())?;
-    let svc = Service::for_process(runs_dir)?;
     // A service manager hands the daemon a bare PATH, so the unit carries the installer's own.
     let path = std::env::var("PATH")
         .ok()
@@ -582,16 +594,15 @@ pub fn install(runs_dir: &Path, args: &[String]) -> Result<String, String> {
             let h = std::env::var("HOME").unwrap_or_default();
             format!("{h}/.local/bin:{h}/.cargo/bin:/usr/local/bin:/usr/bin:/bin")
         });
-    let herdr = HerdrEnv::from_process()?;
     let log = runs_dir.join(DAEMON_LOG);
     let spec = Spec {
         exe: &exe,
         workspace: &workspace,
         path: &path,
-        herdr: &herdr,
+        herdr,
         log: &log,
     };
-    install_at(&svc, args, &spec)
+    install_at(svc, args, &spec)
 }
 
 // --- the daemon side: thin wrappers over the pure parts ---

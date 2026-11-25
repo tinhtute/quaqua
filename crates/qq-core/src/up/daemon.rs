@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::cli::{CliError, Env, EXIT_REFUSED, EXIT_UNREACHABLE};
 pub use crate::daemon::service::Names;
-use crate::daemon::service::{ProcessRunner, Runner, Service};
+use crate::daemon::service::{HerdrEnv, ProcessRunner, Runner, Service};
 
 /// The command a human runs to install the unit by hand: exactly what `up` runs for them.
 pub const INSTALL_CMD: &str = "quaqua daemon install";
@@ -222,12 +222,14 @@ pub fn wait_budget(conn: &rusqlite::Connection) -> Wait {
 
 /// The real host: `quaqua ping` through the CLI client, the unit or agent through
 /// [`Service`] (systemd or launchd) and its [`Runner`], the install through
-/// [`crate::daemon::service::install`] (the same call `daemon install` makes), config
+/// [`crate::daemon::service::install_with`] on the host's own service (the spec `daemon install`
+/// writes), config
 /// through the store, the terminal through stdio.
 pub struct ServiceHost {
     runs_dir: PathBuf,
     svc: Result<Service, String>,
     runner: Box<dyn Runner>,
+    herdr: Result<HerdrEnv, String>,
 }
 
 impl ServiceHost {
@@ -249,7 +251,14 @@ impl ServiceHost {
             runs_dir: runs_dir.into(),
             svc,
             runner,
+            herdr: HerdrEnv::from_process(),
         }
+    }
+
+    /// The herdr session the installed unit carries, in place of the process's.
+    pub fn with_herdr(mut self, herdr: HerdrEnv) -> Self {
+        self.herdr = Ok(herdr);
+        self
     }
 }
 
@@ -286,7 +295,16 @@ impl DaemonHost for ServiceHost {
     }
 
     fn install_unit(&mut self) -> Result<(), String> {
-        let text = crate::daemon::service::install(&self.runs_dir, &[String::from("install")])?;
+        // The host's own service, never `Service::for_process`: the file written is the
+        // `svc.file` that `start_unit` loads, and a test host never reads the real HOME.
+        let svc = self.svc.as_ref().map_err(Clone::clone)?;
+        let herdr = self.herdr.as_ref().map_err(Clone::clone)?;
+        let text = crate::daemon::service::install_with(
+            svc,
+            &self.runs_dir,
+            &[String::from("install")],
+            herdr,
+        )?;
         self.line(text.trim_end());
         Ok(())
     }
@@ -778,6 +796,25 @@ mod tests {
             ])
         );
         assert_eq!(calls[2], argv(&["systemctl", "--user", "start", UNIT_NAME]));
+    }
+
+    #[test]
+    fn service_host_installs_through_its_own_service_under_the_scratch_home() {
+        for platform in [Platform::Launchd, Platform::Systemd] {
+            let ws = crate::testkit::TestWorkspace::new("up-host-install");
+            let runner = FakeRunner::default();
+            let svc = service(Some(platform), ws.root());
+            let file = svc.as_ref().unwrap().file.clone();
+            let mut h = ServiceHost::with_service(ws.runs_dir(), svc, Box::new(runner.clone()))
+                .with_herdr(HerdrEnv {
+                    session: "s1".into(),
+                    socket: "/h/herdr.sock".into(),
+                });
+            h.install_unit().unwrap();
+            assert!(file.starts_with(ws.root()), "{}", file.display());
+            assert!(file.is_file(), "{} not written", file.display());
+            assert!(runner.calls().is_empty(), "install runs no command");
+        }
     }
 
     #[test]
