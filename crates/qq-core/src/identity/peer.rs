@@ -321,22 +321,25 @@ impl PeerResolver for HerdrPeers {
             .pointer("/result/panes")
             .and_then(Value::as_array)
             .ok_or_else(|| refuse("herdr pane list has no panes"))?;
-        // (pane id, is cos, pids the pane runs)
-        let mut owned: Vec<(&str, bool, Vec<i64>)> = Vec::new();
+        // (pane id, is cos, pids the pane runs, the pane's shell)
+        let mut owned: Vec<(&str, bool, Vec<i64>, Option<i64>)> = Vec::new();
+        // Panes herdr could not describe. One of them may be the peer's pane, so
+        // they are the difference between "in no pane" and "not knowable".
+        let mut skipped = 0usize;
         for p in panes {
             let Some(id) = p.get("pane_id").and_then(Value::as_str) else {
+                skipped += 1;
                 continue;
             };
-            // A pane whose process info is unavailable cannot own the peer.
             let Ok(info) = json(self.herdr.pane_process_info(id), "pane process-info") else {
+                skipped += 1;
                 continue;
             };
             let info = info.pointer("/result/process_info");
-            let mut pids: Vec<i64> = info
+            let shell = info
                 .and_then(|i| i.get("shell_pid"))
-                .and_then(Value::as_i64)
-                .into_iter()
-                .collect();
+                .and_then(Value::as_i64);
+            let mut pids: Vec<i64> = shell.into_iter().collect();
             pids.extend(
                 info.and_then(|i| i.get("foreground_processes"))
                     .and_then(Value::as_array)
@@ -345,19 +348,34 @@ impl PeerResolver for HerdrPeers {
                     .filter_map(|f| f.get("pid").and_then(Value::as_i64)),
             );
             let cos = p.pointer("/tokens/grid_role").and_then(Value::as_str) == Some("cos");
-            owned.push((id, cos, pids));
+            owned.push((id, cos, pids, shell));
         }
-        // The nearest ancestor that a pane runs decides. A peer that reaches no
-        // pane is the Principal of this uid (the owner at a plain terminal);
-        // the daemon's gate decides which verbs it may run, and herdr being
-        // unreadable is still an error above, so a pane the daemon cannot see
-        // never makes its agent the Principal.
-        let Some((pane, cos)) = chain.iter().find_map(|a| {
+        // The nearest ancestor that a pane runs decides. A process that left the
+        // pane's ancestry but kept its session (`(cmd &)`, `nohup … & disown`, a
+        // double fork) belongs to the pane whose shell leads that session, since
+        // a pane shell leads its own: without this an agent's orphan would be
+        // named the Principal, which may write config and stop the daemon.
+        let by_ancestry = chain.iter().find_map(|a| {
             owned
                 .iter()
-                .find(|(_, _, pids)| pids.contains(&i64::from(*a)))
-                .map(|(id, cos, _)| (*id, *cos))
-        }) else {
+                .find(|(_, _, pids, _)| pids.contains(&i64::from(*a)))
+                .map(|(id, cos, _, _)| (*id, *cos))
+        });
+        let by_session = self.scan.session(cred.pid).and_then(|sid| {
+            owned
+                .iter()
+                .find(|(_, _, _, shell)| *shell == Some(i64::from(sid)))
+                .map(|(id, cos, _, _)| (*id, *cos))
+        });
+        let Some((pane, cos)) = by_ancestry.or(by_session) else {
+            if skipped > 0 {
+                return Err(refuse(format!(
+                    "herdr could not describe {skipped} pane(s): pid {} may be in one of them",
+                    cred.pid
+                )));
+            }
+            // In no pane at all: the Principal of this uid, the owner at a plain
+            // terminal. The daemon's gate decides which verbs it may run.
             return Ok((CallerId(PRINCIPAL.into()), None));
         };
         if cos {
