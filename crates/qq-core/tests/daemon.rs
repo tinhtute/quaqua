@@ -204,6 +204,7 @@ fn daemon_rpc_roundtrip() {
             args: Value::Null,
             caller: Some("peer-a".into()),
             caller_pane: None,
+            caller_principal: false,
         },
     )
     .unwrap()

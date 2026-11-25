@@ -39,6 +39,32 @@ Rules:
   and is recorded in Lead state.
 - Telemetry decides which mechanisms stay: a reviewer that rarely changes outcomes gets turned off.
 
+### Who may call the daemon
+
+The daemon names every caller from the socket peer, never from the request: the peer's pid
+walks its ancestry to the Herdr pane whose shell or foreground process it is, and that pane's
+agent is the caller. A same-uid process in **no** pane is the **Principal** (caller `owner`),
+and it **reads only** (owner decision 2026-11-25): `ping`, `status`, `roster`, `caller.lookup`
+(whose handler still names no agent, so the hook gate keeps reading `unmapped_peer`) and
+`config` limited to `get`, `export`, `diff` and `validate`. Everything that changes the farm
+runs from a Herdr pane: `stop`, `config set`, `config import`, and every agent verb (`task.*`,
+`mail.*`, `push`, `merge`, `pipeline`, `memory.write`, `signal`, `watch.*`, `workflow.start`,
+`pr.merge`). An allowlist means a verb or subcommand added later is closed until someone opens
+it, and a refused write says so: run it from a Herdr pane.
+
+Because nothing writable is reachable outside a pane, a process that leaves its pane's
+ancestry (`(cmd &)`, `nohup … & disown`, a double fork, `setsid`, `systemd-run`, or a socket
+handed on by a connector that exited) cannot stop the daemon or rewrite the topology even when
+it is named the Principal; the same holds for a pane herdr cannot describe (its `process-info`
+fails, or its entry has no `pane_id`), which is why one broken pane cannot turn the owner's
+`ping` into a refusal. A process in a pane that hosts no agent is refused, and so is another
+uid (`foreign_uid`).
+
+Exit codes, so a launcher can branch: `quaqua ping` exits `69` when the daemon is not running
+(start it), `77` when the daemon answered and refused this caller — an agent-only verb, or a
+Herdr outage that leaves the daemon unable to ask which panes exist (`unmapped_peer`) while the
+daemon itself is up — and `0` when it answered.
+
 ## Files
 
 | File | Role |

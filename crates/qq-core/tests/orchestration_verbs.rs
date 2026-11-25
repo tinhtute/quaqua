@@ -312,8 +312,10 @@ fn push_without_a_caller_is_refused() {
     assert!(!origin_has_feat(&origin));
 }
 
+/// Issue #368: the peer is the Principal (in no pane), so both verbs stay
+/// closed to it; only a mapped agent reaches them.
 #[test]
-fn unmapped_peer_is_still_refused_on_both_verbs() {
+fn the_principal_is_still_refused_on_both_verbs() {
     let r = rig("g1-unmapped", true);
     let (work, origin) = repo_with_origin(&r);
     // The test process maps to no pane: the daemon refuses before any handler.
@@ -325,7 +327,7 @@ fn unmapped_peer_is_still_refused_on_both_verbs() {
     );
     let p = call(&r, "push", Some("lead-f"), push_args(&work));
     for e in [t.unwrap_err(), p.unwrap_err()] {
-        assert_eq!(e.code, "unmapped_peer");
+        assert_eq!(e.code, "agent_only");
     }
     assert!(!origin_has_feat(&origin));
     let n: i64 = conn(&r)

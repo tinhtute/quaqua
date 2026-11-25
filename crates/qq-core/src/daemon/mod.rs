@@ -679,8 +679,9 @@ where
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
-/// client's claim is dropped). A peer of another uid is refused outright, and
-/// so is an unmapped peer of the daemon's uid, whatever the verb.
+/// client's claim is dropped). A peer of another uid is refused outright; a peer
+/// in a pane with no agent is refused too, whatever the verb. A same-uid peer in
+/// no pane at all speaks as the Principal, which may run only [`PRINCIPAL_VERBS`].
 fn identify(
     mut req: Request,
     peers: Option<&dyn PeerResolver>,
@@ -703,9 +704,50 @@ fn identify(
         ));
     }
     let (who, pane) = peers.resolve_pane(*cred)?;
+    let principal = pane.is_none() && who.as_str() == peer::PRINCIPAL;
+    if principal && !PRINCIPAL_VERBS.contains(&req.verb.as_str()) {
+        return Err(RpcError::new(
+            peer::AGENT_ONLY,
+            format!(
+                "verb '{}' must be run from a herdr pane: caller pid {} is in no pane, \
+                 so it speaks as the read-only Principal '{}' (or herdr could not \
+                 describe the pane it is in)",
+                req.verb,
+                cred.pid,
+                peer::PRINCIPAL
+            ),
+        ));
+    }
     req.caller = Some(who.0);
     req.caller_pane = pane;
+    req.caller_principal = principal;
     Ok(req)
+}
+
+/// Verbs a caller in no herdr pane may run: **reads only** (owner decision
+/// 2026-11-25). Outside herdr the Principal may look at the farm — the launcher
+/// asks `ping` before it starts a daemon — but nothing that changes it, so an
+/// agent that escapes its pane (`&`, `nohup`, `setsid`, `systemd-run`, a
+/// connector that exited) cannot stop the daemon or write config even when it is
+/// named the Principal. The list is an allowlist, so a verb added later is
+/// closed until someone decides otherwise; none of these names an agent.
+/// `config` is open only because its handler allows the four read subcommands
+/// (`config::verbs::PRINCIPAL_CONFIG`). `caller.lookup` is here because its
+/// handler is the one that refuses a caller it cannot name as an agent: the
+/// Principal reaches it and gets the `unmapped_peer` answer the hook gate has
+/// always read.
+const PRINCIPAL_VERBS: [&str; 5] = ["ping", "status", "roster", "config", caller::VERB];
+
+/// True when the daemon's peer gate named this request's caller as the
+/// Principal: a same-uid peer that reaches no herdr pane. Only the gate sets it
+/// ([`Request::caller_principal`] is never read off the wire), so a client's
+/// `caller` claim cannot reach it and a pane-hosted agent named `owner` is never
+/// it either. A daemon with no resolver ([`Daemon::require_peer`]) names nobody,
+/// so nothing there is the Principal. It grants reads and nothing else: the
+/// config handler uses it to narrow the subcommands, and no code path lets it
+/// past an authority check.
+pub fn is_principal(req: &Request) -> bool {
+    req.caller_principal
 }
 
 #[cfg(test)]
@@ -724,7 +766,7 @@ mod peer_tests {
         assert!(d.service_enabled());
     }
 
-    use crate::identity::peer::{CallerId, PeerCred};
+    use crate::identity::peer::{CallerId, PeerCred, AGENT_ONLY, PRINCIPAL};
 
     #[test]
     fn a_served_verb_leaves_a_start_line_and_a_result_line() {
@@ -828,10 +870,102 @@ mod peer_tests {
     }
 
     #[test]
-    fn unmapped_same_uid_is_refused_for_every_verb() {
+    fn a_peer_the_resolver_cannot_name_is_refused_for_every_verb() {
         for v in ["ping", "stop", "status", "mail.send"] {
             let e = run(v, Err(()), 1000).unwrap_err();
             assert_eq!(e.code, peer::UNMAPPED_PEER, "{v}");
         }
+    }
+
+    /// Issue #368: the Principal runs the farm from a plain terminal, but names
+    /// no agent, so every agent-only verb stays closed to it.
+    #[test]
+    fn the_principal_outside_a_pane_is_refused_every_agent_verb() {
+        for v in [
+            "task.start",
+            "task.create",
+            "worker.stop",
+            "mail.inbox",
+            "mail.send",
+            "push",
+            "push.cos",
+            "merge",
+            "pr.merge",
+            "memory.write",
+            "pipeline",
+            "signal",
+            "watch.agent",
+            "watch.report",
+            "workflow.start",
+            "stop",
+        ] {
+            let e = run(v, Ok(PRINCIPAL), 1000).unwrap_err();
+            assert_eq!(e.code, AGENT_ONLY, "{v}");
+            if v == "stop" {
+                assert!(e.message.contains("herdr pane"), "{}", e.message);
+            }
+        }
+    }
+
+    /// Owner decision 2026-11-25: outside herdr the Principal reads only. The
+    /// launcher asks `ping` before it starts a daemon and the owner may look at
+    /// the farm; nothing that changes it is reachable from a plain terminal, so
+    /// an agent that escapes its pane gains nothing it could not already do.
+    #[test]
+    fn the_read_only_principal_may_ping_status_roster_and_lookup() {
+        for v in ["ping", "status", "roster", caller::VERB] {
+            let req = run(v, Ok(PRINCIPAL), 1000).unwrap_or_else(|e| panic!("{v}: {e:?}"));
+            assert!(is_principal(&req), "{v} is not marked the principal");
+            assert_eq!(req.caller.as_deref(), Some(PRINCIPAL), "{v}");
+            assert_eq!(req.caller_pane, None, "{v}");
+            // Its name is not an agent's: the gate still names nobody.
+            assert_eq!(caller::identified(&req), None, "{v}");
+        }
+    }
+
+    /// The writes stay pane-only, and the refusal says where to run them.
+    #[test]
+    fn the_read_only_principal_may_not_stop_the_daemon() {
+        let e = run("stop", Ok(PRINCIPAL), 1000).unwrap_err();
+        assert_eq!(e.code, AGENT_ONLY, "{e:?}");
+        assert!(e.message.contains("herdr pane"), "{}", e.message);
+        // The `config` verb itself is open: its subcommands decide, in the
+        // handler, and it carries no agent name either way.
+        let req = run("config", Ok(PRINCIPAL), 1000).expect("config reaches its handler");
+        assert!(is_principal(&req));
+    }
+
+    /// Review finding 4: the name alone is not the Principal. Only the gate sets
+    /// it, so a daemon with no resolver (a claim the daemon trusts) cannot reach
+    /// the Principal's config-write shortcut through `QQ_AGENT=owner`.
+    #[test]
+    fn a_claim_of_the_principal_name_is_not_the_principal() {
+        let mut req = Request::new("config", Value::Null);
+        req.caller = Some(PRINCIPAL.into());
+        assert!(!is_principal(&req), "a claim is not the gate's verdict");
+    }
+
+    /// A pane-hosted agent that happens to be called `owner` keeps agent
+    /// rights only: the Principal is never a name a pane can hand out.
+    #[test]
+    fn an_agent_named_owner_is_no_principal() {
+        struct InPane;
+        impl PeerResolver for InPane {
+            fn resolve(&self, _: peer::PeerCred) -> Result<CallerId, RpcError> {
+                Ok(CallerId(PRINCIPAL.into()))
+            }
+            fn resolve_pane(
+                &self,
+                _: peer::PeerCred,
+            ) -> Result<(CallerId, Option<String>), RpcError> {
+                Ok((CallerId(PRINCIPAL.into()), Some("p1".into())))
+            }
+        }
+        let mut req = Request::new("task.start", Value::Null);
+        req.caller = Some("spoof".into());
+        let cred = Ok(PeerCred { pid: 1, uid: 1000 });
+        let req = identify(req, Some(&InPane), Some(&cred), 1000).unwrap();
+        assert!(!is_principal(&req));
+        assert_eq!(caller::identified(&req), Some(PRINCIPAL));
     }
 }

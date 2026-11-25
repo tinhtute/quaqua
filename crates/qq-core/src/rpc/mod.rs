@@ -35,6 +35,11 @@ pub struct Request {
     /// read off the wire; used for placement, never as authority.
     #[serde(skip)]
     pub caller_pane: Option<String>,
+    /// Whether the daemon's peer gate named this request's caller as the
+    /// Principal. Set only by the gate, never read off the wire, so a client's
+    /// `caller` claim cannot reach it.
+    #[serde(skip)]
+    pub caller_principal: bool,
 }
 
 impl Request {
@@ -44,6 +49,7 @@ impl Request {
             args,
             caller: None,
             caller_pane: None,
+            caller_principal: false,
         }
     }
 }

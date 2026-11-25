@@ -39,12 +39,20 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     )
 }
 
+/// The config subcommands the Principal may run, sorted: **reads only** (owner
+/// decision 2026-11-25). Outside herdr the Principal may look at the config, and
+/// every write — `set`, `import`, and any write added later — stays pane-only, so
+/// an agent that escapes its pane cannot rewrite the topology. An allowlist, so a
+/// subcommand added later is closed here until someone adds it on purpose.
+pub const PRINCIPAL_CONFIG: [&str; 4] = ["diff", "export", "get", "validate"];
+
 /// The third argument is the profile the caller's `QUAQUA_PROFILE` named.
 type Exec = fn(&mut Connection, &[String], Option<&str>) -> Result<String, CliError>;
 
-/// `guarded`: every subcommand but `get` and `validate` is a write (so a new
-/// one is guarded by default) and needs a caller that may run an orchestration
-/// call: a Peer and a caller the daemon could not name never write a setting.
+/// `guarded`: every subcommand but the reads in [`PRINCIPAL_CONFIG`] (`get`,
+/// `export`, `diff`, `validate`) is a write, so a subcommand added later is
+/// guarded by default and needs a caller that may run an orchestration call — a
+/// Peer and a caller the daemon could not name never write a setting.
 fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, RpcError> {
     let argv: Vec<String> = req
         .args
@@ -58,12 +66,27 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
         .unwrap_or_default();
     let mut conn = crate::db::open(&ctx.runs_dir.join(DB_FILE))
         .map_err(|e| RpcError::new("internal", e.to_string()))?;
-    if guarded
-        && !matches!(
-            argv.first().map(String::as_str),
-            Some("get" | "validate" | "export" | "diff")
-        )
-    {
+    let sub = argv.first().map(String::as_str).unwrap_or_default();
+    // The Principal's allowlist, checked before anything else: outside herdr it
+    // reads the config and never writes it (owner decision 2026-11-25). Only the
+    // guarded verb has subcommands — `roster` is served here too and its argv is
+    // free text, so keying this on the verb rather than on `guarded` refused a
+    // plain `quaqua roster` with an empty subcommand name.
+    if guarded && crate::daemon::is_principal(req) && !PRINCIPAL_CONFIG.contains(&sub) {
+        return Err(RpcError::new(
+            crate::identity::peer::AGENT_ONLY,
+            format!(
+                "config {sub} must be run from a herdr pane: outside one the Principal \
+                 reads the config only ({PRINCIPAL_CONFIG:?}); herdr may also have failed \
+                 to describe the caller's pane"
+            ),
+        ));
+    }
+    if guarded && !PRINCIPAL_CONFIG.contains(&sub) {
+        // Every write, whoever asks: no caller skips the topology check. A
+        // Principal never arrives here — the allowlist above refused it — so this
+        // branch judges an agent, or a claimed `owner` on a daemon with no peer
+        // resolver, as the non-agent it is.
         let Some(caller) = req.caller.as_deref() else {
             return Err(RpcError::new(
                 "refused",
@@ -947,4 +970,155 @@ fn stored_parsed(conn: &Connection) -> Result<Parsed, ConfigError> {
 /// The stored config must satisfy the checks an import applies.
 fn check_db(conn: &Connection) -> Result<(), ConfigError> {
     validate(&stored_parsed(conn)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::{FakeHerdr, HerdrClient};
+    use crate::identity::peer::HerdrPeers;
+    use crate::rpc::{self, Request};
+    use crate::testkit::TestWorkspace;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn serve_call(socket: &Path, verb: &str, argv: &[&str]) -> Result<Value, RpcError> {
+        let req = Request::new(verb, json!({ "argv": argv }));
+        rpc::call(socket, &req).unwrap().into_result()
+    }
+
+    fn config_call(socket: &Path, argv: &[&str]) -> Result<Value, RpcError> {
+        serve_call(socket, "config", argv)
+    }
+
+    /// Owner decision 2026-11-25: no config write is reachable outside herdr, so
+    /// the Principal no longer skips the authority check — and a Peer agent is
+    /// still refused, as before.
+    #[test]
+    fn a_config_write_is_refused_outside_panes_and_for_a_peer_agent() {
+        let ws = TestWorkspace::new("config-principal");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
+        // The pane belongs to another process tree, so this process is the
+        // Principal, as the owner's terminal is.
+        herdr.set_pane_pids(&pane, 1, &[]);
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        d.require_peer(Arc::new(HerdrPeers::new(
+            Arc::clone(&herdr) as Arc<dyn HerdrClient>
+        )));
+        let handle = d.spawn().unwrap();
+
+        let e = config_call(&handle.socket, &["set", "timers.stall_sec", "90"]).unwrap_err();
+        assert_eq!(e.code, "agent_only", "the principal writes nothing: {e:?}");
+        assert!(e.message.contains("herdr pane"), "{e:?}");
+
+        // The same pid, now in a pane whose agent is a Peer: the authority
+        // check runs as it always has.
+        let conn = crate::db::open(&ws.db_path()).unwrap();
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('w-1', 'peer', 0)",
+            [],
+        )
+        .unwrap();
+        herdr.set_pane_pids(&pane, std::process::id(), &[]);
+        let e = config_call(&handle.socket, &["set", "timers.stall_sec", "60"]).unwrap_err();
+        assert_eq!(e.code, "refused", "{e:?}");
+        assert!(e.message.contains("Peer"), "{e:?}");
+
+        // A Lead in a pane still writes, so the narrowed scope did not close
+        // the door on the agents that own it.
+        herdr.set_pane_pids(&pane, 1, &[]);
+        let lead_pane = herdr.seed_pane("l", None, &[]);
+        herdr
+            .agent_start("lead-1", "claude", &lead_pane, 0, &[])
+            .unwrap();
+        herdr.set_pane_pids(&lead_pane, std::process::id(), &[]);
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('lead-1', 'lead', 0)",
+            [],
+        )
+        .unwrap();
+        config_call(&handle.socket, &["set", "timers.stall_sec", "90"])
+            .expect("a Lead writes config");
+        let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
+        assert_eq!(got["out"], "90", "{got}");
+        handle.stop().unwrap();
+    }
+
+    /// Review finding 4: the shortcut belongs to the peer gate, not to the name.
+    /// A daemon with no resolver trusts every claim, but `owner` is still not an
+    /// agent, so a config write keeps the authority check it always had.
+    #[test]
+    fn a_claimed_owner_on_a_daemon_with_no_resolver_gets_no_config_write() {
+        let ws = TestWorkspace::new("config-noclaim");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        let handle = d.spawn().unwrap();
+        let mut req = Request::new(
+            "config",
+            json!({ "argv": ["set", "timers.stall_sec", "90"] }),
+        );
+        req.caller = Some(crate::identity::peer::PRINCIPAL.to_string());
+        let e = rpc::call(&handle.socket, &req)
+            .unwrap()
+            .into_result()
+            .unwrap_err();
+        assert_eq!(e.code, "refused", "{e:?}");
+        handle.stop().unwrap();
+    }
+
+    /// Delta review finding 0: `serve` is shared by `config` (guarded) and
+    /// `roster` (not guarded), so the Principal allowlist must key on `guarded`.
+    /// A plain `quaqua roster` carries no argv, so its subcommand read as "" and
+    /// was refused `agent_only` although roster is a read the owner has.
+    #[test]
+    fn the_principal_reads_roster_and_config_through_the_real_handlers() {
+        let ws = TestWorkspace::new("config-roster-principal");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        // Another process tree: this process is the Principal.
+        herdr.set_pane_pids(&pane, 1, &[]);
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        d.require_peer(Arc::new(HerdrPeers::new(
+            Arc::clone(&herdr) as Arc<dyn HerdrClient>
+        )));
+        let handle = d.spawn().unwrap();
+
+        // Roster, through its real handler, with and without args.
+        for argv in [&[][..], &["sude-kinds"][..]] {
+            let v = serve_call(&handle.socket, "roster", argv).expect("roster answers");
+            assert!(v["out"].is_string(), "{argv:?}: {v}");
+        }
+        // The config reads answer, through the real serve.
+        for argv in [&["get"][..], &["export"][..], &["validate"][..]] {
+            let v = serve_call(&handle.socket, "config", argv).expect("a read answers");
+            assert!(v["out"].is_string(), "{argv:?}: {v}");
+        }
+        // The writes and an unknown subcommand still refuse.
+        for argv in [
+            &["set", "timers.stall_sec", "90"][..],
+            &["import", "/tmp/team.toml"][..],
+            &["frobnicate"][..],
+        ] {
+            let e = serve_call(&handle.socket, "config", argv).unwrap_err();
+            assert_eq!(e.code, "agent_only", "{argv:?}: {e:?}");
+        }
+        handle.stop().unwrap();
+    }
 }

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The owner's terminal can read the farm**: a same-uid caller in no Herdr pane is the Principal (`owner`) instead of being refused with `unmapped_peer`, and it **reads only** — `quaqua ping`, `status`, `roster`, `caller.lookup` and `config get|export|diff|validate` work from a plain terminal. Everything that changes the farm runs from a Herdr pane: `stop`, `config set`, `config import` and every agent verb are refused with a message naming the pane to run them from. A pane that hosts no agent is still refused, and so is another uid (`foreign_uid`) (#368).
+- **Caller refusals have their own exit code**: the daemon answering and refusing the caller exits `77` (`EXIT_REFUSED`), distinct from `69` for a daemon that is not running, so `quaqua ping || start-the-daemon` no longer starts a second daemon (#368).
+- **Nothing writable is reachable outside Herdr**: no config write skips the authority check, so a process that leaves its pane (an orphan, `nohup`, a double fork, `setsid`, `systemd-run`, a socket handed on by a dead connector) reaches at most the read verbs — data the same uid can already read from `runs/qq.db` and `team.toml`. A pane Herdr cannot describe is likewise not a refusal, so one broken pane cannot turn the owner's `ping` into `77` (#368).
+
 ## [3.0.0] - 2026-11-23
 
 Rewrite release: one Rust crate, `qq-core`, now builds the single `quaqua` binary. 479 commits since 2.7.0.

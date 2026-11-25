@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::daemon::{Config, Daemon};
 use crate::herdr::CliHerdr;
+use crate::identity::peer;
 use crate::rpc::{self, Request};
 
 /// What a command runs against.
@@ -24,6 +25,11 @@ pub const EXIT_USAGE: i32 = 64;
 /// Exit status when the daemon cannot be reached (sysexits EX_UNAVAILABLE).
 /// Start the daemon; do not resend. Exit 1 keeps its per-command meaning.
 pub const EXIT_UNREACHABLE: i32 = 69;
+/// Exit status when the daemon reached the caller and refused it (sysexits
+/// EX_NOPERM): the peer is in a pane with no agent, is the Principal calling an
+/// agent-only verb, or belongs to another uid. The daemon is up, so starting it
+/// again cannot help; only a different caller can.
+pub const EXIT_REFUSED: i32 = 77;
 
 /// A failed command: the message goes to stderr, `code` is the exit status.
 #[derive(Debug)]
@@ -183,9 +189,18 @@ pub fn rpc_call_as(
     let mut req = Request::new(verb, args);
     req.caller = claim;
     match rpc::call(&socket, &req) {
-        Ok(resp) => resp
-            .into_result()
-            .map_err(|e| CliError::new(1, e.to_string())),
+        Ok(resp) => resp.into_result().map_err(|e| {
+            // A refusal names the caller, not the daemon: the daemon answered.
+            let code = if matches!(
+                e.code.as_str(),
+                peer::UNMAPPED_PEER | peer::FOREIGN_UID | peer::AGENT_ONLY
+            ) {
+                EXIT_REFUSED
+            } else {
+                1
+            };
+            CliError::new(code, e.to_string())
+        }),
         Err(e)
             if matches!(
                 e.kind(),
