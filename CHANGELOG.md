@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-11-25
+
+### Added
+- **The CoS and Lead panes carry a sidebar label**: `identity heal` and `memory hook session-start` now restore the `--display-agent` label as well as the tokens, and a Lead spawn labels its pane `<slug>-lead`, so a herdr sidebar rule matching `CoS` or `-lead` has something to match on. The CoS label comes from the new **`ui.cos_label`** setting (default `🍑 CoS`, blank falls back to it); `quaqua config set ui.cos_label …` moves it. The label is part of the "already complete" check, so a pane with tokens but no label converges on the next run. `ui` joins the `config export`/`import` sections (`[ui] cos_label = "..."`), and the shipped `team.toml` keeps the key as a comment so no workspace drifts.
+- **`docs/herdr-sidebar.md`**: the herdr snippet that styles the `agent` label (and the `$grid_role` fallback) — CoS pink bold, Lead orange — with the caveats that a custom `ui.cos_label` needs its rule changed and that a Lead's label is written only at spawn, so a Lead row stays grey after a herdr restart until that Lead respawns.
+
 ## [3.1.0] - 2026-11-25
 
 ### Added

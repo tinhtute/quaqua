@@ -541,6 +541,9 @@ fn lead_spawn_registers_the_project_lead_and_its_integ_branch() {
         )
         .unwrap();
     assert_eq!(integ, "quaqua/alpha-integ");
+    // The Lead's pane carries the display label a sidebar rule matches on.
+    let label = display_agent(&fx, "alpha-lead");
+    assert_eq!(label.as_deref(), Some("alpha-lead"));
 }
 
 #[test]
@@ -1132,6 +1135,16 @@ fn pane_of(fx: &Fx, name: &str) -> String {
             r.get(0)
         })
         .unwrap()
+}
+
+/// The `--display-agent` label the fake herdr holds for the pane of `name`.
+fn display_agent(fx: &Fx, name: &str) -> Option<String> {
+    let pane = pane_of(fx, name);
+    let got = fx.herdr.pane_get(&pane).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&got.body).unwrap();
+    v.pointer("/result/pane/display_agent")
+        .and_then(|d| d.as_str())
+        .map(String::from)
 }
 
 #[test]

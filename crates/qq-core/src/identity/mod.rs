@@ -1,7 +1,8 @@
 //! `quaqua identity heal` and the CoS pane re-tag that `memory hook session-start`
 //! repeats: both restore the herdr pane tokens `grid_role=cos grid_owner=cos
-//! grid_farm=<farm>` after a herdr restart dropped them. Every step reads the
-//! pane first and writes only the difference, so a repeat is a no-op.
+//! grid_farm=<farm>` and the `--display-agent` label a sidebar rule matches on,
+//! after a herdr restart dropped them. Every step reads the pane first and writes
+//! only the difference, so a repeat is a no-op.
 //!
 //! Pane access goes through [`PaneOps`], two calls the CLI forwards to
 //! `CliHerdr` (`pane_get` and `pane_report_metadata`).
@@ -24,12 +25,14 @@ pub const TOKEN_SOURCE: &str = "herdr-quaqua";
 pub trait PaneOps {
     /// `herdr pane get PANE`, parsed: `{"result":{"pane":{"tokens":{..},"agent_session":..}}}`.
     fn pane_get(&self, pane: &str) -> Result<Value, String>;
-    /// `herdr pane report-metadata PANE --source SOURCE --token K=V ...`; tokens merge.
+    /// `herdr pane report-metadata PANE --source SOURCE --token K=V ...
+    /// [--display-agent TEXT]`; tokens merge.
     fn pane_report_metadata(
         &self,
         pane: &str,
         source: &str,
         tokens: &[(&str, &str)],
+        display: Option<&str>,
     ) -> Result<(), String>;
 }
 
@@ -42,9 +45,10 @@ impl PaneOps for CliHerdr {
         pane: &str,
         source: &str,
         tokens: &[(&str, &str)],
+        display: Option<&str>,
     ) -> Result<(), String> {
         report_metadata_reply(HerdrClient::pane_report_metadata(
-            self, pane, source, tokens, None,
+            self, pane, source, tokens, display,
         ))
     }
 }
@@ -119,9 +123,22 @@ fn token(pane: &Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Tags `pane` as the CoS pane of `farm`. A pane that carries a role other than
-/// `cos` is never touched; one already complete is not rewritten.
-pub fn retag_cos(panes: &dyn PaneOps, pane: &str, farm: &str) -> Result<Retag, String> {
+/// The `--display-agent` label herdr holds for the pane, if any.
+fn display_agent(pane: &Value) -> Option<String> {
+    pane.pointer("/result/pane/display_agent")
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+/// Tags `pane` as the CoS pane of `farm` and labels it `label`, the text a herdr
+/// sidebar rule matches on. A pane that carries a role other than `cos` is
+/// never touched; one already complete is not rewritten.
+pub fn retag_cos(
+    panes: &dyn PaneOps,
+    pane: &str,
+    farm: &str,
+    label: &str,
+) -> Result<Retag, String> {
     if pane.is_empty() {
         return Err("pane is empty".into());
     }
@@ -130,7 +147,8 @@ pub fn retag_cos(panes: &dyn PaneOps, pane: &str, farm: &str) -> Result<Retag, S
         Some(r) if r != "cos" => return Ok(Retag::Skipped(r)),
         Some(_)
             if token(&got, "grid_owner").as_deref() == Some("cos")
-                && token(&got, "grid_farm").as_deref() == Some(farm) =>
+                && token(&got, "grid_farm").as_deref() == Some(farm)
+                && display_agent(&got).as_deref() == Some(label) =>
         {
             return Ok(Retag::Unchanged)
         }
@@ -144,6 +162,7 @@ pub fn retag_cos(panes: &dyn PaneOps, pane: &str, farm: &str) -> Result<Retag, S
             ("grid_owner", "cos"),
             ("grid_farm", farm),
         ],
+        Some(label),
     )?;
     Ok(Retag::Tagged)
 }
@@ -237,7 +256,13 @@ pub fn session_retag(
     if !is_eligible_workspace(cwd, ws_root) {
         return None;
     }
-    Some(retag_cos(panes, pane, &farm_of(ws_root)).and_then(|r| {
+    Some(retag_cos(
+        panes,
+        pane,
+        &farm_of(ws_root),
+        &crate::config::cos_label_in(&ws_root.join("runs")),
+    )
+    .and_then(|r| {
         if !matches!(r, Retag::Skipped(_)) {
             record_identity(panes, pane, &ws_root.join("runs"))?;
         }
@@ -276,7 +301,7 @@ pub fn heal(panes: &dyn PaneOps, runs_dir: &Path) -> Result<Vec<String>, String>
     if agent_session(&got).as_deref() != Some(session.as_str()) {
         return Ok(vec![]);
     }
-    Ok(match retag_cos(panes, &pane, &farm)? {
+    Ok(match retag_cos(panes, &pane, &farm, &crate::config::cos_label_in(runs_dir))? {
         Retag::Tagged => vec![format!("tagged cos pane {pane} (farm {farm})")],
         Retag::Unchanged | Retag::Skipped(_) => vec![],
     })
