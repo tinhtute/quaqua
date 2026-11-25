@@ -306,7 +306,12 @@ fn new_pane(ctx: &Ctx, cwd: &Path) -> R<String> {
     pane_of(&r.body).ok_or_else(|| fail("herdr split reply has no pane id"))
 }
 
-fn report_tokens(ctx: &Ctx, pane: &str, tokens: &[(&str, &str)]) -> R<()> {
+fn report_tokens(
+    ctx: &Ctx,
+    pane: &str,
+    tokens: &[(&str, &str)],
+    display: Option<&str>,
+) -> R<()> {
     let mut all: Vec<(&str, &str)> = tokens.to_vec();
     let farm = crate::grid::farm_id(&ctx.runs_dir);
     if let Some(f) = farm.as_deref() {
@@ -314,7 +319,7 @@ fn report_tokens(ctx: &Ctx, pane: &str, tokens: &[(&str, &str)]) -> R<()> {
     }
     let r = ctx
         .herdr
-        .pane_report_metadata(pane, "quaqua", &all, None)
+        .pane_report_metadata(pane, "quaqua", &all, display)
         .map_err(|e| fail(format!("herdr could not tag the pane: {e}")))?;
     if r.ok {
         Ok(())
@@ -633,6 +638,7 @@ pub fn spawn_placed(ctx: &Ctx, p: &Placed) -> R<WorkerSpawned> {
             ("grid_tab", &tab),
             ("grid_ready", "1"),
         ],
+        None,
     )?;
     let pane = place_pane(ctx, &pane, fresh)?;
     spawn_rooted(
@@ -946,6 +952,7 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
         None => (new_pane(ctx, &wt)?, true),
     };
     // The Lead gets its own workspace `<slug>` (its grid_group) before it starts.
+    // Its display label is the `<slug>-lead` a herdr sidebar rule matches on.
     report_tokens(
         ctx,
         &pane,
@@ -956,6 +963,7 @@ pub fn run_lead(ctx: &Ctx, args: &[String]) -> R<LeadSpawned> {
             ("grid_tab", &format!("{slug}-lead")),
             ("grid_ready", "1"),
         ],
+        Some(&format!("{slug}-lead")),
     )?;
     let pane = place_pane(ctx, &pane, fresh)?;
     spawn(

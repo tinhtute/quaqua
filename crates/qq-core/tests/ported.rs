@@ -18,10 +18,12 @@ use qq_core::testkit::TestWorkspace;
 use qq_core::transcripts;
 use serde_json::{json, Value};
 
-/// A herdr pane that remembers the tokens written to it.
+/// A herdr pane that remembers the tokens and the `--display-agent` label
+/// written to it.
 struct FakePane {
     session: Option<String>,
     tokens: RefCell<BTreeMap<String, String>>,
+    label: RefCell<Option<String>>,
     writes: RefCell<usize>,
 }
 
@@ -29,6 +31,7 @@ impl FakePane {
     fn new(session: Option<&str>, tokens: &[(&str, &str)]) -> Self {
         FakePane {
             session: session.map(String::from),
+            label: RefCell::new(None),
             tokens: RefCell::new(
                 tokens
                     .iter()
@@ -41,6 +44,9 @@ impl FakePane {
     fn token(&self, k: &str) -> Option<String> {
         self.tokens.borrow().get(k).cloned()
     }
+    fn label(&self) -> Option<String> {
+        self.label.borrow().clone()
+    }
 }
 
 impl PaneOps for FakePane {
@@ -49,6 +55,9 @@ impl PaneOps for FakePane {
         if let Some(s) = &self.session {
             pane["agent_session"] = json!({ "value": s });
         }
+        if let Some(l) = self.label() {
+            pane["display_agent"] = json!(l);
+        }
         Ok(json!({ "result": { "pane": pane } }))
     }
     fn pane_report_metadata(
@@ -56,6 +65,7 @@ impl PaneOps for FakePane {
         _: &str,
         source: &str,
         tokens: &[(&str, &str)],
+        display: Option<&str>,
     ) -> Result<(), String> {
         assert_eq!(source, identity::TOKEN_SOURCE);
         *self.writes.borrow_mut() += 1;
@@ -63,6 +73,9 @@ impl PaneOps for FakePane {
             self.tokens
                 .borrow_mut()
                 .insert(k.to_string(), v.to_string());
+        }
+        if let Some(d) = display {
+            *self.label.borrow_mut() = Some(d.to_string());
         }
         Ok(())
     }
@@ -192,6 +205,7 @@ fn ported_verbs_answer() {
     let first = identity::heal(&pane, &ws.runs_dir()).expect("heal");
     assert_eq!(first.len(), 1, "{first:?}");
     assert_eq!(pane.token("grid_role").as_deref(), Some("cos"));
+    assert_eq!(pane.label().as_deref(), Some(qq_core::config::COS_LABEL));
     assert!(identity::heal(&pane, &ws.runs_dir())
         .expect("heal again")
         .is_empty());
@@ -250,6 +264,60 @@ fn ported_verbs_answer() {
         2
     );
     daemon.stop().unwrap();
+}
+
+#[test]
+/// The CoS pane's sidebar label: tokens already complete but no
+/// `--display-agent` is the live pane's shape today, so it must re-report once
+/// and converge; `ui.cos_label` overrides the shipped default.
+fn the_cos_pane_reports_its_sidebar_label() {
+    let ws = TestWorkspace::new("cos-label");
+    let root = ws.root();
+    init::run(root, false, false).unwrap();
+    let farm = identity::farm_of(root);
+    let tagged = [
+        ("grid_role", "cos"),
+        ("grid_owner", "cos"),
+        ("grid_farm", farm.as_str()),
+    ];
+    let pane = FakePane::new(Some("s"), &tagged);
+    let r = identity::session_retag(&pane, Some("p1"), root, root)
+        .expect("eligible")
+        .expect("retag");
+    assert_eq!(r, identity::Retag::Tagged, "a missing label is re-reported");
+    assert_eq!(pane.label().as_deref(), Some(qq_core::config::COS_LABEL));
+    let r = identity::session_retag(&pane, Some("p1"), root, root)
+        .expect("eligible")
+        .expect("retag again");
+    assert_eq!(r, identity::Retag::Unchanged, "the label now matches");
+    assert_eq!(*pane.writes.borrow(), 1);
+
+    // `ui.cos_label` wins over the default, and the stored label follows it.
+    let conn = qq_core::db::open(&ws.db_path()).expect("open qq db");
+    conn.execute(
+        "INSERT INTO setting (key, value_json) VALUES ('ui.cos_label', '\"CoS quê\"') \
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        [],
+    )
+    .expect("set ui.cos_label");
+    let r = identity::session_retag(&pane, Some("p1"), root, root)
+        .expect("eligible")
+        .expect("retag");
+    assert_eq!(r, identity::Retag::Tagged, "a changed label is re-reported");
+    assert_eq!(pane.label().as_deref(), Some("CoS quê"));
+    assert_eq!(*pane.writes.borrow(), 2);
+
+    // A blank setting cannot erase the label: the default stands.
+    conn.execute(
+        "UPDATE setting SET value_json = '\"  \"' WHERE key = 'ui.cos_label'",
+        [],
+    )
+    .expect("blank ui.cos_label");
+    let r = identity::session_retag(&pane, Some("p1"), root, root)
+        .expect("eligible")
+        .expect("retag");
+    assert_eq!(r, identity::Retag::Tagged);
+    assert_eq!(pane.label().as_deref(), Some(qq_core::config::COS_LABEL));
 }
 
 #[test]

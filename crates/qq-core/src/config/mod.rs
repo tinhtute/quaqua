@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 mod export;
@@ -32,6 +32,7 @@ const MAPPED_TOP: &[&str] = &[
     "roles",
     "profile",
     "profiles",
+    "ui",
 ];
 
 /// The `setting` key that names the active profile (`profile = "name"`).
@@ -73,6 +74,8 @@ const SETTING_SECTIONS: &[&str] = &[
     // `notify.daemon_start_sec`: how long `quaqua up` gives a daemon start (see
     // [`daemon_start_sec`]); `notify.stall_sec` was already read from the store.
     "notify",
+    // `ui.cos_label`: the label the CoS pane reports to herdr (see [`cos_label`]).
+    "ui",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1188,6 +1191,33 @@ pub fn setting(conn: &Connection, key: &str) -> Result<Option<serde_json::Value>
         .optional()?;
     raw.map(|s| serde_json::from_str(&s).map_err(|e| ConfigError::Invalid(e.to_string())))
         .transpose()
+}
+
+/// The name the CoS pane reports to herdr when `ui.cos_label` is unset. Pane
+/// tokens alone leave the sidebar row nameless, so no `contains` rule can match.
+pub const COS_LABEL: &str = "🍑 CoS";
+
+/// `ui.cos_label`, else [`COS_LABEL`]. A blank value falls back too: the label is
+/// the only text a sidebar rule can match on.
+pub fn cos_label(conn: &Connection) -> String {
+    setting(conn, "ui.cos_label")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| COS_LABEL.to_string())
+}
+
+/// [`cos_label`] for the workspace whose runs directory is `runs_dir`. A missing
+/// or unreadable database falls back to the default: a label is never worth
+/// failing a re-tag for (same read-only open as `memory::situation`).
+pub fn cos_label_in(runs_dir: &Path) -> String {
+    let db = runs_dir.join(crate::db::path::DB_FILE);
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return COS_LABEL.to_string();
+    };
+    cos_label(&conn)
 }
 
 /// How long `quaqua up` gives a daemon start before it gives up: the setting

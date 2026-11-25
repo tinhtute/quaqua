@@ -686,6 +686,8 @@ fn config_seed_set_export_roundtrip() {
         run(&["config", "set", "projects.alpha.root", "\"/tmp/a\""]),
         0
     );
+    // The sidebar label the CoS pane reports to herdr (`docs/herdr-sidebar.md`).
+    assert_eq!(run(&["config", "set", "ui.cos_label", "🌾 CoS quê"]), 0);
     assert_eq!(
         run(&[
             "config",
@@ -709,6 +711,10 @@ fn config_seed_set_export_roundtrip() {
     let conn = open(&ws);
     let exported = config::config_cmd(&env, &strs(&["export"])).unwrap();
     assert!(exported.contains("[profiles.fast.ni]"), "{exported}");
+    assert!(
+        exported.contains("[ui]\ncos_label = \"🌾 CoS quê\""),
+        "{exported}"
+    );
     // The export is the base config: the active profile and the env switch
     // never reach it.
     assert_eq!(

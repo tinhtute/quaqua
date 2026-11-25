@@ -109,3 +109,9 @@ integ_branch = "quaqua/{slug}-integ"
 [grid]
 workers_tab = "workers"
 deferred_statuses = ["working"]
+
+# [ui]
+# The label the CoS pane reports to herdr (`--display-agent`); the sidebar styles
+# a pane by it. Unset means the engine default, 🍑 CoS. The snippet that colours
+# the CoS and Lead rows is docs/herdr-sidebar.md.
+# cos_label = "🍑 CoS"
