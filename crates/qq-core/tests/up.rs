@@ -793,7 +793,8 @@ fn up_agent_list_marks_the_root_pane_live() {
 // ---- the real host, against a scripted herdr --------------------------------------
 
 /// A herdr that records its argv and answers `status server` from a file, so the real
-/// `CliUp` seam can be exercised without herdr.
+/// `CliUp` seam can be exercised without herdr. The server branch writes `ready` last, so
+/// its existence means `pids` and the log line are already there.
 fn fake_herdr(dir: &Path) -> String {
     let bin = dir.join("herdr");
     let script = format!(
@@ -808,9 +809,8 @@ case "$1 $2" in
     ;;
   "server ")
     echo $$ >> "$dir/pids"
-    ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
     echo "server was here" >&2
-    touch "$dir/up"
+    touch "$dir/ready"
     sleep 30
     ;;
 esac
@@ -823,12 +823,39 @@ esac
     bin.to_string_lossy().into_owned()
 }
 
-fn own_pgid() -> String {
+/// Wait, bounded, for a marker a child process writes when (and only when) everything
+/// the test then reads is already on disk.
+fn wait_for(path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// The process group of `pid`, from the kernel: `/proc/<pid>/stat` field 5. The `comm`
+/// field is parenthesised and may itself hold spaces or a `)`, so the split starts after
+/// the last `)`. `ps` is only the fallback where there is no `/proc`; a CI image without
+/// it would otherwise answer "" and every comparison against it would pass for free.
+fn pgid_of(pid: &str) -> String {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let rest = stat.rsplit_once(')').map_or(stat.as_str(), |(_, r)| r);
+        if let Some(pgid) = rest.split_whitespace().nth(2) {
+            return pgid.to_string();
+        }
+    }
     let out = std::process::Command::new("ps")
-        .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+        .args(["-o", "pgid=", "-p", pid])
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn own_pgid() -> String {
+    pgid_of(&std::process::id().to_string())
 }
 
 /// M3: the server `up` starts must not share `up`'s process group (a Ctrl-C at the y/N
@@ -844,11 +871,17 @@ fn up_start_session_detaches_the_server_and_logs_it() {
     host.set_root(ws.root());
 
     host.start_session().expect("the fake session comes up");
+    // `start_session` returns once `status server` answers, which the fake does at once:
+    // the server must be given until its last write, or its files are read half-made.
+    assert!(
+        wait_for(&dir.join("ready")),
+        "the fake server never reached its last marker"
+    );
     let pids = std::fs::read_to_string(dir.join("pids")).expect("the fake server ran");
-    let pid = pids.lines().next().unwrap().trim().to_string();
-    let pgid = std::fs::read_to_string(dir.join("pgids")).unwrap();
-    let pgid = pgid.lines().next().unwrap().trim().to_string();
+    let pid = pids.lines().next().expect("the fake wrote a pid").trim().to_string();
+    let pgid = pgid_of(&pid);
 
+    assert!(!pgid.is_empty(), "no pgid for pid {pid}");
     assert_ne!(pgid, own_pgid(), "the server shares up's process group");
     let log = std::fs::read_to_string(ws.runs_dir().join("herdr-server.log")).unwrap_or_default();
     assert!(log.contains("server was here"), "stderr went to {log:?}");
