@@ -28,10 +28,40 @@ pub struct Workspace {
 }
 
 /// A herdr agent that `agent list` still reports.
+///
+/// The pane is the identity: only an agent started with a name carries one, and the CoS
+/// this launcher has to recognise may carry none, so nothing here keys on a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
-    pub name: String,
+    /// The name given at `agent start`, when herdr reports one.
+    pub name: Option<String>,
     pub pane: String,
+    /// `agent_status`: `working`, `idle`, `blocked`, `done` or `unknown`.
+    pub status: String,
+    /// `agent_session.value`, when the entry carries one.
+    pub session: Option<String>,
+}
+
+/// The first agent `agent list` reports for `pane`, from its raw JSON. A pure function so
+/// the seam's answer is tested against the payload herdr really prints.
+pub fn agent_in_pane_json(list: &str, pane: &str) -> Option<Agent> {
+    let v: Value = serde_json::from_str(list).ok()?;
+    let a = v
+        .pointer("/result/agents")?
+        .as_array()?
+        .iter()
+        .find(|a| a.get("pane_id").and_then(Value::as_str) == Some(pane))?;
+    let text = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+    Some(Agent {
+        name: text("name"),
+        pane: pane.to_string(),
+        status: text("agent_status").unwrap_or_default(),
+        session: a
+            .pointer("/agent_session/value")
+            .or_else(|| a.get("agent_session"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// The outside world, one method per effect.
@@ -49,14 +79,15 @@ pub trait UpHost {
     fn launch(&mut self) -> Result<CosLaunch, CliError>;
     /// The farm root every path here is derived from.
     fn workspace_root(&self) -> PathBuf;
-    /// The `agent_session` recorded in `runs/cos.identity.json`, if any.
-    fn recorded_session(&mut self) -> Option<String>;
+    /// `(agent_session, pane_id)` from `runs/cos.identity.json`, if any.
+    fn recorded(&mut self) -> Option<(String, String)>;
     /// The workspace carrying `label`, when it exists.
     fn workspace(&mut self, label: &str) -> Option<Workspace>;
     /// `herdr workspace create --cwd CWD --label LABEL --no-focus`.
     fn create_workspace(&mut self, label: &str, cwd: &Path) -> Result<Workspace, String>;
-    /// The agent `name` from `herdr agent list`, when herdr still reports it.
-    fn agent(&mut self, name: &str) -> Option<Agent>;
+    /// The agent `herdr agent list` reports for `pane`, when it reports one. Named or
+    /// not: the pane is what tells the CoS from everything else.
+    fn agent_in_pane(&mut self, pane: &str) -> Option<Agent>;
     /// `herdr agent start NAME --kind KIND --pane PANE -- ARGS`.
     fn start_agent(
         &mut self,
@@ -65,8 +96,8 @@ pub trait UpHost {
         pane: &str,
         args: &[String],
     ) -> Result<(), String>;
-    /// `herdr agent focus NAME`.
-    fn focus(&mut self, name: &str) -> Result<(), String>;
+    /// Focus `pane`: the CoS may have no name to focus by.
+    fn focus(&mut self, pane: &str) -> Result<(), String>;
     /// Attach the herdr TUI in this terminal; only called outside herdr.
     fn attach(&mut self) -> Result<(), String>;
     /// One line for the human.
@@ -172,6 +203,15 @@ impl CliUp {
             .map(str::to_string)
     }
 
+    /// One herdr call that must succeed; the error is herdr's own text.
+    fn verb(&self, args: &[&str]) -> Result<(), String> {
+        match self.herdr(args) {
+            Ok(r) if r.ok => Ok(()),
+            Ok(r) => Err(r.body.trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     fn find_workspace(&mut self, label: &str) -> Option<Workspace> {
         let v = self.json(&["workspace", "list"])?;
         let id = v
@@ -271,8 +311,8 @@ impl UpHost for CliUp {
         self.root.clone()
     }
 
-    fn recorded_session(&mut self) -> Option<String> {
-        identity::load_cos_identity(&self.runs_dir).map(|(session, _)| session)
+    fn recorded(&mut self) -> Option<(String, String)> {
+        identity::load_cos_identity(&self.runs_dir)
     }
 
     fn workspace(&mut self, label: &str) -> Option<Workspace> {
@@ -299,21 +339,9 @@ impl UpHost for CliUp {
             .ok_or_else(|| format!("herdr created no workspace labelled '{label}'"))
     }
 
-    fn agent(&mut self, name: &str) -> Option<Agent> {
-        let v = self.json(&["agent", "list"])?;
-        let a = v
-            .pointer("/result/agents")?
-            .as_array()?
-            .iter()
-            .find(|a| a.get("name").and_then(Value::as_str) == Some(name))?;
-        Some(Agent {
-            name: name.to_string(),
-            pane: a
-                .get("pane_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        })
+    fn agent_in_pane(&mut self, pane: &str) -> Option<Agent> {
+        let r = self.herdr(&["agent", "list"]).ok().filter(|r| r.ok)?;
+        agent_in_pane_json(&r.body, pane)
     }
 
     fn start_agent(
@@ -344,14 +372,31 @@ impl UpHost for CliUp {
         Err(r.body.trim().to_string())
     }
 
-    fn focus(&mut self, name: &str) -> Result<(), String> {
-        let r = self
-            .herdr(&["agent", "focus", name])
-            .map_err(|e| e.to_string())?;
-        if r.ok {
-            return Ok(());
+    /// `agent focus` takes an explicit pane id (herdr's skill: "an explicit pane ID, or a
+    /// unique agent name"), so an unnamed CoS is focusable. A refusal falls back to the
+    /// pane's tab and then its workspace: both are documented, pane-derived targets.
+    fn focus(&mut self, pane: &str) -> Result<(), String> {
+        if let Err(mut why) = self.verb(&["agent", "focus", pane]) {
+            let v = self.json(&["pane", "get", pane]);
+            let field = |k: &str| {
+                v.as_ref()
+                    .and_then(|v| v.pointer(&format!("/result/pane/{k}")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            for (verb, id) in [
+                ("tab", field("tab_id")),
+                ("workspace", field("workspace_id")),
+            ] {
+                let Some(id) = id else { continue };
+                match self.verb(&[verb, "focus", &id]) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => why = e,
+                }
+            }
+            return Err(why);
         }
-        Err(r.body.trim().to_string())
+        Ok(())
     }
 
     fn attach(&mut self) -> Result<(), String> {

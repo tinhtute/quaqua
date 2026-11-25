@@ -79,9 +79,9 @@ pub fn up(
         }
     };
     // R3: the CoS in the workspace's root pane.
-    let cos = ensure_cos(host, &launch, &ws.root_pane, created)?;
-    host.focus(config::COS_ROLE)
-        .map_err(|e| CliError::new(1, format!("herdr agent focus {}: {e}", config::COS_ROLE)))?;
+    let (cos, focused) = ensure_cos(host, &launch, &ws.root_pane, created)?;
+    host.focus(&focused)
+        .map_err(|e| CliError::new(1, format!("herdr focus {focused}: {e}")))?;
     // R1: the TUI only outside herdr; inside, focus and return.
     if !host.inside_herdr() {
         host.attach()
@@ -97,32 +97,40 @@ fn ensure_cos(
     launch: &CosLaunch,
     pane: &str,
     created: bool,
-) -> Result<Cos, CliError> {
-    let name = config::COS_ROLE;
-    if let Some(agent) = host.agent(name) {
+) -> Result<(Cos, String), CliError> {
+    // The pane is the identity, not a name: the CoS the launcher starts may carry none.
+    if let Some(agent) = host.agent_in_pane(pane) {
         host.line(&format!(
-            "quaqua up: the CoS is running in pane {} ({})",
-            agent.pane, launch.harness
+            "quaqua up: the CoS is running in pane {} ({}, {})",
+            agent.pane, launch.harness, agent.status
         ));
-        return Ok(Cos::Live);
+        return Ok((Cos::Live, pane.to_string()));
     }
     // A workspace `up` just made never ran a CoS, so a stale record cannot be resumed.
-    let recorded = if created {
-        None
-    } else {
-        host.recorded_session()
-    };
-    if let Some(session) = recorded {
+    let recorded = if created { None } else { host.recorded() };
+    // A CoS restarted by hand in its recorded pane is still the CoS: never start a second.
+    if let Some((_, there)) = &recorded {
+        if there != pane {
+            if let Some(agent) = host.agent_in_pane(there) {
+                host.line(&format!(
+                    "quaqua up: the CoS is running in its recorded pane {} ({})",
+                    agent.pane, agent.status
+                ));
+                return Ok((Cos::Live, there.clone()));
+            }
+        }
+    }
+    if let Some((session, _)) = recorded {
         match resume_args(&launch.harness, &session) {
             Some(more) => {
                 let mut args = launch.agent_args().to_vec();
                 args.extend(more);
-                match host.start_agent(name, &launch.herdr_kind, pane, &args) {
+                match host.start_agent(config::COS_ROLE, &launch.herdr_kind, pane, &args) {
                     Ok(()) => {
                         host.line(&format!(
                             "quaqua up: resumed the CoS session {session} in pane {pane}"
                         ));
-                        return Ok(Cos::Resumed);
+                        return Ok((Cos::Resumed, pane.to_string()));
                     }
                     Err(e) => host.line(&format!(
                         "quaqua up: could not resume the CoS session {session} ({e}); starting a fresh one"
@@ -143,7 +151,11 @@ fn ensure_cos(
     start_fresh(host, launch, pane)
 }
 
-fn start_fresh(host: &mut dyn UpHost, launch: &CosLaunch, pane: &str) -> Result<Cos, CliError> {
+fn start_fresh(
+    host: &mut dyn UpHost,
+    launch: &CosLaunch,
+    pane: &str,
+) -> Result<(Cos, String), CliError> {
     host.start_agent(
         config::COS_ROLE,
         &launch.herdr_kind,
@@ -164,7 +176,7 @@ fn start_fresh(host: &mut dyn UpHost, launch: &CosLaunch, pane: &str) -> Result<
         "quaqua up: started a fresh CoS in pane {pane} ({}, {} {})",
         launch.harness, launch.model, launch.effort
     ));
-    Ok(Cos::Fresh)
+    Ok((Cos::Fresh, pane.to_string()))
 }
 
 /// The harness's resume flag and the recorded id, from the driver that owns it; `None`

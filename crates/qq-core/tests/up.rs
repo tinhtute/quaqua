@@ -295,7 +295,7 @@ fn up_starts_the_session_then_launches_the_cos_from_the_config_keys() {
         fake.starts,
         vec!["claude|p-new|--model claude-opus-5-5 --effort low".to_string()]
     );
-    assert_eq!(fake.focused, 1);
+    assert_eq!(fake.focused, vec!["p-new".to_string()]);
     assert!(
         fake.lines.iter().any(|l| l.contains(&label)),
         "{:?}",
@@ -312,6 +312,7 @@ fn up_finds_a_live_cos_and_starts_nothing() {
         name: None,
         pane: "p1".into(),
         status: "working".into(),
+        session: None,
     }];
     fake.recorded = Some(("s-old".into(), "p1".into()));
 
@@ -547,7 +548,10 @@ fn up_agent_list_marks_the_root_pane_live() {
     assert_eq!(live.pane, "w1:pEZ");
     assert_eq!(live.name, None);
     assert_eq!(live.status, "working");
-    assert_eq!(live.session.as_deref(), Some("00000000-aaaa-bbbb-cccc-000000000001"));
+    assert_eq!(
+        live.session.as_deref(),
+        Some("00000000-aaaa-bbbb-cccc-000000000001")
+    );
 
     assert!(
         qq_core::up::herdr::agent_in_pane_json(ROOT_AGENT_ABSENT, "w1:pEZ").is_none(),
@@ -571,6 +575,7 @@ fn up_live_cos_in_the_root_pane_is_found_by_pane_not_name() {
         name: None,
         pane: "p1".into(),
         status: "working".into(),
+        session: None,
     }];
 
     let cos = run(&mut fake).expect("up carries on");
@@ -594,14 +599,12 @@ fn up_live_cos_in_its_recorded_pane_is_found() {
         id: "w1".into(),
         root_pane: "p1".into(),
     });
-    fake.recorded = Some((
-        "00000000-aaaa-bbbb-cccc-000000000003".into(),
-        "p7".into(),
-    ));
+    fake.recorded = Some(("00000000-aaaa-bbbb-cccc-000000000003".into(), "p7".into()));
     fake.agents = vec![Agent {
         name: None,
         pane: "p7".into(),
         status: "idle".into(),
+        session: None,
     }];
 
     let cos = run(&mut fake).expect("up carries on");
