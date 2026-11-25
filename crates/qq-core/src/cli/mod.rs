@@ -237,7 +237,7 @@ fn core_commands() -> Vec<Command> {
     vec![
         Command {
             name: "daemon",
-            help: "run the farm daemon in the foreground, or 'install' its systemd unit",
+            help: "run the farm daemon in the foreground, or 'install' its systemd unit or launchd agent",
             run: |env, args| {
                 if args.first().map(String::as_str) == Some("install") {
                     return crate::daemon::service::install(&env.runs_dir, args)

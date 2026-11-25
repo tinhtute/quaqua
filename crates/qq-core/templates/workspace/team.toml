@@ -21,6 +21,11 @@ mail_ack = "30m"
 # How long `quaqua up` gives a daemon start before it gives up (seconds).
 daemon_start_sec = 90
 
+[daemon]
+# The launchd agent (macOS) that `quaqua daemon install` writes. systemd ignores these.
+launchd_label = "com.quaqua.daemon"
+launchd_dir = "~/Library/LaunchAgents"
+
 [roles.cos]
 # How the CoS is launched: read here, hardcoded nowhere.
 harness = "claude"

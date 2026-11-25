@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 
 use qq_core::cli::CliError;
 use qq_core::config::{self, CosLaunch};
+use qq_core::daemon::service::{Platform, Ran, Runner, Service, NO_BACKEND};
 use qq_core::db;
 use qq_core::testkit::TestWorkspace;
-use qq_core::up::daemon::{Answer, DaemonHost, Ping, Platform, Wait};
+use qq_core::up::daemon::{Answer, DaemonHost, Names, Ping, ServiceHost, Wait};
 use qq_core::up::herdr::{
     agent_in_pane_json, cos_pane, Agent, CosPane, PaneLists, UpHost, Workspace,
 };
@@ -219,9 +220,23 @@ impl UpHost for FakeUp {
     }
 }
 
+fn systemd_names() -> Names {
+    Names {
+        unit: "quaqua-daemon.service".into(),
+        status: "systemctl --user status quaqua-daemon.service".into(),
+    }
+}
+
+fn launchd_names() -> Names {
+    Names {
+        unit: "com.quaqua.daemon".into(),
+        status: "launchctl print gui/501/com.quaqua.daemon".into(),
+    }
+}
+
 /// The daemon world: ping answers, the unit is installed, the human says no.
 struct FakeDaemon {
-    platform: Platform,
+    service: Result<Names, String>,
     pings: Vec<Ping>,
     unit_installed: bool,
     answer: Answer,
@@ -237,7 +252,7 @@ struct FakeDaemon {
 impl FakeDaemon {
     fn answers() -> Self {
         FakeDaemon {
-            platform: Platform::Linux,
+            service: Ok(systemd_names()),
             pings: vec![Ping::Answers],
             unit_installed: true,
             answer: Answer::No,
@@ -253,8 +268,8 @@ impl FakeDaemon {
 }
 
 impl DaemonHost for FakeDaemon {
-    fn platform(&self) -> Platform {
-        self.platform
+    fn service(&self) -> Result<Names, String> {
+        self.service.clone()
     }
 
     fn ping(&mut self) -> Ping {
@@ -878,7 +893,12 @@ fn up_start_session_detaches_the_server_and_logs_it() {
         "the fake server never reached its last marker"
     );
     let pids = std::fs::read_to_string(dir.join("pids")).expect("the fake server ran");
-    let pid = pids.lines().next().expect("the fake wrote a pid").trim().to_string();
+    let pid = pids
+        .lines()
+        .next()
+        .expect("the fake wrote a pid")
+        .trim()
+        .to_string();
     let pgid = pgid_of(&pid);
 
     assert!(!pgid.is_empty(), "no pgid for pid {pid}");
@@ -924,4 +944,120 @@ fn up_session_running_is_false_without_a_herdr_answer() {
         .into_owned();
     host.set_root(ws.root());
     assert!(!host.session_running());
+}
+
+// ---- the service seam: both backends, a recording runner, a scratch home ------------
+
+/// Records every command and answers from a list; no process runs.
+#[derive(Clone, Default)]
+struct FakeRunner {
+    calls: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>,
+    answers: std::rc::Rc<std::cell::RefCell<Vec<std::io::Result<Ran>>>>,
+}
+
+impl Runner for FakeRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<Ran> {
+        let call = std::iter::once(program.to_string())
+            .chain(args.iter().cloned())
+            .collect();
+        self.calls.borrow_mut().push(call);
+        self.answers.borrow_mut().remove(0)
+    }
+}
+
+fn ran(code: i32, stdout: &str) -> std::io::Result<Ran> {
+    Ok(Ran {
+        code: Some(code),
+        stdout: stdout.into(),
+        stderr: String::new(),
+    })
+}
+
+/// With no daemon and no backend, `up` says why and carries on to the CoS.
+#[test]
+fn up_without_a_service_backend_carries_on() {
+    let ws = TestWorkspace::new("up-no-backend");
+    let mut fake = FakeUp::new(ws.root());
+    let mut daemon = FakeDaemon::answers();
+    daemon.service = Err(NO_BACKEND.into());
+    daemon.pings = vec![Ping::Unreachable];
+    up::up(&mut fake, &mut daemon).expect("no backend is not a stop");
+    assert_eq!((daemon.starts, daemon.installs), (0, 0));
+    assert!(
+        daemon.lines.iter().any(|l| l.contains(NO_BACKEND)),
+        "{:?}",
+        daemon.lines
+    );
+}
+
+/// On launchd `up` starts the installed agent and waits on the label.
+#[test]
+fn up_starts_the_launchd_agent_and_names_the_label() {
+    let ws = TestWorkspace::new("up-launchd-start");
+    let mut fake = FakeUp::new(ws.root());
+    let mut daemon = FakeDaemon::answers();
+    daemon.service = Ok(launchd_names());
+    daemon.pings = vec![Ping::Unreachable, Ping::Answers];
+    up::up(&mut fake, &mut daemon).expect("up carries on");
+    assert_eq!(daemon.starts, 1);
+    assert!(
+        daemon.lines.iter().any(|l| l.contains("com.quaqua.daemon")),
+        "{:?}",
+        daemon.lines
+    );
+}
+
+/// The real host on launchd: plist check and start go through the runner, in a scratch home.
+#[test]
+fn service_host_launchd_uses_the_plist_and_launchctl() {
+    let ws = TestWorkspace::new("up-host-launchd");
+    let runner = FakeRunner::default();
+    *runner.answers.borrow_mut() = vec![ran(0, ""), ran(0, "")];
+    let svc = Service::resolve(
+        Some(Platform::Launchd),
+        ws.root(),
+        None,
+        &Default::default(),
+        501,
+    );
+    let mut host = ServiceHost::with_service(ws.runs_dir(), svc, Box::new(runner.clone()));
+    assert_eq!(host.service().unwrap(), launchd_names());
+    assert!(!host.unit_installed());
+    let plist = ws
+        .root()
+        .join("Library/LaunchAgents/com.quaqua.daemon.plist");
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(&plist, "<plist/>").unwrap();
+    assert!(host.unit_installed());
+    host.start_unit().unwrap();
+    let calls = runner.calls.borrow().clone();
+    let expect = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        vec![
+            expect(&["launchctl", "print", "gui/501/com.quaqua.daemon"]),
+            expect(&["launchctl", "kickstart", "gui/501/com.quaqua.daemon"]),
+        ]
+    );
+}
+
+/// The real host on systemd: LoadState and start go through the runner.
+#[test]
+fn service_host_systemd_uses_systemctl() {
+    let ws = TestWorkspace::new("up-host-systemd");
+    let runner = FakeRunner::default();
+    *runner.answers.borrow_mut() = vec![ran(0, "loaded\n"), ran(0, "")];
+    let svc = Service::resolve(
+        Some(Platform::Systemd),
+        ws.root(),
+        None,
+        &Default::default(),
+        501,
+    );
+    let mut host = ServiceHost::with_service(ws.runs_dir(), svc, Box::new(runner.clone()));
+    assert_eq!(host.service().unwrap(), systemd_names());
+    assert!(host.unit_installed());
+    host.start_unit().unwrap();
+    let calls = runner.calls.borrow().clone();
+    assert_eq!(calls[1][..3], ["systemctl", "--user", "start"]);
 }
