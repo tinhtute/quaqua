@@ -40,6 +40,15 @@ rows = [[
 ], ["workspace", "tab"]]
 ```
 
+The `agent` rule must match whatever `ui.cos_label` is set to: `contains = "CoS"`
+matches only the default `🍑 CoS`. After `quaqua config set ui.cos_label "Chief"`,
+change that rule to `contains = "Chief"`, or the CoS row falls back to the grey
+`$grid_role` cell.
+
+A Lead's `<slug>-lead` label and its `grid_role` token are written only at
+spawn; only the CoS pane is re-tagged later. After a herdr restart a Lead row stays
+grey (neither rule matches) until that Lead is respawned.
+
 Per-harness rows (`[ui.sidebar.agents.rows_by_agent]`, one entry per canonical
 agent id such as `claude`) take the same cells; keep the two rule lists in each
 row you write.
