@@ -49,9 +49,10 @@ pub const PRINCIPAL_CONFIG: [&str; 4] = ["diff", "export", "get", "validate"];
 /// The third argument is the profile the caller's `QUAQUA_PROFILE` named.
 type Exec = fn(&mut Connection, &[String], Option<&str>) -> Result<String, CliError>;
 
-/// `guarded`: every subcommand but `get` and `validate` is a write (so a new
-/// one is guarded by default) and needs a caller that may run an orchestration
-/// call: a Peer and a caller the daemon could not name never write a setting.
+/// `guarded`: every subcommand but the reads in [`PRINCIPAL_CONFIG`] (`get`,
+/// `export`, `diff`, `validate`) is a write, so a subcommand added later is
+/// guarded by default and needs a caller that may run an orchestration call — a
+/// Peer and a caller the daemon could not name never write a setting.
 fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, RpcError> {
     let argv: Vec<String> = req
         .args
@@ -73,14 +74,16 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
             crate::identity::peer::AGENT_ONLY,
             format!(
                 "config {sub} must be run from a herdr pane: outside one the Principal \
-                 reads the config only ({PRINCIPAL_CONFIG:?})"
+                 reads the config only ({PRINCIPAL_CONFIG:?}); herdr may also have failed \
+                 to describe the caller's pane"
             ),
         ));
     }
-    if guarded && !matches!(sub, "get" | "validate" | "export" | "diff") {
-        // Every write, whoever asks: no caller skips the topology check, so a
-        // pane-less process that was named the Principal is refused here as the
-        // non-agent it is.
+    if guarded && !PRINCIPAL_CONFIG.contains(&sub) {
+        // Every write, whoever asks: no caller skips the topology check. A
+        // Principal never arrives here — the allowlist above refused it — so this
+        // branch judges an agent, or a claimed `owner` on a daemon with no peer
+        // resolver, as the non-agent it is.
         let Some(caller) = req.caller.as_deref() else {
             return Err(RpcError::new(
                 "refused",

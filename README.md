@@ -61,8 +61,9 @@ fails, or its entry has no `pane_id`), which is why one broken pane cannot turn 
 uid (`foreign_uid`).
 
 Exit codes, so a launcher can branch: `quaqua ping` exits `69` when the daemon is not running
-(start it), `77` when the daemon answered and refused this caller (starting it cannot help),
-and `0` when it answered.
+(start it), `77` when the daemon answered and refused this caller — an agent-only verb, or a
+Herdr outage that leaves the daemon unable to ask which panes exist (`unmapped_peer`) while the
+daemon itself is up — and `0` when it answered.
 
 ## Files
 

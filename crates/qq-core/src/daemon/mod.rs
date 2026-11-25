@@ -709,7 +709,9 @@ fn identify(
         return Err(RpcError::new(
             peer::AGENT_ONLY,
             format!(
-                "verb '{}' must be run from a herdr pane: caller pid {} is in no pane, so it speaks as the read-only Principal '{}'",
+                "verb '{}' must be run from a herdr pane: caller pid {} is in no pane, \
+                 so it speaks as the read-only Principal '{}' (or herdr could not \
+                 describe the pane it is in)",
                 req.verb,
                 cred.pid,
                 peer::PRINCIPAL
