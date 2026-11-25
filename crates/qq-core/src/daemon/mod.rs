@@ -718,6 +718,7 @@ fn identify(
     }
     req.caller = Some(who.0);
     req.caller_pane = pane;
+    req.caller_principal = principal;
     Ok(req)
 }
 
@@ -731,13 +732,13 @@ fn identify(
 const PRINCIPAL_VERBS: [&str; 6] = ["ping", "status", "stop", "config", "roster", caller::VERB];
 
 /// True when the daemon's peer gate named this request's caller as the
-/// Principal: a same-uid peer that reaches no herdr pane. The gate overwrites
-/// every request's `caller` and `caller_pane` when a resolver is installed, so a
-/// client's own claim cannot reach it, and a pane-hosted agent named `owner` is
-/// never it either (it has a pane). A daemon with no resolver trusts every
-/// claim anyway ([`Daemon::require_peer`]), so this adds no hole there.
+/// Principal: a same-uid peer that reaches no herdr pane. Only the gate sets it
+/// ([`Request::caller_principal`] is never read off the wire), so a client's
+/// `caller` claim cannot reach it and a pane-hosted agent named `owner` is never
+/// it either. A daemon with no resolver ([`Daemon::require_peer`]) names nobody,
+/// so nothing there is the Principal and every claim keeps the ordinary check.
 pub fn is_principal(req: &Request) -> bool {
-    req.caller.as_deref() == Some(peer::PRINCIPAL) && req.caller_pane.is_none()
+    req.caller_principal
 }
 
 #[cfg(test)]

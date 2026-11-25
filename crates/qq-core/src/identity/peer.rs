@@ -29,8 +29,10 @@ const MAX_DEPTH: usize = 64;
 /// plus the absence of a pane, never claimed by the request.
 ///
 /// The Principal runs the farm from a plain terminal, so the daemon opens
-/// `ping`, `status`, `stop`, `config` and `roster` to it and nothing else: it
-/// names no agent, so no agent verb can be reached through it.
+/// `ping`, `status`, `stop`, `config`, `roster` and `caller.lookup` to it and
+/// nothing else, and inside `config` only the subcommands in
+/// `config::verbs::PRINCIPAL_CONFIG`: it names no agent, so no agent verb can be
+/// reached through it.
 pub const PRINCIPAL: &str = "owner";
 
 /// Refusal code for an agent-only verb called by the Principal. Distinct from
@@ -538,7 +540,9 @@ mod tests {
         herdr.agent_start("w-9", "claude", &pane, 0, &[]).unwrap();
         herdr.set_pane_pids(&pane, 777, &[]);
         let r = scripted_resolver(&herdr, Scripted::in_session(777));
-        let (who, mapped) = r.resolve_pane(outside_every_pane()).expect("the pane's agent");
+        let (who, mapped) = r
+            .resolve_pane(outside_every_pane())
+            .expect("the pane's agent");
         assert_eq!(who.as_str(), "w-9");
         assert_eq!(mapped.as_deref(), Some(pane.as_str()));
     }

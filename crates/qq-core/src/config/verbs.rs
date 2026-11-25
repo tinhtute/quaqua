@@ -97,6 +97,17 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
             }
         }
     }
+    // The Principal's own allowlist, checked for every subcommand, read or
+    // write: a name nobody decided on never runs for it.
+    if crate::daemon::is_principal(req) {
+        let sub = argv.first().map(String::as_str).unwrap_or_default();
+        if !PRINCIPAL_CONFIG.contains(&sub) {
+            return Err(RpcError::new(
+                crate::identity::peer::AGENT_ONLY,
+                format!("config '{sub}' is agent-only: the Principal may run {PRINCIPAL_CONFIG:?}"),
+            ));
+        }
+    }
     let profile = req
         .args
         .get("profile")
@@ -1079,7 +1090,10 @@ mod tests {
         });
         install(&mut Registry::new(), &mut d).unwrap();
         let handle = d.spawn().unwrap();
-        let mut req = Request::new("config", json!({ "argv": ["set", "timers.stall_sec", "90"] }));
+        let mut req = Request::new(
+            "config",
+            json!({ "argv": ["set", "timers.stall_sec", "90"] }),
+        );
         req.caller = Some(crate::identity::peer::PRINCIPAL.to_string());
         let e = rpc::call(&handle.socket, &req)
             .unwrap()

@@ -164,8 +164,10 @@ fn a_pane_process_info_failure_refuses_config_and_stop() {
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
     r.herdr.set_pane_pids(&pane, me(), &[]);
-    r.herdr
-        .set_fault(qq_core::herdr::Verb::PaneProcessInfo, std::io::ErrorKind::BrokenPipe);
+    r.herdr.set_fault(
+        qq_core::herdr::Verb::PaneProcessInfo,
+        std::io::ErrorKind::BrokenPipe,
+    );
     for v in ["config", "stop"] {
         assert_eq!(call(&r, v, None).unwrap_err().code, "unmapped_peer", "{v}");
     }
