@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-25
+
 ### Added
-- **`quaqua up`**: one command brings the farm up — the Herdr session (started when stopped), the daemon (installed from the `y/N` prompt when no unit and a terminal), the workspace labelled after the farm root, the CoS in its root pane, focus, and the TUI only outside Herdr. A CoS that has exited is resumed from `runs/cos.identity.json` through the harness's own resume flag (`claude --resume`, `pi --session`); no record or a refused resume prints one line and starts a fresh CoS.
+- **`quaqua up`**: one command brings the farm up — the Herdr session (started when stopped), the daemon (installed from the `y/N` prompt when no unit and a terminal), the workspace labelled after the farm root, the CoS in its pane, focus, and the TUI only outside Herdr. The CoS pane comes from the real listings: the pane tagged `grid_role=cos` first, else the pane recorded in `runs/cos.identity.json` when the agent session in it is the recorded one, else the first pane of the first tab — a pane tagged `grid_role=worker` is never the CoS. A pane that already runs an agent is left alone: `up` prints one line and starts no second CoS there. A CoS that has exited is resumed from `runs/cos.identity.json` through the harness's own resume flag (`claude --resume`, `pi --session`); no record or a refused resume prints one line and starts a fresh CoS.
+- **The Herdr server `up` starts is detached**: it runs in its own process group, so a Ctrl-C at the `y/N` prompt cannot take the server, the CoS and every worker with it, and its output goes to `runs/herdr-server.log` rather than a pipe nobody drains.
 - **The CoS launch is config**: `[roles.cos]` takes `harness`, `model` and `effort` (seeded `claude` / `opus-5.5` / `low`), so `quaqua config set roles.cos.model …` moves the CoS. A missing key makes `up` exit non-zero with the missing keys and the exact `config set` lines to run; the Herdr session is started first, because those writes need a pane.
 - **`notify.daemon_start_sec`**: how long `up` gives a daemon start (default 90 s, well under the 600 s stall). `up`'s wait reads it instead of the stall knob.
 
