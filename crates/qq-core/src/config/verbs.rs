@@ -979,9 +979,13 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    fn config_call(socket: &Path, argv: &[&str]) -> Result<Value, RpcError> {
-        let req = Request::new("config", json!({ "argv": argv }));
+    fn serve_call(socket: &Path, verb: &str, argv: &[&str]) -> Result<Value, RpcError> {
+        let req = Request::new(verb, json!({ "argv": argv }));
         rpc::call(socket, &req).unwrap().into_result()
+    }
+
+    fn config_call(socket: &Path, argv: &[&str]) -> Result<Value, RpcError> {
+        serve_call(socket, "config", argv)
     }
 
     /// Owner decision 2026-11-25: no config write is reachable outside herdr, so
@@ -1068,6 +1072,50 @@ mod tests {
             .into_result()
             .unwrap_err();
         assert_eq!(e.code, "refused", "{e:?}");
+        handle.stop().unwrap();
+    }
+
+    /// Delta review finding 0: `serve` is shared by `config` (guarded) and
+    /// `roster` (not guarded), so the Principal allowlist must key on `guarded`.
+    /// A plain `quaqua roster` carries no argv, so its subcommand read as "" and
+    /// was refused `agent_only` although roster is a read the owner has.
+    #[test]
+    fn the_principal_reads_roster_and_config_through_the_real_handlers() {
+        let ws = TestWorkspace::new("config-roster-principal");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        // Another process tree: this process is the Principal.
+        herdr.set_pane_pids(&pane, 1, &[]);
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        d.require_peer(Arc::new(HerdrPeers::new(
+            Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        )));
+        let handle = d.spawn().unwrap();
+
+        // Roster, through its real handler, with and without args.
+        for argv in [&[][..], &["sude-kinds"][..]] {
+            let v = serve_call(&handle.socket, "roster", argv).expect("roster answers");
+            assert!(v["out"].is_string(), "{argv:?}: {v}");
+        }
+        // The config reads answer, through the real serve.
+        for argv in [&["get"][..], &["export"][..], &["validate"][..]] {
+            let v = serve_call(&handle.socket, "config", argv).expect("a read answers");
+            assert!(v["out"].is_string(), "{argv:?}: {v}");
+        }
+        // The writes and an unknown subcommand still refuse.
+        for argv in [
+            &["set", "timers.stall_sec", "90"][..],
+            &["import", "/tmp/team.toml"][..],
+            &["frobnicate"][..],
+        ] {
+            let e = serve_call(&handle.socket, "config", argv).unwrap_err();
+            assert_eq!(e.code, "agent_only", "{argv:?}: {e:?}");
+        }
         handle.stop().unwrap();
     }
 }
