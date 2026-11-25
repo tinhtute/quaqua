@@ -18,6 +18,10 @@ cost_buffer = 0.2
 mail_ack = "30m"
 
 [roles.cos]
+# How the CoS is launched: read here, hardcoded nowhere.
+harness = "claude"
+model = "opus-5.5"
+effort = "low"
 can_spawn = ["lead", "peer"]
 can_prompt = ["lead", "peer"]
 

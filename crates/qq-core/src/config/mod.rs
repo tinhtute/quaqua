@@ -49,6 +49,18 @@ const NOT_PORTED: &str = "taskforce";
 /// Keys a `[roles.<role>]` table may carry.
 const ROLE_KEYS: &[&str] = &["can_spawn", "can_prompt", "reports_to", "max_peers"];
 
+/// The role whose harness, model and effort start the CoS (`quaqua up`, R2).
+pub const COS_ROLE: &str = "cos";
+
+/// The launch keys only `[roles.cos]` carries: everything the CoS is started
+/// with, so the engine hardcodes no harness, model or effort.
+pub const COS_KEYS: &[&str] = &["harness", "model", "effort"];
+
+/// Whether a `[roles.<role>]` table may carry `key`.
+fn role_key_ok(role: &str, key: &str) -> bool {
+    ROLE_KEYS.contains(&key) || (role == COS_ROLE && COS_KEYS.contains(&key))
+}
+
 /// Sections copied flat into `setting` as `<section>.<key>`.
 const SETTING_SECTIONS: &[&str] = &[
     "limits",
@@ -208,6 +220,27 @@ pub struct Kind {
     pub spawn_approval: bool,
     pub use_for: Option<String>,
     pub avoid: Option<String>,
+}
+
+/// The CoS launch read from `[roles.cos]`: `quaqua up` starts the CoS with
+/// exactly this, and nothing here is a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosLaunch {
+    pub harness: String,
+    pub model: String,
+    pub effort: String,
+    /// The herdr agent kind (`herdr agent start --kind`).
+    pub herdr_kind: String,
+    /// The command that starts the CoS: the harness program, then the agent
+    /// args herdr's `agent start NAME --kind KIND --pane PANE --` takes.
+    pub argv: Vec<String>,
+}
+
+impl CosLaunch {
+    /// The args after herdr's `--` (`argv[1..]`).
+    pub fn agent_args(&self) -> &[String] {
+        &self.argv[1..]
+    }
 }
 
 /// Everything a spawn needs about one kind, read from SQLite alone.
@@ -412,10 +445,23 @@ fn parse(text: &str) -> Result<Parsed, ConfigError> {
                 expected: "table",
             })?;
             for key in row.keys() {
-                if !ROLE_KEYS.contains(&key.as_str()) {
+                if !role_key_ok(role, key) {
                     return Err(ConfigError::UnknownKey {
                         path: format!("{path}.{key}"),
                     });
+                }
+            }
+            // The CoS launch (R2): stored as plain settings, so `config get`
+            // and `config set` reach them like any other key.
+            if role == COS_ROLE {
+                for key in COS_KEYS {
+                    if let Some(v) = row.get(*key) {
+                        let s = v.as_str().ok_or(ConfigError::BadType {
+                            path: format!("{path}.{key}"),
+                            expected: "string",
+                        })?;
+                        settings.push((format!("{path}.{key}"), serde_json::json!(s)));
+                    }
                 }
             }
             if let Some(v) = row.get("can_spawn") {
@@ -592,6 +638,38 @@ fn validate(p: &Parsed) -> Result<(), ConfigError> {
                     referrer: format!("kinds.{name}.fallback"),
                     kind: f.clone(),
                 });
+            }
+        }
+    }
+    // The CoS launch keys (R2) name a harness the same way a kind does, and an
+    // empty value is not a launch: `up` reads only what is here.
+    let cos = |key: &str| {
+        p.settings
+            .iter()
+            .find(|(k, _)| *k == format!("roles.{COS_ROLE}.{key}"))
+            .and_then(|(_, v)| v.as_str())
+            .map(str::to_string)
+    };
+    for key in COS_KEYS {
+        if cos(key).is_some_and(|v| v.trim().is_empty()) {
+            return Err(ConfigError::Invalid(format!(
+                "roles.{COS_ROLE}.{key}: empty value"
+            )));
+        }
+    }
+    if let Some(h) = cos("harness") {
+        if natives.get(&h).is_none() && !p.harnesses.contains_key(&h) {
+            return Err(ConfigError::UnknownHarness {
+                kind: format!("roles.{COS_ROLE}.harness"),
+                harness: h,
+            });
+        }
+        if let (Some(e), Some(Some(spec))) = (cos("effort"), p.harnesses.get(&h)) {
+            if !spec.efforts.is_empty() && !spec.efforts.contains(&e) {
+                return Err(ConfigError::Invalid(format!(
+                    "roles.{COS_ROLE}.effort '{e}' is not one of harnesses.{h}.efforts {:?}",
+                    spec.efforts
+                )));
             }
         }
     }
@@ -1005,6 +1083,76 @@ pub fn resolve_spawn(conn: &Connection, kind_name: &str) -> Result<SpawnTarget, 
         model: k.model,
         effort: k.effort,
         fallback: k.fallback,
+    })
+}
+
+/// The CoS launch: harness, model and effort from `[roles.cos]`, plus the argv
+/// that starts it, built by the driver the engine launches kinds with.
+///
+/// Every key is required and none has a default (`rules.md`: the engine
+/// hardcodes nothing). When one is missing the error names each missing key and
+/// the `quaqua config set` command that writes it; those writes run from a herdr
+/// pane only, so the message says so.
+pub fn cos_launch(conn: &Connection) -> Result<CosLaunch, ConfigError> {
+    let field = |key: &str| -> Result<Option<String>, ConfigError> {
+        let raw = setting(conn, &format!("roles.{COS_ROLE}.{key}"))?;
+        Ok(raw
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string))
+    };
+    let (name, model, effort) = (field("harness")?, field("model")?, field("effort")?);
+    let missing: Vec<&str> = [
+        ("harness", name.is_none()),
+        ("model", model.is_none()),
+        ("effort", effort.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(k, gone)| gone.then_some(k))
+    .collect();
+    if !missing.is_empty() {
+        let named = missing
+            .iter()
+            .map(|k| format!("roles.{COS_ROLE}.{k}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cmds = missing
+            .iter()
+            .map(|k| format!("  quaqua config set roles.{COS_ROLE}.{k} <{k}>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(ConfigError::Invalid(format!(
+            "the CoS launch is not configured: missing {named}.\n\
+             run each of these from a herdr pane (outside one the Principal reads \
+             the config only):\n{cmds}"
+        )));
+    }
+    let (Some(name), Some(model), Some(effort)) = (name, model, effort) else {
+        unreachable!("no key is missing here: {missing:?}")
+    };
+    // The same driver a kind's spawn uses: native by name, else the stored
+    // harness row. No second harness -> argv mapping lives in this module.
+    let natives = crate::driver::Registry::native();
+    let unknown = || ConfigError::UnknownHarness {
+        kind: format!("roles.{COS_ROLE}.harness"),
+        harness: name.clone(),
+    };
+    let driver = match natives.get(&name) {
+        Some(d) => d,
+        None => natives
+            .resolve(&harness(conn, &name)?.ok_or_else(unknown)?)
+            .ok_or_else(unknown)?,
+    };
+    let mut argv = vec![driver.herdr_kind().to_string()];
+    argv.extend(driver.launch_args(&model, Some(&effort)));
+    Ok(CosLaunch {
+        harness: name,
+        model,
+        effort,
+        herdr_kind: driver.herdr_kind().to_string(),
+        argv,
     })
 }
 
