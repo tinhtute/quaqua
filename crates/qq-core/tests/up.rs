@@ -46,16 +46,17 @@ struct FakeUp {
     start_session: Result<(), String>,
     launch: Result<CosLaunch, CliError>,
     root: PathBuf,
-    recorded: Option<String>,
+    recorded: Option<(String, String)>,
     workspace: Option<Workspace>,
-    agent: Option<Agent>,
+    /// One entry per live agent, keyed by pane: the shape `agent list` reports.
+    agents: Vec<Agent>,
     /// Each `start_agent` as `kind|pane|arg arg ...`.
     starts: Vec<String>,
     /// The first N `start_agent` calls fail (a failed resume).
     fail_starts: usize,
     log: Vec<String>,
     lines: Vec<String>,
-    focused: usize,
+    focused: Vec<String>,
     attached: usize,
 }
 
@@ -72,12 +73,12 @@ impl FakeUp {
                 id: "w1".into(),
                 root_pane: "p1".into(),
             }),
-            agent: None,
+            agents: Vec::new(),
             starts: Vec::new(),
             fail_starts: 0,
             log: Vec::new(),
             lines: Vec::new(),
-            focused: 0,
+            focused: Vec::new(),
             attached: 0,
         }
     }
@@ -115,8 +116,8 @@ impl UpHost for FakeUp {
         self.root.clone()
     }
 
-    fn recorded_session(&mut self) -> Option<String> {
-        self.log.push("recorded_session".into());
+    fn recorded(&mut self) -> Option<(String, String)> {
+        self.log.push("recorded".into());
         self.recorded.clone()
     }
 
@@ -136,9 +137,9 @@ impl UpHost for FakeUp {
         Ok(ws)
     }
 
-    fn agent(&mut self, name: &str) -> Option<Agent> {
-        self.log.push(format!("agent:{name}"));
-        self.agent.clone()
+    fn agent_in_pane(&mut self, pane: &str) -> Option<Agent> {
+        self.log.push(format!("agent_in_pane:{pane}"));
+        self.agents.iter().find(|a| a.pane == pane).cloned()
     }
 
     fn start_agent(
@@ -160,9 +161,9 @@ impl UpHost for FakeUp {
         Ok(())
     }
 
-    fn focus(&mut self, name: &str) -> Result<(), String> {
-        self.log.push(format!("focus:{name}"));
-        self.focused += 1;
+    fn focus(&mut self, pane: &str) -> Result<(), String> {
+        self.log.push(format!("focus:{pane}"));
+        self.focused.push(pane.to_string());
         Ok(())
     }
 
@@ -307,16 +308,17 @@ fn up_starts_the_session_then_launches_the_cos_from_the_config_keys() {
 fn up_finds_a_live_cos_and_starts_nothing() {
     let ws = TestWorkspace::new("up-live");
     let mut fake = FakeUp::new(ws.root());
-    fake.agent = Some(Agent {
-        name: "cos".into(),
+    fake.agents = vec![Agent {
+        name: None,
         pane: "p1".into(),
-    });
-    fake.recorded = Some("s-old".into());
+        status: "working".into(),
+    }];
+    fake.recorded = Some(("s-old".into(), "p1".into()));
 
     let cos = run(&mut fake).expect("up carries on");
     assert_eq!(cos, Cos::Live);
     assert!(fake.starts.is_empty(), "{:?}", fake.starts);
-    assert_eq!(fake.focused, 1);
+    assert_eq!(fake.focused, vec!["p1".to_string()]);
 }
 
 // ---- R3: resume, no record, failed resume -----------------------------------------
@@ -326,7 +328,7 @@ fn up_finds_a_live_cos_and_starts_nothing() {
 fn up_resumes_the_recorded_session_of_an_exited_cos() {
     let ws = TestWorkspace::new("up-resume");
     let mut fake = FakeUp::new(ws.root());
-    fake.recorded = Some("sess-1234".into());
+    fake.recorded = Some(("sess-1234".into(), "p1".into()));
 
     let cos = run(&mut fake).expect("up carries on");
     assert_eq!(cos, Cos::Resumed);
@@ -360,7 +362,7 @@ fn up_without_a_recorded_session_says_so_and_starts_fresh() {
 fn up_failed_resume_names_the_id_and_starts_fresh() {
     let ws = TestWorkspace::new("up-badresume");
     let mut fake = FakeUp::new(ws.root());
-    fake.recorded = Some("sess-bogus".into());
+    fake.recorded = Some(("sess-bogus".into(), "p1".into()));
     fake.fail_starts = 1;
 
     let cos = run(&mut fake).expect("up carries on");
@@ -415,7 +417,7 @@ fn up_attaches_only_outside_herdr() {
     let mut inside = FakeUp::new(ws.root());
     run(&mut inside).expect("up carries on");
     assert_eq!(inside.attached, 0);
-    assert_eq!(inside.focused, 1);
+    assert_eq!(inside.focused, vec!["p1".to_string()]);
 
     let mut outside = FakeUp::new(ws.root());
     outside.inside = false;
@@ -516,4 +518,94 @@ fn up_daemon_start_sec_is_parsed_from_team_toml() {
         Ready::Answers,
         Arc::new(()),
     );
+}
+
+// ---- the live CoS, found by pane --------------------------------------------------
+
+/// The real `agent list` shape (ids replaced): only agents started with a name carry
+/// `name`, and the CoS started by the launcher carries none.
+const ROOT_AGENT_UNNAMED: &str = r#"{"id":"cli:agent:list","result":{"agents":[
+  {"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"00000000-aaaa-bbbb-cccc-000000000001"},"agent_status":"working","cwd":"/farm","focused":true,"pane_id":"w1:pEZ","tab_id":"w1:t1Z7","tokens":{"grid_farm":"quaqua","grid_owner":"cos","grid_role":"cos","logo":""},"workspace_id":"w1"},
+  {"agent":"pi","name":"sude-upint","agent_status":"working","pane_id":"w1:pHP","workspace_id":"w1"}
+]},"type":"agent_list"}"#;
+
+/// Nothing in the root pane: the entry is in another workspace.
+const ROOT_AGENT_ABSENT: &str = r#"{"id":"cli:agent:list","result":{"agents":[
+  {"agent":"pi","name":"sude-upint","agent_status":"working","pane_id":"w1:pHP","workspace_id":"w1"}
+]},"type":"agent_list"}"#;
+
+/// A CoS that was started with the name `cos` in the root pane.
+const ROOT_AGENT_NAMED: &str = r#"{"id":"cli:agent:list","result":{"agents":[
+  {"agent":"claude","name":"cos","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"00000000-aaaa-bbbb-cccc-000000000002"},"agent_status":"idle","pane_id":"w2:pQA","workspace_id":"w2"}
+]},"type":"agent_list"}"#;
+
+/// The parser behind the seam, on the real payload: the root pane decides, never a name.
+#[test]
+fn up_agent_list_marks_the_root_pane_live() {
+    let live = qq_core::up::herdr::agent_in_pane_json(ROOT_AGENT_UNNAMED, "w1:pEZ")
+        .expect("an unnamed agent in the root pane is the CoS");
+    assert_eq!(live.pane, "w1:pEZ");
+    assert_eq!(live.name, None);
+    assert_eq!(live.status, "working");
+    assert_eq!(live.session.as_deref(), Some("00000000-aaaa-bbbb-cccc-000000000001"));
+
+    assert!(
+        qq_core::up::herdr::agent_in_pane_json(ROOT_AGENT_ABSENT, "w1:pEZ").is_none(),
+        "an agent in another pane is not the CoS"
+    );
+
+    let named = qq_core::up::herdr::agent_in_pane_json(ROOT_AGENT_NAMED, "w2:pQA")
+        .expect("a named cos in the root pane is the CoS too");
+    assert_eq!(named.name.as_deref(), Some("cos"));
+    // A name is never the key: `cos` is not found in a pane it does not occupy.
+    assert!(qq_core::up::herdr::agent_in_pane_json(ROOT_AGENT_NAMED, "w2:pOTHER").is_none());
+}
+
+/// Start state (b): the session is up and the CoS runs, unnamed, in the root pane. `up`
+/// starts nothing and focuses that pane.
+#[test]
+fn up_live_cos_in_the_root_pane_is_found_by_pane_not_name() {
+    let ws = TestWorkspace::new("up-live-pane");
+    let mut fake = FakeUp::new(ws.root());
+    fake.agents = vec![Agent {
+        name: None,
+        pane: "p1".into(),
+        status: "working".into(),
+    }];
+
+    let cos = run(&mut fake).expect("up carries on");
+    assert_eq!(cos, Cos::Live);
+    assert!(fake.starts.is_empty(), "{:?}", fake.starts);
+    assert_eq!(fake.focused, vec!["p1".to_string()]);
+    assert!(
+        !fake.log.iter().any(|l| l.starts_with("recorded")),
+        "a live CoS needs no record: {:?}",
+        fake.log
+    );
+}
+
+/// A CoS restarted by hand in its recorded pane is still the CoS: found there, focused
+/// there, and never started a second time in the root pane.
+#[test]
+fn up_live_cos_in_its_recorded_pane_is_found() {
+    let ws = TestWorkspace::new("up-live-recorded-pane");
+    let mut fake = FakeUp::new(ws.root());
+    fake.workspace = Some(Workspace {
+        id: "w1".into(),
+        root_pane: "p1".into(),
+    });
+    fake.recorded = Some((
+        "00000000-aaaa-bbbb-cccc-000000000003".into(),
+        "p7".into(),
+    ));
+    fake.agents = vec![Agent {
+        name: None,
+        pane: "p7".into(),
+        status: "idle".into(),
+    }];
+
+    let cos = run(&mut fake).expect("up carries on");
+    assert_eq!(cos, Cos::Live);
+    assert!(fake.starts.is_empty(), "{:?}", fake.starts);
+    assert_eq!(fake.focused, vec!["p7".to_string()]);
 }
