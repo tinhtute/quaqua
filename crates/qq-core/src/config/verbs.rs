@@ -988,12 +988,11 @@ mod tests {
         rpc::call(socket, &req).unwrap().into_result()
     }
 
-    /// Issue #368: the owner writes config from a plain terminal, while an agent
-    /// that is a Peer still may not. The bypass belongs to the Principal (a peer
-    /// in no pane), never to the verb: the same call is judged again as soon as
-    /// a pane names its agent.
+    /// Owner decision 2026-11-25: no config write is reachable outside herdr, so
+    /// the Principal no longer skips the authority check — and a Peer agent is
+    /// still refused, as before.
     #[test]
-    fn the_principal_writes_config_and_a_peer_agent_still_may_not() {
+    fn a_config_write_is_refused_outside_panes_and_for_a_peer_agent() {
         let ws = TestWorkspace::new("config-principal");
         ws.seal_herdr();
         let herdr = Arc::new(FakeHerdr::new());
@@ -1012,10 +1011,10 @@ mod tests {
         )));
         let handle = d.spawn().unwrap();
 
-        config_call(&handle.socket, &["set", "timers.stall_sec", "90"])
-            .expect("the principal writes config");
+        let e = config_call(&handle.socket, &["set", "timers.stall_sec", "90"]).unwrap_err();
+        assert_eq!(e.code, "agent_only", "the principal writes nothing: {e:?}");
         let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
-        assert_eq!(got["out"], "90", "{got}");
+        assert_eq!(got["out"], Value::Null, "{got}");
 
         // The same pid, now in a pane whose agent is a Peer: the authority
         // check runs as it always has.
@@ -1030,17 +1029,18 @@ mod tests {
         assert_eq!(e.code, "refused", "{e:?}");
         assert!(e.message.contains("Peer"), "{e:?}");
         let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
-        assert_eq!(got["out"], "90", "a refused write changes nothing: {got}");
+        assert_eq!(got["out"], Value::Null, "a refused write changes nothing: {got}");
         handle.stop().unwrap();
     }
 
-    /// Review finding 3: the Principal's config subcommands, spelled out. A new
-    /// subcommand does not open to the Principal until it is added here.
+    /// Owner decision 2026-11-25: the Principal reads the config from a plain
+    /// terminal and nothing else. Spelled out, so a subcommand added later does
+    /// not open to it by accident.
     #[test]
     fn the_principal_may_run_exactly_these_config_subcommands() {
         assert_eq!(
-            PRINCIPAL_CONFIG,
-            ["diff", "export", "get", "import", "set", "validate"]
+            PRINCIPAL_CONFIG.as_slice(),
+            ["diff", "export", "get", "validate"]
         );
     }
 
@@ -1064,15 +1064,21 @@ mod tests {
         )));
         let handle = d.spawn().unwrap();
         for argv in [
+            &["set", "timers.stall_sec", "90"][..],
+            &["import", "/tmp/team.toml"][..],
             &["topology", "peer", "lead"][..],
             &["reset"][..],
-            &["kind.peer.can_review", "true"][..],
         ] {
             let e = config_call(&handle.socket, argv).unwrap_err();
             assert_eq!(e.code, "agent_only", "{argv:?}: {e:?}");
+            assert!(e.message.contains("herdr pane"), "{argv:?}: {e:?}");
         }
-        // A listed subcommand still runs.
-        config_call(&handle.socket, &["set", "timers.stall_sec", "90"]).expect("listed");
+        // The reads still run, before and after the refusals.
+        assert_eq!(
+            config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap()["out"],
+            Value::Null,
+            "nothing written"
+        );
         handle.stop().unwrap();
     }
 

@@ -406,50 +406,6 @@ mod tests {
         HerdrPeers::new(Arc::clone(herdr) as Arc<dyn HerdrClient>)
     }
 
-    /// A process tree a test controls: the pid's ancestry and its session.
-    struct Scripted {
-        parents: Vec<(i32, i32)>,
-        session: Option<i32>,
-    }
-
-    impl Scripted {
-        fn new(pid: i32, session: Option<i32>) -> Self {
-            Scripted {
-                parents: vec![(pid, 0)],
-                session,
-            }
-        }
-
-        fn in_session(session: i32) -> Self {
-            Scripted::new(4242, Some(session))
-        }
-    }
-
-    impl ProcScan for Scripted {
-        fn parent(&self, pid: i32) -> Option<i32> {
-            self.parents
-                .iter()
-                .find(|(child, _)| *child == pid)
-                .map(|(_, parent)| *parent)
-                .filter(|parent| *parent > 0)
-        }
-
-        fn session(&self, _: i32) -> Option<i32> {
-            self.session
-        }
-    }
-
-    fn scripted_resolver(herdr: &Arc<FakeHerdr>, scan: Scripted) -> HerdrPeers {
-        HerdrPeers::with_scan(Arc::clone(herdr) as Arc<dyn HerdrClient>, Arc::new(scan))
-    }
-
-    fn outside_every_pane() -> PeerCred {
-        PeerCred {
-            pid: 4242,
-            uid: own_uid(),
-        }
-    }
-
     /// A pane herdr knows, run by some other process tree, with an agent in it.
     fn pane_belonging_to_another_tree(herdr: &FakeHerdr) -> String {
         let pane = herdr.seed_pane("w", None, &[]);
@@ -502,61 +458,32 @@ mod tests {
         assert!(e.message.contains("hosts no known agent"), "{}", e.message);
     }
 
-    /// Review finding 1: a pane whose process info the daemon cannot read may be
-    /// the pane the peer is in, so it is a refusal — never the Principal, which
-    /// would carry config write and stop.
+    /// Owner decision 2026-11-25: outside herdr the Principal reads only, so a
+    /// pane herdr cannot describe is no longer a refusal — the peer is the
+    /// read-only Principal, and no write is at stake. This keeps a worker churn
+    /// that breaks one pane's process-info from blocking the owner's `ping`.
     #[test]
-    fn a_pane_whose_process_info_fails_never_makes_the_peer_the_principal() {
+    fn a_pane_whose_process_info_fails_leaves_the_peer_the_read_only_principal() {
         let herdr = Arc::new(FakeHerdr::new());
         let pane = herdr.seed_pane("w", None, &[]);
         herdr.set_pane_pids(&pane, std::process::id(), &[]);
         herdr.set_fault(Verb::PaneProcessInfo, io::ErrorKind::BrokenPipe);
-        let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
-        assert_eq!(e.code, UNMAPPED_PEER, "{e:?}");
-        assert!(e.message.contains("could not describe"), "{}", e.message);
+        let (who, mapped) = resolver(&herdr).resolve_pane(me()).expect("the principal");
+        assert_eq!(who.as_str(), PRINCIPAL);
+        assert_eq!(mapped, None);
     }
 
-    /// Review finding 1: the same hole from the other side — a pane entry with no
-    /// `pane_id` is skipped today, so its agent would fall through to the
-    /// Principal.
+    /// The same for a pane entry with no `pane_id`: undescribable, not the
+    /// peer's pane as far as the daemon can tell.
     #[test]
-    fn a_pane_entry_without_an_id_never_makes_the_peer_the_principal() {
+    fn a_pane_entry_without_an_id_leaves_the_peer_the_read_only_principal() {
         let herdr = Arc::new(FakeHerdr::new());
         herdr.set_reply(
             Verb::PaneList,
             Reply::ok(r#"{"result":{"panes":[{"tab_id":"t1"},{"tab_id":"t2"}]}}"#),
         );
-        let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
-        assert_eq!(e.code, UNMAPPED_PEER, "{e:?}");
-    }
-
-    /// Review finding 2: an orphan that keeps its pane shell's session (`(cmd &)`,
-    /// `nohup … & disown`, a double fork) reaches no pane by descent but is still
-    /// that pane's process: it speaks as the pane's agent, never as the Principal.
-    #[test]
-    fn a_peer_whose_session_a_pane_shell_leads_is_that_panes_agent() {
-        let herdr = Arc::new(FakeHerdr::new());
-        let pane = herdr.seed_pane("w", None, &[]);
-        herdr.agent_start("w-9", "claude", &pane, 0, &[]).unwrap();
-        herdr.set_pane_pids(&pane, 777, &[]);
-        let r = scripted_resolver(&herdr, Scripted::in_session(777));
-        let (who, mapped) = r
-            .resolve_pane(outside_every_pane())
-            .expect("the pane's agent");
-        assert_eq!(who.as_str(), "w-9");
-        assert_eq!(mapped.as_deref(), Some(pane.as_str()));
-    }
-
-    /// The same escape into a pane that hosts no agent: refused, not the
-    /// Principal, so an orphan of a human's shell gets no admin verbs.
-    #[test]
-    fn a_pane_shells_session_with_no_agent_is_refused_not_the_principal() {
-        let herdr = Arc::new(FakeHerdr::new());
-        let pane = herdr.seed_pane("h", Some("zsh"), &[]);
-        herdr.set_pane_pids(&pane, 777, &[]);
-        let r = scripted_resolver(&herdr, Scripted::in_session(777));
-        let e = r.resolve_pane(outside_every_pane()).unwrap_err();
-        assert_eq!(e.code, UNMAPPED_PEER, "{e:?}");
-        assert!(e.message.contains("hosts no known agent"), "{}", e.message);
+        let (who, mapped) = resolver(&herdr).resolve_pane(me()).expect("the principal");
+        assert_eq!(who.as_str(), PRINCIPAL);
+        assert_eq!(mapped, None);
     }
 }

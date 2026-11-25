@@ -155,11 +155,12 @@ fn herdr_failure_fails_closed() {
     stop(r);
 }
 
-/// Review finding 1, end to end: a pane the daemon cannot describe may be the
-/// pane the peer is in, so it is a refusal — the worker in it gets neither
-/// `config` (a write, unchecked for the Principal) nor `stop`.
+/// Owner decision 2026-11-25: outside herdr the Principal reads only, so a pane
+/// herdr cannot describe is no longer a refusal — it may not be the peer's pane,
+/// and the worst it can hide is a reader. A worker churn that makes a pane
+/// undescribable must not stop the launcher's `ping` from answering.
 #[test]
-fn a_pane_process_info_failure_refuses_config_and_stop() {
+fn an_undescribable_other_pane_does_not_block_the_read_only_principal() {
     let r = rig("peer-procinfo-fault");
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
@@ -168,12 +169,14 @@ fn a_pane_process_info_failure_refuses_config_and_stop() {
         qq_core::herdr::Verb::PaneProcessInfo,
         std::io::ErrorKind::BrokenPipe,
     );
-    for v in ["config", "stop"] {
-        assert_eq!(call(&r, v, None).unwrap_err().code, "unmapped_peer", "{v}");
-    }
-    // The refused stop left the daemon up, and a describable herdr still maps.
-    r.herdr.clear(qq_core::herdr::Verb::PaneProcessInfo);
+    // The peer is in no pane; the one pane is undescribable.
     assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
+    assert!(call(&r, "status", None).is_ok(), "status");
+    // The writes stay closed to it, and the message says where to run them.
+    let e = call(&r, "stop", None).unwrap_err();
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(e.message.contains("herdr pane"), "{}", e.message);
+    r.herdr.clear(qq_core::herdr::Verb::PaneProcessInfo);
     stop(r);
 }
 
@@ -189,30 +192,55 @@ fn call(r: &Rig, verb: &str, claim: Option<&str>) -> Result<Value, rpc::RpcError
     rpc::call(&r.daemon.socket, &req).unwrap().into_result()
 }
 
-/// Issue #368: the owner runs the farm from a plain terminal, so a peer in no
-/// pane is the Principal and the lifecycle and read-only verbs answer it. The
-/// identity probe still names no agent, and a mapped peer still wins.
+/// Issue #368, as narrowed by the owner on 2026-11-25: a peer in no pane is the
+/// read-only Principal. It may look at the farm but not stop or change it —
+/// those run from a herdr pane. The identity probe still names no agent, and a
+/// mapped peer still wins.
 #[test]
-fn the_principal_outside_a_pane_may_ping_status_roster_and_config() {
+fn the_read_only_principal_may_ping_status_and_roster_but_not_stop() {
     let r = rig("peer-human");
     unmapped(&r);
     // A claim of another caller's name decides nothing: the gate names the peer.
     assert_eq!(call(&r, "ping", Some("cos")).unwrap()["pong"], true);
     assert!(call(&r, "status", None).is_ok(), "status");
-    assert_eq!(call(&r, "config", None).unwrap()["ran"], true);
     assert_eq!(call(&r, "roster", None).unwrap()["ran"], true);
     // Its handler is the one that refuses a caller it cannot name as an agent.
     assert_eq!(
         call(&r, "caller.lookup", None).unwrap_err().code,
         "unmapped_peer"
     );
-    // A mapped peer still reaches the same daemon.
+    let e = call(&r, "stop", None).unwrap_err();
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(e.message.contains("herdr pane"), "{}", e.message);
+    // A mapped peer still reaches the same daemon, stop included.
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-3", "claude", &pane, 0, &[]).unwrap();
     r.herdr.set_pane_pids(&pane, me(), &[]);
     assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
-    // The owner stops the farm from the same terminal.
     assert_eq!(call(&r, "stop", None).unwrap()["stopping"], true);
+    r.daemon.stop().unwrap();
+}
+
+/// The same through the CLI, which is how the launcher and the owner call it: a
+/// write from a plain terminal exits 77 with a message naming the herdr pane.
+#[test]
+fn quaqua_stop_from_a_plain_terminal_is_refused_with_the_pane_message() {
+    let r = rig("peer-cli-stop");
+    unmapped(&r);
+    let runs = r._ws.runs_dir();
+    let refused = qq(&runs, &["stop"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(qq_core::cli::EXIT_REFUSED),
+        "{refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("herdr pane"),
+        "{refused:?}"
+    );
+    // The refused stop left the farm up, and ping still answers with 0.
+    let up = qq(&runs, &["ping"]);
+    assert_eq!(up.status.code(), Some(0), "{up:?}");
     r.daemon.stop().unwrap();
 }
 

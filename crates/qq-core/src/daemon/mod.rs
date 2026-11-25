@@ -888,19 +888,23 @@ mod peer_tests {
             "watch.agent",
             "watch.report",
             "workflow.start",
+            "stop",
         ] {
             let e = run(v, Ok(PRINCIPAL), 1000).unwrap_err();
             assert_eq!(e.code, AGENT_ONLY, "{v}");
+            if v == "stop" {
+                assert!(e.message.contains("herdr pane"), "{}", e.message);
+            }
         }
     }
 
-    /// The verbs the Principal needs from its own terminal: the launcher asks
-    /// `ping` before it starts a daemon, and the owner stops and configures the
-    /// farm from there. None of them names an agent, so the gate names it the
-    /// Principal and no agent verb comes with it.
+    /// Owner decision 2026-11-25: outside herdr the Principal reads only. The
+    /// launcher asks `ping` before it starts a daemon and the owner may look at
+    /// the farm; nothing that changes it is reachable from a plain terminal, so
+    /// an agent that escapes its pane gains nothing it could not already do.
     #[test]
-    fn the_principal_outside_a_pane_may_ping_status_stop_and_write_config() {
-        for v in ["ping", "status", "stop", "config", "roster", caller::VERB] {
+    fn the_read_only_principal_may_ping_status_roster_and_lookup() {
+        for v in ["ping", "status", "roster", caller::VERB] {
             let req = run(v, Ok(PRINCIPAL), 1000).unwrap_or_else(|e| panic!("{v}: {e:?}"));
             assert!(is_principal(&req), "{v} is not marked the principal");
             assert_eq!(req.caller.as_deref(), Some(PRINCIPAL), "{v}");
@@ -908,6 +912,18 @@ mod peer_tests {
             // Its name is not an agent's: the gate still names nobody.
             assert_eq!(caller::identified(&req), None, "{v}");
         }
+    }
+
+    /// The writes stay pane-only, and the refusal says where to run them.
+    #[test]
+    fn the_read_only_principal_may_not_stop_the_daemon() {
+        let e = run("stop", Ok(PRINCIPAL), 1000).unwrap_err();
+        assert_eq!(e.code, AGENT_ONLY, "{e:?}");
+        assert!(e.message.contains("herdr pane"), "{}", e.message);
+        // The `config` verb itself is open: its subcommands decide, in the
+        // handler, and it carries no agent name either way.
+        let req = run("config", Ok(PRINCIPAL), 1000).expect("config reaches its handler");
+        assert!(is_principal(&req));
     }
 
     /// Review finding 4: the name alone is not the Principal. Only the gate sets
