@@ -1030,3 +1030,182 @@ fn config_import_refuses_to_reset_values_the_file_omits() {
     assert_eq!(run(&["config", "import", toml, "extra.toml"]), 1);
     daemon.stop().unwrap();
 }
+
+// ---- R2: the CoS launch keys, `[roles.cos]` harness / model / effort ----------
+
+/// Q5: the shipped template seeds the CoS launch, and the reader hands back the
+/// argv the claude driver itself builds (no second mapping in the reader).
+#[test]
+fn roles_cos_launch_seeded_from_the_shipped_template() {
+    let ws = TestWorkspace::new("cfg-cos-template");
+    let mut conn = open(&ws);
+    assert_eq!(
+        config::seed(&mut conn, config::ENGINE_DEFAULT).unwrap(),
+        Seeded::Fresh
+    );
+
+    let l = config::cos_launch(&conn).expect("the template seeds roles.cos");
+    assert_eq!(l.harness, "claude");
+    assert_eq!(l.model, "opus-5.5");
+    assert_eq!(l.effort, "low");
+    assert_eq!(l.herdr_kind, "claude");
+    assert_eq!(
+        l.argv,
+        ["claude", "--model", "claude-opus-5-5", "--effort", "low"]
+    );
+    assert_eq!(l.agent_args(), &l.argv[1..]);
+}
+
+/// The two verbs lane C's caller uses: `config get roles.cos.<key>` shows the
+/// value, `config set roles.cos.<key> <v>` changes what the reader returns.
+#[test]
+fn roles_cos_launch_through_config_get_and_set() {
+    let ws = seeded("cfg-cos-verbs");
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "roles.cos.model"])).unwrap(),
+        "opus-5.5"
+    );
+    assert_eq!(run(&["config", "set", "roles.cos.model", "sonnet-5.5"]), 0);
+    assert_eq!(run(&["config", "set", "roles.cos.effort", "high"]), 0);
+    assert_eq!(
+        config::config_cmd(&env, &strs(&["get", "roles.cos.model"])).unwrap(),
+        "sonnet-5.5"
+    );
+    let l = config::cos_launch(&open(&ws)).unwrap();
+    assert_eq!(
+        (l.model.as_str(), l.effort.as_str()),
+        ("sonnet-5.5", "high")
+    );
+    assert_eq!(
+        l.argv,
+        ["claude", "--model", "claude-sonnet-5-5", "--effort", "high"]
+    );
+
+    // The keys choose the harness too, and the argv follows the driver.
+    assert_eq!(run(&["config", "set", "roles.cos.harness", "pi"]), 0);
+    let l = config::cos_launch(&open(&ws)).unwrap();
+    assert_eq!((l.harness.as_str(), l.herdr_kind.as_str()), ("pi", "pi"));
+
+    // They are cos keys only: another role still refuses them.
+    assert_eq!(run(&["config", "set", "roles.lead.model", "opus-5.5"]), 1);
+    daemon.stop().unwrap();
+}
+
+/// A missing key is an error naming every missing key, its exact `config set`
+/// command and the pane-only rule (R2, #368) — never a fallback value.
+#[test]
+fn roles_cos_launch_missing_keys_name_the_set_commands() {
+    let ws = seeded("cfg-cos-missing");
+    let conn = open(&ws);
+
+    conn.execute("DELETE FROM setting WHERE key = 'roles.cos.effort'", [])
+        .unwrap();
+    let e = config::cos_launch(&conn).unwrap_err().to_string();
+    assert!(e.contains("roles.cos.effort"), "{e}");
+    assert!(
+        e.contains("quaqua config set roles.cos.effort <effort>"),
+        "{e}"
+    );
+    assert!(e.contains("herdr pane"), "{e}");
+    assert!(!e.contains("roles.cos.model"), "only the missing key: {e}");
+
+    conn.execute("DELETE FROM setting WHERE key LIKE 'roles.cos.%'", [])
+        .unwrap();
+    let e = config::cos_launch(&conn).unwrap_err().to_string();
+    for k in ["harness", "model", "effort"] {
+        assert!(e.contains(&format!("roles.cos.{k}")), "{e}");
+        assert!(
+            e.contains(&format!("quaqua config set roles.cos.{k} <{k}>")),
+            "{e}"
+        );
+    }
+    assert!(
+        !e.contains("opus-5.5") && !e.contains("claude-opus"),
+        "no value may be invented: {e}"
+    );
+}
+
+/// An unknown harness in `[roles.cos]` is refused by `config validate`, by a
+/// seed and by the reader — the same check a kind's harness gets.
+#[test]
+fn roles_cos_launch_validate_rejects_an_unknown_harness() {
+    let anchor = "harness = \"claude\"\nmodel = \"opus-5.5\"\neffort = \"low\"\ncan_spawn";
+    let bad = template().replace(anchor, &anchor.replace("\"claude\"", "\"nope\""));
+    assert_ne!(bad, template(), "the fixture seeds roles.cos.harness");
+
+    // A fresh database refuses the file and writes nothing. One workspace per
+    // test (it holds the env lock), so the empty db is a second file here.
+    let ws = seeded("cfg-cos-badharness");
+    let mut conn = db::open(&ws.runs_dir().join("fresh.db")).expect("open fresh db");
+    match config::seed(&mut conn, &bad) {
+        Err(ConfigError::UnknownHarness { kind, harness }) => {
+            assert_eq!(kind, "roles.cos.harness");
+            assert_eq!(harness, "nope");
+        }
+        other => panic!("expected UnknownHarness, got {other:?}"),
+    }
+    assert_eq!(count(&conn, "setting"), 0);
+
+    // `config validate <file>` refuses it on the seeded workspace.
+    let env = Env {
+        runs_dir: ws.runs_dir(),
+    };
+    let (registry, daemon) = start(&ws);
+    let run = |a: &[&str]| registry.dispatch(&env, &strs(a));
+    let path = ws.team_toml().with_file_name("bad-team.toml");
+    std::fs::write(&path, &bad).unwrap();
+    let p = path.to_str().unwrap();
+    assert_eq!(run(&["config", "validate", p]), 1);
+    let e = config::config_cmd(&env, &strs(&["validate", p])).unwrap_err();
+    assert!(e.message.contains("roles.cos.harness"), "{}", e.message);
+    assert!(e.message.contains("nope"), "{}", e.message);
+
+    // A stored unknown harness is refused by `config validate` and by the
+    // reader: `up` must fail rather than start another harness.
+    assert_eq!(
+        run(&["config", "set", "roles.cos.harness", "nope"]),
+        0,
+        "a write is allowed; validate is the gate"
+    );
+    assert_eq!(run(&["config", "validate"]), 1);
+    assert!(matches!(
+        config::cos_launch(&open(&ws)),
+        Err(ConfigError::UnknownHarness { .. })
+    ));
+    daemon.stop().unwrap();
+}
+
+/// The new keys are settings like any other: `export` carries them, a re-seed
+/// from the export reads the same launch, and `diff` against the file is clean.
+#[test]
+fn roles_cos_launch_export_diff_roundtrip() {
+    let ws = seeded("cfg-cos-export");
+    let conn = open(&ws);
+    let exported = config::export_toml(&conn).unwrap();
+    assert!(exported.contains("[roles.cos]"), "{exported}");
+
+    let mut copy = db::open(&ws.runs_dir().join("cos-copy.db")).expect("open copy");
+    assert_eq!(config::seed(&mut copy, &exported).unwrap(), Seeded::Fresh);
+    for (k, v) in [
+        ("harness", "claude"),
+        ("model", "opus-5.5"),
+        ("effort", "low"),
+    ] {
+        assert_eq!(
+            config::setting(&copy, &format!("roles.cos.{k}")).unwrap(),
+            Some(serde_json::json!(v)),
+            "roles.cos.{k} survives the export"
+        );
+    }
+    assert_eq!(
+        config::cos_launch(&copy).unwrap(),
+        config::cos_launch(&conn).unwrap()
+    );
+    assert_eq!(config::diff(&conn, &template()).unwrap(), "no differences");
+}
