@@ -76,6 +76,8 @@ const SETTING_SECTIONS: &[&str] = &[
     "notify",
     // `ui.cos_label`: the label the CoS pane reports to herdr (see [`cos_label`]).
     "ui",
+    // `daemon.launchd_label`, `daemon.launchd_dir`: the macOS agent (see [`launchd_config`]).
+    "daemon",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1220,6 +1222,39 @@ pub fn cos_label_in(runs_dir: &Path) -> String {
     cos_label(&conn)
 }
 
+/// The raw `daemon.launchd_label` and `daemon.launchd_dir` settings. Unvalidated:
+/// `Service::resolve` has home, so it applies the defaults and the rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchdConfig {
+    pub label: Option<String>,
+    pub dir: Option<String>,
+}
+
+/// `daemon.launchd_label` and `daemon.launchd_dir` as stored; a non-string is unset.
+pub fn launchd_config(conn: &Connection) -> LaunchdConfig {
+    let get = |k: &str| {
+        setting(conn, k)
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_str().map(str::to_string))
+    };
+    LaunchdConfig {
+        label: get("daemon.launchd_label"),
+        dir: get("daemon.launchd_dir"),
+    }
+}
+
+/// [`launchd_config`] for the workspace whose runs directory is `runs_dir`. A
+/// missing or unreadable database is the default (same read-only open as
+/// [`cos_label_in`]).
+pub fn launchd_config_in(runs_dir: &Path) -> LaunchdConfig {
+    let db = runs_dir.join(crate::db::path::DB_FILE);
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return LaunchdConfig::default();
+    };
+    launchd_config(&conn)
+}
+
 /// How long `quaqua up` gives a daemon start before it gives up: the setting
 /// `notify.daemon_start_sec`, else [`DAEMON_START_SEC`]. Well under the 600 s stall
 /// default: a start that has not answered in 90 s is a broken unit, not a slow one.
@@ -1275,4 +1310,55 @@ pub fn topology(conn: &Connection) -> Result<Vec<Edge>, ConfigError> {
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::db::migrate::migrate(&mut c).unwrap();
+        c
+    }
+
+    #[test]
+    fn launchd_config_reads_the_daemon_section() {
+        let c = db();
+        // no keys: raw None, the defaults are Service::resolve's
+        assert_eq!(launchd_config(&c), LaunchdConfig::default());
+        c.execute(
+            "INSERT INTO setting (key, value_json) VALUES
+             ('daemon.launchd_label', '\"com.x.y\"'),
+             ('daemon.launchd_dir', '\"/opt/agents\"')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            launchd_config(&c),
+            LaunchdConfig {
+                label: Some("com.x.y".into()),
+                dir: Some("/opt/agents".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn launchd_config_in_without_a_db_is_default() {
+        let dir = std::env::temp_dir().join(format!("qq-launchd-nodb-{}", std::process::id()));
+        assert_eq!(launchd_config_in(&dir), LaunchdConfig::default());
+    }
+
+    #[test]
+    fn shipped_team_toml_seeds_the_daemon_section() {
+        let mut c = db();
+        seed(&mut c, include_str!("../../templates/workspace/team.toml")).unwrap();
+        assert_eq!(
+            launchd_config(&c),
+            LaunchdConfig {
+                label: Some("com.quaqua.daemon".into()),
+                dir: Some("~/Library/LaunchAgents".into()),
+            }
+        );
+    }
 }
