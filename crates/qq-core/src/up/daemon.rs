@@ -50,9 +50,8 @@ pub enum Answer {
 }
 
 /// How long the unit gets to answer and how often to look. Both come from config: the
-/// deadline is `notify.stall_sec` through [`crate::config::stall_sec`] (the farm's one
-/// "no progress, give up" knob), the cadence is the daemon's own report poll. See
-/// [`wait_budget`] for the key this would really want.
+/// deadline is `notify.daemon_start_sec` through [`crate::config::daemon_start_sec`], the
+/// cadence is the daemon's own report poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wait {
     pub deadline: Duration,
@@ -148,7 +147,7 @@ pub fn ensure_answers(host: &mut dyn DaemonHost) -> Result<Ready, CliError> {
     })?;
     let wait = host.wait();
     host.line(&format!(
-        "quaqua up: started {UNIT_NAME}; waiting up to {}s for it to answer (notify.stall_sec)",
+        "quaqua up: started {UNIT_NAME}; waiting up to {}s for it to answer (notify.daemon_start_sec)",
         wait.deadline.as_secs()
     ));
     wait_until_up(host, wait)
@@ -210,13 +209,12 @@ fn wait_until_up(host: &mut dyn DaemonHost, wait: Wait) -> Result<Ready, CliErro
     }
 }
 
-/// The wait budget: the deadline is the farm's stall limit (`notify.stall_sec`, read by
-/// [`crate::config::stall_sec`], env `QQ_STALL_SEC`, else its own default), the cadence
-/// is the daemon's report poll. No dedicated key exists for "how long a daemon start may
-/// take" and this module adds none; `notify.daemon_start_sec` is the key it would want.
+/// The wait budget: the deadline is `notify.daemon_start_sec` (read by
+/// [`crate::config::daemon_start_sec`], default [`crate::config::DAEMON_START_SEC`], well
+/// under the 600 s stall), the cadence is the daemon's own report poll.
 pub fn wait_budget(conn: &rusqlite::Connection) -> Wait {
     Wait {
-        deadline: crate::config::stall_sec(conn),
+        deadline: crate::config::daemon_start_sec(conn),
         poll: crate::daemon::watch::REPORT_POLL,
     }
 }
@@ -328,7 +326,7 @@ impl DaemonHost for SystemdHost {
         crate::db::open(&path).map_or_else(
             // No store to read: the stall default `config::stall_sec` itself falls back to.
             |_| Wait {
-                deadline: Duration::from_secs(crate::task::prompt::STALL_SEC),
+                deadline: Duration::from_secs(crate::config::DAEMON_START_SEC),
                 poll: crate::daemon::watch::REPORT_POLL,
             },
             |c| wait_budget(&c),
@@ -629,17 +627,24 @@ mod tests {
     }
 
     #[test]
-    fn up_daemon_wait_budget_is_the_stall_reader_and_the_report_poll() {
+    fn up_daemon_wait_budget_is_the_daemon_start_reader_and_the_report_poll() {
         let mut c = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::migrate::migrate(&mut c).unwrap();
+        let w = wait_budget(&c);
+        assert_eq!(w.poll, crate::daemon::watch::REPORT_POLL);
+        // no key: the module's own default, well under the 600 s stall
+        assert_eq!(
+            w.deadline,
+            Duration::from_secs(crate::config::DAEMON_START_SEC)
+        );
         c.execute(
-            "INSERT INTO setting (key, value_json) VALUES ('notify.stall_sec', '42')",
+            "INSERT INTO setting (key, value_json) VALUES ('notify.daemon_start_sec', '42')",
             [],
         )
         .unwrap();
+        // the deadline is whatever the start reader says, never a number of its own
         let w = wait_budget(&c);
-        assert_eq!(w.poll, crate::daemon::watch::REPORT_POLL);
-        // the deadline is whatever the stall reader says, never a number of its own
-        assert_eq!(w.deadline, crate::config::stall_sec(&c));
+        assert_eq!(w.deadline, crate::config::daemon_start_sec(&c));
+        assert_eq!(w.deadline, Duration::from_secs(42));
     }
 }

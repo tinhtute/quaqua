@@ -246,7 +246,7 @@ pub fn session_retag(
 }
 
 /// The CoS identity `runs/cos.identity.json` records: `(agent_session, pane_id)`.
-fn load_cos_identity(runs_dir: &Path) -> Option<(String, String)> {
+pub fn load_cos_identity(runs_dir: &Path) -> Option<(String, String)> {
     let v: Value =
         serde_json::from_str(&std::fs::read_to_string(runs_dir.join(COS_IDENTITY_FILE)).ok()?)
             .ok()?;

@@ -70,6 +70,9 @@ const SETTING_SECTIONS: &[&str] = &[
     "grid",
     "opencode_models",
     "projects",
+    // `notify.daemon_start_sec`: how long `quaqua up` gives a daemon start (see
+    // [`daemon_start_sec`]); `notify.stall_sec` was already read from the store.
+    "notify",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1185,6 +1188,24 @@ pub fn setting(conn: &Connection, key: &str) -> Result<Option<serde_json::Value>
         .optional()?;
     raw.map(|s| serde_json::from_str(&s).map_err(|e| ConfigError::Invalid(e.to_string())))
         .transpose()
+}
+
+/// How long `quaqua up` gives a daemon start before it gives up: the setting
+/// `notify.daemon_start_sec`, else [`DAEMON_START_SEC`]. Well under the 600 s stall
+/// default: a start that has not answered in 90 s is a broken unit, not a slow one.
+pub const DAEMON_START_SEC: u64 = 90;
+
+/// `notify.daemon_start_sec`, else [`DAEMON_START_SEC`]. A value that is not a finite
+/// number >= 0 falls back to the default; never 0 (a zero budget would never wait).
+pub fn daemon_start_sec(conn: &Connection) -> std::time::Duration {
+    let default = std::time::Duration::from_secs(DAEMON_START_SEC);
+    setting(conn, "notify.daemon_start_sec")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
+        .unwrap_or(default)
 }
 
 /// How long a worker may go without a change before it is stalled: `QQ_STALL_SEC`,

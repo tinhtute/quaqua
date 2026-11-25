@@ -96,6 +96,13 @@ pub trait HarnessDriver: Send + Sync {
     /// Args after herdr's `--` for a roster `model` and optional `effort`.
     fn launch_args(&self, model: &str, effort: Option<&str>) -> Vec<String>;
 
+    /// The args that resume the session herdr reported in `agent_session` (`quaqua up`
+    /// R3), appended to [`Self::launch_args`]. `None`: this harness has no verified
+    /// resume flag, and no caller may append a guessed one.
+    fn resume_args(&self, _session: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// How this driver's agent was declared in config.
     fn driver(&self) -> Driver {
         Driver::Native

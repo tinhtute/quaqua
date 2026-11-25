@@ -84,7 +84,11 @@ impl FakeUp {
 }
 
 impl UpHost for FakeUp {
-    fn inside_herdr(&mut self) -> bool {
+    fn name(&self) -> String {
+        qq_core::identity::farm_of(&self.root)
+    }
+
+    fn inside_herdr(&self) -> bool {
         self.inside
     }
 
@@ -101,10 +105,13 @@ impl UpHost for FakeUp {
 
     fn launch(&mut self) -> Result<CosLaunch, CliError> {
         self.log.push("launch".into());
-        self.launch.clone()
+        match &self.launch {
+            Ok(l) => Ok(l.clone()),
+            Err(e) => Err(CliError::new(e.code, e.message.clone())),
+        }
     }
 
-    fn workspace_root(&mut self) -> PathBuf {
+    fn workspace_root(&self) -> PathBuf {
         self.root.clone()
     }
 
@@ -144,10 +151,12 @@ impl UpHost for FakeUp {
         self.log.push(format!("start_agent:{name}:{pane}"));
         if self.fail_starts > 0 {
             self.fail_starts -= 1;
-            self.starts.push(format!("{kind}|{pane}|{}", args.join(" ")));
+            self.starts
+                .push(format!("{kind}|{pane}|{}", args.join(" ")));
             return Err("agent_not_ready".into());
         }
-        self.starts.push(format!("{kind}|{pane}|{}", args.join(" ")));
+        self.starts
+            .push(format!("{kind}|{pane}|{}", args.join(" ")));
         Ok(())
     }
 
@@ -286,7 +295,11 @@ fn up_starts_the_session_then_launches_the_cos_from_the_config_keys() {
         vec!["claude|p-new|--model claude-opus-5-5 --effort low".to_string()]
     );
     assert_eq!(fake.focused, 1);
-    assert!(fake.lines.iter().any(|l| l.contains(&label)), "{:?}", fake.lines);
+    assert!(
+        fake.lines.iter().any(|l| l.contains(&label)),
+        "{:?}",
+        fake.lines
+    );
 }
 
 /// A live CoS is found, not started again; a created workspace is never resumed.
@@ -469,11 +482,7 @@ fn up_wait_budget_reads_notify_daemon_start_sec() {
     let mut conn = db::open(&ws.db_path()).unwrap();
     config::seed(&mut conn, &template()).unwrap();
     let w = up::daemon::wait_budget(&conn);
-    assert!(
-        w.deadline < Duration::from_secs(600),
-        "{:?}",
-        w.deadline
-    );
+    assert!(w.deadline < Duration::from_secs(600), "{:?}", w.deadline);
     assert_eq!(w.deadline, Duration::from_secs(config::DAEMON_START_SEC));
 
     conn.execute(
@@ -494,13 +503,17 @@ fn up_wait_budget_reads_notify_daemon_start_sec() {
 fn up_daemon_start_sec_is_parsed_from_team_toml() {
     let ws = TestWorkspace::new("up-budget-file");
     let mut conn: Connection = db::open(&ws.db_path()).unwrap();
-    let text = format!("{}[notify]\ndaemon_start_sec = 7\n", template());
+    let text = template().replace("daemon_start_sec = 90", "daemon_start_sec = 7");
     config::seed(&mut conn, &text).expect("a [notify] section is a known section");
     assert_eq!(
         up::daemon::wait_budget(&conn).deadline,
         Duration::from_secs(7)
     );
-    let _ = (Env {
-        runs_dir: ws.runs_dir(),
-    }, Ready::Answers, Arc::new(()));
+    let _ = (
+        Env {
+            runs_dir: ws.runs_dir(),
+        },
+        Ready::Answers,
+        Arc::new(()),
+    );
 }
