@@ -709,7 +709,7 @@ fn identify(
         return Err(RpcError::new(
             peer::AGENT_ONLY,
             format!(
-                "verb '{}' needs an agent: caller pid {} is in no herdr pane, so it speaks as the Principal '{}'",
+                "verb '{}' must be run from a herdr pane: caller pid {} is in no pane, so it speaks as the read-only Principal '{}'",
                 req.verb,
                 cred.pid,
                 peer::PRINCIPAL
@@ -722,21 +722,28 @@ fn identify(
     Ok(req)
 }
 
-/// Verbs a caller in no herdr pane may run: the Principal owns the farm and
-/// must see it, stop it and write the config tables from a plain terminal. The
-/// list is an allowlist, so a verb added later is closed to the Principal until
-/// someone decides otherwise; none of these names an agent. `caller.lookup` is
-/// here because its handler is the one that refuses a caller it cannot name as
-/// an agent: the Principal reaches it and gets the same `unmapped_peer` answer
-/// the hook gate has always read.
-const PRINCIPAL_VERBS: [&str; 6] = ["ping", "status", "stop", "config", "roster", caller::VERB];
+/// Verbs a caller in no herdr pane may run: **reads only** (owner decision
+/// 2026-11-25). Outside herdr the Principal may look at the farm — the launcher
+/// asks `ping` before it starts a daemon — but nothing that changes it, so an
+/// agent that escapes its pane (`&`, `nohup`, `setsid`, `systemd-run`, a
+/// connector that exited) cannot stop the daemon or write config even when it is
+/// named the Principal. The list is an allowlist, so a verb added later is
+/// closed until someone decides otherwise; none of these names an agent.
+/// `config` is open only because its handler allows the four read subcommands
+/// (`config::verbs::PRINCIPAL_CONFIG`). `caller.lookup` is here because its
+/// handler is the one that refuses a caller it cannot name as an agent: the
+/// Principal reaches it and gets the `unmapped_peer` answer the hook gate has
+/// always read.
+const PRINCIPAL_VERBS: [&str; 5] = ["ping", "status", "roster", "config", caller::VERB];
 
 /// True when the daemon's peer gate named this request's caller as the
 /// Principal: a same-uid peer that reaches no herdr pane. Only the gate sets it
 /// ([`Request::caller_principal`] is never read off the wire), so a client's
 /// `caller` claim cannot reach it and a pane-hosted agent named `owner` is never
 /// it either. A daemon with no resolver ([`Daemon::require_peer`]) names nobody,
-/// so nothing there is the Principal and every claim keeps the ordinary check.
+/// so nothing there is the Principal. It grants reads and nothing else: the
+/// config handler uses it to narrow the subcommands, and no code path lets it
+/// past an authority check.
 pub fn is_principal(req: &Request) -> bool {
     req.caller_principal
 }

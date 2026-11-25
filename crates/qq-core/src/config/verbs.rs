@@ -39,13 +39,12 @@ fn install(registry: &mut Registry, daemon: &mut Daemon) -> Result<(), String> {
     )
 }
 
-/// The config subcommands the Principal may run, sorted. An allowlist like the
-/// daemon's verb one: a subcommand added later is closed to the Principal until
-/// someone adds it here on purpose, so a future write that touches authority
-/// does not open to the owner's terminal by accident. These are the subcommands
-/// `config_cmd` accepts: read the config, write a key or a kind, or take a
-/// `team.toml` file in and out.
-pub const PRINCIPAL_CONFIG: [&str; 6] = ["diff", "export", "get", "import", "set", "validate"];
+/// The config subcommands the Principal may run, sorted: **reads only** (owner
+/// decision 2026-11-25). Outside herdr the Principal may look at the config, and
+/// every write — `set`, `import`, and any write added later — stays pane-only, so
+/// an agent that escapes its pane cannot rewrite the topology. An allowlist, so a
+/// subcommand added later is closed here until someone adds it on purpose.
+pub const PRINCIPAL_CONFIG: [&str; 4] = ["diff", "export", "get", "validate"];
 
 /// The third argument is the profile the caller's `QUAQUA_PROFILE` named.
 type Exec = fn(&mut Connection, &[String], Option<&str>) -> Result<String, CliError>;
@@ -66,45 +65,39 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
         .unwrap_or_default();
     let mut conn = crate::db::open(&ctx.runs_dir.join(DB_FILE))
         .map_err(|e| RpcError::new("internal", e.to_string()))?;
-    if guarded
-        && !matches!(
-            argv.first().map(String::as_str),
-            Some("get" | "validate" | "export" | "diff")
-        )
-    {
-        // The Principal owns the farm and has no agent row, so the topology has
-        // no edge to check: the peer gate named it, and it reaches this handler
-        // only through the verbs open to it (issue #368).
-        if !crate::daemon::is_principal(req) {
-            let Some(caller) = req.caller.as_deref() else {
-                return Err(RpcError::new(
-                    "refused",
-                    "a config write needs an identified caller",
-                ));
-            };
-            let d = crate::authority::check_orchestration(
-                &conn,
-                caller,
-                crate::authority::Op::ConfigWrite,
-                crate::authority::Fence::Fenced,
-            )
-            .map_err(|e| RpcError::new("internal", e.0))?;
-            if let crate::authority::Decision::Refused(r) = d {
-                return Err(RpcError::new(
-                    "refused",
-                    format!("{} -> {}: {}", r.caller, r.target, r.reason),
-                ));
-            }
-        }
+    let sub = argv.first().map(String::as_str).unwrap_or_default();
+    // The Principal's allowlist, checked before anything else: outside herdr it
+    // reads the config and never writes it (owner decision 2026-11-25).
+    if crate::daemon::is_principal(req) && !PRINCIPAL_CONFIG.contains(&sub) {
+        return Err(RpcError::new(
+            crate::identity::peer::AGENT_ONLY,
+            format!(
+                "config {sub} must be run from a herdr pane: outside one the Principal \
+                 reads the config only ({PRINCIPAL_CONFIG:?})"
+            ),
+        ));
     }
-    // The Principal's own allowlist, checked for every subcommand, read or
-    // write: a name nobody decided on never runs for it.
-    if crate::daemon::is_principal(req) {
-        let sub = argv.first().map(String::as_str).unwrap_or_default();
-        if !PRINCIPAL_CONFIG.contains(&sub) {
+    if guarded && !matches!(sub, "get" | "validate" | "export" | "diff") {
+        // Every write, whoever asks: no caller skips the topology check, so a
+        // pane-less process that was named the Principal is refused here as the
+        // non-agent it is.
+        let Some(caller) = req.caller.as_deref() else {
             return Err(RpcError::new(
-                crate::identity::peer::AGENT_ONLY,
-                format!("config '{sub}' is agent-only: the Principal may run {PRINCIPAL_CONFIG:?}"),
+                "refused",
+                "a config write needs an identified caller",
+            ));
+        };
+        let d = crate::authority::check_orchestration(
+            &conn,
+            caller,
+            crate::authority::Op::ConfigWrite,
+            crate::authority::Fence::Fenced,
+        )
+        .map_err(|e| RpcError::new("internal", e.0))?;
+        if let crate::authority::Decision::Refused(r) = d {
+            return Err(RpcError::new(
+                "refused",
+                format!("{} -> {}: {}", r.caller, r.target, r.reason),
             ));
         }
     }
@@ -1013,8 +1006,7 @@ mod tests {
 
         let e = config_call(&handle.socket, &["set", "timers.stall_sec", "90"]).unwrap_err();
         assert_eq!(e.code, "agent_only", "the principal writes nothing: {e:?}");
-        let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
-        assert_eq!(got["out"], Value::Null, "{got}");
+        assert!(e.message.contains("herdr pane"), "{e:?}");
 
         // The same pid, now in a pane whose agent is a Peer: the authority
         // check runs as it always has.
@@ -1028,57 +1020,24 @@ mod tests {
         let e = config_call(&handle.socket, &["set", "timers.stall_sec", "60"]).unwrap_err();
         assert_eq!(e.code, "refused", "{e:?}");
         assert!(e.message.contains("Peer"), "{e:?}");
-        let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
-        assert_eq!(got["out"], Value::Null, "a refused write changes nothing: {got}");
-        handle.stop().unwrap();
-    }
 
-    /// Owner decision 2026-11-25: the Principal reads the config from a plain
-    /// terminal and nothing else. Spelled out, so a subcommand added later does
-    /// not open to it by accident.
-    #[test]
-    fn the_principal_may_run_exactly_these_config_subcommands() {
-        assert_eq!(
-            PRINCIPAL_CONFIG.as_slice(),
-            ["diff", "export", "get", "validate"]
-        );
-    }
-
-    /// The same list at the door: a name off it is refused before `exec`, so a
-    /// subcommand nobody decided on never runs for the Principal.
-    #[test]
-    fn the_principal_may_not_run_a_config_subcommand_off_the_list() {
-        let ws = TestWorkspace::new("config-subcommands");
-        ws.seal_herdr();
-        let herdr = Arc::new(FakeHerdr::new());
-        let pane = herdr.seed_pane("w", None, &[]);
-        // Another process tree: this process is the Principal.
+        // A Lead in a pane still writes, so the narrowed scope did not close
+        // the door on the agents that own it.
         herdr.set_pane_pids(&pane, 1, &[]);
-        let mut d = Daemon::new(crate::daemon::Config {
-            runs_dir: ws.runs_dir(),
-            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
-        });
-        install(&mut Registry::new(), &mut d).unwrap();
-        d.require_peer(Arc::new(HerdrPeers::new(
-            Arc::clone(&herdr) as Arc<dyn HerdrClient>
-        )));
-        let handle = d.spawn().unwrap();
-        for argv in [
-            &["set", "timers.stall_sec", "90"][..],
-            &["import", "/tmp/team.toml"][..],
-            &["topology", "peer", "lead"][..],
-            &["reset"][..],
-        ] {
-            let e = config_call(&handle.socket, argv).unwrap_err();
-            assert_eq!(e.code, "agent_only", "{argv:?}: {e:?}");
-            assert!(e.message.contains("herdr pane"), "{argv:?}: {e:?}");
-        }
-        // The reads still run, before and after the refusals.
-        assert_eq!(
-            config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap()["out"],
-            Value::Null,
-            "nothing written"
-        );
+        let lead_pane = herdr.seed_pane("l", None, &[]);
+        herdr
+            .agent_start("lead-1", "claude", &lead_pane, 0, &[])
+            .unwrap();
+        herdr.set_pane_pids(&lead_pane, std::process::id(), &[]);
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('lead-1', 'lead', 0)",
+            [],
+        )
+        .unwrap();
+        config_call(&handle.socket, &["set", "timers.stall_sec", "90"])
+            .expect("a Lead writes config");
+        let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
+        assert_eq!(got["out"], "90", "{got}");
         handle.stop().unwrap();
     }
 
