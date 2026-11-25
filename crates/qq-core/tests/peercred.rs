@@ -42,6 +42,8 @@ fn rig_with(tag: &str, bootstrap: bool) -> Rig {
         "mail.inbox.x",
         "pingx",
         "status.all",
+        "config",
+        "roster",
     ] {
         d.register_verb(v, Box::new(|_, _| Ok(json!({ "ran": true }))))
             .unwrap();
@@ -116,14 +118,15 @@ fn descendant_of_the_pane_shell_maps_to_the_pane() {
 }
 
 #[test]
-fn unmapped_peer_is_refused_and_the_claim_does_not_save_it() {
+fn a_principal_is_refused_every_agent_verb_and_the_claim_does_not_save_it() {
     let r = rig("peer-unmapped");
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
-    // The pane belongs to some other process tree.
+    // The pane belongs to some other process tree, so the peer is the Principal.
     r.herdr.set_pane_pids(&pane, 1, &[]);
     let e = whoami(&r, Some("w-1")).unwrap_err();
-    assert_eq!(e.code, "unmapped_peer");
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(e.message.contains("owner"), "names the principal: {e:?}");
     stop(r);
 }
 
@@ -164,30 +167,31 @@ fn call(r: &Rig, verb: &str, claim: Option<&str>) -> Result<Value, rpc::RpcError
     rpc::call(&r.daemon.socket, &req).unwrap().into_result()
 }
 
+/// Issue #368: the owner runs the farm from a plain terminal, so a peer in no
+/// pane is the Principal and the lifecycle and read-only verbs answer it. The
+/// identity probe still names no agent, and a mapped peer still wins.
 #[test]
-fn unmapped_same_uid_is_refused_on_every_verb_lifecycle_and_read_only_included() {
+fn the_principal_outside_a_pane_may_ping_status_roster_and_config() {
     let r = rig("peer-human");
     unmapped(&r);
-    for v in [
-        "ping",
-        "status",
-        "stop",
-        "roster",
-        "mail.inbox",
-        "mail.send",
-    ] {
-        assert_eq!(
-            call(&r, v, Some("cos")).unwrap_err().code,
-            "unmapped_peer",
-            "{v}"
-        );
-    }
-    // The refused stop left the daemon up: a mapped peer still reaches it.
+    // A claim of another caller's name decides nothing: the gate names the peer.
+    assert_eq!(call(&r, "ping", Some("cos")).unwrap()["pong"], true);
+    assert!(call(&r, "status", None).is_ok(), "status");
+    assert_eq!(call(&r, "config", None).unwrap()["ran"], true);
+    assert_eq!(call(&r, "roster", None).unwrap()["ran"], true);
+    // Its handler is the one that refuses a caller it cannot name as an agent.
+    assert_eq!(
+        call(&r, "caller.lookup", None).unwrap_err().code,
+        "unmapped_peer"
+    );
+    // A mapped peer still reaches the same daemon.
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-3", "claude", &pane, 0, &[]).unwrap();
     r.herdr.set_pane_pids(&pane, me(), &[]);
     assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
-    stop(r);
+    // The owner stops the farm from the same terminal.
+    assert_eq!(call(&r, "stop", None).unwrap()["stopping"], true);
+    r.daemon.stop().unwrap();
 }
 
 #[test]
@@ -204,24 +208,75 @@ fn descendant_of_a_pane_process_may_ping_status_and_stop() {
 }
 
 #[test]
-fn unmapped_same_uid_is_refused_on_worker_spawn_and_on_lookalike_verbs() {
+fn the_principal_outside_a_pane_is_refused_agent_verbs_and_lookalikes() {
     let r = rig("peer-human-spawn");
     unmapped(&r);
-    // Refused for every verb name, lookalikes included.
+    // Refused for every agent verb, and for every name the allowlist does not
+    // match exactly: no prefix of an open verb opens a closed one.
     for v in [
         "task.start",
         "worker.stop",
+        "mail.inbox",
+        "mail.send",
+        "pipeline",
+        "Push",
         "mail.inbox.x",
         "pingx",
         "status.all",
     ] {
-        assert_eq!(call(&r, v, None).unwrap_err().code, "unmapped_peer", "{v}");
+        assert_eq!(call(&r, v, None).unwrap_err().code, "agent_only", "{v}");
     }
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-2", "claude", &pane, 0, &[]).unwrap();
     r.herdr.set_pane_pids(&pane, me(), &[]);
     assert_eq!(call(&r, "task.start", None).unwrap()["ran"], true);
     stop(r);
+}
+
+/// `quaqua <args>` from this process's own runs directory, as the owner's
+/// terminal would run it.
+fn qq(runs: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_quaqua"))
+        .args(args)
+        .env("QUAQUA_RUNS_DIR", runs)
+        .env("QUAQUA_TEST", "1")
+        .output()
+        .expect("run quaqua")
+}
+
+/// Issue #368, acceptance end to end: from a process in no herdr pane, `quaqua
+/// ping` exits 0 while the daemon runs, exits with the unreachable code while it
+/// is stopped, and with the refusal code (never 69) when the daemon refuses it —
+/// so a launcher can tell "start the daemon" from "this caller may not".
+#[test]
+fn quaqua_ping_from_a_plain_terminal_answers_and_tells_its_two_failures_apart() {
+    let r = rig("peer-cli");
+    unmapped(&r);
+    let runs = r._ws.runs_dir();
+    let up = qq(&runs, &["ping"]);
+    assert_eq!(up.status.code(), Some(0), "{up:?}");
+    assert!(
+        String::from_utf8_lossy(&up.stdout).contains("pong"),
+        "{up:?}"
+    );
+    // The daemon answers and refuses this caller: not the unreachable code.
+    let refused = qq(&runs, &["call", "mail.send", "{}"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(qq_core::cli::EXIT_REFUSED),
+        "{refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("agent_only"),
+        "{refused:?}"
+    );
+    r.daemon.stop().unwrap();
+    let down = qq(&runs, &["ping"]);
+    assert_eq!(
+        down.status.code(),
+        Some(qq_core::cli::EXIT_UNREACHABLE),
+        "{down:?}"
+    );
 }
 
 fn cos_rows(r: &Rig) -> i64 {
@@ -251,7 +306,7 @@ fn first_call_from_the_cos_pane_makes_one_active_cos_agent() {
 }
 
 #[test]
-fn bootstrap_makes_no_cos_row_for_a_worker_pane_or_an_unmapped_peer() {
+fn bootstrap_makes_no_cos_row_for_a_worker_pane_or_the_principal() {
     let r = rig_with("cos-boot-none", true);
     let pane = r.herdr.seed_pane("w", None, &[]);
     r.herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
@@ -263,7 +318,7 @@ fn bootstrap_makes_no_cos_row_for_a_worker_pane_or_an_unmapped_peer() {
         "a claim of 'cos' from a worker pane seeds nothing"
     );
     r.herdr.set_pane_pids(&pane, 1, &[]);
-    assert_eq!(whoami(&r, Some("cos")).unwrap_err().code, "unmapped_peer");
-    assert_eq!(cos_rows(&r), 0, "an unmapped peer seeds nothing");
+    assert_eq!(whoami(&r, Some("cos")).unwrap_err().code, "agent_only");
+    assert_eq!(cos_rows(&r), 0, "the principal seeds nothing");
     stop(r);
 }

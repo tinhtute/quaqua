@@ -250,8 +250,14 @@ fn json(r: io::Result<Reply>, what: &str) -> Result<Value, RpcError> {
 }
 
 impl PeerResolver for HerdrPeers {
+    /// Agent identity only: `quaqua worker spawn` reads this, and a process in
+    /// no pane must never be taken for an agent, so the Principal is refused
+    /// here even though [`HerdrPeers::resolve_pane`] names it.
     fn resolve(&self, cred: PeerCred) -> Result<CallerId, RpcError> {
-        self.resolve_pane(cred).map(|(c, _)| c)
+        match self.resolve_pane(cred)? {
+            (who, Some(_)) => Ok(who),
+            (_, None) => Err(refuse(format!("pid {} is in no herdr pane", cred.pid))),
+        }
     }
 
     fn resolve_pane(&self, cred: PeerCred) -> Result<(CallerId, Option<String>), RpcError> {
@@ -287,16 +293,19 @@ impl PeerResolver for HerdrPeers {
             let cos = p.pointer("/tokens/grid_role").and_then(Value::as_str) == Some("cos");
             owned.push((id, cos, pids));
         }
-        // The nearest ancestor that a pane runs decides.
-        let (pane, cos) = chain
-            .iter()
-            .find_map(|a| {
-                owned
-                    .iter()
-                    .find(|(_, _, pids)| pids.contains(&i64::from(*a)))
-                    .map(|(id, cos, _)| (*id, *cos))
-            })
-            .ok_or_else(|| refuse(format!("pid {} is in no herdr pane", cred.pid)))?;
+        // The nearest ancestor that a pane runs decides. A peer that reaches no
+        // pane is the Principal of this uid (the owner at a plain terminal);
+        // the daemon's gate decides which verbs it may run, and herdr being
+        // unreadable is still an error above, so a pane the daemon cannot see
+        // never makes its agent the Principal.
+        let Some((pane, cos)) = chain.iter().find_map(|a| {
+            owned
+                .iter()
+                .find(|(_, _, pids)| pids.contains(&i64::from(*a)))
+                .map(|(id, cos, _)| (*id, *cos))
+        }) else {
+            return Ok((CallerId(PRINCIPAL.into()), None));
+        };
         if cos {
             self.ensure_cos(pane)?;
             return Ok((CallerId("cos".into()), Some(pane.to_string())));

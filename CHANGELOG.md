@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The owner's own terminal can reach the daemon again**: a same-uid caller in no Herdr pane is the Principal (`owner`) instead of being refused with `unmapped_peer`, so `quaqua ping`, `status`, `stop` and `config set` work from a plain terminal; every agent verb stays closed to it, a pane with no agent is still refused, and another uid is still `foreign_uid` (#368).
+- **Caller refusals have their own exit code**: the daemon answering and refusing the caller exits `77` (`EXIT_REFUSED`), distinct from `69` for a daemon that is not running, so `quaqua ping || start-the-daemon` no longer starts a second daemon (#368).
+
 ## [3.0.0] - 2026-11-23
 
 Rewrite release: one Rust crate, `qq-core`, now builds the single `quaqua` binary. 479 commits since 2.7.0.

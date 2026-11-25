@@ -679,8 +679,9 @@ where
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
-/// client's claim is dropped). A peer of another uid is refused outright, and
-/// so is an unmapped peer of the daemon's uid, whatever the verb.
+/// client's claim is dropped). A peer of another uid is refused outright; a peer
+/// in a pane with no agent is refused too, whatever the verb. A same-uid peer in
+/// no pane at all speaks as the Principal, which may run only [`PRINCIPAL_VERBS`].
 fn identify(
     mut req: Request,
     peers: Option<&dyn PeerResolver>,
@@ -703,9 +704,40 @@ fn identify(
         ));
     }
     let (who, pane) = peers.resolve_pane(*cred)?;
+    let principal = pane.is_none() && who.as_str() == peer::PRINCIPAL;
+    if principal && !PRINCIPAL_VERBS.contains(&req.verb.as_str()) {
+        return Err(RpcError::new(
+            peer::AGENT_ONLY,
+            format!(
+                "verb '{}' needs an agent: caller pid {} is in no herdr pane, so it speaks as the Principal '{}'",
+                req.verb,
+                cred.pid,
+                peer::PRINCIPAL
+            ),
+        ));
+    }
     req.caller = Some(who.0);
     req.caller_pane = pane;
     Ok(req)
+}
+
+/// Verbs a caller in no herdr pane may run: the Principal owns the farm and
+/// must see it, stop it and write the config tables from a plain terminal. The
+/// list is an allowlist, so a verb added later is closed to the Principal until
+/// someone decides otherwise; none of these names an agent. `caller.lookup` is
+/// here because its handler is the one that refuses a caller it cannot name as
+/// an agent: the Principal reaches it and gets the same `unmapped_peer` answer
+/// the hook gate has always read.
+const PRINCIPAL_VERBS: [&str; 6] = ["ping", "status", "stop", "config", "roster", caller::VERB];
+
+/// True when the daemon's peer gate named this request's caller as the
+/// Principal: a same-uid peer that reaches no herdr pane. The gate overwrites
+/// every request's `caller` and `caller_pane` when a resolver is installed, so a
+/// client's own claim cannot reach it, and a pane-hosted agent named `owner` is
+/// never it either (it has a pane). A daemon with no resolver trusts every
+/// claim anyway ([`Daemon::require_peer`]), so this adds no hole there.
+pub fn is_principal(req: &Request) -> bool {
+    req.caller.as_deref() == Some(peer::PRINCIPAL) && req.caller_pane.is_none()
 }
 
 #[cfg(test)]
@@ -855,10 +887,49 @@ mod peer_tests {
             "watch.agent",
             "watch.report",
             "workflow.start",
-            caller::VERB,
         ] {
             let e = run(v, Ok(PRINCIPAL), 1000).unwrap_err();
             assert_eq!(e.code, AGENT_ONLY, "{v}");
         }
+    }
+
+    /// The verbs the Principal needs from its own terminal: the launcher asks
+    /// `ping` before it starts a daemon, and the owner stops and configures the
+    /// farm from there. None of them names an agent, so the gate names it the
+    /// Principal and no agent verb comes with it.
+    #[test]
+    fn the_principal_outside_a_pane_may_ping_status_stop_and_write_config() {
+        for v in ["ping", "status", "stop", "config", "roster", caller::VERB] {
+            let req = run(v, Ok(PRINCIPAL), 1000).unwrap_or_else(|e| panic!("{v}: {e:?}"));
+            assert!(is_principal(&req), "{v} is not marked the principal");
+            assert_eq!(req.caller.as_deref(), Some(PRINCIPAL), "{v}");
+            assert_eq!(req.caller_pane, None, "{v}");
+            // Its name is not an agent's: the gate still names nobody.
+            assert_eq!(caller::identified(&req), None, "{v}");
+        }
+    }
+
+    /// A pane-hosted agent that happens to be called `owner` keeps agent
+    /// rights only: the Principal is never a name a pane can hand out.
+    #[test]
+    fn an_agent_named_owner_is_no_principal() {
+        struct InPane;
+        impl PeerResolver for InPane {
+            fn resolve(&self, _: peer::PeerCred) -> Result<CallerId, RpcError> {
+                Ok(CallerId(PRINCIPAL.into()))
+            }
+            fn resolve_pane(
+                &self,
+                _: peer::PeerCred,
+            ) -> Result<(CallerId, Option<String>), RpcError> {
+                Ok((CallerId(PRINCIPAL.into()), Some("p1".into())))
+            }
+        }
+        let mut req = Request::new("task.start", Value::Null);
+        req.caller = Some("spoof".into());
+        let cred = Ok(PeerCred { pid: 1, uid: 1000 });
+        let req = identify(req, Some(&InPane), Some(&cred), 1000).unwrap();
+        assert!(!is_principal(&req));
+        assert_eq!(caller::identified(&req), Some(PRINCIPAL));
     }
 }

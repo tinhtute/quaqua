@@ -39,6 +39,22 @@ Rules:
   and is recorded in Lead state.
 - Telemetry decides which mechanisms stay: a reviewer that rarely changes outcomes gets turned off.
 
+### Who may call the daemon
+
+The daemon names every caller from the socket peer, never from the request: the peer's pid
+walks its ancestry to the Herdr pane whose shell or foreground process it is, and that pane's
+agent is the caller. A same-uid process in **no** pane is the **Principal** (caller `owner`) —
+the owner at a plain terminal — and may run only `ping`, `status`, `stop`, `config`, `roster`
+and `caller.lookup` (whose handler still names no agent, so the hook gate keeps reading
+`unmapped_peer`). Every agent verb (`task.*`, `mail.*`, `push`, `merge`, `pipeline`,
+`memory.write`, `signal`, `watch.*`, `workflow.start`, `pr.merge`) stays closed to it, and an
+allowlist means a verb added later is closed until someone opens it. A process in a pane that
+hosts no agent is still refused, and so is another uid (`foreign_uid`).
+
+Exit codes, so a launcher can branch: `quaqua ping` exits `69` when the daemon is not running
+(start it), `77` when the daemon answered and refused this caller (starting it cannot help),
+and `0` when it answered.
+
 ## Files
 
 | File | Role |

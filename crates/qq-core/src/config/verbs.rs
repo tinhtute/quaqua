@@ -64,24 +64,29 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
             Some("get" | "validate" | "export" | "diff")
         )
     {
-        let Some(caller) = req.caller.as_deref() else {
-            return Err(RpcError::new(
-                "refused",
-                "a config write needs an identified caller",
-            ));
-        };
-        let d = crate::authority::check_orchestration(
-            &conn,
-            caller,
-            crate::authority::Op::ConfigWrite,
-            crate::authority::Fence::Fenced,
-        )
-        .map_err(|e| RpcError::new("internal", e.0))?;
-        if let crate::authority::Decision::Refused(r) = d {
-            return Err(RpcError::new(
-                "refused",
-                format!("{} -> {}: {}", r.caller, r.target, r.reason),
-            ));
+        // The Principal owns the farm and has no agent row, so the topology has
+        // no edge to check: the peer gate named it, and it reaches this handler
+        // only through the verbs open to it (issue #368).
+        if !crate::daemon::is_principal(req) {
+            let Some(caller) = req.caller.as_deref() else {
+                return Err(RpcError::new(
+                    "refused",
+                    "a config write needs an identified caller",
+                ));
+            };
+            let d = crate::authority::check_orchestration(
+                &conn,
+                caller,
+                crate::authority::Op::ConfigWrite,
+                crate::authority::Fence::Fenced,
+            )
+            .map_err(|e| RpcError::new("internal", e.0))?;
+            if let crate::authority::Decision::Refused(r) = d {
+                return Err(RpcError::new(
+                    "refused",
+                    format!("{} -> {}: {}", r.caller, r.target, r.reason),
+                ));
+            }
         }
     }
     let profile = req
@@ -947,4 +952,66 @@ fn stored_parsed(conn: &Connection) -> Result<Parsed, ConfigError> {
 /// The stored config must satisfy the checks an import applies.
 fn check_db(conn: &Connection) -> Result<(), ConfigError> {
     validate(&stored_parsed(conn)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::{FakeHerdr, HerdrClient};
+    use crate::identity::peer::HerdrPeers;
+    use crate::rpc::{self, Request};
+    use crate::testkit::TestWorkspace;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn config_call(socket: &Path, argv: &[&str]) -> Result<Value, RpcError> {
+        let req = Request::new("config", json!({ "argv": argv }));
+        rpc::call(socket, &req).unwrap().into_result()
+    }
+
+    /// Issue #368: the owner writes config from a plain terminal, while an agent
+    /// that is a Peer still may not. The bypass belongs to the Principal (a peer
+    /// in no pane), never to the verb: the same call is judged again as soon as
+    /// a pane names its agent.
+    #[test]
+    fn the_principal_writes_config_and_a_peer_agent_still_may_not() {
+        let ws = TestWorkspace::new("config-principal");
+        ws.seal_herdr();
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
+        // The pane belongs to another process tree, so this process is the
+        // Principal, as the owner's terminal is.
+        herdr.set_pane_pids(&pane, 1, &[]);
+        let mut d = Daemon::new(crate::daemon::Config {
+            runs_dir: ws.runs_dir(),
+            herdr: Arc::clone(&herdr) as Arc<dyn HerdrClient>,
+        });
+        install(&mut Registry::new(), &mut d).unwrap();
+        d.require_peer(Arc::new(HerdrPeers::new(
+            Arc::clone(&herdr) as Arc<dyn HerdrClient>
+        )));
+        let handle = d.spawn().unwrap();
+
+        config_call(&handle.socket, &["set", "timers.stall_sec", "90"])
+            .expect("the principal writes config");
+        let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
+        assert_eq!(got["out"], "90", "{got}");
+
+        // The same pid, now in a pane whose agent is a Peer: the authority
+        // check runs as it always has.
+        let conn = crate::db::open(&ws.db_path()).unwrap();
+        conn.execute(
+            "INSERT INTO agent (name, role, started_ms) VALUES ('w-1', 'peer', 0)",
+            [],
+        )
+        .unwrap();
+        herdr.set_pane_pids(&pane, std::process::id(), &[]);
+        let e = config_call(&handle.socket, &["set", "timers.stall_sec", "60"]).unwrap_err();
+        assert_eq!(e.code, "refused", "{e:?}");
+        assert!(e.message.contains("Peer"), "{e:?}");
+        let got = config_call(&handle.socket, &["get", "timers.stall_sec"]).unwrap();
+        assert_eq!(got["out"], "90", "a refused write changes nothing: {got}");
+        handle.stop().unwrap();
+    }
 }
