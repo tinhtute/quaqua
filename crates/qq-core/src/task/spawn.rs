@@ -115,7 +115,7 @@ impl std::error::Error for SpawnError {}
 /// lines, something drawn there (a blank pane is claude still booting) and
 /// herdr reporting `idle`. herdr says `idle` right after the keys while claude
 /// is still booting, and a prompt typed then is dropped.
-fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, ready: &Ready) -> Trust {
+pub fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, ready: &Ready) -> Trust {
     let mut drawn = String::new();
     for i in 0..=ready.settle_polls {
         match herdr.pane_read(pane, 40) {
@@ -154,7 +154,7 @@ fn accept_trust_dialog(herdr: &dyn HerdrClient, name: &str, pane: &str, ready: &
 
 /// What [`accept_trust_dialog`] found.
 #[derive(PartialEq)]
-enum Trust {
+pub enum Trust {
     /// The pane shows no trust dialog.
     NoDialog,
     /// The dialog was accepted and claude is ready.

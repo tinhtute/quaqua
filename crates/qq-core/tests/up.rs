@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use qq_core::cli::{CliError, Env};
+use qq_core::cli::CliError;
 use qq_core::config::{self, CosLaunch};
 use qq_core::db;
 use qq_core::testkit::TestWorkspace;
@@ -148,9 +148,7 @@ impl UpHost for FakeUp {
     fn create_workspace(&mut self, label: &str, cwd: &Path) -> Result<Workspace, String> {
         self.log
             .push(format!("create_workspace:{label}:{}", cwd.display()));
-        let ws = Workspace {
-            id: "w-new".into(),
-        };
+        let ws = Workspace { id: "w-new".into() };
         self.workspace = Some(ws.clone());
         Ok(ws)
     }
@@ -178,7 +176,8 @@ impl UpHost for FakeUp {
         _dialog: bool,
     ) -> Result<(), String> {
         self.log.push(format!("start_agent:{name}:{pane}"));
-        self.starts.push(format!("{kind}|{pane}|{}", args.join(" ")));
+        self.starts
+            .push(format!("{kind}|{pane}|{}", args.join(" ")));
         if self.fail_starts > 0 {
             self.fail_starts -= 1;
             if self.fail_live {
@@ -333,7 +332,11 @@ fn up_starts_the_session_then_launches_the_cos_from_the_config_keys() {
         "{:?}",
         fake.log
     );
-    assert!(fake.log.contains(&"cos_pane:w-new".to_string()), "{:?}", fake.log);
+    assert!(
+        fake.log.contains(&"cos_pane:w-new".to_string()),
+        "{:?}",
+        fake.log
+    );
     assert_eq!(
         fake.starts,
         vec!["claude|p1|--model claude-opus-5-5 --effort low".to_string()]
@@ -485,7 +488,10 @@ fn up_missing_cos_keys_prints_the_error_verbatim() {
     assert_eq!(fake.log[0], "session_running");
     assert_eq!(fake.log[1], "start_session");
     // and the config error costs no daemon side effect.
-    assert_eq!(daemon.installs, 0, "nothing is installed for a config error");
+    assert_eq!(
+        daemon.installs, 0,
+        "nothing is installed for a config error"
+    );
     assert_eq!(daemon.starts, 0);
     assert!(!fake.log.iter().any(|l| l.starts_with("create_workspace")));
     assert!(fake.starts.is_empty());
@@ -541,7 +547,18 @@ fn up_daemon_refusal_stops_before_the_cos() {
     let e = up::up(&mut fake, &mut daemon).unwrap_err();
     assert_eq!(e.code, qq_core::cli::EXIT_UNREACHABLE);
     assert!(fake.starts.is_empty());
-    assert!(!fake.log.contains(&"launch".to_string()), "{:?}", fake.log);
+    // The config read comes first (finding 4), the daemon next: no workspace either way.
+    assert!(fake.log.contains(&"launch".to_string()), "{:?}", fake.log);
+    assert!(
+        !fake.log.iter().any(|l| l.starts_with("workspace")),
+        "{:?}",
+        fake.log
+    );
+    assert!(
+        !fake.log.contains(&"cos_pane:w1".to_string()),
+        "{:?}",
+        fake.log
+    );
 }
 
 /// `Ready` from the daemon half is a carry-on, never a stop.
@@ -582,7 +599,7 @@ fn up_focus_failure_warns_and_still_exits_zero() {
     let cos = run(&mut fake).expect("a focus miss is not a failure");
     assert_eq!(cos, Cos::Live);
     assert!(
-        fake.lines.iter().any(|l| l.contains("could not focus")),
+        fake.lines.iter().any(|l| l.contains("focusing it failed")),
         "{:?}",
         fake.lines
     );
@@ -683,6 +700,7 @@ const TABS_UNTAGGED: &str = r#"{"result":{"tabs":[
 ]}}"#;
 
 const AGENTS_NEW: &str = r#"{"result":{"agents":[
+ {"agent":"claude","agent_status":"done","pane_id":"w1:pAA","tokens":{"grid_role":"cos"}},
  {"agent":"claude","agent_session":{"agent":"claude","kind":"id","value":"00000000-aaaa-bbbb-cccc-0000000000aa"},"agent_status":"done","pane_id":"w1:pY","tokens":{"grid_role":""}},
  {"agent":"pi","name":"sude-upint","agent_status":"working","pane_id":"w1:pWW"}
 ]}}"#;
@@ -711,7 +729,10 @@ fn up_cos_pane_never_returns_a_worker_pane() {
     let e = cos_pane(&l, "w1", None).expect_err("workers only");
     assert!(e.contains("w1"), "{e}");
     // A record pointing at a worker does not make it the CoS either.
-    let rec = ("00000000-aaaa-bbbb-cccc-0000000000aa".to_string(), "w1:pWW".to_string());
+    let rec = (
+        "00000000-aaaa-bbbb-cccc-0000000000aa".to_string(),
+        "w1:pWW".to_string(),
+    );
     assert!(cos_pane(&l, "w1", Some(&rec)).is_err());
 }
 
@@ -863,7 +884,11 @@ fn up_addresses_the_configured_session_even_inside_herdr() {
 fn up_session_running_is_false_without_a_herdr_answer() {
     let ws = TestWorkspace::new("up-session-missing");
     let mut host = qq_core::up::herdr::CliUp::new(ws.runs_dir());
-    host.bin = ws.root().join("no-such-herdr").to_string_lossy().into_owned();
+    host.bin = ws
+        .root()
+        .join("no-such-herdr")
+        .to_string_lossy()
+        .into_owned();
     host.set_root(ws.root());
     assert!(!host.session_running());
 }
