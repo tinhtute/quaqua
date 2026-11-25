@@ -255,6 +255,7 @@ const KNOWN_SUBS: &[(&str, &[&str])] = &[
     ("playbook", &["list", "show"]),
     ("run", &["show", "list"]),
     ("transcripts", &["tail"]),
+    ("daemon", &["install"]),
 ];
 
 /// Does the registry provide `key` (`verb` or `verb sub`)?
