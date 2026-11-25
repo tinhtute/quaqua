@@ -724,7 +724,7 @@ mod peer_tests {
         assert!(d.service_enabled());
     }
 
-    use crate::identity::peer::{CallerId, PeerCred};
+    use crate::identity::peer::{CallerId, PeerCred, AGENT_ONLY, PRINCIPAL};
 
     #[test]
     fn a_served_verb_leaves_a_start_line_and_a_result_line() {
@@ -828,10 +828,37 @@ mod peer_tests {
     }
 
     #[test]
-    fn unmapped_same_uid_is_refused_for_every_verb() {
+    fn a_peer_the_resolver_cannot_name_is_refused_for_every_verb() {
         for v in ["ping", "stop", "status", "mail.send"] {
             let e = run(v, Err(()), 1000).unwrap_err();
             assert_eq!(e.code, peer::UNMAPPED_PEER, "{v}");
+        }
+    }
+
+    /// Issue #368: the Principal runs the farm from a plain terminal, but names
+    /// no agent, so every agent-only verb stays closed to it.
+    #[test]
+    fn the_principal_outside_a_pane_is_refused_every_agent_verb() {
+        for v in [
+            "task.start",
+            "task.create",
+            "worker.stop",
+            "mail.inbox",
+            "mail.send",
+            "push",
+            "push.cos",
+            "merge",
+            "pr.merge",
+            "memory.write",
+            "pipeline",
+            "signal",
+            "watch.agent",
+            "watch.report",
+            "workflow.start",
+            caller::VERB,
+        ] {
+            let e = run(v, Ok(PRINCIPAL), 1000).unwrap_err();
+            assert_eq!(e.code, AGENT_ONLY, "{v}");
         }
     }
 }

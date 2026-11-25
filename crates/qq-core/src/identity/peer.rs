@@ -3,8 +3,10 @@
 //! Data shape: the kernel's [`PeerCred`] `{pid, uid}` for the connected socket
 //! -> [`PeerResolver::resolve`] walks the pid's ancestry to the herdr pane whose
 //! shell or foreground process it is -> that pane's agent is the [`CallerId`].
-//! Every step fails closed: an unmapped peer is refused, whatever the request
-//! claims.
+//! A peer of the daemon's own uid that reaches no pane is the [`PRINCIPAL`], the
+//! owner of the farm; it names no agent, so the daemon keeps it to a few verbs.
+//! Every other step fails closed: a peer in a pane with no agent, or from
+//! another uid, is refused whatever the request claims.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -21,6 +23,20 @@ pub const UNMAPPED_PEER: &str = "unmapped_peer";
 
 /// Longest ancestry walked from the peer pid.
 const MAX_DEPTH: usize = 64;
+
+/// The name a same-uid peer that reaches no herdr pane speaks as: the
+/// Principal, the uid that owns the farm. Named by the socket peer (the uid)
+/// plus the absence of a pane, never claimed by the request.
+///
+/// The Principal runs the farm from a plain terminal, so the daemon opens
+/// `ping`, `status`, `stop`, `config` and `roster` to it and nothing else: it
+/// names no agent, so no agent verb can be reached through it.
+pub const PRINCIPAL: &str = "owner";
+
+/// Refusal code for an agent-only verb called by the Principal. Distinct from
+/// [`UNMAPPED_PEER`] (the daemon could name nobody) so a script can tell "not
+/// allowed" from "not known" and from a daemon that is down.
+pub const AGENT_ONLY: &str = "agent_only";
 
 /// Refusal code for a peer owned by another uid than the daemon.
 pub const FOREIGN_UID: &str = "foreign_uid";
@@ -54,10 +70,13 @@ impl CallerId {
 
 /// Maps a peer to the caller it speaks as.
 pub trait PeerResolver: Send + Sync {
+    /// The agent the peer speaks as. A process in no pane, or in a pane with no
+    /// agent, is an error here: never taken for an agent.
     fn resolve(&self, cred: PeerCred) -> Result<CallerId, RpcError>;
 
     /// As [`PeerResolver::resolve`], plus the pane the peer was mapped to.
-    /// For placement only (where to split a new pane), never authority.
+    /// `Some` pane is for placement (where to split a new pane); `None` says
+    /// the peer reached no pane, which the daemon reads as the [`PRINCIPAL`].
     fn resolve_pane(&self, cred: PeerCred) -> Result<(CallerId, Option<String>), RpcError> {
         self.resolve(cred).map(|c| (c, None))
     }
@@ -292,5 +311,67 @@ impl PeerResolver for HerdrPeers {
             .and_then(|a| a.get("name").and_then(Value::as_str))
             .map(|n| (CallerId(n.to_string()), Some(pane.to_string())))
             .ok_or_else(|| refuse(format!("pane {pane} hosts no known agent")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::{FakeHerdr, HerdrClient};
+
+    fn resolver(herdr: &Arc<FakeHerdr>) -> HerdrPeers {
+        HerdrPeers::new(Arc::clone(herdr) as Arc<dyn HerdrClient>)
+    }
+
+    /// A pane herdr knows, run by some other process tree, with an agent in it.
+    fn pane_belonging_to_another_tree(herdr: &FakeHerdr) -> String {
+        let pane = herdr.seed_pane("w", None, &[]);
+        herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
+        herdr.set_pane_pids(&pane, 1, &[]);
+        pane
+    }
+
+    fn me() -> PeerCred {
+        PeerCred {
+            pid: std::process::id() as i32,
+            uid: own_uid(),
+        }
+    }
+
+    /// Issue #368: a same-uid process that reaches no herdr pane is the
+    /// Principal of this uid, not an unnameable peer. The daemon decides which
+    /// verbs it may run; naming it here is what lets `quaqua ping` answer from
+    /// a plain terminal.
+    #[test]
+    fn a_same_uid_pid_in_no_pane_is_the_principal() {
+        let herdr = Arc::new(FakeHerdr::new());
+        pane_belonging_to_another_tree(&herdr);
+        let (who, pane) = resolver(&herdr)
+            .resolve_pane(me())
+            .expect("a peer in no pane is the principal");
+        assert_eq!(who.as_str(), PRINCIPAL);
+        assert_eq!(pane, None, "the principal sits in no pane");
+    }
+
+    /// `resolve` is the agent-only door (`quaqua worker spawn` reads it): the
+    /// principal must stay refused there, so no spawn is ever attributed to it.
+    #[test]
+    fn the_principal_is_no_agent() {
+        let herdr = Arc::new(FakeHerdr::new());
+        pane_belonging_to_another_tree(&herdr);
+        let e = resolver(&herdr).resolve(me()).unwrap_err();
+        assert_eq!(e.code, UNMAPPED_PEER);
+    }
+
+    /// A process inside a pane that hosts no known agent is still refused: only
+    /// a peer that reaches no pane at all is the principal.
+    #[test]
+    fn a_pane_with_no_agent_is_still_refused() {
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("h", Some("zsh"), &[]);
+        herdr.set_pane_pids(&pane, std::process::id(), &[]);
+        let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
+        assert_eq!(e.code, UNMAPPED_PEER);
+        assert!(e.message.contains("hosts no known agent"), "{}", e.message);
     }
 }
