@@ -229,7 +229,9 @@ pub struct ServiceHost {
     runs_dir: PathBuf,
     svc: Result<Service, String>,
     runner: Box<dyn Runner>,
-    herdr: Result<HerdrEnv, String>,
+    /// A test's fixed session; `None` reads the process env when the unit is installed,
+    /// after `up` has resolved it, never at construction.
+    herdr: Option<HerdrEnv>,
 }
 
 impl ServiceHost {
@@ -251,13 +253,13 @@ impl ServiceHost {
             runs_dir: runs_dir.into(),
             svc,
             runner,
-            herdr: HerdrEnv::from_process(),
+            herdr: None,
         }
     }
 
     /// The herdr session the installed unit carries, in place of the process's.
     pub fn with_herdr(mut self, herdr: HerdrEnv) -> Self {
-        self.herdr = Ok(herdr);
+        self.herdr = Some(herdr);
         self
     }
 }
@@ -298,12 +300,15 @@ impl DaemonHost for ServiceHost {
         // The host's own service, never `Service::for_process`: the file written is the
         // `svc.file` that `start_unit` loads, and a test host never reads the real HOME.
         let svc = self.svc.as_ref().map_err(Clone::clone)?;
-        let herdr = self.herdr.as_ref().map_err(Clone::clone)?;
+        let herdr = match &self.herdr {
+            Some(h) => h.clone(),
+            None => HerdrEnv::from_process()?,
+        };
         let text = crate::daemon::service::install_with(
             svc,
             &self.runs_dir,
             &[String::from("install")],
-            herdr,
+            &herdr,
         )?;
         self.line(text.trim_end());
         Ok(())
@@ -815,6 +820,27 @@ mod tests {
             assert!(file.is_file(), "{} not written", file.display());
             assert!(runner.calls().is_empty(), "install runs no command");
         }
+    }
+
+    #[test]
+    fn service_host_reads_the_herdr_env_at_install_not_at_construction() {
+        // TestWorkspace holds the crate's env lock, clears the herdr vars and restores them on drop.
+        let ws = crate::testkit::TestWorkspace::new("up-host-lazy-herdr");
+        let runner = FakeRunner::default();
+        let svc = service(Some(Platform::Launchd), ws.root());
+        let file = svc.as_ref().unwrap().file.clone();
+        let mut h = ServiceHost::with_service(ws.runs_dir(), svc, Box::new(runner.clone()));
+        // What `CliUp::resolve_env` does after `up_cmd` built the host.
+        std::env::set_var("HERDR_SESSION", "late-session");
+        std::env::set_var("HERDR_SOCKET_PATH", "/late/herdr.sock");
+        let res = h.install_unit();
+        ws.seal_herdr();
+        res.unwrap();
+        let unit = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            unit.contains("late-session") && unit.contains("/late/herdr.sock"),
+            "{unit}"
+        );
     }
 
     #[test]
