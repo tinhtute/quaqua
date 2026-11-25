@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`quaqua up` starts the daemon on macOS**: `daemon install` writes a launchd LaunchAgent plist (`com.quaqua.daemon` in `~/Library/LaunchAgents`; `daemon.launchd_label` and `daemon.launchd_dir` move it) and `up` starts it through `launchctl print`, then `kickstart` for a loaded label or `bootstrap` for an unloaded one, never booting out a live daemon. Linux and macOS share one service seam; a target with no backend still gets one line and carries on. See `docs/daemon-service.md` (#369).
+
+### Fixed
+- **The `daemon::service` tests pass on macOS**: both backends are plain code tested on every OS, with a recording runner instead of real `systemctl` or `launchctl` calls (#363).
+
 ## [3.2.0] - 2026-11-25
 
 ### Added

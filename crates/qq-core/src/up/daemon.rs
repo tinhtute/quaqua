@@ -1,8 +1,8 @@
 //! The daemon half of `quaqua up` (R4): make sure the farm daemon answers before the
-//! CoS is started, or say why it cannot. Every outside effect — the ping, `systemctl`,
-//! the unit-file check, the TTY prompt, the platform, the clock and the printed lines —
-//! goes through [`DaemonHost`], so the decision is unit-tested against fakes and this
-//! module never touches a real unit, a real socket or a real terminal in a test.
+//! CoS is started, or say why it cannot. Every outside effect — the ping, the service
+//! manager (systemd or launchd, through `daemon::service`), the TTY prompt, the clock and
+//! the printed lines — goes through [`DaemonHost`], so the decision is unit-tested against
+//! fakes and this module never touches a real unit, a real socket or a real terminal in a test.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -10,21 +10,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::cli::{CliError, Env, EXIT_REFUSED, EXIT_UNREACHABLE};
-use crate::daemon::service::UNIT_NAME;
-
-/// NG2 (issue #369): the launchd LaunchAgent that would let `up` start the daemon on
-/// macOS. Until it exists, `up` names it and carries on.
-pub const MACOS_ISSUE: u32 = 369;
+pub use crate::daemon::service::Names;
+use crate::daemon::service::{ProcessRunner, Runner, Service};
 
 /// The command a human runs to install the unit by hand: exactly what `up` runs for them.
 pub const INSTALL_CMD: &str = "quaqua daemon install";
-
-/// Whether `up` can start anything here at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    Linux,
-    MacOs,
-}
 
 /// One `quaqua ping`, as the exit codes #368/#370 gave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,20 +60,22 @@ pub enum Ready {
     /// `up` started the unit — installing it first when the human said yes — and it
     /// answers now.
     Started,
-    /// macOS: nothing can be started from here (#369).
+    /// No service backend here (a target that is neither Linux nor macOS, or no HOME):
+    /// nothing can be started from this host.
     Unsupported,
 }
 
-/// The outside world, one method per effect. The real one is [`SystemdHost`]; a test
-/// implements this and never runs systemd, waits, or asks a terminal.
+/// The outside world, one method per effect. The real one is [`ServiceHost`]; a test
+/// implements this and never runs systemd or launchd, waits, or asks a terminal.
 pub trait DaemonHost {
-    /// `cfg!(target_os = "macos")` in the real host.
-    fn platform(&self) -> Platform;
+    /// The unit (or launchd label) and the status command to show. `Err(why)` means
+    /// nothing can be started here, for example `NO_BACKEND` or "HOME is not set".
+    fn service(&self) -> Result<Names, String>;
     /// One `quaqua ping`.
     fn ping(&mut self) -> Ping;
-    /// Whether `quaqua-daemon.service` exists for the user manager.
+    /// Whether the unit (systemd) or the plist (launchd) exists.
     fn unit_installed(&mut self) -> bool;
-    /// `systemctl --user start quaqua-daemon.service`; the error text is systemd's own.
+    /// Starts the unit or agent; the error names the failing command and its stderr.
     fn start_unit(&mut self) -> Result<(), String>;
     /// The same install `quaqua daemon install` runs, output printed through [`line`].
     ///
@@ -104,18 +96,12 @@ pub trait DaemonHost {
 /// Makes sure the farm daemon answers.
 ///
 /// `Ok` means `up` carries on: the daemon answers, answers and refuses this caller, was
-/// started here, or cannot be started on this platform (#369).
+/// started here, or cannot be started on this target (no backend).
 /// `Err` is a daemon that is not running and will not be: no unit and no install (the
 /// message names [`INSTALL_CMD`]), a failed install or start, or a unit that did not
-/// answer within the config's budget (the message names [`UNIT_NAME`]). Exit status is
+/// answer within the config's budget (the message names the unit or label). Exit status is
 /// [`EXIT_UNREACHABLE`]: the daemon is unreachable, so sending anything again cannot help.
 pub fn ensure_answers(host: &mut dyn DaemonHost) -> Result<Ready, CliError> {
-    if host.platform() == Platform::MacOs {
-        host.line(&format!(
-            "quaqua up: starting the daemon is not supported on macOS yet (issue #{MACOS_ISSUE}); start it yourself, then run up again"
-        ));
-        return Ok(Ready::Unsupported);
-    }
     match host.ping() {
         Ping::Answers => return Ok(Ready::Answers),
         Ping::Refused(why) => {
@@ -132,8 +118,17 @@ pub fn ensure_answers(host: &mut dyn DaemonHost) -> Result<Ready, CliError> {
         }
         Ping::Unreachable => {}
     }
+    let names = match host.service() {
+        Ok(n) => n,
+        Err(why) => {
+            host.line(&format!(
+                "quaqua up: cannot start the daemon here ({why}); start it yourself, then run up again"
+            ));
+            return Ok(Ready::Unsupported);
+        }
+    };
     let Some(installed) = installed_or_asked(host)? else {
-        return Err(no_unit_error());
+        return Err(no_unit_error(&names));
     };
     if !installed {
         host.install_unit()
@@ -142,15 +137,16 @@ pub fn ensure_answers(host: &mut dyn DaemonHost) -> Result<Ready, CliError> {
     host.start_unit().map_err(|e| {
         CliError::new(
             EXIT_UNREACHABLE,
-            format!("`systemctl --user start {UNIT_NAME}` failed: {e}"),
+            format!("starting {} failed: {e}", names.unit),
         )
     })?;
     let wait = host.wait();
     host.line(&format!(
-        "quaqua up: started {UNIT_NAME}; waiting up to {}s for it to answer (notify.daemon_start_sec)",
+        "quaqua up: started {}; waiting up to {}s for it to answer (notify.daemon_start_sec)",
+        names.unit,
         wait.deadline.as_secs()
     ));
-    wait_until_up(host, wait)
+    wait_until_up(host, wait, &names)
 }
 
 /// `true` when the unit is already installed, `false` when the human agreed to install
@@ -165,16 +161,19 @@ fn installed_or_asked(host: &mut dyn DaemonHost) -> Result<Option<bool>, CliErro
     }
 }
 
-fn no_unit_error() -> CliError {
+fn no_unit_error(names: &Names) -> CliError {
     CliError::new(
         EXIT_UNREACHABLE,
-        format!("the daemon is not running and {UNIT_NAME} is not installed; install it with `{INSTALL_CMD}`"),
+        format!(
+            "the daemon is not running and {} is not installed; install it with `{INSTALL_CMD}`",
+            names.unit
+        ),
     )
 }
 
 /// Pings until the daemon answers or the budget runs out. A refusal counts as answered:
 /// the unit is up, it just does not want this caller.
-fn wait_until_up(host: &mut dyn DaemonHost, wait: Wait) -> Result<Ready, CliError> {
+fn wait_until_up(host: &mut dyn DaemonHost, wait: Wait, names: &Names) -> Result<Ready, CliError> {
     let begin = host.now();
     loop {
         match host.ping() {
@@ -200,8 +199,10 @@ fn wait_until_up(host: &mut dyn DaemonHost, wait: Wait) -> Result<Ready, CliErro
             return Err(CliError::new(
                 EXIT_UNREACHABLE,
                 format!(
-                    "{UNIT_NAME} did not answer within {}s of `systemctl --user start`; see `systemctl --user status {UNIT_NAME}`",
-                    wait.deadline.as_secs()
+                    "{} did not answer within {}s of the start; see `{}`",
+                    names.unit,
+                    wait.deadline.as_secs(),
+                    names.status
                 ),
             ));
         }
@@ -219,47 +220,42 @@ pub fn wait_budget(conn: &rusqlite::Connection) -> Wait {
     }
 }
 
-/// The real host: `quaqua ping` through the CLI client, systemd through `systemctl`, the
-/// install through [`crate::daemon::service::install`] (the same call `daemon install`
-/// makes), config through the store, the terminal through stdio.
-pub struct SystemdHost {
+/// The real host: `quaqua ping` through the CLI client, the unit or agent through
+/// [`Service`] (systemd or launchd) and its [`Runner`], the install through
+/// [`crate::daemon::service::install`] (the same call `daemon install` makes), config
+/// through the store, the terminal through stdio.
+pub struct ServiceHost {
     runs_dir: PathBuf,
+    svc: Result<Service, String>,
+    runner: Box<dyn Runner>,
 }
 
-impl SystemdHost {
+impl ServiceHost {
+    /// The process's own service (HOME, XDG, uid, config, target) and the real runner.
+    /// Only `up_cmd` calls this.
     pub fn new(runs_dir: impl Into<PathBuf>) -> Self {
-        SystemdHost {
+        let runs_dir = runs_dir.into();
+        let svc = Service::for_process(&runs_dir);
+        ServiceHost::with_service(runs_dir, svc, Box::new(ProcessRunner))
+    }
+
+    /// A host on a given service and runner: what a test builds with a recording fake.
+    pub fn with_service(
+        runs_dir: impl Into<PathBuf>,
+        svc: Result<Service, String>,
+        runner: Box<dyn Runner>,
+    ) -> Self {
+        ServiceHost {
             runs_dir: runs_dir.into(),
-        }
-    }
-
-    fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
-        std::process::Command::new("systemctl")
-            .arg("--user")
-            .args(args)
-            .output()
-    }
-
-    /// stderr when systemd said something, else its exit status.
-    fn systemctl_error(out: &std::process::Output) -> String {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if err.is_empty() {
-            format!("systemctl exited {}", out.status)
-        } else {
-            err
+            svc,
+            runner,
         }
     }
 }
 
-impl DaemonHost for SystemdHost {
-    fn platform(&self) -> Platform {
-        if cfg!(target_os = "macos") {
-            Platform::MacOs
-        } else {
-            // The daemon unit is systemd, and `daemon install` already refuses anything
-            // that is not Linux; every other target lands here and fails loudly there.
-            Platform::Linux
-        }
+impl DaemonHost for ServiceHost {
+    fn service(&self) -> Result<Names, String> {
+        self.svc.as_ref().map(Service::names).map_err(Clone::clone)
     }
 
     fn ping(&mut self) -> Ping {
@@ -276,25 +272,17 @@ impl DaemonHost for SystemdHost {
     }
 
     fn unit_installed(&mut self) -> bool {
-        // `show` succeeds even for a unit that is not there, so the answer is its
-        // LoadState: `not-found` (or nothing at all) means no unit. `masked` and
-        // `bad-setting` are installed, and `start` names them when it refuses.
-        match Self::systemctl(&["show", "--property=LoadState", "--value", UNIT_NAME]) {
-            Ok(out) if out.status.success() => {
-                let load = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                !matches!(load.as_str(), "" | "not-found")
-            }
-            // No user manager, or no systemd: nothing is installed for this user.
-            _ => false,
-        }
+        // Systemd: `show`'s LoadState; launchd: the plist on disk (see `Service::installed`).
+        self.svc
+            .as_ref()
+            .is_ok_and(|svc| svc.installed(self.runner.as_mut()))
     }
 
     fn start_unit(&mut self) -> Result<(), String> {
-        let out = Self::systemctl(&["start", UNIT_NAME]).map_err(|e| format!("{e}"))?;
-        if out.status.success() {
-            return Ok(());
+        match &self.svc {
+            Ok(svc) => svc.start(self.runner.as_mut()),
+            Err(why) => Err(why.clone()),
         }
-        Err(Self::systemctl_error(&out))
     }
 
     fn install_unit(&mut self) -> Result<(), String> {
@@ -308,8 +296,11 @@ impl DaemonHost for SystemdHost {
         if !std::io::stdin().is_terminal() {
             return Answer::NoTty;
         }
+        let unit = self
+            .service()
+            .map_or_else(|_| "the daemon".to_string(), |n| n.unit);
         self.line(&format!(
-            "quaqua up: {UNIT_NAME} is not installed; install it now? [y/N]"
+            "quaqua up: {unit} is not installed; install it now? [y/N]"
         ));
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
@@ -350,12 +341,31 @@ impl DaemonHost for SystemdHost {
 mod tests {
     use super::*;
 
+    use crate::daemon::service::{Platform, Ran, NO_BACKEND, UNIT_NAME};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     const POLL_MS: u64 = 250;
+    const LABEL: &str = "com.quaqua.daemon";
+
+    fn systemd_names() -> Names {
+        Names {
+            unit: UNIT_NAME.into(),
+            status: format!("systemctl --user status {UNIT_NAME}"),
+        }
+    }
+
+    fn launchd_names() -> Names {
+        Names {
+            unit: LABEL.into(),
+            status: format!("launchctl print gui/501/{LABEL}"),
+        }
+    }
 
     /// A host that records every effect and answers from a list of pings; the last one
     /// repeats. `sleep` only moves its own clock, so a test never waits.
     struct Fake {
-        platform: Platform,
+        service: Result<Names, String>,
         pings: Vec<Ping>,
         unit_installed: bool,
         start: Result<(), String>,
@@ -373,7 +383,7 @@ mod tests {
     impl Fake {
         fn new() -> Self {
             Fake {
-                platform: Platform::Linux,
+                service: Ok(systemd_names()),
                 pings: vec![Ping::Answers],
                 unit_installed: true,
                 start: Ok(()),
@@ -407,8 +417,13 @@ mod tests {
             self
         }
 
-        fn macos(mut self) -> Self {
-            self.platform = Platform::MacOs;
+        fn no_backend(mut self, why: &str) -> Self {
+            self.service = Err(why.to_string());
+            self
+        }
+
+        fn names(mut self, n: Names) -> Self {
+            self.service = Ok(n);
             self
         }
 
@@ -433,8 +448,8 @@ mod tests {
     }
 
     impl DaemonHost for Fake {
-        fn platform(&self) -> Platform {
-            self.platform
+        fn service(&self) -> Result<Names, String> {
+            self.service.clone()
         }
         fn ping(&mut self) -> Ping {
             if self.pings.len() > 1 {
@@ -585,17 +600,199 @@ mod tests {
     }
 
     #[test]
-    fn up_daemon_macos_says_unsupported_and_starts_nothing() {
-        let mut h = Fake::new().macos().pings(&[Ping::Unreachable]);
+    fn up_daemon_without_a_backend_says_why_and_starts_nothing() {
+        let mut h = Fake::new()
+            .no_backend(NO_BACKEND)
+            .pings(&[Ping::Unreachable]);
         assert_eq!(ensure_answers(&mut h).unwrap(), Ready::Unsupported);
         assert_eq!(h.lines.len(), 1, "{:?}", h.lines);
-        assert!(h.lines[0].contains("not supported"), "{}", h.lines[0]);
-        assert!(
-            h.lines[0].contains(&format!("#{MACOS_ISSUE}")),
-            "{}",
-            h.lines[0]
-        );
+        assert!(h.lines[0].contains(NO_BACKEND), "{}", h.lines[0]);
         assert_eq!((h.starts, h.installs), (0, 0));
+    }
+
+    #[test]
+    fn up_daemon_without_a_backend_still_accepts_a_live_daemon() {
+        let mut h = Fake::new().no_backend(NO_BACKEND);
+        assert_eq!(ensure_answers(&mut h).unwrap(), Ready::Answers);
+        assert!(h.lines.is_empty(), "{:?}", h.lines);
+    }
+
+    #[test]
+    fn up_daemon_launchd_start_names_the_label() {
+        let mut h = Fake::new()
+            .names(launchd_names())
+            .pings(&[Ping::Unreachable, Ping::Answers]);
+        assert_eq!(ensure_answers(&mut h).unwrap(), Ready::Started);
+        assert_eq!(h.starts, 1);
+        assert!(h.lines[0].contains(LABEL), "{}", h.lines[0]);
+    }
+
+    #[test]
+    fn up_daemon_launchd_start_failure_wraps_the_command_error() {
+        let mut h = Fake::new()
+            .names(launchd_names())
+            .pings(&[Ping::Unreachable])
+            .start(Err(
+                "`launchctl bootstrap gui/501 /x.plist` failed: Bootstrap failed: 5".into(),
+            ));
+        let e = ensure_answers(&mut h).unwrap_err();
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert!(
+            e.message
+                .starts_with(&format!("starting {LABEL} failed: `launchctl bootstrap")),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn up_daemon_launchd_timeout_names_the_label_and_print() {
+        let mut h = Fake::new()
+            .names(launchd_names())
+            .pings(&[Ping::Unreachable])
+            .deadline_ms(500);
+        let e = ensure_answers(&mut h).unwrap_err();
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert!(e.message.contains(LABEL), "{}", e.message);
+        assert!(
+            e.message
+                .contains(&format!("launchctl print gui/501/{LABEL}")),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Records every command and answers from a list; no process runs.
+    #[derive(Clone, Default)]
+    struct FakeRunner {
+        calls: Rc<RefCell<Vec<Vec<String>>>>,
+        answers: Rc<RefCell<Vec<std::io::Result<Ran>>>>,
+    }
+
+    impl FakeRunner {
+        fn answering(a: Vec<std::io::Result<Ran>>) -> Self {
+            FakeRunner {
+                calls: Rc::default(),
+                answers: Rc::new(RefCell::new(a)),
+            }
+        }
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<Ran> {
+            self.calls.borrow_mut().push(
+                std::iter::once(program.to_string())
+                    .chain(args.iter().cloned())
+                    .collect(),
+            );
+            self.answers.borrow_mut().remove(0)
+        }
+    }
+
+    fn ran(code: i32, stdout: &str, stderr: &str) -> std::io::Result<Ran> {
+        Ok(Ran {
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn service(platform: Option<Platform>, home: &std::path::Path) -> Result<Service, String> {
+        Service::resolve(platform, home, None, &Default::default(), 501)
+    }
+
+    #[test]
+    fn service_host_launchd_checks_the_plist_and_starts_through_launchctl() {
+        let ws = crate::testkit::TestWorkspace::new("up-host-launchd");
+        let runner = FakeRunner::answering(vec![ran(113, "", ""), ran(0, "", "")]);
+        let mut h = ServiceHost::with_service(
+            ws.runs_dir(),
+            service(Some(Platform::Launchd), ws.root()),
+            Box::new(runner.clone()),
+        );
+        assert_eq!(h.service().unwrap().unit, LABEL);
+        assert!(!h.unit_installed(), "no plist yet");
+        let plist = ws
+            .root()
+            .join("Library/LaunchAgents")
+            .join(format!("{LABEL}.plist"));
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<plist/>").unwrap();
+        assert!(h.unit_installed());
+        assert!(
+            runner.calls().is_empty(),
+            "launchd installed runs no command"
+        );
+        h.start_unit().unwrap();
+        assert_eq!(
+            runner.calls(),
+            vec![
+                argv(&["launchctl", "print", "gui/501/com.quaqua.daemon"]),
+                argv(&[
+                    "launchctl",
+                    "bootstrap",
+                    "gui/501",
+                    &plist.display().to_string()
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_host_systemd_reads_load_state_and_starts_the_unit() {
+        let ws = crate::testkit::TestWorkspace::new("up-host-systemd");
+        let runner = FakeRunner::answering(vec![
+            ran(0, "loaded\n", ""),
+            ran(0, "not-found\n", ""),
+            ran(0, "", ""),
+            ran(1, "", "Unit quaqua-daemon.service is masked."),
+        ]);
+        let mut h = ServiceHost::with_service(
+            ws.runs_dir(),
+            service(Some(Platform::Systemd), ws.root()),
+            Box::new(runner.clone()),
+        );
+        assert_eq!(h.service().unwrap(), systemd_names());
+        assert!(h.unit_installed());
+        assert!(!h.unit_installed());
+        h.start_unit().unwrap();
+        let e = h.start_unit().unwrap_err();
+        assert!(e.contains("masked") && e.contains("systemctl"), "{e}");
+        let calls = runner.calls();
+        assert_eq!(
+            calls[0],
+            argv(&[
+                "systemctl",
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                UNIT_NAME
+            ])
+        );
+        assert_eq!(calls[2], argv(&["systemctl", "--user", "start", UNIT_NAME]));
+    }
+
+    #[test]
+    fn service_host_without_a_backend_runs_nothing() {
+        let ws = crate::testkit::TestWorkspace::new("up-host-none");
+        let runner = FakeRunner::default();
+        let mut h = ServiceHost::with_service(
+            ws.runs_dir(),
+            service(None, ws.root()),
+            Box::new(runner.clone()),
+        );
+        assert_eq!(h.service().unwrap_err(), NO_BACKEND);
+        assert!(!h.unit_installed());
+        assert_eq!(h.start_unit().unwrap_err(), NO_BACKEND);
+        assert!(runner.calls().is_empty());
     }
 
     #[test]

@@ -228,6 +228,6 @@ fn up_cmd(env: &Env, args: &[String]) -> Result<String, CliError> {
         return Err(CliError::new(crate::cli::EXIT_USAGE, USAGE));
     }
     let mut host = CliUp::new(env.runs_dir.clone());
-    let mut sys = daemon::SystemdHost::new(env.runs_dir.clone());
+    let mut sys = daemon::ServiceHost::new(env.runs_dir.clone());
     up(&mut host, &mut sys).map(|_| String::new())
 }
