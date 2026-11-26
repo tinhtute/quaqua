@@ -67,19 +67,16 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
     let mut conn = crate::db::open(&ctx.runs_dir.join(DB_FILE))
         .map_err(|e| RpcError::new("internal", e.to_string()))?;
     let sub = argv.first().map(String::as_str).unwrap_or_default();
-    // The Principal's allowlist, checked before anything else: outside herdr it
-    // reads the config and never writes it (owner decision 2026-11-25). Only the
-    // guarded verb has subcommands — `roster` is served here too and its argv is
-    // free text, so keying this on the verb rather than on `guarded` refused a
-    // plain `quaqua roster` with an empty subcommand name.
+    // The Principal's allowlist, checked before anything else: outside an agent's
+    // pane it reads the config and never writes it (owner decision 2026-11-25).
+    // Only the guarded verb has subcommands — `roster` is served here too and its
+    // argv is free text, so keying this on the verb rather than on `guarded`
+    // refused a plain `quaqua roster` with an empty subcommand name.
     if guarded && crate::daemon::is_principal(req) && !PRINCIPAL_CONFIG.contains(&sub) {
-        return Err(RpcError::new(
-            crate::identity::peer::AGENT_ONLY,
-            format!(
-                "config {sub} must be run from a herdr pane: outside one the Principal \
-                 reads the config only ({PRINCIPAL_CONFIG:?}); herdr may also have failed \
-                 to describe the caller's pane"
-            ),
+        // One text with every other farm-changing verb: it names the CoS pane.
+        return Err(crate::identity::peer::agent_only_refusal(
+            &format!("config {sub}"),
+            None,
         ));
     }
     if guarded && !PRINCIPAL_CONFIG.contains(&sub) {

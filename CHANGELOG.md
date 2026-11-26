@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The owner's shell pane inside Herdr reads the farm**: a same-uid caller in a pane that hosts no known agent is now the same read-only Principal as one in no pane, so `quaqua ping`, `status`, `roster` and the config reads answer there; every farm-changing verb stays refused and now names the CoS pane as where to run it (#375).
+
 ## [3.3.0] - 2026-11-26
 
 ### Added
