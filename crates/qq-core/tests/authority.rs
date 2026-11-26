@@ -1181,7 +1181,9 @@ mod caller_gate {
             assert!(is_block(&r.bash(cmd)), "{cmd}");
         }
         // A readable merge with a value file still asks.
-        assert!(is_ask(&r.bash("gh pr merge 5 --body-file notes.txt --squash")));
+        assert!(is_ask(
+            &r.bash("gh pr merge 5 --body-file notes.txt --squash")
+        ));
     }
 
     /// F3: the gate asks for a merge at every repo/lane tier and with a full
@@ -1213,7 +1215,10 @@ mod caller_gate {
         for word in ["low", "medium"] {
             set("repo_tier", "repo", word);
             set("plan_lane", "lane", word);
-            assert!(is_ask(&r.run(hook("gh pr merge 5"))), "repo and lane {word}");
+            assert!(
+                is_ask(&r.run(hook("gh pr merge 5"))),
+                "repo and lane {word}"
+            );
             if word == "low" {
                 // The rows are live: a release at low tier is allowed.
                 assert_eq!(

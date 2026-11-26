@@ -6,11 +6,13 @@
 //!   any `git push` that is not a pure branch delete, a `gh` merge that
 //!   bypasses the owner or cannot be read (`--admin`, `--auto`,
 //!   `--disable-auto`, a `gh api` merge endpoint or mutation, a merge flag the
-//!   scanner does not know, a `$` expansion), deleting main/master, and a ref
-//!   or contents write that lands on main/master.
+//!   scanner does not know, a `$` expansion, a word the tokenizer drops, a
+//!   merge under `xargs` or `parallel`), deleting main/master, and a ref or
+//!   contents write that lands on main/master.
 //! - The approval list, decided by caller and tier (R7, R14, R5): branch delete,
 //!   `git branch -m|-M|-f` on main/master, `git tag`, `gh release create`,
-//!   `gh pr merge` (the owner's prompt, tier-judged like a release), history
+//!   `gh pr merge` (the owner's prompt at every tier, lane and grant; only the
+//!   daemon's `pr.merge` door keeps the tier math), history
 //!   rewrite on shared refs, the #297 bypass spellings (alias push,
 //!   `gh api` ref/contents writes off main, `query=@file`), pane input and
 //!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
@@ -342,6 +344,12 @@ fn judge(
             }
             Pending::CosOnly => continue,
         };
+        // A merge is the owner's call at every tier, lane and grant; only the
+        // daemon's `pr.merge` door keeps the tier math.
+        if action == Action::MergeRequest {
+            ask = Some(h.reason);
+            continue;
+        }
         // A full grant is the one exception to "unmerged asks at every tier",
         // and only for a target the scanner could read.
         if action == Action::BranchDeleteUnmerged
@@ -678,6 +686,12 @@ fn scan(command: &str) -> Found {
 fn scan_with(command: &str, deep: bool) -> Found {
     let segs = tokenize(command);
     let mut f = Found::pass();
+    // A `gh pr merge` whose text carries a word the tokenizer drops (`$(…)`, a
+    // backtick, `<(…)`, `''`/`""`) has an argv bash builds and the gate never
+    // reads: hard-block it for everyone, the CoS included.
+    if segs.iter().any(|s| is_gh_merge(s)) && merge_tail(command).is_some_and(drops_words) {
+        f.absorb(Found::block(MERGE_MESSAGE));
+    }
     for seg in &segs {
         f.absorb(check_words_in(seg, deep));
         f.absorb(git_env_words(seg));
@@ -1020,8 +1034,11 @@ fn check_cmd(w: &[String], i: usize, deep: bool) -> Found {
         "find" => check_find(a),
         // The command word was a substitution the tokenizer dropped.
         "call" => check_quaqua(&w[i..]),
+        // `xargs` and `parallel` add words from outside the text: a merge under
+        // one cannot be read, so it stays a hard block.
+        b @ ("xargs" | "parallel") => merge_behind(b, a),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
-        | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
+        | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
         b => {
             let mut f = names_db(b, a);
             // A command word built at run time (`$Q call …`) may be `quaqua`.
@@ -1689,9 +1706,9 @@ fn targets_trunk(x: &str) -> bool {
 }
 
 /// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation: a plain,
-/// readable `pr merge` is on the approval list (the owner's prompt), the bypass
-/// flags and unreadable shapes are hard blocks; a ref/contents write or a
-/// hidden query is a push by another name: blocked when it lands on
+/// readable `pr merge` is on the approval list (the owner's prompt at every
+/// tier), the bypass flags and unreadable shapes are hard blocks; a ref/contents
+/// write or a hidden query is a push by another name: blocked when it lands on
 /// main/master, else on the approval list.
 fn check_gh(a: &[String]) -> Found {
     // `-R/--repo` names another repo than the cwd's.
@@ -1759,7 +1776,9 @@ fn gh_globals_readable(a: &[String], from: usize, to: usize) -> bool {
 }
 
 /// The words after `merge`: the PR argument and the merge flags the reader
-/// knows. Anything else, a forbidden flag included, is not read.
+/// knows. Anything else, a forbidden flag included, is not read. A separate
+/// value stays in the stream: a word the tokenizer dropped (`''`, `$(…)`) can
+/// shift the slot, so a flag-looking value is judged as the flag it spells.
 fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
     let mut i = m + 1;
     while i < a.len() {
@@ -1772,10 +1791,6 @@ fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
             let name = rest.split('=').next().unwrap_or(rest);
             if merge_forbidden(name) || !(merge_boolean(name) || merge_takes_value(name)) {
                 return false;
-            }
-            // `--flag=value` carries it; otherwise the next word does.
-            if merge_takes_value(name) && !rest.contains('=') {
-                i += 1;
             }
             continue;
         }
@@ -1790,10 +1805,8 @@ fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
                 }
                 at += c.len_utf8();
                 if merge_takes_value(&name) {
-                    // The rest of the cluster is its value, else the next word.
-                    if at == cluster.len() {
-                        i += 1;
-                    }
+                    // The rest of the cluster is its value; a separate word is
+                    // judged on its own (see above).
                     break;
                 }
             }
@@ -1807,22 +1820,50 @@ fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
     true
 }
 
+/// The positions of `pr` and `merge` when the words after `gh` name a merge.
+fn gh_merge_at(a: &[String]) -> Option<(usize, usize)> {
+    let p = a.iter().position(|x| x == "pr")?;
+    let m = p + 1 + a[p + 1..].iter().position(|x| x == "merge")?;
+    Some((p, m))
+}
+
+/// A simple command's words open with `gh` and hold `pr … merge`.
+fn is_gh_merge(s: &[String]) -> bool {
+    let Some(i) = s.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
+        return false;
+    };
+    s[i].rsplit('/').next().unwrap_or(&s[i]) == "gh" && gh_merge_at(&s[i + 1..]).is_some()
+}
+
+/// The raw text after the `merge` that follows `pr`: the merge argv, as far as
+/// the text tells. A heuristic, read only to reject text the tokenizer dropped
+/// words from.
+fn merge_tail(command: &str) -> Option<&str> {
+    let p = command.find("pr")?;
+    let m = command[p..].find("merge")?;
+    Some(&command[p + m + "merge".len()..])
+}
+
+/// Constructs that make bash build words the tokenizer drops: command and
+/// process substitutions, backticks, and empty quoted words.
+fn drops_words(text: &str) -> bool {
+    text.contains("$(")
+        || text.contains('`')
+        || text.contains("<(")
+        || text.contains("''")
+        || text.contains("\"\"")
+}
+
 fn check_gh_cmd(a: &[String]) -> Found {
-    if let Some(p) = a.iter().position(|x| x == "pr") {
-        if let Some(m) = a[p + 1..]
-            .iter()
-            .position(|x| x == "merge")
-            .map(|m| p + 1 + m)
-        {
-            let readable = gh_globals_readable(a, 0, p)
-                && gh_globals_readable(a, p + 1, m)
-                && gh_merge_args_readable(a, m);
-            return if readable {
-                Found::act(Action::MergeRequest, ASK_MERGE)
-            } else {
-                Found::block(MERGE_MESSAGE)
-            };
-        }
+    if let Some((p, m)) = gh_merge_at(a) {
+        let readable = gh_globals_readable(a, 0, p)
+            && gh_globals_readable(a, p + 1, m)
+            && gh_merge_args_readable(a, m);
+        return if readable {
+            Found::act(Action::MergeRequest, ASK_MERGE)
+        } else {
+            Found::block(MERGE_MESSAGE)
+        };
     }
     if a.windows(2).any(|w| w[0] == "release" && w[1] == "create") {
         return Found::act(Action::Release, ASK_RELEASE);
@@ -2564,6 +2605,14 @@ fn spaced_word(x: &str) -> Found {
 /// [`check_cmd`] (db writes, path writers, grants) still applies.
 fn check_flat(w: &[String]) -> Found {
     let base = w[0].rsplit('/').next().unwrap_or(&w[0]);
+    if matches!(base, "xargs" | "parallel") {
+        // Shallow: no wrapper deep scan here, only the merge shape.
+        return if (0..w.len()).any(|j| is_gh_merge(&w[j..])) {
+            Found::block(MERGE_MESSAGE)
+        } else {
+            Found::pass()
+        };
+    }
     if matches!(
         base,
         "sudo"
@@ -2575,7 +2624,6 @@ fn check_flat(w: &[String]) -> Found {
             | "nohup"
             | "setsid"
             | "stdbuf"
-            | "xargs"
             | "builtin"
             | "chrt"
             | "ionice"
@@ -2585,6 +2633,20 @@ fn check_flat(w: &[String]) -> Found {
         return Found::pass();
     }
     check_cmd(w, 0, false)
+}
+
+/// A wrapper that adds words the text does not show (`xargs`, `parallel`): a
+/// `gh pr merge` it runs is not readable, whatever its visible argv says.
+fn merge_behind(base: &str, a: &[String]) -> Found {
+    let f = wrapper(base, a);
+    if f.listed
+        .iter()
+        .any(|h| matches!(h.p, Pending::Act(Action::MergeRequest)))
+    {
+        Found::block(MERGE_MESSAGE)
+    } else {
+        f
+    }
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
