@@ -1142,6 +1142,98 @@ mod caller_gate {
         }
     }
 
+    /// F1: a value word the tokenizer drops (`''`, `""`, `$(…)`, `<(…)`) must
+    /// not shift a literal bypass flag into the value slot.
+    #[test]
+    fn ask_tier_merge_dropped_value_does_not_hide_admin_or_auto() {
+        let r = rig("ask-merge-drop", Who::Cos);
+        for cmd in [
+            "gh pr merge 5 --body '' --admin",
+            "gh pr merge 5 --body \"\" --auto",
+            "gh pr merge 5 -b '' --admin",
+            "gh pr merge 5 --body --admin",
+            "gh pr merge 5 --subject \"$(cat s)\" --admin",
+            "gh pr merge 5 -A \"$(git config user.email)\" --auto",
+            "gh pr merge 5 --match-head-commit $(git rev-parse HEAD) --admin",
+            "gh pr merge 5 -b\"$(cat m)\" --admin",
+            "gh pr merge 5 --body <(cat m) --admin",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    /// F2: `$(…)`, a backtick, `<(…)`, a dropped empty word, and a merge under
+    /// `xargs`/`parallel` are an argv the reader cannot see.
+    #[test]
+    fn ask_tier_merge_unreadable_argv_stays_blocked() {
+        let r = rig("ask-merge-unread", Who::Cos);
+        for cmd in [
+            "gh pr merge 5 $(echo --admin)",
+            "gh pr merge 5 `echo --admin`",
+            "gh pr merge $(echo 5 --auto)",
+            "gh pr merge 5 --body ''",
+            "gh pr merge 5 --body-file <(echo notes)",
+            "echo --admin | xargs gh pr merge 5",
+            "xargs gh pr merge 5",
+            "parallel gh pr merge 5",
+            "xargs -n1 gh pr merge 5 --squash",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+        // A readable merge with a value file still asks.
+        assert!(is_ask(&r.bash("gh pr merge 5 --body-file notes.txt --squash")));
+    }
+
+    /// F3: the gate asks for a merge at every repo/lane tier and with a full
+    /// grant; only the daemon's `pr.merge` door keeps the tier math.
+    #[test]
+    fn ask_tier_merge_asks_at_every_tier_and_grant() {
+        let r = rig("ask-merge-tier", Who::Cos);
+        let dir = r.ws.root().join("merge-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = tier::repo_key(&dir);
+        let hook = |cmd: &str| {
+            json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": cmd},
+                "cwd": dir.to_string_lossy(),
+            })
+        };
+        assert!(is_ask(&r.run(hook("gh pr merge 5"))), "unlisted repo");
+        let c = qq_core::db::open(&r.ws.db_path()).unwrap();
+        let set = |table: &str, col: &str, word: &str| {
+            c.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {table} ({col}, tier, set_ms, set_by) VALUES (?1, ?2, 1, 'cos')"
+                ),
+                params![key, word],
+            )
+            .unwrap();
+        };
+        for word in ["low", "medium"] {
+            set("repo_tier", "repo", word);
+            set("plan_lane", "lane", word);
+            assert!(is_ask(&r.run(hook("gh pr merge 5"))), "repo and lane {word}");
+            if word == "low" {
+                // The rows are live: a release at low tier is allowed.
+                assert_eq!(
+                    r.run(hook("gh release create v1 --notes x")),
+                    GateVerdict::Allow
+                );
+            }
+        }
+        c.execute(
+            "INSERT OR REPLACE INTO grant_full (repo, granted_ms, granted_by) VALUES (?1, 1, 'cos')",
+            params![key],
+        )
+        .unwrap();
+        assert!(is_ask(&r.run(hook("gh pr merge 5"))), "full grant");
+        assert!(
+            is_ask(&r.run(hook("gh pr merge 5 --squash --delete-branch"))),
+            "granted squash"
+        );
+    }
+
     #[test]
     fn ask_tier_reading_tags_is_not_a_hit() {
         let r = rig("ask-tag-read", Who::Down);
