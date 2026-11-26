@@ -18,10 +18,21 @@ struct Rig {
 }
 
 fn rig(tag: &str) -> Rig {
-    rig_with(tag, false)
+    rig_full(tag, false, false)
 }
 
 fn rig_with(tag: &str, bootstrap: bool) -> Rig {
+    rig_full(tag, bootstrap, false)
+}
+
+/// A rig whose `config` verb is the daemon's real one. The stand-in other rigs
+/// register answers `{"ran": true}` to every subcommand, so it cannot show a
+/// config write refused by the handler's own allowlist rather than by the gate.
+fn rig_real_config(tag: &str) -> Rig {
+    rig_full(tag, false, true)
+}
+
+fn rig_full(tag: &str, bootstrap: bool, real_config: bool) -> Rig {
     let ws = TestWorkspace::new(tag);
     ws.seal_herdr();
     let herdr = Arc::new(FakeHerdr::new());
@@ -35,18 +46,24 @@ fn rig_with(tag: &str, bootstrap: bool) -> Rig {
     )
     .unwrap();
     // Stand-ins for verbs whose real handlers need more wiring: the peer gate
-    // runs before any handler, so a refusal here is the real refusal.
-    for v in [
+    // runs before any handler, so a refusal here is the real refusal. `config`
+    // and `roster` install together, so a real-config rig skips both here.
+    let mut stand_ins = vec![
         "task.start",
         "worker.stop",
         "mail.inbox.x",
         "pingx",
         "status.all",
-        "config",
-        "roster",
-    ] {
+    ];
+    if !real_config {
+        stand_ins.extend(["config", "roster"]);
+    }
+    for v in stand_ins {
         d.register_verb(v, Box::new(|_, _| Ok(json!({ "ran": true }))))
             .unwrap();
+    }
+    if real_config {
+        qq_core::config::INSTALL(&mut qq_core::cli::Registry::new(), &mut d).unwrap();
     }
     if bootstrap {
         d.require_peer(Arc::new(HerdrPeers::with_cos_bootstrap(
@@ -130,12 +147,92 @@ fn a_principal_is_refused_every_agent_verb_and_the_claim_does_not_save_it() {
     stop(r);
 }
 
+/// Issue #375: the owner runs `quaqua` from a plain shell pane inside herdr, so
+/// a pane that hosts no agent resolves exactly like no pane at all — the
+/// read-only Principal. It reads, and every farm-changing verb is refused with
+/// the pane it does run from named (the CoS pane for `stop`, an agent's pane for
+/// agent verbs).
 #[test]
-fn mapped_pane_without_an_agent_is_refused() {
+fn a_pane_with_no_agent_is_the_read_only_principal() {
     let r = rig("peer-noagent");
     let pane = r.herdr.seed_pane("h", Some("zsh"), &[]);
     r.herdr.set_pane_pids(&pane, me(), &[]);
-    assert_eq!(whoami(&r, None).unwrap_err().code, "unmapped_peer");
+    // The reads answer, exactly as they do from a terminal outside herdr.
+    assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
+    assert!(call(&r, "status", None).is_ok(), "status");
+    assert_eq!(call(&r, "roster", None).unwrap()["ran"], true);
+    // The identity probe still names no agent, as for the plain Principal.
+    assert_eq!(whoami(&r, None).unwrap_err().code, "agent_only");
+    // A farm-changing verb is refused, and the message says where to run it.
+    let e = call(&r, "stop", None).unwrap_err();
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(
+        e.message.contains("must be run from the CoS pane"),
+        "names where to run it: {e:?}"
+    );
+    // An agent verb points at an agent's pane instead: a Peer pushes its own
+    // branch and a Lead merges its queue, so the CoS pane is not the only door.
+    let e = call(&r, "task.start", None).unwrap_err();
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(
+        e.message.contains("an agent's pane"),
+        "the advice fits the verb: {e:?}"
+    );
+    // The same through the CLI, as the owner runs it: `quaqua ping` answers and
+    // `quaqua stop` exits refused, naming the CoS pane.
+    let runs = r._ws.runs_dir();
+    let ping = qq(&runs, &["ping"]);
+    assert_eq!(ping.status.code(), Some(0), "{ping:?}");
+    assert!(
+        String::from_utf8_lossy(&ping.stdout).contains("pong"),
+        "{ping:?}"
+    );
+    let refused = qq(&runs, &["stop"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(qq_core::cli::EXIT_REFUSED),
+        "{refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("CoS pane"),
+        "{refused:?}"
+    );
+    r.herdr.pane_close(&pane).unwrap();
+    stop(r);
+}
+
+/// `config <argv>` over the socket, the way the CLI sends it.
+fn config_call(r: &Rig, argv: &[&str]) -> Result<Value, rpc::RpcError> {
+    let req = Request::new("config", json!({ "argv": argv }));
+    rpc::call(&r.daemon.socket, &req).unwrap().into_result()
+}
+
+/// The two claims a stand-in cannot show: the real `caller.lookup` handler still
+/// answers `unmapped_peer` for an agent-less pane (so the hook gate keeps reading
+/// the caller as unknown), and the real `config` handler refuses its writes while
+/// its reads answer.
+#[test]
+fn an_agent_less_pane_reads_config_and_writes_none() {
+    let r = rig_real_config("peer-noagent-config");
+    let pane = r.herdr.seed_pane("h", Some("zsh"), &[]);
+    r.herdr.set_pane_pids(&pane, me(), &[]);
+    let e = config_call(&r, &["set", "timers.stall_sec", "90"]).unwrap_err();
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(
+        e.message.contains("must be run from the CoS pane"),
+        "names where: {e:?}"
+    );
+    // The reads answer, and the refused write changed nothing behind them.
+    let before = config_call(&r, &["get"]).expect("a principal reads config");
+    let e = config_call(&r, &["get", "timers.stall_sec"]).unwrap_err();
+    assert_eq!(e.code, "config_refused", "the write did not land: {e:?}");
+    let after = config_call(&r, &["get"]).expect("a principal reads config");
+    assert_eq!(before, after, "the refused write changed nothing: {after}");
+    // The identity probe is the hook gate's question, and it still names no agent.
+    assert_eq!(
+        call(&r, "caller.lookup", None).unwrap_err().code,
+        "unmapped_peer"
+    );
     r.herdr.pane_close(&pane).unwrap();
     stop(r);
 }

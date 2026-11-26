@@ -3,12 +3,13 @@
 //! Data shape: the kernel's [`PeerCred`] `{pid, uid}` for the connected socket
 //! -> [`PeerResolver::resolve`] walks the pid's ancestry to the herdr pane whose
 //! shell or foreground process it is -> that pane's agent is the [`CallerId`].
-//! A peer of the daemon's own uid that reaches no pane is the [`PRINCIPAL`], the
-//! owner of the farm; it names no agent, so the daemon keeps it to **read** verbs
-//! (owner decision 2026-11-25): nothing that changes the farm is reachable from
-//! outside herdr, so an agent whose process leaves its pane gains nothing.
-//! Every other step fails closed: a peer in a pane with no agent, or from
-//! another uid, is refused whatever the request claims.
+//! A peer of the daemon's own uid that reaches no agent is the [`PRINCIPAL`],
+//! the owner of the farm: it reaches no pane at all, or it reaches a pane that
+//! hosts no known agent (the owner at a shell inside herdr). It names no agent,
+//! so the daemon keeps it to **read** verbs (owner decision 2026-11-25): nothing
+//! that changes the farm is reachable from outside an agent's pane, so an agent
+//! whose process leaves its pane gains nothing. Every other step fails closed: a
+//! peer from another uid is refused whatever the request claims.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -26,15 +27,20 @@ pub const UNMAPPED_PEER: &str = "unmapped_peer";
 /// Longest ancestry walked from the peer pid.
 const MAX_DEPTH: usize = 64;
 
-/// The name a same-uid peer that reaches no herdr pane speaks as: the
-/// Principal, the uid that owns the farm. Named by the socket peer (the uid)
-/// plus the absence of a pane, never claimed by the request.
+/// The name a same-uid peer that reaches no agent speaks as: the Principal, the
+/// uid that owns the farm. Named by the socket peer (the uid) plus the absence
+/// of an agent, never claimed by the request: it is a process in no herdr pane
+/// (the owner at a plain terminal, or one that left its pane) and equally one in
+/// a herdr pane that hosts no known agent (the owner at a shell inside herdr).
 ///
 /// The Principal looks at the farm from a plain terminal and cannot change it:
 /// the daemon opens `ping`, `status`, `roster`, `config` and `caller.lookup` to
 /// it and nothing else, and inside `config` only the read subcommands in
 /// `config::verbs::PRINCIPAL_CONFIG`. It names no agent, so no agent verb can be
-/// reached through it, and `stop` and every config write stay pane-only.
+/// reached through it, and every farm-changing verb — `stop`, every config
+/// write, spawn, prompt — answers [`agent_only_refusal`] naming the pane it
+/// runs from (the CoS pane for `stop` and `config`, the owning agent's pane
+/// for agent verbs).
 pub const PRINCIPAL: &str = "owner";
 
 /// Refusal code for an agent-only verb called by the Principal. Distinct from
@@ -44,6 +50,41 @@ pub const AGENT_ONLY: &str = "agent_only";
 
 /// Refusal code for a peer owned by another uid than the daemon.
 pub const FOREIGN_UID: &str = "foreign_uid";
+
+/// The refusal every farm-changing verb answers when the gate named the caller
+/// the read-only Principal: it says where the verb does run, so the owner in a
+/// shell pane inside herdr is told where to walk rather than being left with
+/// "not identified". `peer` is the socket peer's pid when the caller knows it
+/// (the gate does; a handler reached for a `config` subcommand does not). One
+/// text for every such verb, so the advice never drifts.
+pub fn agent_only_refusal(verb: &str, peer: Option<i32>) -> RpcError {
+    let who = match peer {
+        Some(pid) => format!("caller pid {pid} speaks"),
+        None => "the caller speaks".to_string(),
+    };
+    RpcError::new(
+        AGENT_ONLY,
+        format!(
+            "'{verb}' changes the farm, so it must be run from {}: {who} as the \
+             read-only Principal '{PRINCIPAL}' — it is in no herdr pane, in one that hosts \
+             no known agent, or in one herdr could not describe",
+            verb_home(verb)
+        ),
+    )
+}
+
+/// The pane a farm-changing verb runs from. The daemon's own switch and the
+/// config writes change the farm itself, so they belong to the CoS pane; every
+/// other verb is an agent verb (`task.*`, `mail.*`, `push`, `signal`, `merge`,
+/// …) and runs in whichever agent's pane owns it — a Peer's, a Lead's, or the
+/// CoS's. Only the verbs the gate refuses reach here, so a read never asks.
+fn verb_home(verb: &str) -> &'static str {
+    if verb == "stop" || verb.starts_with("config") {
+        "the CoS pane"
+    } else {
+        "an agent's pane (the CoS pane for `stop` and `config`)"
+    }
+}
 
 /// The daemon's own effective uid.
 pub fn own_uid() -> u32 {
@@ -255,12 +296,15 @@ fn json(r: io::Result<Reply>, what: &str) -> Result<Value, RpcError> {
 
 impl PeerResolver for HerdrPeers {
     /// Agent identity only: `quaqua worker spawn` reads this, and a process in
-    /// no pane must never be taken for an agent, so the Principal is refused
+    /// no agent must never be taken for an agent, so the Principal is refused
     /// here even though [`HerdrPeers::resolve_pane`] names it.
     fn resolve(&self, cred: PeerCred) -> Result<CallerId, RpcError> {
         match self.resolve_pane(cred)? {
             (who, Some(_)) => Ok(who),
-            (_, None) => Err(refuse(format!("pid {} is in no herdr pane", cred.pid))),
+            (_, None) => Err(refuse(format!(
+                "pid {} reaches no herdr agent: run it from an agent's pane",
+                cred.pid
+            ))),
         }
     }
 
@@ -318,16 +362,27 @@ impl PeerResolver for HerdrPeers {
             self.ensure_cos(pane)?;
             return Ok((CallerId("cos".into()), Some(pane.to_string())));
         }
+        // A pane that hosts no known agent names no agent either: the owner at a
+        // shell inside herdr, a pane whose agent already left, a pane the agent
+        // start has not registered yet. Issue #375: it resolves exactly like a
+        // peer that reaches no pane — the read-only Principal — so the owner
+        // gets the same `ping` inside herdr as outside it, and nothing more: the
+        // daemon's gate opens no farm-changing verb to a caller with no pane.
+        // `resolve` still refuses it, so no spawn is ever attributed to it.
         let agents = json(self.herdr.agent_list(), "agent list")?;
-        agents
-            .pointer("/result/agents")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|a| a.get("pane_id").and_then(Value::as_str) == Some(pane))
-            .and_then(|a| a.get("name").and_then(Value::as_str))
-            .map(|n| (CallerId(n.to_string()), Some(pane.to_string())))
-            .ok_or_else(|| refuse(format!("pane {pane} hosts no known agent")))
+        Ok(
+            match agents
+                .pointer("/result/agents")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|a| a.get("pane_id").and_then(Value::as_str) == Some(pane))
+                .and_then(|a| a.get("name").and_then(Value::as_str))
+            {
+                Some(name) => (CallerId(name.to_string()), Some(pane.to_string())),
+                None => (CallerId(PRINCIPAL.into()), None),
+            },
+        )
     }
 }
 
@@ -380,16 +435,49 @@ mod tests {
         assert_eq!(e.code, UNMAPPED_PEER);
     }
 
-    /// A process inside a pane that hosts no known agent is still refused: only
-    /// a peer that reaches no pane at all is the principal.
+    /// Issue #375: a process inside a pane that hosts no known agent — the
+    /// owner's shell pane inside herdr — is the same read-only Principal as one
+    /// that reaches no pane at all. It is named here, and the daemon's gate is
+    /// what keeps it to the read verbs.
     #[test]
-    fn a_pane_with_no_agent_is_still_refused() {
+    fn a_pane_with_no_agent_is_the_principal() {
         let herdr = Arc::new(FakeHerdr::new());
         let pane = herdr.seed_pane("h", Some("zsh"), &[]);
         herdr.set_pane_pids(&pane, std::process::id(), &[]);
-        let e = resolver(&herdr).resolve_pane(me()).unwrap_err();
+        let (who, mapped) = resolver(&herdr)
+            .resolve_pane(me())
+            .expect("an agent-less pane is the principal");
+        assert_eq!(who.as_str(), PRINCIPAL);
+        assert_eq!(mapped, None, "it reaches no agent, so it places no pane");
+    }
+
+    /// The agent-only door still refuses it: a pane with no agent must never
+    /// spawn an agent as the Principal.
+    #[test]
+    fn an_agent_less_pane_is_no_agent() {
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("h", Some("zsh"), &[]);
+        herdr.set_pane_pids(&pane, std::process::id(), &[]);
+        let e = resolver(&herdr).resolve(me()).unwrap_err();
         assert_eq!(e.code, UNMAPPED_PEER);
-        assert!(e.message.contains("hosts no known agent"), "{}", e.message);
+        assert!(
+            e.message.contains("reaches no herdr agent"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// A pane that does host an agent still names it, so the new fallthrough did
+    /// not swallow a real caller.
+    #[test]
+    fn a_pane_with_an_agent_still_names_it() {
+        let herdr = Arc::new(FakeHerdr::new());
+        let pane = herdr.seed_pane("w", None, &[]);
+        herdr.agent_start("w-1", "claude", &pane, 0, &[]).unwrap();
+        herdr.set_pane_pids(&pane, std::process::id(), &[]);
+        let (who, mapped) = resolver(&herdr).resolve_pane(me()).unwrap();
+        assert_eq!(who.as_str(), "w-1");
+        assert_eq!(mapped.as_deref(), Some(pane.as_str()));
     }
 
     /// Owner decision 2026-11-25: outside herdr the Principal reads only, so a
@@ -419,5 +507,45 @@ mod tests {
         let (who, mapped) = resolver(&herdr).resolve_pane(me()).expect("the principal");
         assert_eq!(who.as_str(), PRINCIPAL);
         assert_eq!(mapped, None);
+    }
+
+    /// Review finding: the refusal fits the verb — the CoS pane for the farm's
+    /// own switch and config writes, an agent's pane for agent verbs — and it
+    /// names every way to be the Principal, a pane herdr cannot describe
+    /// included, so nobody is left with a wrong diagnosis.
+    #[test]
+    fn the_refusal_fits_the_verb_and_names_every_way_to_be_the_principal() {
+        for verb in ["stop", "config set", "config import"] {
+            let e = agent_only_refusal(verb, Some(4000));
+            assert_eq!(e.code, AGENT_ONLY);
+            assert!(
+                e.message.contains("must be run from the CoS pane"),
+                "{verb}: {}",
+                e.message
+            );
+        }
+        for verb in ["task.start", "mail.send", "push", "signal"] {
+            let e = agent_only_refusal(verb, Some(4000));
+            assert_eq!(e.code, AGENT_ONLY);
+            assert!(
+                e.message.contains("an agent's pane"),
+                "{verb}: {}",
+                e.message
+            );
+            assert!(
+                !e.message.contains("must be run from the CoS pane"),
+                "{verb}: {}",
+                e.message
+            );
+        }
+        let e = agent_only_refusal("stop", None);
+        assert!(e.message.contains("the caller speaks"), "{}", e.message);
+        for clause in [
+            "in no herdr pane",
+            "hosts no known agent",
+            "herdr could not describe",
+        ] {
+            assert!(e.message.contains(clause), "{clause}: {}", e.message);
+        }
     }
 }

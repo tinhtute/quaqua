@@ -679,9 +679,10 @@ where
 }
 
 /// With a resolver, `req.caller` becomes the agent the socket peer maps to (the
-/// client's claim is dropped). A peer of another uid is refused outright; a peer
-/// in a pane with no agent is refused too, whatever the verb. A same-uid peer in
-/// no pane at all speaks as the Principal, which may run only [`PRINCIPAL_VERBS`].
+/// client's claim is dropped). A peer of another uid is refused outright; a
+/// same-uid peer that reaches no agent speaks as the Principal — in no pane at
+/// all, or in a pane that hosts no known agent (issue #375) — and may run only
+/// [`PRINCIPAL_VERBS`].
 fn identify(
     mut req: Request,
     peers: Option<&dyn PeerResolver>,
@@ -706,17 +707,7 @@ fn identify(
     let (who, pane) = peers.resolve_pane(*cred)?;
     let principal = pane.is_none() && who.as_str() == peer::PRINCIPAL;
     if principal && !PRINCIPAL_VERBS.contains(&req.verb.as_str()) {
-        return Err(RpcError::new(
-            peer::AGENT_ONLY,
-            format!(
-                "verb '{}' must be run from a herdr pane: caller pid {} is in no pane, \
-                 so it speaks as the read-only Principal '{}' (or herdr could not \
-                 describe the pane it is in)",
-                req.verb,
-                cred.pid,
-                peer::PRINCIPAL
-            ),
-        ));
+        return Err(peer::agent_only_refusal(&req.verb, Some(cred.pid)));
     }
     req.caller = Some(who.0);
     req.caller_pane = pane;
@@ -724,13 +715,15 @@ fn identify(
     Ok(req)
 }
 
-/// Verbs a caller in no herdr pane may run: **reads only** (owner decision
-/// 2026-11-25). Outside herdr the Principal may look at the farm — the launcher
-/// asks `ping` before it starts a daemon — but nothing that changes it, so an
-/// agent that escapes its pane (`&`, `nohup`, `setsid`, `systemd-run`, a
-/// connector that exited) cannot stop the daemon or write config even when it is
-/// named the Principal. The list is an allowlist, so a verb added later is
-/// closed until someone decides otherwise; none of these names an agent.
+/// Verbs a caller in no agent's pane may run: **reads only** (owner decision
+/// 2026-11-25). The Principal may look at the farm — the launcher asks `ping`
+/// before it starts a daemon — but nothing that changes it, so an agent that
+/// escapes its pane (`&`, `nohup`, `setsid`, `systemd-run`, a connector that
+/// exited) cannot stop the daemon or write config even when it is named the
+/// Principal. Issue #375: the owner's shell pane inside herdr reaches no agent
+/// either, so it gets the same list and no more. The list is an allowlist, so a
+/// verb added later is closed until someone decides otherwise; none of these
+/// names an agent.
 /// `config` is open only because its handler allows the four read subcommands
 /// (`config::verbs::PRINCIPAL_CONFIG`). `caller.lookup` is here because its
 /// handler is the one that refuses a caller it cannot name as an agent: the
@@ -739,7 +732,8 @@ fn identify(
 const PRINCIPAL_VERBS: [&str; 5] = ["ping", "status", "roster", "config", caller::VERB];
 
 /// True when the daemon's peer gate named this request's caller as the
-/// Principal: a same-uid peer that reaches no herdr pane. Only the gate sets it
+/// Principal: a same-uid peer that reaches no herdr agent — in no pane at all,
+/// or in a pane that hosts no known agent (issue #375). Only the gate sets it
 /// ([`Request::caller_principal`] is never read off the wire), so a client's
 /// `caller` claim cannot reach it and a pane-hosted agent named `owner` is never
 /// it either. A daemon with no resolver ([`Daemon::require_peer`]) names nobody,
