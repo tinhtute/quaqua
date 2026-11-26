@@ -73,7 +73,8 @@ fn serve(ctx: &Ctx, req: &Request, exec: Exec, guarded: bool) -> Result<Value, R
     // argv is free text, so keying this on the verb rather than on `guarded`
     // refused a plain `quaqua roster` with an empty subcommand name.
     if guarded && crate::daemon::is_principal(req) && !PRINCIPAL_CONFIG.contains(&sub) {
-        // One text with every other farm-changing verb: it names the CoS pane.
+        // One text with every other farm-changing verb, and it names the CoS
+        // pane: a config write is the farm's own configuration.
         return Err(crate::identity::peer::agent_only_refusal(
             &format!("config {sub}"),
             None,

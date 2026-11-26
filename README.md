@@ -52,7 +52,11 @@ pane inside herdr gets the same caller as one at a plain terminal (issue #375). 
 runs from a Herdr agent's pane: `stop`, `config set`, `config import`, and every agent verb
 (`task.*`, `mail.*`, `push`, `merge`, `pipeline`, `memory.write`, `signal`, `watch.*`,
 `workflow.start`, `pr.merge`). An allowlist means a verb or subcommand added later is closed
-until someone opens it, and a refused write says so: run it from the CoS pane.
+until someone opens it, and a refused write says where to run it instead: the CoS pane for
+`stop` and the config writes, and the agent's own pane for an agent verb (a Peer pushes its
+branch from its pane, a Lead merges its queue from its own). `quaqua daemon install` is the one
+farm-shaping command that needs no pane: it is client-side, writes the launchd or systemd unit
+from the same files, and never reaches the daemon, so no caller's identity is asked for.
 
 Because nothing writable is reachable outside a pane, a process that leaves its pane's
 ancestry (`(cmd &)`, `nohup … & disown`, a double fork, `setsid`, `systemd-run`, or a socket

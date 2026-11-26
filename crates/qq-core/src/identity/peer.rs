@@ -38,7 +38,9 @@ const MAX_DEPTH: usize = 64;
 /// it and nothing else, and inside `config` only the read subcommands in
 /// `config::verbs::PRINCIPAL_CONFIG`. It names no agent, so no agent verb can be
 /// reached through it, and every farm-changing verb — `stop`, every config
-/// write, spawn, prompt — answers [`agent_only_refusal`] naming the CoS pane.
+/// write, spawn, prompt — answers [`agent_only_refusal`] naming the pane it
+/// runs from (the CoS pane for `stop` and `config`, the owning agent's pane
+/// for agent verbs).
 pub const PRINCIPAL: &str = "owner";
 
 /// Refusal code for an agent-only verb called by the Principal. Distinct from
@@ -51,10 +53,10 @@ pub const FOREIGN_UID: &str = "foreign_uid";
 
 /// The refusal every farm-changing verb answers when the gate named the caller
 /// the read-only Principal: it says where the verb does run, so the owner in a
-/// shell pane inside herdr is told to walk to the CoS pane rather than being
-/// left with "not identified". `peer` is the socket peer's pid when the caller
-/// knows it (the gate does; a handler reached for a `config` subcommand does
-/// not). One text for every such verb, so the advice never drifts.
+/// shell pane inside herdr is told where to walk rather than being left with
+/// "not identified". `peer` is the socket peer's pid when the caller knows it
+/// (the gate does; a handler reached for a `config` subcommand does not). One
+/// text for every such verb, so the advice never drifts.
 pub fn agent_only_refusal(verb: &str, peer: Option<i32>) -> RpcError {
     let who = match peer {
         Some(pid) => format!("caller pid {pid} speaks"),
@@ -63,11 +65,25 @@ pub fn agent_only_refusal(verb: &str, peer: Option<i32>) -> RpcError {
     RpcError::new(
         AGENT_ONLY,
         format!(
-            "'{verb}' changes the farm, so it must be run from the CoS pane: {who} as the \
-             read-only Principal '{PRINCIPAL}' — it is in no herdr pane, or in one that hosts \
-             no known agent"
+            "'{verb}' changes the farm, so it must be run from {}: {who} as the \
+             read-only Principal '{PRINCIPAL}' — it is in no herdr pane, in one that hosts \
+             no known agent, or in one herdr could not describe",
+            verb_home(verb)
         ),
     )
+}
+
+/// The pane a farm-changing verb runs from. The daemon's own switch and the
+/// config writes change the farm itself, so they belong to the CoS pane; every
+/// other verb is an agent verb (`task.*`, `mail.*`, `push`, `signal`, `merge`,
+/// …) and runs in whichever agent's pane owns it — a Peer's, a Lead's, or the
+/// CoS's. Only the verbs the gate refuses reach here, so a read never asks.
+fn verb_home(verb: &str) -> &'static str {
+    if verb == "stop" || verb.starts_with("config") {
+        "the CoS pane"
+    } else {
+        "an agent's pane (the CoS pane for `stop` and `config`)"
+    }
 }
 
 /// The daemon's own effective uid.
@@ -286,7 +302,7 @@ impl PeerResolver for HerdrPeers {
         match self.resolve_pane(cred)? {
             (who, Some(_)) => Ok(who),
             (_, None) => Err(refuse(format!(
-                "pid {} reaches no herdr agent: run it from the CoS pane",
+                "pid {} reaches no herdr agent: run it from an agent's pane",
                 cred.pid
             ))),
         }
@@ -491,5 +507,45 @@ mod tests {
         let (who, mapped) = resolver(&herdr).resolve_pane(me()).expect("the principal");
         assert_eq!(who.as_str(), PRINCIPAL);
         assert_eq!(mapped, None);
+    }
+
+    /// Review finding: the refusal fits the verb — the CoS pane for the farm's
+    /// own switch and config writes, an agent's pane for agent verbs — and it
+    /// names every way to be the Principal, a pane herdr cannot describe
+    /// included, so nobody is left with a wrong diagnosis.
+    #[test]
+    fn the_refusal_fits_the_verb_and_names_every_way_to_be_the_principal() {
+        for verb in ["stop", "config set", "config import"] {
+            let e = agent_only_refusal(verb, Some(4000));
+            assert_eq!(e.code, AGENT_ONLY);
+            assert!(
+                e.message.contains("must be run from the CoS pane"),
+                "{verb}: {}",
+                e.message
+            );
+        }
+        for verb in ["task.start", "mail.send", "push", "signal"] {
+            let e = agent_only_refusal(verb, Some(4000));
+            assert_eq!(e.code, AGENT_ONLY);
+            assert!(
+                e.message.contains("an agent's pane"),
+                "{verb}: {}",
+                e.message
+            );
+            assert!(
+                !e.message.contains("must be run from the CoS pane"),
+                "{verb}: {}",
+                e.message
+            );
+        }
+        let e = agent_only_refusal("stop", None);
+        assert!(e.message.contains("the caller speaks"), "{}", e.message);
+        for clause in [
+            "in no herdr pane",
+            "hosts no known agent",
+            "herdr could not describe",
+        ] {
+            assert!(e.message.contains(clause), "{clause}: {}", e.message);
+        }
     }
 }
