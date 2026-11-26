@@ -839,6 +839,51 @@ mod tests {
         assert_eq!(wake_body(90_000, None), None);
     }
 
+    /// The pane in #376: herdr exports the socket to every pane and never the name.
+    const PANE_SOCKET: &str = "/h/.config/herdr/sessions/quaqua/herdr.sock";
+
+    /// A herdr that answers the way the real one does in a pane: `status server --json`
+    /// reports the socket with a null session, `session list --json` ties that socket to
+    /// the running session's name.
+    fn fake_herdr(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("fake-herdr");
+        let running = format!(
+            "{{\"status\":\"running\",\"running\":true,\"session\":null,\"socket\":\"{PANE_SOCKET}\"}}"
+        );
+        let list = format!(
+            "{{\"sessions\":[\
+             {{\"name\":\"default\",\"running\":false,\"socket_path\":\"/h/.config/herdr/herdr.sock\"}},\
+             {{\"name\":\"quaqua\",\"running\":true,\"socket_path\":\"{PANE_SOCKET}\"}}]}}"
+        );
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*'status server'*) echo '{running}' ;;\n\
+                 *'session list'*) echo '{list}' ;;\n\
+                 *) echo \"unexpected: $*\" >&2; exit 1 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// #376: `daemon install` in a herdr pane must take the session herdr reports instead
+    /// of refusing because the pane never exports `HERDR_SESSION`.
+    #[test]
+    fn install_takes_the_session_herdr_reports_when_the_env_lacks_it() {
+        let ws = crate::testkit::TestWorkspace::new("service-install-pane");
+        let bin = fake_herdr(ws.root());
+        std::env::set_var("HERDR_BIN_PATH", &bin);
+        std::env::set_var("HERDR_SOCKET_PATH", PANE_SOCKET);
+        let got = HerdrEnv::from_process();
+        ws.seal_herdr();
+        let got = got.expect("daemon install must resolve the session herdr reports");
+        assert_eq!(got.session, "quaqua");
+        assert_eq!(got.socket, PANE_SOCKET);
+    }
+
     #[test]
     fn herdr_env_names_what_is_missing() {
         let e = HerdrEnv::from_vars(None, Some(String::new())).unwrap_err();
