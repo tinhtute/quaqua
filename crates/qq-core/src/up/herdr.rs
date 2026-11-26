@@ -802,6 +802,21 @@ mod tests {
         assert!(calls.contains("--session farm-a"), "calls: {calls}");
     }
 
+    /// A pair that names the farm but sits in a process where herdr answers nothing: main
+    /// read no env at all, so `up` must resolve nothing here too (review finding A). The
+    /// socket is unverified and could be stale.
+    #[test]
+    fn resolve_env_reports_nothing_when_herdr_is_absent_whatever_the_env_names() {
+        let ws = crate::testkit::TestWorkspace::new("up-herdr-absent-own-pair");
+        let farm = ws.root().join("farm-a");
+        std::env::set_var("HERDR_SESSION", "farm-a");
+        std::env::set_var("HERDR_SOCKET_PATH", "/h/env/herdr.sock");
+        let mut up = up_for(&farm);
+        let pair = up.resolve_env();
+        ws.seal_herdr();
+        assert_eq!(pair, None);
+    }
+
     /// No herdr at all and a foreign pair in the env: `up` resolves nothing, as on main,
     /// rather than pairing the farm's name with another session's socket.
     #[test]
