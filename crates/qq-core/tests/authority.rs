@@ -1095,59 +1095,34 @@ mod caller_gate {
         assert_ask_for_cos_deny_for_rest("ask-rel", "gh release create v1 --notes x");
     }
 
+    /// The one canonical merge line asks the CoS and blocks everyone else.
     #[test]
-    fn ask_tier_pr_merge_asks_for_cos() {
+    fn ask_tier_pr_merge_canonical_asks_for_cos() {
         for (tag, cmd) in [
             ("ask-merge", "gh pr merge 5"),
-            ("ask-merge-bare", "gh pr merge"),
-            ("ask-merge-squash", "gh pr merge 5 --squash"),
-            ("ask-merge-merge", "gh pr merge 5 --merge"),
-            ("ask-merge-rebase", "gh pr merge 5 --rebase"),
-            ("ask-merge-del", "gh pr merge 5 --squash --delete-branch"),
-            ("ask-merge-sha", "gh pr merge 5 --match-head-commit abc123"),
+            ("ask-merge-zeros", "gh pr merge 007"),
+            ("ask-merge-repo", "gh pr merge 5 --repo o/r"),
+            ("ask-merge-r", "gh pr merge 5 -R o/r --squash"),
+            ("ask-merge-rebase", "gh pr merge 5 --rebase --delete-branch"),
+            ("ask-merge-sha", "gh pr merge 5 --match-head-commit abc1234"),
             (
-                "ask-merge-sha-eq",
-                "gh pr merge 5 --match-head-commit=abc123",
+                "ask-merge-all",
+                "gh pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc1234def",
             ),
-            ("ask-merge-r", "gh pr merge -R o/r 5"),
-            ("ask-merge-repo", "gh pr merge --repo o/r 5 --squash"),
-            ("ask-merge-g", "gh -R o/r pr merge 5"),
-            ("ask-merge-grepo", "gh --repo o/r pr merge 5"),
-            ("ask-merge-gap", "gh pr --repo o/r merge 5"),
-            // `-A` is `--author-email <text>` in gh 2.46, not an auto flag.
-            ("ask-merge-a", "gh pr merge 5 -A me@x"),
-            ("ask-merge-cluster", "gh pr merge 5 -sd"),
         ] {
             assert_ask_for_cos_deny_for_rest(tag, cmd);
         }
     }
 
+    /// Every other merge shape keeps the 193bd14 hard block: the three
+    /// reviews' repros, the chained and quoted lines that used to ask, and
+    /// every non-canonical spelling.
     #[test]
-    fn ask_tier_merge_bypass_or_unreadable_stays_blocked_for_cos() {
+    fn ask_tier_merge_every_other_shape_stays_blocked_for_cos() {
         let r = rig("ask-merge-block", Who::Cos);
         for cmd in [
+            // F1: a dropped value must not hide a literal bypass flag.
             "gh pr merge 5 --admin",
-            "gh pr merge --admin=false 5",
-            "gh pr merge --auto 5",
-            "gh pr merge 5 --auto=true",
-            "gh pr merge 5 --disable-auto",
-            "gh pr --auto merge 5",
-            "gh pr merge 5 --bogus",
-            "gh pr merge -Z 5",
-            "gh pr merge $FLAG 5",
-            "gh pr list merge",
-            "gh pr view --json merge",
-        ] {
-            assert!(is_block(&r.bash(cmd)), "{cmd}");
-        }
-    }
-
-    /// F1: a value word the tokenizer drops (`''`, `""`, `$(…)`, `<(…)`) must
-    /// not shift a literal bypass flag into the value slot.
-    #[test]
-    fn ask_tier_merge_dropped_value_does_not_hide_admin_or_auto() {
-        let r = rig("ask-merge-drop", Who::Cos);
-        for cmd in [
             "gh pr merge 5 --body '' --admin",
             "gh pr merge 5 --body \"\" --auto",
             "gh pr merge 5 -b '' --admin",
@@ -1157,17 +1132,8 @@ mod caller_gate {
             "gh pr merge 5 --match-head-commit $(git rev-parse HEAD) --admin",
             "gh pr merge 5 -b\"$(cat m)\" --admin",
             "gh pr merge 5 --body <(cat m) --admin",
-        ] {
-            assert!(is_block(&r.bash(cmd)), "{cmd}");
-        }
-    }
-
-    /// F2: `$(…)`, a backtick, `<(…)`, a dropped empty word, and a merge under
-    /// `xargs`/`parallel` are an argv the reader cannot see.
-    #[test]
-    fn ask_tier_merge_unreadable_argv_stays_blocked() {
-        let r = rig("ask-merge-unread", Who::Cos);
-        for cmd in [
+            "gh pr merge --admin=false 5",
+            // F2: an argv the tokenizer cannot see.
             "gh pr merge 5 $(echo --admin)",
             "gh pr merge 5 `echo --admin`",
             "gh pr merge $(echo 5 --auto)",
@@ -1177,91 +1143,76 @@ mod caller_gate {
             "xargs gh pr merge 5",
             "parallel gh pr merge 5",
             "xargs -n1 gh pr merge 5 --squash",
-        ] {
-            assert!(is_block(&r.bash(cmd)), "{cmd}");
-        }
-        // A readable merge with a value file still asks.
-        assert!(is_ask(
-            &r.bash("gh pr merge 5 --body-file notes.txt --squash")
-        ));
-    }
-
-    /// N1: a wrapper in front of gh is not the fence's door.
-    #[test]
-    fn ask_tier_merge_behind_a_wrapper_stays_blocked() {
-        let r = rig("ask-merge-wrap", Who::Cos);
-        for cmd in [
+            // Flags and spellings the canonical line does not hold.
+            "gh pr merge 5 --auto",
+            "gh pr merge --auto 5",
+            "gh pr merge 5 --auto=true",
+            "gh pr merge 5 --disable-auto",
+            "gh pr --auto merge 5",
+            "gh pr merge 5 --bogus",
+            "gh pr merge -Z 5",
+            "gh pr merge $FLAG 5",
+            "gh pr merge",
+            "gh pr merge 5 --body hi",
+            "gh pr merge 5 --body-file notes.txt",
+            "gh pr merge 5 -A me@x",
+            "gh pr merge 5 -sd",
+            "gh pr merge 5 --match-head-commit=abc1234",
+            "gh pr merge 5 --match-head-commit abc123",
+            "gh pr merge 5 --squash --repo o/r",
+            "gh pr merge 5 --delete-branch --squash",
+            "gh pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc1234def extra",
+            "gh pr merge -R o/r 5",
+            "gh pr merge --repo o/r 5 --squash",
+            "gh -R o/r pr merge 5",
+            "gh --repo o/r pr merge 5",
+            "gh pr --repo o/r merge 5",
+            "gh pr list merge",
+            "gh pr view --json merge",
+            // Chained, quoted and substituted lines that used to ask.
+            "cd /tmp/x && gh pr merge 5 --squash",
+            "gh pr merge 5 --squash && echo done",
+            "x=$(echo); gh pr merge 5 --squash",
+            "gh pr merge 5 --squash --subject 'feat: x' --body 'y z'",
+            "gh pr merge https://github.com/o/r/pull/5 --rebase",
+            "gh pr merge 5 -R o/r -s -d",
+            // N1: a wrapper in front of gh.
             "env gh pr merge 5 $(echo --admin)",
             "command gh pr merge 5 $(echo --admin)",
             "exec gh pr merge 5 $(echo --admin)",
             "timeout 60 gh pr merge 5 $(echo --admin)",
             "sudo gh pr merge 5 `echo --admin`",
             "nice gh pr merge 5 <(echo x)",
-        ] {
-            assert!(is_block(&r.bash(cmd)), "{cmd}");
-        }
-    }
-
-    /// N2: a verb split by quotes or escapes still carries the substitution.
-    #[test]
-    fn ask_tier_merge_quoted_verb_stays_blocked() {
-        let r = rig("ask-merge-quote", Who::Cos);
-        for cmd in [
+            // N2: a quoted or escaped verb.
             "gh pr m'erge' 5 $(echo --admin)",
             "gh pr m\"erge\" 5 $(echo --admin)",
             "gh pr me\\rge 5 $(echo --admin)",
             "gh pr mer\\\nge 5 $(echo --admin)",
             "gh pr m'erge' 5 `echo --auto`",
-        ] {
-            assert!(is_block(&r.bash(cmd)), "{cmd:?}");
-        }
-    }
-
-    /// N3: bash brace expansion builds words the reader never sees.
-    #[test]
-    fn ask_tier_merge_brace_expansion_stays_blocked() {
-        let r = rig("ask-merge-brace", Who::Cos);
-        for cmd in ["gh pr merge {--admin,5}", "gh pr merge 5 {--auto,}"] {
-            assert!(is_block(&r.bash(cmd)), "{cmd}");
-        }
-    }
-
-    /// N4: `find -exec` and globs add words the text does not hold.
-    #[test]
-    fn ask_tier_merge_find_and_globs_stay_blocked() {
-        let r = rig("ask-merge-find", Who::Cos);
-        for cmd in [
+            // N3: brace expansion.
+            "gh pr merge {--admin,5}",
+            "gh pr merge 5 {--auto,}",
+            // N4/N5: find -exec, globs, a body starting with `-`.
             "find . -name x -exec gh pr merge 5 {} +",
             "find . -exec gh pr merge {} \\;",
             "gh pr merge 5 *",
             "gh pr merge 5 [-]-admin",
+            "gh pr merge 5 --squash --body '- bullet one'",
+            // R1: comments and heredoc bodies.
+            "true # don't\ngh pr merge 5 $(echo --admin)",
+            "echo hi # it's\ngh pr merge 5 `echo --auto`",
+            "x=$(echo hi # it's\n); gh pr merge 5 $(echo --admin)",
+            "cat <<EOF\nit's\nEOF\ngh pr merge 5 $(echo --admin)",
+            // R2: a substitution inside a double-quoted -c script.
+            "env sh -c \"gh pr merge 5 $(echo --admin)\"",
+            "bash -c \"gh pr merge 5 $(echo --admin)\"",
+            "sh -c \"gh pr merge 5 `echo --auto`\"",
+            // R3: a shell function named gh.
+            "gh() { command gh \"$@\" --admin; }; gh pr merge 5",
+            "gh() {\n command gh \"$@\" --admin\n}\ngh pr merge 5 --squash",
+            "function gh { command gh \"$@\" --auto; }; gh pr merge 5",
         ] {
-            assert!(is_block(&r.bash(cmd)), "{cmd}");
-        }
-        // N5 accepted: a body that starts with `-` is read as a flag cluster.
-        assert!(is_block(
-            &r.bash("gh pr merge 5 --squash --body '- bullet one'")
-        ));
-    }
-
-    /// The review's plain list keeps asking: compound commands, sibling
-    /// substitutions and quoted values are readable.
-    #[test]
-    fn ask_tier_merge_plain_spellings_still_ask() {
-        let r = rig("ask-merge-plain", Who::Cos);
-        for cmd in [
-            "gh pr merge 5",
-            "gh pr merge 5 --repo o/r --merge",
-            "gh pr merge 5 --repo o/r --squash --delete-branch",
-            "gh pr merge 5 --squash --match-head-commit abc1234def",
-            "gh pr merge 5 -R o/r -s -d",
-            "gh pr merge 5 --squash --subject 'feat: x' --body 'y z'",
-            "gh pr merge https://github.com/o/r/pull/5 --rebase",
-            "cd /tmp/x && gh pr merge 5 --squash",
-            "gh pr merge 5 --squash && echo done",
-            "x=$(echo); gh pr merge 5 --squash",
-        ] {
-            assert!(is_ask(&r.bash(cmd)), "{cmd}");
+            assert!(is_block(&r.bash(cmd)), "{cmd:?}");
         }
     }
 
