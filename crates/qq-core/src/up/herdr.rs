@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::cli::{CliError, EXIT_UNREACHABLE};
 use crate::config::CosLaunch;
+use crate::daemon::service::{HerdrEnv, HerdrFacts};
 use crate::db;
 use crate::herdr::{HerdrClient, Reply};
 use crate::identity;
@@ -299,11 +300,17 @@ impl CliUp {
         )
     }
 
-    /// One herdr call. The configured session is named on the command line, so a run from
-    /// another session's pane still reaches this farm's.
+    /// One herdr call against the farm's session: the configured session is named on the
+    /// command line, so a run from another session's pane still reaches this farm's.
     fn herdr(&self, args: &[&str]) -> std::io::Result<Reply> {
+        self.herdr_in(&self.name(), args)
+    }
+
+    /// [`CliUp::herdr`] against `session` by name: what the shared resolver's `preferred`
+    /// session asks for.
+    fn herdr_in(&self, session: &str, args: &[&str]) -> std::io::Result<Reply> {
         let mut cmd = Command::new(&self.bin);
-        cmd.arg("--session").arg(self.name());
+        cmd.arg("--session").arg(session);
         if let Some((session, socket)) = &self.resolved {
             cmd.env("HERDR_SESSION", session)
                 .env("HERDR_SOCKET_PATH", socket);
@@ -322,9 +329,16 @@ impl CliUp {
         })
     }
 
-    /// `herdr status server --json` as JSON.
+    /// `herdr --session <farm> status server --json` as JSON.
     fn status(&self) -> Option<Value> {
-        let r = self.herdr(&["status", "server", "--json"]).ok()?;
+        self.status_in(&self.name())
+    }
+
+    /// `herdr --session <session> status server --json` as JSON.
+    fn status_in(&self, session: &str) -> Option<Value> {
+        let r = self
+            .herdr_in(session, &["status", "server", "--json"])
+            .ok()?;
         serde_json::from_str(&r.body).ok()
     }
 
@@ -342,18 +356,21 @@ impl CliUp {
         Err(format!("herdr {}: {}", args.join(" "), r.body.trim()))
     }
 
-    /// Resolves `(session, socket)` and exports them: `service::install` reads the
-    /// process env, so the install path works outside herdr.
+    /// Resolves `(session, socket)` through the resolver `daemon install` shares, with the
+    /// farm's own session as the name — never whatever pair the calling pane carries — and
+    /// exports them: the install path reads the process env.
     fn resolve_env(&mut self) -> Option<(String, String)> {
         if let Some(v) = &self.resolved {
             return Some(v.clone());
         }
-        let v = self.status()?;
-        let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-        let pair = (text("session")?, text("socket")?);
+        // The farm's session is the one to ask herdr about by name: every call below names it.
+        let preferred = self.name();
+        let facts = CliFacts { up: self };
+        let resolved = HerdrEnv::resolve(Some(&preferred), &facts).ok()?;
         // The CLI path of `up` is single-threaded; see the module's `start_session` note.
-        std::env::set_var("HERDR_SESSION", &pair.0);
-        std::env::set_var("HERDR_SOCKET_PATH", &pair.1);
+        std::env::set_var("HERDR_SESSION", &resolved.session);
+        std::env::set_var("HERDR_SOCKET_PATH", &resolved.socket);
+        let pair = (resolved.session, resolved.socket);
         self.resolved = Some(pair.clone());
         Some(pair)
     }
@@ -365,6 +382,27 @@ impl CliUp {
             Ok(r) => Err(r.body.trim().to_string()),
             Err(e) => Err(e.to_string()),
         }
+    }
+}
+
+/// `up`'s herdr seam for the resolver `daemon install` shares: every call names a session on
+/// the command line, so the resolver's `server(session)` is answered for that very session.
+struct CliFacts<'a> {
+    up: &'a CliUp,
+}
+
+impl HerdrFacts for CliFacts<'_> {
+    /// `herdr --session <session> status server --json`, the farm's own session when the
+    /// resolver names none: the same call `up` made before the resolver was shared.
+    fn server(&self, session: Option<&str>) -> Option<Value> {
+        match session {
+            Some(session) => self.up.status_in(session),
+            None => self.up.status(),
+        }
+    }
+
+    fn sessions(&self) -> Option<Value> {
+        self.up.json(&["session", "list", "--json"])
     }
 }
 
@@ -705,5 +743,109 @@ impl HerdrClient for Session<'_> {
             "--lines",
             &n,
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A herdr that answers `status server --json` for the one session it is asked about,
+    /// and logs every call so a test can see which session was named.
+    fn fake_herdr(dir: &Path, session: &str, socket: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 *'status server'*) echo '{{\"status\":\"running\",\"running\":true,\"session\":\"{session}\",\"socket\":\"{socket}\"}}' ;;\n\
+                 *'session list'*) echo '{{\"sessions\":[{{\"name\":\"{session}\",\"running\":true,\"socket_path\":\"{socket}\"}}]}}' ;;\n\
+                 *) echo \"unexpected: $*\" >&2; exit 1 ;;\nesac\n",
+                log = dir.join("calls").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// A `CliUp` for the farm at `farm`, its runs dir created.
+    fn up_for(farm: &Path) -> CliUp {
+        std::fs::create_dir_all(farm.join("runs")).unwrap();
+        let mut up = CliUp::new(farm.join("runs"));
+        up.set_root(farm);
+        up
+    }
+
+    /// A pane of another farm exports its own pair (`up` exports it before starting the
+    /// server, so every pane of a farm carries one). `up` names its own farm's session on
+    /// every herdr call, so that pair must not become the unit's or the server's env.
+    #[test]
+    fn resolve_env_keeps_the_farm_session_over_a_foreign_env_pair() {
+        let ws = crate::testkit::TestWorkspace::new("up-herdr-foreign-pair");
+        let farm = ws.root().join("farm-a");
+        let bin = fake_herdr(ws.root(), "farm-a", "/h/farm-a/herdr.sock");
+        std::env::set_var("HERDR_BIN_PATH", &bin);
+        std::env::set_var("HERDR_SESSION", "farm-b");
+        std::env::set_var("HERDR_SOCKET_PATH", "/h/farm-b/herdr.sock");
+        let mut up = up_for(&farm);
+        let pair = up.resolve_env();
+        let calls = std::fs::read_to_string(ws.root().join("calls")).unwrap_or_default();
+        ws.seal_herdr();
+        assert_eq!(
+            pair,
+            Some(("farm-a".to_string(), "/h/farm-a/herdr.sock".to_string())),
+            "calls: {calls}"
+        );
+        assert!(calls.contains("--session farm-a"), "calls: {calls}");
+    }
+
+    /// A pair that names the farm but sits in a process where herdr answers nothing: main
+    /// read no env at all, so `up` must resolve nothing here too (review finding A). The
+    /// socket is unverified and could be stale.
+    #[test]
+    fn resolve_env_reports_nothing_when_herdr_is_absent_whatever_the_env_names() {
+        let ws = crate::testkit::TestWorkspace::new("up-herdr-absent-own-pair");
+        let farm = ws.root().join("farm-a");
+        std::env::set_var("HERDR_SESSION", "farm-a");
+        std::env::set_var("HERDR_SOCKET_PATH", "/h/env/herdr.sock");
+        let mut up = up_for(&farm);
+        let pair = up.resolve_env();
+        ws.seal_herdr();
+        assert_eq!(pair, None);
+    }
+
+    /// No herdr at all and a foreign pair in the env: `up` resolves nothing, as on main,
+    /// rather than pairing the farm's name with another session's socket.
+    #[test]
+    fn resolve_env_takes_no_foreign_socket_when_herdr_is_absent() {
+        let ws = crate::testkit::TestWorkspace::new("up-herdr-absent");
+        let farm = ws.root().join("farm-a");
+        std::env::set_var("HERDR_SESSION", "farm-b");
+        std::env::set_var("HERDR_SOCKET_PATH", "/h/farm-b/herdr.sock");
+        let mut up = up_for(&farm);
+        let pair = up.resolve_env();
+        ws.seal_herdr();
+        assert_eq!(pair, None);
+    }
+
+    /// Half a foreign pair must not be mixed with the farm's: session from one session and
+    /// socket from another is a pair no daemon can use.
+    #[test]
+    fn resolve_env_keeps_the_farm_socket_over_half_a_foreign_pair() {
+        let ws = crate::testkit::TestWorkspace::new("up-herdr-foreign-socket");
+        let farm = ws.root().join("farm-a");
+        let bin = fake_herdr(ws.root(), "farm-a", "/h/farm-a/herdr.sock");
+        std::env::set_var("HERDR_BIN_PATH", &bin);
+        std::env::set_var("HERDR_SOCKET_PATH", "/h/farm-b/herdr.sock");
+        let mut up = up_for(&farm);
+        let pair = up.resolve_env();
+        ws.seal_herdr();
+        assert_eq!(
+            pair,
+            Some(("farm-a".to_string(), "/h/farm-a/herdr.sock".to_string()))
+        );
     }
 }

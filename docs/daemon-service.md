@@ -11,6 +11,7 @@ Linux (systemd) and macOS (launchd) are supported. The sleep guard is Linux only
 - On macOS `quaqua daemon install [--dry-run]` writes a LaunchAgent plist, `~/Library/LaunchAgents/com.quaqua.daemon.plist` by default
   (`daemon.launchd_label` and `daemon.launchd_dir` in `team.toml` move it), and prints `launchctl bootstrap gui/<uid> <plist>`.
   The plist runs `quaqua daemon` with `QUAQUA_HOME`, `PATH`, `HERDR_SESSION` and `HERDR_SOCKET_PATH` from the installing environment,
+  else from herdr as the systemd path below,
   `RunAtLoad`, `KeepAlive` on a non-zero exit only (a clean `quaqua stop` stays stopped) and a 5s `ThrottleInterval`; stdout and stderr go to `runs/daemon.log`.
   Like the systemd path, install never loads or starts it. A legacy `com.quaqua.auditor*.plist` is printed as a `duplicate:` and left alone.
 - `quaqua up` starts the daemon on either OS through the same service seam when it does not answer. On systemd it runs `systemctl --user start quaqua-daemon.service`.
@@ -18,11 +19,21 @@ Linux (systemd) and macOS (launchd) are supported. The sleep guard is Linux only
   an unloaded one gets `launchctl bootstrap gui/<uid> <plist>`. Only the exit status of `print` counts. `up` never boots out an agent. With no plist it offers the install, as on Linux.
   A failed command is shown as `starting <unit> failed: \`<command>\` failed: <stderr>`, and a start that does not answer in time names `launchctl print gui/<uid>/<label>`.
   The `gui/<uid>` domain needs a GUI login: over SSH, `bootstrap` fails and its error is shown verbatim.
-- The unit also carries `HERDR_SESSION` and `HERDR_SOCKET_PATH`, copied from the installing environment, so the daemon
-  reaches herdr (a systemd user unit starts with neither). Install refuses, naming the missing variable, when either is unset or empty:
-  run it from inside the herdr session the daemon should use. The socket path is
-  `~/.config/herdr/sessions/<session>/herdr.sock`; it is keyed by session name, so it stays the same across reboots, but
-  re-run install if you move the daemon to another session.
+- The unit also carries `HERDR_SESSION` and `HERDR_SOCKET_PATH`, so the daemon reaches herdr (a systemd user unit starts with
+  neither). For `daemon install`, each value comes from the installing environment first and from herdr second: a herdr
+  pane exports `HERDR_SOCKET_PATH` and never `HERDR_SESSION` (#376), so a missing name is read from
+  `herdr session list --json` — the running session whose `socket_path` is that socket — and a missing socket from
+  `herdr status server --json`. An explicit `HERDR_SESSION` herdr reports as not running still installs, followed by a
+  `warning:` line naming the state (so `--dry-run` prints the unit text and that line): the name was typed, and the unit
+  reaches herdr once that session runs. Install refuses only when neither the environment nor herdr can tell, and then it
+  names the step that works: `herdr session list` prints every session with its socket, so
+  `HERDR_SESSION=<name> HERDR_SOCKET_PATH=<socket> quaqua daemon install` runs anywhere. `quaqua up` resolves the pair with
+  the same code but passes the session its farm lives in, so herdr's answer for that name wins over whatever
+  `HERDR_SESSION`/`HERDR_SOCKET_PATH` the calling pane carries, and a herdr that does not answer leaves `up` with
+  no pair at all — a pane of another farm cannot put its own pair in the unit
+  or in the env of the server `up` starts — and it exports the pair before installing. The
+  socket path is `~/.config/herdr/sessions/<session>/herdr.sock`; it is keyed by session name, so it stays the same across
+  reboots, but re-run install if you move the daemon to another session.
 - The daemon's Supervisor job owns the auditor (#316). If `systemd/user/` still holds a legacy `quaqua-auditor*.timer` or
   `.service`, install prints each as a `duplicate:` and leaves it alone; disable and remove it yourself
   (`systemctl --user disable --now quaqua-auditor.timer`). There is no `quaqua doctor` in the engine, so install is where this is checked.
