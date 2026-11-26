@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::cli::{CliError, EXIT_UNREACHABLE};
 use crate::config::CosLaunch;
+use crate::daemon::service::{HerdrEnv, HerdrFacts};
 use crate::db;
 use crate::herdr::{HerdrClient, Reply};
 use crate::identity;
@@ -342,18 +343,20 @@ impl CliUp {
         Err(format!("herdr {}: {}", args.join(" "), r.body.trim()))
     }
 
-    /// Resolves `(session, socket)` and exports them: `service::install` reads the
-    /// process env, so the install path works outside herdr.
+    /// Resolves `(session, socket)` through the resolver `daemon install` shares — the env
+    /// first, then herdr — and exports them: the install path reads the process env.
     fn resolve_env(&mut self) -> Option<(String, String)> {
         if let Some(v) = &self.resolved {
             return Some(v.clone());
         }
-        let v = self.status()?;
-        let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-        let pair = (text("session")?, text("socket")?);
+        // The farm's session is the one to ask herdr about by name: every call below names it.
+        let preferred = self.name();
+        let facts = CliFacts { up: self };
+        let resolved = HerdrEnv::resolve(Some(&preferred), &facts).ok()?;
         // The CLI path of `up` is single-threaded; see the module's `start_session` note.
-        std::env::set_var("HERDR_SESSION", &pair.0);
-        std::env::set_var("HERDR_SOCKET_PATH", &pair.1);
+        std::env::set_var("HERDR_SESSION", &resolved.session);
+        std::env::set_var("HERDR_SOCKET_PATH", &resolved.socket);
+        let pair = (resolved.session, resolved.socket);
         self.resolved = Some(pair.clone());
         Some(pair)
     }
@@ -365,6 +368,23 @@ impl CliUp {
             Ok(r) => Err(r.body.trim().to_string()),
             Err(e) => Err(e.to_string()),
         }
+    }
+}
+
+/// `up`'s herdr seam for the resolver `daemon install` shares: every call names the farm's
+/// session, so a status is asked about that session and the listing is the plain one.
+struct CliFacts<'a> {
+    up: &'a CliUp,
+}
+
+impl HerdrFacts for CliFacts<'_> {
+    fn server(&self, _session: Option<&str>) -> Option<Value> {
+        // `herdr --session <farm> status server --json`, which is what `up` always asks.
+        self.up.status()
+    }
+
+    fn sessions(&self) -> Option<Value> {
+        self.up.json(&["session", "list", "--json"])
     }
 }
 

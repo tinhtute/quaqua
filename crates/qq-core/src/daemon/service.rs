@@ -15,40 +15,213 @@ fn quote(s: &str) -> String {
     format!("\"{body}\"")
 }
 
-/// The herdr session the daemon must reach, taken from the installing environment.
+/// The herdr session the daemon must reach: what the installing environment carries, then
+/// what herdr says — a herdr pane exports `HERDR_SOCKET_PATH` and never the session name (#376).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdrEnv {
     pub session: String,
     pub socket: String,
 }
 
-impl HerdrEnv {
-    /// Both `HERDR_SESSION` and `HERDR_SOCKET_PATH` must be set and non-empty:
-    /// a daemon without them cannot reach herdr, so install refuses and names the missing ones.
-    pub fn from_vars(session: Option<String>, socket: Option<String>) -> Result<Self, String> {
-        let session = session.filter(|s| !s.is_empty());
-        let socket = socket.filter(|s| !s.is_empty());
-        match (session, socket) {
-            (Some(session), Some(socket)) => Ok(HerdrEnv { session, socket }),
-            (s, p) => {
-                let missing: Vec<&str> = [
-                    ("HERDR_SESSION", s.is_none()),
-                    ("HERDR_SOCKET_PATH", p.is_none()),
-                ]
-                .into_iter()
-                .filter_map(|(n, m)| m.then_some(n))
-                .collect();
-                Err(format!(
-                    "{} not set: run `daemon install` from inside the herdr session the daemon should use",
-                    missing.join(" and ")
-                ))
-            }
-        }
+/// What herdr says about itself, through the caller's own seam: [`ProcessFacts`] runs the
+/// binary, `up` answers from its session-scoped calls, a test from a literal.
+pub trait HerdrFacts {
+    /// The JSON of `herdr status server --json`, asking about `session` by name when set.
+    fn server(&self, session: Option<&str>) -> Option<serde_json::Value>;
+    /// The JSON of `herdr session list --json`: every session, its name and its socket.
+    fn sessions(&self) -> Option<serde_json::Value>;
+}
+
+/// A herdr call that has not answered in this long is hung, not slow.
+const HERDR_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The real herdr: `HERDR_BIN_PATH` when set and non-empty, else `herdr`, the same lookup
+/// [`crate::herdr::CliHerdr`] makes.
+#[derive(Debug, Clone)]
+pub struct ProcessFacts {
+    pub bin: String,
+}
+
+impl ProcessFacts {
+    pub fn new() -> Self {
+        let bin = std::env::var("HERDR_BIN_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "herdr".to_string());
+        ProcessFacts { bin }
     }
 
+    /// One verb's JSON: a failed, hung or unparseable call says nothing.
+    fn json(&self, args: &[&str]) -> Option<serde_json::Value> {
+        let mut cmd = std::process::Command::new(&self.bin);
+        cmd.args(args);
+        let out = crate::proc::output_within(&mut cmd, HERDR_LIMIT).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        serde_json::from_slice(&out.stdout).ok()
+    }
+}
+
+impl Default for ProcessFacts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HerdrFacts for ProcessFacts {
+    fn server(&self, session: Option<&str>) -> Option<serde_json::Value> {
+        let mut args: Vec<&str> = Vec::new();
+        if let Some(session) = session {
+            args.extend_from_slice(&["--session", session]);
+        }
+        args.extend_from_slice(&["status", "server", "--json"]);
+        self.json(&args)
+    }
+
+    fn sessions(&self) -> Option<serde_json::Value> {
+        self.json(&["session", "list", "--json"])
+    }
+}
+
+/// A present, non-blank value: an empty env var is an unset one.
+fn clean(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// One non-blank string field of a JSON object.
+fn field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// The name of the running session whose socket is `socket`, from `herdr session list --json`.
+/// Only a running session counts: a stopped one's socket says nothing about which session this
+/// process is in, and herdr reports `"session": null` when it is not asked by name.
+pub fn session_of_socket(list: &serde_json::Value, socket: &str) -> Option<String> {
+    list.get("sessions")?
+        .as_array()?
+        .iter()
+        .find(|s| {
+            s.get("running").and_then(serde_json::Value::as_bool) == Some(true)
+                && s.get("socket_path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|p| same_path(p, socket))
+        })
+        .and_then(|s| field(s, "name"))
+}
+
+/// The socket of `session`, running or stopped: the name was given, so the listing only maps
+/// it to the socket the daemon must reach.
+pub fn socket_of_session(list: &serde_json::Value, session: &str) -> Option<String> {
+    list.get("sessions")?
+        .as_array()?
+        .iter()
+        .find(|s| field(s, "name").is_some_and(|n| n == session))
+        .and_then(|s| field(s, "socket_path"))
+}
+
+/// The error when neither the environment nor herdr can tell: `herdr session list` prints the
+/// name and the socket of every session, running or stopped, so the step it names works.
+fn unresolved(session: bool, socket: bool, why: &[String]) -> String {
+    let mut missing = Vec::new();
+    if !session {
+        missing.push("HERDR_SESSION");
+    }
+    if !socket {
+        missing.push("HERDR_SOCKET_PATH");
+    }
+    let them = if missing.len() == 1 { "it" } else { "them" };
+    let tail = if why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", why.join("; "))
+    };
+    format!(
+        "{} not set and herdr did not report {them}: run `herdr session list`, then \
+         `HERDR_SESSION=<name> HERDR_SOCKET_PATH=<socket> quaqua daemon install`{tail}",
+        missing.join(" and ")
+    )
+}
+
+impl HerdrEnv {
+    /// `HERDR_SESSION` and `HERDR_SOCKET_PATH` from the process env, else from herdr: what
+    /// `daemon install` writes into the unit, and what `up` exports before installing.
     pub fn from_process() -> Result<Self, String> {
+        Self::resolve(None, &ProcessFacts::new())
+    }
+
+    /// The session the daemon must reach: the environment when it carries a value, herdr for
+    /// whatever it lacks. `preferred` is a session to ask herdr about by name — `up` knows its
+    /// farm's — and `None` asks herdr which session this process is in.
+    pub fn resolve(preferred: Option<&str>, facts: &dyn HerdrFacts) -> Result<Self, String> {
         let var = |k| std::env::var(k).ok();
-        Self::from_vars(var("HERDR_SESSION"), var("HERDR_SOCKET_PATH"))
+        Self::resolve_with(
+            var("HERDR_SESSION"),
+            var("HERDR_SOCKET_PATH"),
+            preferred,
+            facts,
+        )
+    }
+
+    /// [`HerdrEnv::resolve`] on the given env values: what a test drives, and what `up` runs
+    /// with its farm's session as the preference.
+    pub fn resolve_with(
+        session: Option<String>,
+        socket: Option<String>,
+        preferred: Option<&str>,
+        facts: &dyn HerdrFacts,
+    ) -> Result<Self, String> {
+        let (env_session, env_socket) = (clean(session), clean(socket));
+        // A herdr pane exports its own pair, and `up` exports the one it resolved: the env wins.
+        if let (Some(session), Some(socket)) = (env_session.clone(), env_socket.clone()) {
+            return Ok(HerdrEnv { session, socket });
+        }
+        let mut why: Vec<String> = Vec::new();
+        // Asked by name, herdr answers with that session's own pair, so its socket wins over
+        // half an env; asked without a name, it only knows the socket.
+        let named = env_session
+            .clone()
+            .or_else(|| preferred.map(str::to_string));
+        let server = facts.server(named.as_deref());
+        if server.is_none() {
+            why.push("`herdr status server --json` gave no answer".to_string());
+        }
+        let herdr_session = server.as_ref().and_then(|v| field(v, "session"));
+        let herdr_socket = server.as_ref().and_then(|v| field(v, "socket"));
+        let mut session = env_session.or(herdr_session);
+        let mut socket = if named.is_some() {
+            herdr_socket.or(env_socket)
+        } else {
+            env_socket.or(herdr_socket)
+        };
+        if session.is_none() {
+            if let Some(p) = &socket {
+                session = facts
+                    .sessions()
+                    .as_ref()
+                    .and_then(|l| session_of_socket(l, p));
+            }
+        }
+        if socket.is_none() {
+            if let Some(s) = &session {
+                socket = facts
+                    .sessions()
+                    .as_ref()
+                    .and_then(|l| socket_of_session(l, s));
+            }
+        }
+        match (session, socket) {
+            (Some(session), Some(socket)) => Ok(HerdrEnv { session, socket }),
+            (session, socket) => Err(unresolved(session.is_some(), socket.is_some(), &why)),
+        }
     }
 }
 
@@ -568,11 +741,22 @@ pub fn install_at(svc: &Service, args: &[String], spec: &Spec) -> Result<String,
 }
 
 /// `quaqua daemon install` for the running process: exe from `current_exe`, home from `HOME`,
-/// the workspace is the parent of `runs_dir`.
+/// the workspace is the parent of `runs_dir`, the herdr session from the env then herdr.
 pub fn install(runs_dir: &Path, args: &[String]) -> Result<String, String> {
     let svc = Service::for_process(runs_dir)?;
-    let herdr = HerdrEnv::from_process()?;
-    install_with(&svc, runs_dir, args, &herdr)
+    install_resolved(&svc, runs_dir, args, &ProcessFacts::new())
+}
+
+/// [`install`] with herdr injected: the same resolver `up` runs, with a test answering for
+/// herdr instead of the binary answering.
+pub fn install_resolved(
+    svc: &Service,
+    runs_dir: &Path,
+    args: &[String],
+    facts: &dyn HerdrFacts,
+) -> Result<String, String> {
+    let herdr = HerdrEnv::resolve(None, facts)?;
+    install_with(svc, runs_dir, args, &herdr)
 }
 
 /// [`install_at`] on a given service and herdr session, the rest of the spec (exe, PATH,
@@ -884,19 +1068,148 @@ mod tests {
         assert_eq!(got.socket, PANE_SOCKET);
     }
 
+    /// Nothing in the env and a herdr that names no running session: the error must name a
+    /// step that works, not the herdr pane that never exports `HERDR_SESSION`.
     #[test]
-    fn herdr_env_names_what_is_missing() {
-        let e = HerdrEnv::from_vars(None, Some(String::new())).unwrap_err();
-        assert!(e.contains("HERDR_SESSION") && e.contains("HERDR_SOCKET_PATH"));
-        let e = HerdrEnv::from_vars(Some("s".into()), None).unwrap_err();
-        assert!(!e.contains("HERDR_SESSION") && e.contains("HERDR_SOCKET_PATH"));
-        assert_eq!(
-            HerdrEnv::from_vars(Some("s".into()), Some("/p".into())).unwrap(),
-            HerdrEnv {
-                session: "s".into(),
-                socket: "/p".into()
-            }
+    fn unresolved_herdr_env_names_a_step_that_works() {
+        let facts = Facts::default();
+        let e = HerdrEnv::resolve_with(None, None, None, &facts).unwrap_err();
+        assert!(
+            e.contains("HERDR_SESSION") && e.contains("HERDR_SOCKET_PATH"),
+            "{e}"
         );
+        assert!(e.contains("herdr session list"), "{e}");
+        assert!(!e.contains("from inside the herdr session"), "{e}");
+        // A missing socket alone is named alone: the fix step still shows both exports.
+        let e = HerdrEnv::resolve_with(Some("s".into()), None, None, &facts).unwrap_err();
+        assert!(e.starts_with("HERDR_SOCKET_PATH not set"), "{e}");
+    }
+
+    /// herdr's two answers: the JSON `status server --json` prints and the one
+    /// `session list --json` prints, with the name the resolver asked for recorded.
+    #[derive(Default)]
+    struct Facts {
+        server: Option<serde_json::Value>,
+        sessions: Option<serde_json::Value>,
+        asked: std::cell::RefCell<Vec<Option<String>>>,
+    }
+
+    impl Facts {
+        fn new(server: &str, sessions: &str) -> Self {
+            Facts {
+                server: serde_json::from_str(server).ok(),
+                sessions: serde_json::from_str(sessions).ok(),
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<Option<String>> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl HerdrFacts for Facts {
+        fn server(&self, session: Option<&str>) -> Option<serde_json::Value> {
+            self.asked.borrow_mut().push(session.map(str::to_string));
+            self.server.clone()
+        }
+
+        fn sessions(&self) -> Option<serde_json::Value> {
+            self.sessions.clone()
+        }
+    }
+
+    /// What the real herdr prints when it is not asked by name: the socket, no session.
+    fn pane_status() -> String {
+        format!(r#"{{"status":"running","running":true,"session":null,"socket":"{PANE_SOCKET}"}}"#)
+    }
+
+    /// `herdr session list --json`: a stopped default session and the running one.
+    fn session_list() -> String {
+        format!(
+            "{{\"sessions\":[\
+             {{\"name\":\"default\",\"running\":false,\"socket_path\":\"/h/.config/herdr/herdr.sock\"}},\
+             {{\"name\":\"quaqua\",\"running\":true,\"socket_path\":\"{PANE_SOCKET}\"}}]}}"
+        )
+    }
+
+    #[test]
+    fn resolve_names_the_session_of_the_sockets_owner() {
+        let facts = Facts::new(&pane_status(), &session_list());
+        let h = HerdrEnv::resolve_with(None, Some(PANE_SOCKET.into()), None, &facts).unwrap();
+        assert_eq!(h.session, "quaqua");
+        assert_eq!(h.socket, PANE_SOCKET);
+    }
+
+    #[test]
+    fn resolve_fills_the_socket_when_the_env_has_only_the_session() {
+        let facts = Facts::new(&pane_status(), &session_list());
+        let h = HerdrEnv::resolve_with(Some("quaqua".into()), None, None, &facts).unwrap();
+        assert_eq!(h.session, "quaqua");
+        assert_eq!(h.socket, PANE_SOCKET);
+        // Asked by name, because a named session answers with its own pair.
+        assert_eq!(facts.asked(), vec![Some("quaqua".to_string())]);
+    }
+
+    #[test]
+    fn resolve_keeps_the_env_pair_and_runs_no_herdr() {
+        let facts = Facts::default();
+        let h = HerdrEnv::resolve_with(Some("s1".into()), Some("/p".into()), None, &facts).unwrap();
+        assert_eq!(h.session, "s1");
+        assert_eq!(h.socket, "/p");
+        assert!(facts.asked().is_empty(), "a full env asks herdr nothing");
+        // A blank value is an unset one.
+        let facts = Facts::new(&pane_status(), &session_list());
+        let h = HerdrEnv::resolve_with(Some(String::new()), Some(PANE_SOCKET.into()), None, &facts)
+            .unwrap();
+        assert_eq!(h.session, "quaqua");
+    }
+
+    #[test]
+    fn resolve_asks_herdr_by_name_for_the_preferred_session() {
+        // `up` knows its farm's session: herdr answers that name with its own socket.
+        let status = r#"{"running":true,"session":"quaqua","socket":"/h/quaqua.sock"}"#;
+        let facts = Facts::new(status, &session_list());
+        let h = HerdrEnv::resolve_with(None, None, Some("quaqua"), &facts).unwrap();
+        assert_eq!(h.session, "quaqua");
+        assert_eq!(h.socket, "/h/quaqua.sock");
+        assert_eq!(facts.asked(), vec![Some("quaqua".to_string())]);
+    }
+
+    #[test]
+    fn a_stopped_session_socket_names_no_session() {
+        let list: serde_json::Value = serde_json::from_str(&session_list()).unwrap();
+        assert_eq!(
+            session_of_socket(&list, "/h/.config/herdr/herdr.sock"),
+            None
+        );
+        assert_eq!(
+            session_of_socket(&list, &format!("{PANE_SOCKET}/")),
+            Some("quaqua".to_string())
+        );
+        assert_eq!(
+            socket_of_session(&list, "default"),
+            Some("/h/.config/herdr/herdr.sock".to_string())
+        );
+    }
+
+    /// `daemon install --dry-run` in a herdr pane: the text carries the session herdr names.
+    #[test]
+    fn install_dry_run_carries_the_session_herdr_names() {
+        // The env lock, and a sealed pane: neither the socket nor the name is in the env.
+        let ws = crate::testkit::TestWorkspace::new("service-install-resolved");
+        let runs = ws.runs_dir();
+        for svc in [launchd(ws.root()), systemd(ws.root())] {
+            let facts = Facts::new(&pane_status(), &session_list());
+            let out =
+                install_resolved(&svc, &runs, &argv(&["install", "--dry-run"]), &facts).unwrap();
+            assert!(
+                out.contains("HERDR_SESSION") && out.contains("quaqua"),
+                "{out}"
+            );
+            assert!(out.contains(PANE_SOCKET), "{out}");
+        }
+        assert!(!ws.root().join("Library").exists() && !ws.root().join(".config").exists());
     }
 
     use crate::config::LaunchdConfig;
