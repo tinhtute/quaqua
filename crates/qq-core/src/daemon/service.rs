@@ -196,6 +196,15 @@ impl HerdrEnv {
         let server = facts.server(named.as_deref());
         if server.is_none() {
             why.push("`herdr status server --json` gave no answer".to_string());
+            // `up` must resolve exactly what it resolved on main: herdr's answer for the
+            // farm's session, or nothing — a pair in the calling pane is never a stand-in
+            // for a silent herdr (review finding A).
+            if let Some(name) = preferred {
+                return Err(format!(
+                    "herdr gave no answer for session {name} (`herdr status server --json` \
+                     failed): nothing to install or start with"
+                ));
+            }
         }
         let herdr_session = server.as_ref().and_then(|v| field(v, "session"));
         let herdr_socket = server.as_ref().and_then(|v| field(v, "socket"));
@@ -1232,6 +1241,36 @@ mod tests {
         let h = HerdrEnv::resolve_with(None, Some("/h/farm-b.sock".into()), Some("farm-a"), &facts)
             .unwrap();
         assert_eq!(h.socket, "/h/farm-a.sock");
+    }
+
+    /// herdr 0.9.5 asked by name always answers with both fields; when it omits one, the pair
+    /// is completed only from things that name this same session — the name itself, the env
+    /// socket when the env names it too, or `session list` — never from another session's env
+    /// socket, and never invented.
+    #[test]
+    fn a_preferred_session_completes_a_half_answer_from_the_same_session_only() {
+        let facts = Facts::new(r#"{"running":true}"#, &session_list());
+        let h =
+            HerdrEnv::resolve_with(None, Some("/h/foreign.sock".into()), Some("quaqua"), &facts)
+                .unwrap();
+        assert_eq!(
+            (h.session.as_str(), h.socket.as_str()),
+            ("quaqua", PANE_SOCKET)
+        );
+        // No listing either: only a socket the env ties to this same name is left to use.
+        let facts = Facts::new(r#"{"running":true}"#, "{}");
+        let h = HerdrEnv::resolve_with(
+            Some("quaqua".into()),
+            Some("/h/env/herdr.sock".into()),
+            Some("quaqua"),
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(h.socket, "/h/env/herdr.sock");
+        // Nothing names this session's socket: refuse rather than guess one.
+        let facts = Facts::new(r#"{"running":true}"#, "{}");
+        let e = HerdrEnv::resolve_with(None, None, Some("quaqua"), &facts).unwrap_err();
+        assert!(e.contains("HERDR_SOCKET_PATH not set"), "{e}");
     }
 
     /// An explicit name that herdr reports as not running still installs, with a warning: the

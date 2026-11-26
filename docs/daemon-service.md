@@ -29,7 +29,8 @@ Linux (systemd) and macOS (launchd) are supported. The sleep guard is Linux only
   names the step that works: `herdr session list` prints every session with its socket, so
   `HERDR_SESSION=<name> HERDR_SOCKET_PATH=<socket> quaqua daemon install` runs anywhere. `quaqua up` resolves the pair with
   the same code but passes the session its farm lives in, so herdr's answer for that name wins over whatever
-  `HERDR_SESSION`/`HERDR_SOCKET_PATH` the calling pane carries — a pane of another farm cannot put its own pair in the unit
+  `HERDR_SESSION`/`HERDR_SOCKET_PATH` the calling pane carries, and a herdr that does not answer leaves `up` with
+  no pair at all — a pane of another farm cannot put its own pair in the unit
   or in the env of the server `up` starts — and it exports the pair before installing. The
   socket path is `~/.config/herdr/sessions/<session>/herdr.sock`; it is keyed by session name, so it stays the same across
   reboots, but re-run install if you move the daemon to another session.
