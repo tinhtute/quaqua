@@ -1095,6 +1095,207 @@ mod caller_gate {
         assert_ask_for_cos_deny_for_rest("ask-rel", "gh release create v1 --notes x");
     }
 
+    /// The one canonical merge line asks the CoS and blocks everyone else.
+    #[test]
+    fn ask_tier_pr_merge_canonical_asks_for_cos() {
+        for (tag, cmd) in [
+            ("ask-merge", "gh pr merge 5"),
+            ("ask-merge-zeros", "gh pr merge 007"),
+            ("ask-merge-repo", "gh pr merge 5 --repo o/r"),
+            ("ask-merge-r", "gh pr merge 5 -R o/r --squash"),
+            ("ask-merge-rebase", "gh pr merge 5 --rebase --delete-branch"),
+            ("ask-merge-sha", "gh pr merge 5 --match-head-commit abc1234"),
+            ("ask-merge-repo-merge", "gh pr merge 5 --repo o/r --merge"),
+            (
+                "ask-merge-repo-squash",
+                "gh pr merge 5 --repo o/r --squash --delete-branch",
+            ),
+            (
+                "ask-merge-squash-sha",
+                "gh pr merge 5 --squash --match-head-commit abc1234def",
+            ),
+            (
+                "ask-merge-all",
+                "gh pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc1234def",
+            ),
+        ] {
+            assert_ask_for_cos_deny_for_rest(tag, cmd);
+        }
+    }
+
+    /// Every other merge shape keeps the 193bd14 hard block: the three
+    /// reviews' repros, the chained and quoted lines that used to ask, and
+    /// every non-canonical spelling.
+    #[test]
+    fn ask_tier_merge_every_other_shape_stays_blocked_for_cos() {
+        let r = rig("ask-merge-block", Who::Cos);
+        for cmd in [
+            // F1: a dropped value must not hide a literal bypass flag.
+            "gh pr merge 5 --admin",
+            "gh pr merge 5 --body '' --admin",
+            "gh pr merge 5 --body \"\" --auto",
+            "gh pr merge 5 -b '' --admin",
+            "gh pr merge 5 --body --admin",
+            "gh pr merge 5 --subject \"$(cat s)\" --admin",
+            "gh pr merge 5 -A \"$(git config user.email)\" --auto",
+            "gh pr merge 5 --match-head-commit $(git rev-parse HEAD) --admin",
+            "gh pr merge 5 -b\"$(cat m)\" --admin",
+            "gh pr merge 5 --body <(cat m) --admin",
+            "gh pr merge --admin=false 5",
+            // F2: an argv the tokenizer cannot see.
+            "gh pr merge 5 $(echo --admin)",
+            "gh pr merge 5 `echo --admin`",
+            "gh pr merge $(echo 5 --auto)",
+            "gh pr merge 5 --body ''",
+            "gh pr merge 5 --body-file <(echo notes)",
+            "echo --admin | xargs gh pr merge 5",
+            "xargs gh pr merge 5",
+            "parallel gh pr merge 5",
+            "xargs -n1 gh pr merge 5 --squash",
+            // Flags and spellings the canonical line does not hold.
+            "gh pr merge 5 --auto",
+            "gh pr merge --auto 5",
+            "gh pr merge 5 --auto=true",
+            "gh pr merge 5 --disable-auto",
+            "gh pr --auto merge 5",
+            "gh pr merge 5 --bogus",
+            "gh pr merge -Z 5",
+            "gh pr merge $FLAG 5",
+            "gh pr merge",
+            "gh pr merge 5 --body hi",
+            "gh pr merge 5 --body-file notes.txt",
+            "gh pr merge 5 -A me@x",
+            "gh pr merge 5 -sd",
+            "gh pr merge 5 --match-head-commit=abc1234",
+            "gh pr merge 5 --match-head-commit abc123",
+            "gh pr merge 5 --squash --repo o/r",
+            "gh pr merge 5 --delete-branch --squash",
+            "gh pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc1234def extra",
+            // N1: a repo value that reads like a bypass flag is not a repo.
+            "gh pr merge 5 -R --admin/x",
+            "gh pr merge 5 --repo --auto/x --squash",
+            "gh pr merge 5 -R -/- --squash",
+            "gh pr merge 5 -R ../.. --squash",
+            // N2: whitespace, control and non-ASCII near-misses.
+            "gh pr merge 5 ",
+            " gh pr merge 5",
+            "gh pr merge 5\t",
+            "gh\tpr\tmerge\t5",
+            "gh pr merge 5\r",
+            "gh pr merge 5\n",
+            "gh pr merge 5\n--admin",
+            "gh pr merge 5\r\n--admin",
+            "gh pr merge  5",
+            "gh pr merge 5\u{A0}--admin",
+            "gh pr merge \u{0665}",
+            "gh pr merge \u{FF15}",
+            "gh pr merge -R o/r 5",
+            "gh pr merge --repo o/r 5 --squash",
+            "gh -R o/r pr merge 5",
+            "gh --repo o/r pr merge 5",
+            "gh pr --repo o/r merge 5",
+            "gh pr list merge",
+            "gh pr view --json merge",
+            // Chained, quoted and substituted lines that used to ask.
+            "cd /tmp/x && gh pr merge 5 --squash",
+            "gh pr merge 5 --squash && echo done",
+            "x=$(echo); gh pr merge 5 --squash",
+            "gh pr merge 5 --squash --subject 'feat: x' --body 'y z'",
+            "gh pr merge https://github.com/o/r/pull/5 --rebase",
+            "gh pr merge 5 -R o/r -s -d",
+            // N1: a wrapper in front of gh.
+            "env gh pr merge 5 $(echo --admin)",
+            "command gh pr merge 5 $(echo --admin)",
+            "exec gh pr merge 5 $(echo --admin)",
+            "timeout 60 gh pr merge 5 $(echo --admin)",
+            "sudo gh pr merge 5 `echo --admin`",
+            "nice gh pr merge 5 <(echo x)",
+            // N2: a quoted or escaped verb.
+            "gh pr m'erge' 5 $(echo --admin)",
+            "gh pr m\"erge\" 5 $(echo --admin)",
+            "gh pr me\\rge 5 $(echo --admin)",
+            "gh pr mer\\\nge 5 $(echo --admin)",
+            "gh pr m'erge' 5 `echo --auto`",
+            // N3: brace expansion.
+            "gh pr merge {--admin,5}",
+            "gh pr merge 5 {--auto,}",
+            // N4/N5: find -exec, globs, a body starting with `-`.
+            "find . -name x -exec gh pr merge 5 {} +",
+            "find . -exec gh pr merge {} \\;",
+            "gh pr merge 5 *",
+            "gh pr merge 5 [-]-admin",
+            "gh pr merge 5 --squash --body '- bullet one'",
+            // R1: comments and heredoc bodies.
+            "true # don't\ngh pr merge 5 $(echo --admin)",
+            "echo hi # it's\ngh pr merge 5 `echo --auto`",
+            "x=$(echo hi # it's\n); gh pr merge 5 $(echo --admin)",
+            "cat <<EOF\nit's\nEOF\ngh pr merge 5 $(echo --admin)",
+            // R2: a substitution inside a double-quoted -c script.
+            "env sh -c \"gh pr merge 5 $(echo --admin)\"",
+            "bash -c \"gh pr merge 5 $(echo --admin)\"",
+            "sh -c \"gh pr merge 5 `echo --auto`\"",
+            // R3: a shell function named gh.
+            "gh() { command gh \"$@\" --admin; }; gh pr merge 5",
+            "gh() {\n command gh \"$@\" --admin\n}\ngh pr merge 5 --squash",
+            "function gh { command gh \"$@\" --auto; }; gh pr merge 5",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd:?}");
+        }
+    }
+
+    /// F3: the gate asks for a merge at every repo/lane tier and with a full
+    /// grant; only the daemon's `pr.merge` door keeps the tier math.
+    #[test]
+    fn ask_tier_merge_asks_at_every_tier_and_grant() {
+        let r = rig("ask-merge-tier", Who::Cos);
+        let dir = r.ws.root().join("merge-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = tier::repo_key(&dir);
+        let hook = |cmd: &str| {
+            json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": cmd},
+                "cwd": dir.to_string_lossy(),
+            })
+        };
+        assert!(is_ask(&r.run(hook("gh pr merge 5"))), "unlisted repo");
+        let c = qq_core::db::open(&r.ws.db_path()).unwrap();
+        let set = |table: &str, col: &str, word: &str| {
+            c.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {table} ({col}, tier, set_ms, set_by) VALUES (?1, ?2, 1, 'cos')"
+                ),
+                params![key, word],
+            )
+            .unwrap();
+        };
+        for word in ["low", "medium"] {
+            set("repo_tier", "repo", word);
+            set("plan_lane", "lane", word);
+            assert!(
+                is_ask(&r.run(hook("gh pr merge 5"))),
+                "repo and lane {word}"
+            );
+            if word == "low" {
+                // The rows are live: a release at low tier is allowed.
+                assert_eq!(
+                    r.run(hook("gh release create v1 --notes x")),
+                    GateVerdict::Allow
+                );
+            }
+        }
+        c.execute(
+            "INSERT OR REPLACE INTO grant_full (repo, granted_ms, granted_by) VALUES (?1, 1, 'cos')",
+            params![key],
+        )
+        .unwrap();
+        assert!(is_ask(&r.run(hook("gh pr merge 5"))), "full grant");
+        assert!(
+            is_ask(&r.run(hook("gh pr merge 5 --squash --delete-branch"))),
+            "granted squash"
+        );
+    }
+
     #[test]
     fn ask_tier_reading_tags_is_not_a_hit() {
         let r = rig("ask-tag-read", Who::Down);
@@ -1133,13 +1334,12 @@ mod caller_gate {
     }
 
     #[test]
-    fn ask_tier_raw_push_and_merge_stay_blocked_for_cos() {
+    fn ask_tier_raw_push_stays_blocked_for_cos() {
         let r = rig("ask-raw", Who::Cos);
         for cmd in [
             "git push origin feat",
             "git push origin main",
             "git push --force origin feat",
-            "gh pr merge 5",
         ] {
             assert!(is_block(&r.bash(cmd)), "{cmd}");
         }

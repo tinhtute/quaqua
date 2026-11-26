@@ -1,14 +1,21 @@
 //! The `gate` verb: the Claude Code PreToolUse hook (Bash, and Write/Edit on
 //! the live instruction files). Stateless: it tokenizes the hook's command and
-//! sorts what it finds in three bins.
+//! sorts what it finds in three bins. The one merge line the CoS may be
+//! prompted for is matched on the raw command string, before the tokenizer.
 //!
 //! - Hard blocks, for everyone: a herdr pane, tab or workspace spawn/move/close,
-//!   any `git push` that is not a pure branch delete, a `gh` merge (by any
-//!   spelling), deleting main/master, and a ref or contents write that lands on
-//!   main/master.
+//!   any `git push` that is not a pure branch delete, a `gh` merge by any
+//!   spelling except the one canonical line (a chained or quoted command, a
+//!   wrapper, `--admin`, `--auto`, `--disable-auto`, `--body`, `--subject`, an
+//!   unknown shape, a `gh api` merge endpoint or mutation), deleting
+//!   main/master, and a ref or contents write that lands on main/master.
 //! - The approval list, decided by caller and tier (R7, R14, R5): branch delete,
 //!   `git branch -m|-M|-f` on main/master, `git tag`, `gh release create`,
-//!   history rewrite on shared refs, the #297 bypass spellings (alias push,
+//!   `gh pr merge <pr> [--repo o/r] [--squash] [--delete-branch]
+//!   [--match-head-commit sha]` (the one canonical line; the owner's prompt at
+//!   every tier, lane and grant, only the daemon's `pr.merge` door keeping the
+//!   tier math), history
+//!   rewrite on shared refs, the #297 bypass spellings (alias push,
 //!   `gh api` ref/contents writes off main, `query=@file`), pane input and
 //!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
 //!   AGENTS.md and identity.md. Only a hit asks the daemon who is
@@ -55,6 +62,7 @@ const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
 const ASK_TRUNK_MOVE: &str = "approval list: rename or force-move main/master";
 const ASK_TAG: &str = "approval list: git tag";
 const ASK_RELEASE: &str = "approval list: gh release create";
+const ASK_MERGE: &str = "approval list: gh pr merge";
 const ASK_REWRITE: &str = "approval list: history rewrite on shared refs";
 const ASK_BYPASS: &str = "approval list: a push or merge door by another name";
 const ASK_INPUT: &str = "approval list: pane input or a grid_role token";
@@ -245,6 +253,16 @@ fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
             if cmd.trim().is_empty() {
                 return Verdict::Block(PANE_MESSAGE);
             }
+            // The one merge line the CoS may turn into a prompt. Everything
+            // else that scans as a merge keeps the hard block.
+            if canonical_merge(cmd) {
+                return judge(
+                    Found::act(Action::MergeRequest, ASK_MERGE),
+                    &|| env.map_or(Caller::Unknown, |e| caller::lookup(&e.runs_dir)),
+                    env.map(|e| e.runs_dir.as_path()),
+                    cwd.as_deref(),
+                );
+            }
             let mut f = scan(cmd);
             if let Some(env) = env {
                 f.absorb(bash_memory(env, cmd, cwd.as_deref(), 0));
@@ -338,6 +356,12 @@ fn judge(
             }
             Pending::CosOnly => continue,
         };
+        // A merge is the owner's call at every tier, lane and grant; only the
+        // daemon's `pr.merge` door keeps the tier math.
+        if action == Action::MergeRequest {
+            ask = Some(h.reason);
+            continue;
+        }
         // A full grant is the one exception to "unmerged asks at every tier",
         // and only for a target the scanner could read.
         if action == Action::BranchDeleteUnmerged
@@ -1694,6 +1718,65 @@ fn check_gh(a: &[String]) -> Found {
     });
     let t = if other { Target::Unknown } else { Target::Here };
     check_gh_cmd(a).retarget(&t)
+}
+
+/// The one merge line the CoS may turn into a prompt, matched on the raw
+/// command string before the tokenizer: `gh pr merge <number>` and, in this
+/// order, an optional `--repo`/`-R <owner>/<name>`, at most one of `--merge`,
+/// `--squash`, `--rebase`, an optional `--delete-branch` and an optional
+/// `--match-head-commit <7-40 hex>`. Single spaces, nothing before or after.
+/// Every other spelling is the hard block.
+fn canonical_merge(cmd: &str) -> bool {
+    let w: Vec<&str> = cmd.split(' ').collect();
+    if w.len() < 4 || w[..3] != ["gh", "pr", "merge"] {
+        return false;
+    }
+    if w[3].is_empty() || !w[3].chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut i = 4;
+    if i < w.len() && matches!(w[i], "--repo" | "-R") {
+        i += 1;
+        if i >= w.len() || !repo_word(w[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    if i < w.len() && matches!(w[i], "--merge" | "--squash" | "--rebase") {
+        i += 1;
+    }
+    if i < w.len() && w[i] == "--delete-branch" {
+        i += 1;
+    }
+    if i < w.len() && w[i] == "--match-head-commit" {
+        i += 1;
+        if i >= w.len() || !sha_word(w[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    i == w.len()
+}
+
+/// `<owner>/<name>`: each part starts with an ascii letter or digit, is not
+/// `.` or `..`, and holds only letters, digits, dot, underscore and hyphen.
+fn repo_word(x: &str) -> bool {
+    let mut parts = x.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    [owner, name].iter().all(|p| {
+        !p.is_empty()
+            && !matches!(*p, "." | "..")
+            && p.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
+}
+
+/// A full or abbreviated commit sha: 7 to 40 hex characters.
+fn sha_word(x: &str) -> bool {
+    (7..=40).contains(&x.len()) && x.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn check_gh_cmd(a: &[String]) -> Found {
