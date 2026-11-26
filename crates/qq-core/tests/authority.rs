@@ -1186,6 +1186,83 @@ mod caller_gate {
         ));
     }
 
+    /// N1: a wrapper in front of gh is not the fence's door.
+    #[test]
+    fn ask_tier_merge_behind_a_wrapper_stays_blocked() {
+        let r = rig("ask-merge-wrap", Who::Cos);
+        for cmd in [
+            "env gh pr merge 5 $(echo --admin)",
+            "command gh pr merge 5 $(echo --admin)",
+            "exec gh pr merge 5 $(echo --admin)",
+            "timeout 60 gh pr merge 5 $(echo --admin)",
+            "sudo gh pr merge 5 `echo --admin`",
+            "nice gh pr merge 5 <(echo x)",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    /// N2: a verb split by quotes or escapes still carries the substitution.
+    #[test]
+    fn ask_tier_merge_quoted_verb_stays_blocked() {
+        let r = rig("ask-merge-quote", Who::Cos);
+        for cmd in [
+            "gh pr m'erge' 5 $(echo --admin)",
+            "gh pr m\"erge\" 5 $(echo --admin)",
+            "gh pr me\\rge 5 $(echo --admin)",
+            "gh pr mer\\\nge 5 $(echo --admin)",
+            "gh pr m'erge' 5 `echo --auto`",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd:?}");
+        }
+    }
+
+    /// N3: bash brace expansion builds words the reader never sees.
+    #[test]
+    fn ask_tier_merge_brace_expansion_stays_blocked() {
+        let r = rig("ask-merge-brace", Who::Cos);
+        for cmd in ["gh pr merge {--admin,5}", "gh pr merge 5 {--auto,}"] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    /// N4: `find -exec` and globs add words the text does not hold.
+    #[test]
+    fn ask_tier_merge_find_and_globs_stay_blocked() {
+        let r = rig("ask-merge-find", Who::Cos);
+        for cmd in [
+            "find . -name x -exec gh pr merge 5 {} +",
+            "find . -exec gh pr merge {} \\;",
+            "gh pr merge 5 *",
+            "gh pr merge 5 [-]-admin",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+        // N5 accepted: a body that starts with `-` is read as a flag cluster.
+        assert!(is_block(&r.bash("gh pr merge 5 --squash --body '- bullet one'")));
+    }
+
+    /// The review's plain list keeps asking: compound commands, sibling
+    /// substitutions and quoted values are readable.
+    #[test]
+    fn ask_tier_merge_plain_spellings_still_ask() {
+        let r = rig("ask-merge-plain", Who::Cos);
+        for cmd in [
+            "gh pr merge 5",
+            "gh pr merge 5 --repo o/r --merge",
+            "gh pr merge 5 --repo o/r --squash --delete-branch",
+            "gh pr merge 5 --squash --match-head-commit abc1234def",
+            "gh pr merge 5 -R o/r -s -d",
+            "gh pr merge 5 --squash --subject 'feat: x' --body 'y z'",
+            "gh pr merge https://github.com/o/r/pull/5 --rebase",
+            "cd /tmp/x && gh pr merge 5 --squash",
+            "gh pr merge 5 --squash && echo done",
+            "x=$(echo); gh pr merge 5 --squash",
+        ] {
+            assert!(is_ask(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
     /// F3: the gate asks for a merge at every repo/lane tier and with a full
     /// grant; only the daemon's `pr.merge` door keeps the tier math.
     #[test]
