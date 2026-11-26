@@ -130,12 +130,47 @@ fn a_principal_is_refused_every_agent_verb_and_the_claim_does_not_save_it() {
     stop(r);
 }
 
+/// Issue #375: the owner runs `quaqua` from a plain shell pane inside herdr, so
+/// a pane that hosts no agent resolves exactly like no pane at all — the
+/// read-only Principal. It reads, and every farm-changing verb is refused with
+/// the CoS pane named as where to run it.
 #[test]
-fn mapped_pane_without_an_agent_is_refused() {
+fn a_pane_with_no_agent_is_the_read_only_principal() {
     let r = rig("peer-noagent");
     let pane = r.herdr.seed_pane("h", Some("zsh"), &[]);
     r.herdr.set_pane_pids(&pane, me(), &[]);
-    assert_eq!(whoami(&r, None).unwrap_err().code, "unmapped_peer");
+    // The reads answer, exactly as they do from a terminal outside herdr.
+    assert_eq!(call(&r, "ping", None).unwrap()["pong"], true);
+    assert!(call(&r, "status", None).is_ok(), "status");
+    assert_eq!(call(&r, "roster", None).unwrap()["ran"], true);
+    // The identity probe still names no agent, as for the plain Principal.
+    assert_eq!(whoami(&r, None).unwrap_err().code, "agent_only");
+    // A farm-changing verb is refused, and the message says where to run it.
+    let e = call(&r, "stop", None).unwrap_err();
+    assert_eq!(e.code, "agent_only", "{e:?}");
+    assert!(
+        e.message.contains("CoS pane"),
+        "names where to run it: {e:?}"
+    );
+    // The same through the CLI, as the owner runs it: `quaqua ping` answers and
+    // `quaqua stop` exits refused, naming the CoS pane.
+    let runs = r._ws.runs_dir();
+    let ping = qq(&runs, &["ping"]);
+    assert_eq!(ping.status.code(), Some(0), "{ping:?}");
+    assert!(
+        String::from_utf8_lossy(&ping.stdout).contains("pong"),
+        "{ping:?}"
+    );
+    let refused = qq(&runs, &["stop"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(qq_core::cli::EXIT_REFUSED),
+        "{refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("CoS pane"),
+        "{refused:?}"
+    );
     r.herdr.pane_close(&pane).unwrap();
     stop(r);
 }
