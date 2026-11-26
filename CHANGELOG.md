@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **`gh pr merge` asks the CoS instead of blocking**: a plain merge (with `-R/--repo`, `--merge`, `--squash`, `--rebase`, `--delete-branch`, `--match-head-commit`, `--body-file` and friends) reaches the native permission prompt at every tier, lane and full grant; `--admin`, `--auto`, `--disable-auto` (a value slot included), `gh api` merge endpoints and mutations, a word the tokenizer drops (`$(…)`, a backtick, `<(…)`, `''`/`""`), a merge under `xargs`/`parallel`, and any merge the scanner cannot read stay hard-blocked, and every non-CoS caller still blocks.
+- **`gh pr merge` asks the CoS only for the whole readable command**: a plain merge (with `-R/--repo`, `--merge`, `--squash`, `--rebase`, `--delete-branch`, `--match-head-commit`, and quoted `--body`/`--subject` text) reaches the native permission prompt at every tier, lane and full grant; a merge behind a wrapper, `xargs`, `parallel` or `find -exec`, a word the tokenizer drops (`$(…)`, a backtick, `<(…)`, `''`/`""`), a bash expansion, glob or brace, `--admin`, `--auto`, `--disable-auto` (a value slot included), `gh api` merge endpoints and mutations, and any merge the scanner cannot read stay hard-blocked. A `--body`/`--subject` value that starts with `-` or holds shell punctuation (braces, brackets, globs, `~`, redirections, parens, `;`, `&`, `|`, `!`) reads as a flag and blocks; `--body-file` is the way through. Every non-CoS caller still blocks.
 
 ## [3.3.0] - 2026-11-26
 

@@ -4,11 +4,12 @@
 //!
 //! - Hard blocks, for everyone: a herdr pane, tab or workspace spawn/move/close,
 //!   any `git push` that is not a pure branch delete, a `gh` merge that
-//!   bypasses the owner or cannot be read (`--admin`, `--auto`,
-//!   `--disable-auto`, a `gh api` merge endpoint or mutation, a merge flag the
-//!   scanner does not know, a `$` expansion, a word the tokenizer drops, a
-//!   merge under `xargs` or `parallel`), deleting main/master, and a ref or
-//!   contents write that lands on main/master.
+//!   bypasses the owner or is not the whole readable command (`--admin`,
+//!   `--auto`, `--disable-auto`, a `gh api` merge endpoint or mutation, a merge
+//!   flag the scanner does not know, a word the tokenizer drops or bash
+//!   expands, globs or brace-expands, a merge behind a wrapper, `xargs`,
+//!   `parallel` or `find -exec`), deleting main/master, and a ref or contents
+//!   write that lands on main/master.
 //! - The approval list, decided by caller and tier (R7, R14, R5): branch delete,
 //!   `git branch -m|-M|-f` on main/master, `git tag`, `gh release create`,
 //!   `gh pr merge` (the owner's prompt at every tier, lane and grant; only the
@@ -686,11 +687,16 @@ fn scan(command: &str) -> Found {
 fn scan_with(command: &str, deep: bool) -> Found {
     let segs = tokenize(command);
     let mut f = Found::pass();
-    // A `gh pr merge` whose text carries a word the tokenizer drops (`$(…)`, a
-    // backtick, `<(…)`, `''`/`""`) has an argv bash builds and the gate never
-    // reads: hard-block it for everyone, the CoS included.
-    if segs.iter().any(|s| is_gh_merge(s)) && merge_tail(command).is_some_and(drops_words) {
-        f.absorb(Found::block(MERGE_MESSAGE));
+    // A second tokenization marks every word the first one drops (`$(…)`, a
+    // backtick, `<(…)`, `''`/`""`). A merge segment that starts away from gh
+    // (a wrapper, an assignment) or carries a mark has an argv bash builds and
+    // the gate never reads: hard-block it for everyone, the CoS included.
+    for seg in &tokenize(&mark_drops(command)) {
+        if let Some(j) = gh_merge_in(seg) {
+            if j != 0 || seg.iter().any(|w| w.contains(DROP)) {
+                f.absorb(Found::block(MERGE_MESSAGE));
+            }
+        }
     }
     for seg in &segs {
         f.absorb(check_words_in(seg, deep));
@@ -1564,7 +1570,7 @@ fn check_find(a: &[String]) -> Found {
                 .take_while(|x| x.as_str() != ";" && x.as_str() != "+")
                 .cloned()
                 .collect();
-            f.absorb(check_words(&cmd));
+            f.absorb(merge_hit(check_words(&cmd)));
         }
     }
     f
@@ -1706,10 +1712,12 @@ fn targets_trunk(x: &str) -> bool {
 }
 
 /// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation: a plain,
-/// readable `pr merge` is on the approval list (the owner's prompt at every
-/// tier), the bypass flags and unreadable shapes are hard blocks; a ref/contents
-/// write or a hidden query is a push by another name: blocked when it lands on
-/// main/master, else on the approval list.
+/// readable `pr merge` that starts the simple command is on the approval list
+/// (the owner's prompt at every tier); the bypass flags, a word the tokenizer
+/// drops or bash expands/globs/braces, and a merge behind a wrapper or
+/// `find -exec` are hard blocks; a ref/contents write or a hidden query is a
+/// push by another name: blocked when it lands on main/master, else on the
+/// approval list.
 fn check_gh(a: &[String]) -> Found {
     // `-R/--repo` names another repo than the cwd's.
     let other = a.iter().any(|x| {
@@ -1760,7 +1768,13 @@ fn gh_globals_readable(a: &[String], from: usize, to: usize) -> bool {
     while i < to {
         let x = &a[i];
         i += 1;
+        if merge_word_unreadable(x) {
+            return false;
+        }
         if matches!(x.as_str(), "-R" | "--repo" | "--hostname") {
+            if a.get(i).is_some_and(|v| merge_word_unreadable(v)) {
+                return false;
+            }
             i += 1;
             continue;
         }
@@ -1784,6 +1798,9 @@ fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
     while i < a.len() {
         let x = &a[i];
         i += 1;
+        if merge_word_unreadable(x) {
+            return false;
+        }
         if x == "--" {
             continue;
         }
@@ -1827,31 +1844,196 @@ fn gh_merge_at(a: &[String]) -> Option<(usize, usize)> {
     Some((p, m))
 }
 
-/// A simple command's words open with `gh` and hold `pr … merge`.
-fn is_gh_merge(s: &[String]) -> bool {
-    let Some(i) = s.iter().position(|x| !keyword(x) && !is_assignment(x)) else {
-        return false;
-    };
-    s[i].rsplit('/').next().unwrap_or(&s[i]) == "gh" && gh_merge_at(&s[i + 1..]).is_some()
+/// A merge word that carries a mark from [`mark_drops`].
+const DROP: &str = "__qq_drop__";
+
+/// The index where a simple command's words become `gh … pr … merge`. A
+/// non-zero index means a word in front of gh (a wrapper, an assignment, a
+/// keyword): the fence does not read a merge reached through one.
+fn gh_merge_in(s: &[String]) -> Option<usize> {
+    (0..s.len()).find(|&j| {
+        let w = &s[j..];
+        w[0].rsplit('/').next().unwrap_or(&w[0]) == "gh" && gh_merge_at(&w[1..]).is_some()
+    })
 }
 
-/// The raw text after the `merge` that follows `pr`: the merge argv, as far as
-/// the text tells. A heuristic, read only to reject text the tokenizer dropped
-/// words from.
-fn merge_tail(command: &str) -> Option<&str> {
-    let p = command.find("pr")?;
-    let m = command[p..].find("merge")?;
-    Some(&command[p + m + "merge".len()..])
+/// A word bash would expand, glob or brace-expand into other words: a merge
+/// argument holding one is not the text gh receives. Quotes and spaces are
+/// already resolved in a token, so they are plain here.
+fn merge_word_unreadable(w: &str) -> bool {
+    w.contains(DROP)
+        || w.chars().any(|c| {
+            matches!(
+                c,
+                '$' | '`'
+                    | '{'
+                    | '}'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+                    | '~'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '!'
+                    | '\\'
+                    | '\n'
+            )
+        })
 }
 
-/// Constructs that make bash build words the tokenizer drops: command and
-/// process substitutions, backticks, and empty quoted words.
-fn drops_words(text: &str) -> bool {
-    text.contains("$(")
-        || text.contains('`')
-        || text.contains("<(")
-        || text.contains("''")
-        || text.contains("\"\"")
+/// The end of the substitution that starts at `i`: a backtick, or `$(`/`<(`/`>(`
+/// with `i` on the `$`/`<`/`>` and `i + 1` the `(`. Quote-aware and
+/// parenthesis-nested, like the tokenizer's own `subst`.
+fn skip_subst(b: &[char], i: usize) -> usize {
+    if b[i] == '`' {
+        let mut j = i + 1;
+        while j < b.len() {
+            if b[j] == '\\' {
+                j += 2;
+                continue;
+            }
+            if b[j] == '`' {
+                return j + 1;
+            }
+            j += 1;
+        }
+        return b.len();
+    }
+    let mut j = i + 2;
+    let mut depth = 1usize;
+    let mut quote = '\0';
+    while j < b.len() {
+        let c = b[j];
+        match quote {
+            '\'' => {
+                if c == '\'' {
+                    quote = '\0';
+                }
+                j += 1;
+                continue;
+            }
+            '"' => {
+                if c == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if c == '"' {
+                    quote = '\0';
+                }
+                j += 1;
+                continue;
+            }
+            _ => {}
+        }
+        match c {
+            '\'' | '"' => quote = c,
+            '\\' => j += 1,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// Copy `src` with every word the tokenizer would drop replaced by [`DROP`]:
+/// command and process substitutions, backticks, and empty quoted words. A
+/// second tokenize pass then says which simple command carried the drop.
+fn mark_drops(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            '\'' => {
+                if i + 1 < b.len() && b[i + 1] == '\'' {
+                    out.push_str(DROP);
+                    i += 2;
+                    continue;
+                }
+                // No substitution inside single quotes: copy it verbatim.
+                out.push(c);
+                i += 1;
+                while i < b.len() {
+                    out.push(b[i]);
+                    if b[i] == '\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' => {
+                if i + 1 < b.len() && b[i + 1] == '"' {
+                    out.push_str(DROP);
+                    i += 2;
+                    continue;
+                }
+                out.push(c);
+                i += 1;
+                while i < b.len() {
+                    let d = b[i];
+                    if d == '\\' && i + 1 < b.len() {
+                        out.push(d);
+                        out.push(b[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if d == '"' {
+                        out.push(d);
+                        i += 1;
+                        break;
+                    }
+                    if d == '`' || (d == '$' && i + 1 < b.len() && b[i + 1] == '(') {
+                        out.push_str(DROP);
+                        i = skip_subst(&b, i);
+                        continue;
+                    }
+                    out.push(d);
+                    i += 1;
+                }
+            }
+            '\\' => {
+                out.push(c);
+                if i + 1 < b.len() {
+                    out.push(b[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '`' => {
+                out.push_str(DROP);
+                i = skip_subst(&b, i);
+            }
+            '$' if i + 1 < b.len() && b[i + 1] == '(' => {
+                out.push_str(DROP);
+                i = skip_subst(&b, i);
+            }
+            '<' | '>' if i + 1 < b.len() && b[i + 1] == '(' => {
+                out.push_str(DROP);
+                i = skip_subst(&b, i + 1);
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn check_gh_cmd(a: &[String]) -> Found {
@@ -2607,7 +2789,7 @@ fn check_flat(w: &[String]) -> Found {
     let base = w[0].rsplit('/').next().unwrap_or(&w[0]);
     if matches!(base, "xargs" | "parallel") {
         // Shallow: no wrapper deep scan here, only the merge shape.
-        return if (0..w.len()).any(|j| is_gh_merge(&w[j..])) {
+        return if gh_merge_in(w).is_some() {
             Found::block(MERGE_MESSAGE)
         } else {
             Found::pass()
@@ -2635,10 +2817,9 @@ fn check_flat(w: &[String]) -> Found {
     check_cmd(w, 0, false)
 }
 
-/// A wrapper that adds words the text does not show (`xargs`, `parallel`): a
-/// `gh pr merge` it runs is not readable, whatever its visible argv says.
-fn merge_behind(base: &str, a: &[String]) -> Found {
-    let f = wrapper(base, a);
+/// A merge reached through a door that adds or hides words (`xargs`, `find
+/// -exec`, `parallel`) is a hard block, never a prompt.
+fn merge_hit(f: Found) -> Found {
     if f.listed
         .iter()
         .any(|h| matches!(h.p, Pending::Act(Action::MergeRequest)))
@@ -2647,6 +2828,12 @@ fn merge_behind(base: &str, a: &[String]) -> Found {
     } else {
         f
     }
+}
+
+/// A wrapper that adds words the text does not show (`xargs`, `parallel`): a
+/// `gh pr merge` it runs is not readable, whatever its visible argv says.
+fn merge_behind(base: &str, a: &[String]) -> Found {
+    merge_hit(wrapper(base, a))
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a

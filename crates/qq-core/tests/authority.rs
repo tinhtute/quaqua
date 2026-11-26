@@ -1239,7 +1239,9 @@ mod caller_gate {
             assert!(is_block(&r.bash(cmd)), "{cmd}");
         }
         // N5 accepted: a body that starts with `-` is read as a flag cluster.
-        assert!(is_block(&r.bash("gh pr merge 5 --squash --body '- bullet one'")));
+        assert!(is_block(
+            &r.bash("gh pr merge 5 --squash --body '- bullet one'")
+        ));
     }
 
     /// The review's plain list keeps asking: compound commands, sibling
