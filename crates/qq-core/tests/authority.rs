@@ -1096,6 +1096,50 @@ mod caller_gate {
     }
 
     #[test]
+    fn ask_tier_pr_merge_asks_for_cos() {
+        for (tag, cmd) in [
+            ("ask-merge", "gh pr merge 5"),
+            ("ask-merge-bare", "gh pr merge"),
+            ("ask-merge-squash", "gh pr merge 5 --squash"),
+            ("ask-merge-merge", "gh pr merge 5 --merge"),
+            ("ask-merge-rebase", "gh pr merge 5 --rebase"),
+            ("ask-merge-del", "gh pr merge 5 --squash --delete-branch"),
+            ("ask-merge-sha", "gh pr merge 5 --match-head-commit abc123"),
+            ("ask-merge-sha-eq", "gh pr merge 5 --match-head-commit=abc123"),
+            ("ask-merge-r", "gh pr merge -R o/r 5"),
+            ("ask-merge-repo", "gh pr merge --repo o/r 5 --squash"),
+            ("ask-merge-g", "gh -R o/r pr merge 5"),
+            ("ask-merge-grepo", "gh --repo o/r pr merge 5"),
+            ("ask-merge-gap", "gh pr --repo o/r merge 5"),
+            // `-A` is `--author-email <text>` in gh 2.46, not an auto flag.
+            ("ask-merge-a", "gh pr merge 5 -A me@x"),
+            ("ask-merge-cluster", "gh pr merge 5 -sd"),
+        ] {
+            assert_ask_for_cos_deny_for_rest(tag, cmd);
+        }
+    }
+
+    #[test]
+    fn ask_tier_merge_bypass_or_unreadable_stays_blocked_for_cos() {
+        let r = rig("ask-merge-block", Who::Cos);
+        for cmd in [
+            "gh pr merge 5 --admin",
+            "gh pr merge --admin=false 5",
+            "gh pr merge --auto 5",
+            "gh pr merge 5 --auto=true",
+            "gh pr merge 5 --disable-auto",
+            "gh pr --auto merge 5",
+            "gh pr merge 5 --bogus",
+            "gh pr merge -Z 5",
+            "gh pr merge $FLAG 5",
+            "gh pr list merge",
+            "gh pr view --json merge",
+        ] {
+            assert!(is_block(&r.bash(cmd)), "{cmd}");
+        }
+    }
+
+    #[test]
     fn ask_tier_reading_tags_is_not_a_hit() {
         let r = rig("ask-tag-read", Who::Down);
         for ok in [
@@ -1133,13 +1177,12 @@ mod caller_gate {
     }
 
     #[test]
-    fn ask_tier_raw_push_and_merge_stay_blocked_for_cos() {
+    fn ask_tier_raw_push_stays_blocked_for_cos() {
         let r = rig("ask-raw", Who::Cos);
         for cmd in [
             "git push origin feat",
             "git push origin main",
             "git push --force origin feat",
-            "gh pr merge 5",
         ] {
             assert!(is_block(&r.bash(cmd)), "{cmd}");
         }
