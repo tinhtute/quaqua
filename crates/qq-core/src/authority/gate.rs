@@ -1758,13 +1758,20 @@ fn canonical_merge(cmd: &str) -> bool {
     i == w.len()
 }
 
-/// `<owner>/<name>`: ascii letters, digits, dot, underscore and hyphen.
+/// `<owner>/<name>`: each part starts with an ascii letter or digit, is not
+/// `.` or `..`, and holds only letters, digits, dot, underscore and hyphen.
 fn repo_word(x: &str) -> bool {
-    x.split('/').count() == 2
-        && x.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-        && !x.starts_with('/')
-        && !x.ends_with('/')
+    let mut parts = x.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    [owner, name].iter().all(|p| {
+        !p.is_empty()
+            && !matches!(*p, "." | "..")
+            && p.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
 }
 
 /// A full or abbreviated commit sha: 7 to 40 hex characters.
