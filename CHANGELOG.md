@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`gh pr merge` asks the CoS instead of blocking**: a plain merge (with `-R/--repo`, `--merge`, `--squash`, `--rebase`, `--delete-branch` or `--match-head-commit`) now reaches the native permission prompt and is judged by the target repo's tier like `gh release create`; `--admin`, `--auto`, `--disable-auto`, `gh api` merge endpoints and mutations, and any merge the scanner cannot read stay hard-blocked, and every non-CoS caller still blocks.
+
 ## [3.3.0] - 2026-11-26
 
 ### Added

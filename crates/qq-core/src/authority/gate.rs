@@ -3,12 +3,15 @@
 //! sorts what it finds in three bins.
 //!
 //! - Hard blocks, for everyone: a herdr pane, tab or workspace spawn/move/close,
-//!   any `git push` that is not a pure branch delete, a `gh` merge (by any
-//!   spelling), deleting main/master, and a ref or contents write that lands on
-//!   main/master.
+//!   any `git push` that is not a pure branch delete, a `gh` merge that
+//!   bypasses the owner or cannot be read (`--admin`, `--auto`,
+//!   `--disable-auto`, a `gh api` merge endpoint or mutation, a merge flag the
+//!   scanner does not know, a `$` expansion), deleting main/master, and a ref
+//!   or contents write that lands on main/master.
 //! - The approval list, decided by caller and tier (R7, R14, R5): branch delete,
 //!   `git branch -m|-M|-f` on main/master, `git tag`, `gh release create`,
-//!   history rewrite on shared refs, the #297 bypass spellings (alias push,
+//!   `gh pr merge` (the owner's prompt, tier-judged like a release), history
+//!   rewrite on shared refs, the #297 bypass spellings (alias push,
 //!   `gh api` ref/contents writes off main, `query=@file`), pane input and
 //!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
 //!   AGENTS.md and identity.md. Only a hit asks the daemon who is
@@ -55,6 +58,7 @@ const ASK_BRANCH_DELETE: &str = "approval list: delete a branch";
 const ASK_TRUNK_MOVE: &str = "approval list: rename or force-move main/master";
 const ASK_TAG: &str = "approval list: git tag";
 const ASK_RELEASE: &str = "approval list: gh release create";
+const ASK_MERGE: &str = "approval list: gh pr merge";
 const ASK_REWRITE: &str = "approval list: history rewrite on shared refs";
 const ASK_BYPASS: &str = "approval list: a push or merge door by another name";
 const ASK_INPUT: &str = "approval list: pane input or a grid_role token";
@@ -1684,9 +1688,11 @@ fn targets_trunk(x: &str) -> bool {
         .any(|p| x.match_indices(p).any(|(i, _)| at_end(&x[i + p.len()..])))
 }
 
-/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation (hard
-/// blocks); a ref/contents write or a hidden query is a push by another name:
-/// blocked when it lands on main/master, else on the approval list.
+/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation: a plain,
+/// readable `pr merge` is on the approval list (the owner's prompt), the bypass
+/// flags and unreadable shapes are hard blocks; a ref/contents write or a
+/// hidden query is a push by another name: blocked when it lands on
+/// main/master, else on the approval list.
 fn check_gh(a: &[String]) -> Found {
     // `-R/--repo` names another repo than the cwd's.
     let other = a.iter().any(|x| {
@@ -1696,10 +1702,127 @@ fn check_gh(a: &[String]) -> Found {
     check_gh_cmd(a).retarget(&t)
 }
 
+/// `gh pr merge`: an admin bypass, an unattended auto-merge, or arming or
+/// disarming one. No shorthand carries them in gh 2.46 (`-A` is
+/// `--author-email`).
+fn merge_forbidden(name: &str) -> bool {
+    matches!(name, "admin" | "auto" | "disable-auto")
+}
+
+/// A merge flag that carries its value in the next word (`-R`, `--repo`, …).
+fn merge_takes_value(name: &str) -> bool {
+    matches!(
+        name,
+        "R" | "A"
+            | "b"
+            | "F"
+            | "t"
+            | "repo"
+            | "author-email"
+            | "body"
+            | "body-file"
+            | "match-head-commit"
+            | "subject"
+    )
+}
+
+/// A boolean merge flag the reader knows. A name not listed here, and not a
+/// value flag, is unreadable and stays a hard block.
+fn merge_boolean(name: &str) -> bool {
+    matches!(
+        name,
+        "d" | "m" | "r" | "s" | "h" | "delete-branch" | "merge" | "rebase" | "squash" | "help"
+    )
+}
+
+/// The words before `pr` and between `pr` and `merge`: gh's global and
+/// inherited flags only, each with its value. A subcommand word, an unknown
+/// flag or a `$` expansion there means the scanner cannot read the merge.
+fn gh_globals_readable(a: &[String], from: usize, to: usize) -> bool {
+    let mut i = from;
+    while i < to {
+        let x = &a[i];
+        i += 1;
+        if matches!(x.as_str(), "-R" | "--repo" | "--hostname") {
+            i += 1;
+            continue;
+        }
+        let ok = matches!(x.as_str(), "-h" | "--help" | "--version" | "--")
+            || x.starts_with("--repo=")
+            || x.starts_with("--hostname=")
+            || (x.starts_with("-R") && x.len() > 2 && !x.starts_with("--"));
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The words after `merge`: the PR argument and the merge flags the reader
+/// knows. Anything else, a forbidden flag included, is not read.
+fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
+    let mut i = m + 1;
+    while i < a.len() {
+        let x = &a[i];
+        i += 1;
+        if x == "--" {
+            continue;
+        }
+        if let Some(rest) = x.strip_prefix("--") {
+            let name = rest.split('=').next().unwrap_or(rest);
+            if merge_forbidden(name) || !(merge_boolean(name) || merge_takes_value(name)) {
+                return false;
+            }
+            // `--flag=value` carries it; otherwise the next word does.
+            if merge_takes_value(name) && !rest.contains('=') {
+                i += 1;
+            }
+            continue;
+        }
+        if x.len() > 1 && x.starts_with('-') {
+            let cluster = &x[1..];
+            let mut at = 0;
+            while at < cluster.len() {
+                let c = cluster[at..].chars().next().unwrap_or_default();
+                let name = c.to_string();
+                if !(merge_boolean(&name) || merge_takes_value(&name)) {
+                    return false;
+                }
+                at += c.len_utf8();
+                if merge_takes_value(&name) {
+                    // The rest of the cluster is its value, else the next word.
+                    if at == cluster.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        // The PR argument: a number, URL or branch, as written.
+        if x.contains('$') {
+            return false;
+        }
+    }
+    true
+}
+
 fn check_gh_cmd(a: &[String]) -> Found {
-    let pr = a.iter().position(|x| x == "pr");
-    if pr.is_some_and(|p| a[p + 1..].iter().any(|x| x == "merge")) {
-        return Found::block(MERGE_MESSAGE);
+    if let Some(p) = a.iter().position(|x| x == "pr") {
+        if let Some(m) = a[p + 1..]
+            .iter()
+            .position(|x| x == "merge")
+            .map(|m| p + 1 + m)
+        {
+            let readable = gh_globals_readable(a, 0, p)
+                && gh_globals_readable(a, p + 1, m)
+                && gh_merge_args_readable(a, m);
+            return if readable {
+                Found::act(Action::MergeRequest, ASK_MERGE)
+            } else {
+                Found::block(MERGE_MESSAGE)
+            };
+        }
     }
     if a.windows(2).any(|w| w[0] == "release" && w[1] == "create") {
         return Found::act(Action::Release, ASK_RELEASE);
