@@ -200,6 +200,13 @@ impl HerdrEnv {
         let herdr_session = server.as_ref().and_then(|v| field(v, "session"));
         let herdr_socket = server.as_ref().and_then(|v| field(v, "socket"));
         let (mut session, mut socket) = if preferred.is_some() {
+            // The env socket is only this session's when the env named this session: another
+            // session's socket would make a pair no daemon can use (review finding 2).
+            let env_socket = if env_session.is_some() && env_session == named {
+                env_socket
+            } else {
+                None
+            };
             (
                 herdr_session.or_else(|| named.clone()),
                 herdr_socket.or(env_socket),

@@ -802,6 +802,20 @@ mod tests {
         assert!(calls.contains("--session farm-a"), "calls: {calls}");
     }
 
+    /// No herdr at all and a foreign pair in the env: `up` resolves nothing, as on main,
+    /// rather than pairing the farm's name with another session's socket.
+    #[test]
+    fn resolve_env_takes_no_foreign_socket_when_herdr_is_absent() {
+        let ws = crate::testkit::TestWorkspace::new("up-herdr-absent");
+        let farm = ws.root().join("farm-a");
+        std::env::set_var("HERDR_SESSION", "farm-b");
+        std::env::set_var("HERDR_SOCKET_PATH", "/h/farm-b/herdr.sock");
+        let mut up = up_for(&farm);
+        let pair = up.resolve_env();
+        ws.seal_herdr();
+        assert_eq!(pair, None);
+    }
+
     /// Half a foreign pair must not be mixed with the farm's: session from one session and
     /// socket from another is a pair no daemon can use.
     #[test]
