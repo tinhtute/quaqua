@@ -158,9 +158,10 @@ impl HerdrEnv {
         Self::resolve(None, &ProcessFacts::new())
     }
 
-    /// The session the daemon must reach: the environment when it carries a value, herdr for
-    /// whatever it lacks. `preferred` is a session to ask herdr about by name — `up` knows its
-    /// farm's — and `None` asks herdr which session this process is in.
+    /// The session the daemon must reach. `up` passes the session its farm lives in as
+    /// `preferred`: herdr's answer for that name wins and the env only fills a gap, so a pane
+    /// of another farm cannot put its own pair in the unit or in the server's env. `None` (a
+    /// plain `daemon install`) takes the env first and asks herdr for whatever it lacks.
     pub fn resolve(preferred: Option<&str>, facts: &dyn HerdrFacts) -> Result<Self, String> {
         let var = |k| std::env::var(k).ok();
         Self::resolve_with(
@@ -180,27 +181,31 @@ impl HerdrEnv {
         facts: &dyn HerdrFacts,
     ) -> Result<Self, String> {
         let (env_session, env_socket) = (clean(session), clean(socket));
-        // A herdr pane exports its own pair, and `up` exports the one it resolved: the env wins.
-        if let (Some(session), Some(socket)) = (env_session.clone(), env_socket.clone()) {
-            return Ok(HerdrEnv { session, socket });
+        // A plain install with both values set needs neither herdr nor a clearer pair.
+        if preferred.is_none() {
+            if let (Some(session), Some(socket)) = (env_session.clone(), env_socket.clone()) {
+                return Ok(HerdrEnv { session, socket });
+            }
         }
         let mut why: Vec<String> = Vec::new();
-        // Asked by name, herdr answers with that session's own pair, so its socket wins over
-        // half an env; asked without a name, it only knows the socket.
-        let named = env_session
-            .clone()
-            .or_else(|| preferred.map(str::to_string));
+        // A named session is the one to ask herdr about, and its answer is a pair: the socket
+        // that belongs to it, never a socket left over from another session's env.
+        let named = preferred
+            .map(str::to_string)
+            .or_else(|| env_session.clone());
         let server = facts.server(named.as_deref());
         if server.is_none() {
             why.push("`herdr status server --json` gave no answer".to_string());
         }
         let herdr_session = server.as_ref().and_then(|v| field(v, "session"));
         let herdr_socket = server.as_ref().and_then(|v| field(v, "socket"));
-        let mut session = env_session.or(herdr_session);
-        let mut socket = if named.is_some() {
-            herdr_socket.or(env_socket)
+        let (mut session, mut socket) = if preferred.is_some() {
+            (
+                herdr_session.or_else(|| named.clone()),
+                herdr_socket.or(env_socket),
+            )
         } else {
-            env_socket.or(herdr_socket)
+            (env_session.or(herdr_session), env_socket.or(herdr_socket))
         };
         if session.is_none() {
             if let Some(p) = &socket {
@@ -756,7 +761,29 @@ pub fn install_resolved(
     facts: &dyn HerdrFacts,
 ) -> Result<String, String> {
     let herdr = HerdrEnv::resolve(None, facts)?;
-    install_with(svc, runs_dir, args, &herdr)
+    let warn = not_running(&herdr, facts);
+    let text = install_with(svc, runs_dir, args, &herdr)?;
+    Ok(match warn {
+        Some(w) if text.ends_with('\n') => format!("{text}{w}"),
+        Some(w) => format!("{text}\n{w}"),
+        None => text,
+    })
+}
+
+/// A line for a session herdr reports as not running, so a unit naming it is written with a
+/// warning rather than in silence: the daemon cannot reach herdr until that session runs.
+/// `None` when herdr says nothing, or says it runs.
+fn not_running(herdr: &HerdrEnv, facts: &dyn HerdrFacts) -> Option<String> {
+    let status = facts.server(Some(&herdr.session))?;
+    if status.get("running").and_then(serde_json::Value::as_bool) != Some(false) {
+        return None;
+    }
+    let state = field(&status, "status").unwrap_or_else(|| "not running".to_string());
+    Some(format!(
+        "warning: herdr reports session {} as {state}: the unit cannot reach herdr until it runs (\
+         `herdr --session {}`, or pick a running one from `herdr session list`)\n",
+        herdr.session, herdr.session
+    ))
 }
 
 /// [`install_at`] on a given service and herdr session, the rest of the spec (exe, PATH,
@@ -1176,6 +1203,55 @@ mod tests {
         assert_eq!(facts.asked(), vec![Some("quaqua".to_string())]);
     }
 
+    /// A named session's socket wins over an env socket: a pane of another farm must not mix
+    /// its socket with this farm's name. This is the branch the reviewer's mutation M3 hit.
+    #[test]
+    fn a_preferred_session_ignores_a_foreign_env_pair() {
+        let status = r#"{"running":true,"session":"farm-a","socket":"/h/farm-a.sock"}"#;
+        let facts = Facts::new(status, &session_list());
+        let h = HerdrEnv::resolve_with(
+            Some("farm-b".into()),
+            Some("/h/farm-b.sock".into()),
+            Some("farm-a"),
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(
+            (h.session.as_str(), h.socket.as_str()),
+            ("farm-a", "/h/farm-a.sock")
+        );
+        assert_eq!(facts.asked(), vec![Some("farm-a".to_string())]);
+        let facts = Facts::new(status, &session_list());
+        let h = HerdrEnv::resolve_with(None, Some("/h/farm-b.sock".into()), Some("farm-a"), &facts)
+            .unwrap();
+        assert_eq!(h.socket, "/h/farm-a.sock");
+    }
+
+    /// An explicit name that herdr reports as not running still installs, with a warning: the
+    /// name was typed, and the unit is useless until that session starts.
+    #[test]
+    fn install_warns_when_the_named_session_is_not_running() {
+        let ws = crate::testkit::TestWorkspace::new("service-install-stopped");
+        std::env::set_var("HERDR_SESSION", "stopped-s1");
+        let status = r#"{"status":"not_running","running":false,"session":"stopped-s1","socket":"/h/stopped.sock"}"#;
+        let facts = Facts::new(status, &session_list());
+        let out = install_resolved(
+            &launchd(ws.root()),
+            &ws.runs_dir(),
+            &argv(&["install", "--dry-run"]),
+            &facts,
+        )
+        .unwrap();
+        assert!(
+            out.contains("warning:") && out.contains("not_running"),
+            "{out}"
+        );
+        assert!(
+            out.contains("stopped-s1") && out.contains("/h/stopped.sock"),
+            "{out}"
+        );
+    }
+
     #[test]
     fn a_stopped_session_socket_names_no_session() {
         let list: serde_json::Value = serde_json::from_str(&session_list()).unwrap();
@@ -1208,6 +1284,10 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains(PANE_SOCKET), "{out}");
+            assert!(
+                !out.contains("warning:"),
+                "a running session warns about nothing: {out}"
+            );
         }
         assert!(!ws.root().join("Library").exists() && !ws.root().join(".config").exists());
     }

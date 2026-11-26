@@ -300,11 +300,17 @@ impl CliUp {
         )
     }
 
-    /// One herdr call. The configured session is named on the command line, so a run from
-    /// another session's pane still reaches this farm's.
+    /// One herdr call against the farm's session: the configured session is named on the
+    /// command line, so a run from another session's pane still reaches this farm's.
     fn herdr(&self, args: &[&str]) -> std::io::Result<Reply> {
+        self.herdr_in(&self.name(), args)
+    }
+
+    /// [`CliUp::herdr`] against `session` by name: what the shared resolver's `preferred`
+    /// session asks for.
+    fn herdr_in(&self, session: &str, args: &[&str]) -> std::io::Result<Reply> {
         let mut cmd = Command::new(&self.bin);
-        cmd.arg("--session").arg(self.name());
+        cmd.arg("--session").arg(session);
         if let Some((session, socket)) = &self.resolved {
             cmd.env("HERDR_SESSION", session)
                 .env("HERDR_SOCKET_PATH", socket);
@@ -323,9 +329,16 @@ impl CliUp {
         })
     }
 
-    /// `herdr status server --json` as JSON.
+    /// `herdr --session <farm> status server --json` as JSON.
     fn status(&self) -> Option<Value> {
-        let r = self.herdr(&["status", "server", "--json"]).ok()?;
+        self.status_in(&self.name())
+    }
+
+    /// `herdr --session <session> status server --json` as JSON.
+    fn status_in(&self, session: &str) -> Option<Value> {
+        let r = self
+            .herdr_in(session, &["status", "server", "--json"])
+            .ok()?;
         serde_json::from_str(&r.body).ok()
     }
 
@@ -343,8 +356,9 @@ impl CliUp {
         Err(format!("herdr {}: {}", args.join(" "), r.body.trim()))
     }
 
-    /// Resolves `(session, socket)` through the resolver `daemon install` shares — the env
-    /// first, then herdr — and exports them: the install path reads the process env.
+    /// Resolves `(session, socket)` through the resolver `daemon install` shares, with the
+    /// farm's own session as the name — never whatever pair the calling pane carries — and
+    /// exports them: the install path reads the process env.
     fn resolve_env(&mut self) -> Option<(String, String)> {
         if let Some(v) = &self.resolved {
             return Some(v.clone());
@@ -371,16 +385,20 @@ impl CliUp {
     }
 }
 
-/// `up`'s herdr seam for the resolver `daemon install` shares: every call names the farm's
-/// session, so a status is asked about that session and the listing is the plain one.
+/// `up`'s herdr seam for the resolver `daemon install` shares: every call names a session on
+/// the command line, so the resolver's `server(session)` is answered for that very session.
 struct CliFacts<'a> {
     up: &'a CliUp,
 }
 
 impl HerdrFacts for CliFacts<'_> {
-    fn server(&self, _session: Option<&str>) -> Option<Value> {
-        // `herdr --session <farm> status server --json`, which is what `up` always asks.
-        self.up.status()
+    /// `herdr --session <session> status server --json`, the farm's own session when the
+    /// resolver names none: the same call `up` made before the resolver was shared.
+    fn server(&self, session: Option<&str>) -> Option<Value> {
+        match session {
+            Some(session) => self.up.status_in(session),
+            None => self.up.status(),
+        }
     }
 
     fn sessions(&self) -> Option<Value> {

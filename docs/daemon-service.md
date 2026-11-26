@@ -20,13 +20,17 @@ Linux (systemd) and macOS (launchd) are supported. The sleep guard is Linux only
   A failed command is shown as `starting <unit> failed: \`<command>\` failed: <stderr>`, and a start that does not answer in time names `launchctl print gui/<uid>/<label>`.
   The `gui/<uid>` domain needs a GUI login: over SSH, `bootstrap` fails and its error is shown verbatim.
 - The unit also carries `HERDR_SESSION` and `HERDR_SOCKET_PATH`, so the daemon reaches herdr (a systemd user unit starts with
-  neither). Each value comes from the installing environment first and from herdr second: a herdr pane exports
-  `HERDR_SOCKET_PATH` and never `HERDR_SESSION` (#376), so a missing name is read from `herdr session list --json` — the
-  running session whose `socket_path` is that socket — and a missing socket from `herdr status server --json` (a socket
-  herdr reports for a session named on the command line wins over half an env pair). `quaqua up` resolves the pair with the
-  same code, asking herdr about the farm's own session name, and exports it before installing. Install refuses only when
-  neither the environment nor herdr can tell, and then it names the step that works: `herdr session list` prints every
-  session with its socket, so `HERDR_SESSION=<name> HERDR_SOCKET_PATH=<socket> quaqua daemon install` runs anywhere. The
+  neither). For `daemon install`, each value comes from the installing environment first and from herdr second: a herdr
+  pane exports `HERDR_SOCKET_PATH` and never `HERDR_SESSION` (#376), so a missing name is read from
+  `herdr session list --json` — the running session whose `socket_path` is that socket — and a missing socket from
+  `herdr status server --json`. An explicit `HERDR_SESSION` herdr reports as not running still installs, followed by a
+  `warning:` line naming the state (so `--dry-run` prints the unit text and that line): the name was typed, and the unit
+  reaches herdr once that session runs. Install refuses only when neither the environment nor herdr can tell, and then it
+  names the step that works: `herdr session list` prints every session with its socket, so
+  `HERDR_SESSION=<name> HERDR_SOCKET_PATH=<socket> quaqua daemon install` runs anywhere. `quaqua up` resolves the pair with
+  the same code but passes the session its farm lives in, so herdr's answer for that name wins over whatever
+  `HERDR_SESSION`/`HERDR_SOCKET_PATH` the calling pane carries — a pane of another farm cannot put its own pair in the unit
+  or in the env of the server `up` starts — and it exports the pair before installing. The
   socket path is `~/.config/herdr/sessions/<session>/herdr.sock`; it is keyed by session name, so it stays the same across
   reboots, but re-run install if you move the daemon to another session.
 - The daemon's Supervisor job owns the auditor (#316). If `systemd/user/` still holds a legacy `quaqua-auditor*.timer` or
