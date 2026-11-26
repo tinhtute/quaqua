@@ -1,19 +1,20 @@
 //! The `gate` verb: the Claude Code PreToolUse hook (Bash, and Write/Edit on
 //! the live instruction files). Stateless: it tokenizes the hook's command and
-//! sorts what it finds in three bins.
+//! sorts what it finds in three bins. The one merge line the CoS may be
+//! prompted for is matched on the raw command string, before the tokenizer.
 //!
 //! - Hard blocks, for everyone: a herdr pane, tab or workspace spawn/move/close,
-//!   any `git push` that is not a pure branch delete, a `gh` merge that
-//!   bypasses the owner or is not the whole readable command (`--admin`,
-//!   `--auto`, `--disable-auto`, a `gh api` merge endpoint or mutation, a merge
-//!   flag the scanner does not know, a word the tokenizer drops or bash
-//!   expands, globs or brace-expands, a merge behind a wrapper, `xargs`,
-//!   `parallel` or `find -exec`), deleting main/master, and a ref or contents
-//!   write that lands on main/master.
+//!   any `git push` that is not a pure branch delete, a `gh` merge by any
+//!   spelling except the one canonical line (a chained or quoted command, a
+//!   wrapper, `--admin`, `--auto`, `--disable-auto`, `--body`, `--subject`, an
+//!   unknown shape, a `gh api` merge endpoint or mutation), deleting
+//!   main/master, and a ref or contents write that lands on main/master.
 //! - The approval list, decided by caller and tier (R7, R14, R5): branch delete,
 //!   `git branch -m|-M|-f` on main/master, `git tag`, `gh release create`,
-//!   `gh pr merge` (the owner's prompt at every tier, lane and grant; only the
-//!   daemon's `pr.merge` door keeps the tier math), history
+//!   `gh pr merge <pr> [--repo o/r] [--squash] [--delete-branch]
+//!   [--match-head-commit sha]` (the one canonical line; the owner's prompt at
+//!   every tier, lane and grant, only the daemon's `pr.merge` door keeping the
+//!   tier math), history
 //!   rewrite on shared refs, the #297 bypass spellings (alias push,
 //!   `gh api` ref/contents writes off main, `query=@file`), pane input and
 //!   `grid_role` tokens, Bash naming `runs/qq.db`, and Write/Edit of the live
@@ -251,6 +252,16 @@ fn decide_for(env: Option<&Env>, hook_json: &str) -> Verdict {
             let cmd = c.as_str().unwrap_or_default();
             if cmd.trim().is_empty() {
                 return Verdict::Block(PANE_MESSAGE);
+            }
+            // The one merge line the CoS may turn into a prompt. Everything
+            // else that scans as a merge keeps the hard block.
+            if canonical_merge(cmd) {
+                return judge(
+                    Found::act(Action::MergeRequest, ASK_MERGE),
+                    &|| env.map_or(Caller::Unknown, |e| caller::lookup(&e.runs_dir)),
+                    env.map(|e| e.runs_dir.as_path()),
+                    cwd.as_deref(),
+                );
             }
             let mut f = scan(cmd);
             if let Some(env) = env {
@@ -687,17 +698,6 @@ fn scan(command: &str) -> Found {
 fn scan_with(command: &str, deep: bool) -> Found {
     let segs = tokenize(command);
     let mut f = Found::pass();
-    // A second tokenization marks every word the first one drops (`$(…)`, a
-    // backtick, `<(…)`, `''`/`""`). A merge segment that starts away from gh
-    // (a wrapper, an assignment) or carries a mark has an argv bash builds and
-    // the gate never reads: hard-block it for everyone, the CoS included.
-    for seg in &tokenize(&mark_drops(command)) {
-        if let Some(j) = gh_merge_in(seg) {
-            if j != 0 || seg.iter().any(|w| w.contains(DROP)) {
-                f.absorb(Found::block(MERGE_MESSAGE));
-            }
-        }
-    }
     for seg in &segs {
         f.absorb(check_words_in(seg, deep));
         f.absorb(git_env_words(seg));
@@ -1040,11 +1040,8 @@ fn check_cmd(w: &[String], i: usize, deep: bool) -> Found {
         "find" => check_find(a),
         // The command word was a substitution the tokenizer dropped.
         "call" => check_quaqua(&w[i..]),
-        // `xargs` and `parallel` add words from outside the text: a merge under
-        // one cannot be read, so it stays a hard block.
-        b @ ("xargs" | "parallel") => merge_behind(b, a),
         "sudo" | "env" | "command" | "exec" | "nice" | "time" | "nohup" | "setsid" | "stdbuf"
-        | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
+        | "xargs" | "builtin" | "chrt" | "ionice" | "taskset" | "timeout" => wrapper(base, a),
         b => {
             let mut f = names_db(b, a);
             // A command word built at run time (`$Q call …`) may be `quaqua`.
@@ -1570,7 +1567,7 @@ fn check_find(a: &[String]) -> Found {
                 .take_while(|x| x.as_str() != ";" && x.as_str() != "+")
                 .cloned()
                 .collect();
-            f.absorb(merge_hit(check_words(&cmd)));
+            f.absorb(check_words(&cmd));
         }
     }
     f
@@ -1711,13 +1708,9 @@ fn targets_trunk(x: &str) -> bool {
         .any(|p| x.match_indices(p).any(|(i, _)| at_end(&x[i + p.len()..])))
 }
 
-/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation: a plain,
-/// readable `pr merge` that starts the simple command is on the approval list
-/// (the owner's prompt at every tier); the bypass flags, a word the tokenizer
-/// drops or bash expands/globs/braces, and a merge behind a wrapper or
-/// `find -exec` are hard blocks; a ref/contents write or a hidden query is a
-/// push by another name: blocked when it lands on main/master, else on the
-/// approval list.
+/// `gh pr merge`, a merge endpoint through `gh api`, a merge mutation (hard
+/// blocks); a ref/contents write or a hidden query is a push by another name:
+/// blocked when it lands on main/master, else on the approval list.
 fn check_gh(a: &[String]) -> Found {
     // `-R/--repo` names another repo than the cwd's.
     let other = a.iter().any(|x| {
@@ -1727,325 +1720,62 @@ fn check_gh(a: &[String]) -> Found {
     check_gh_cmd(a).retarget(&t)
 }
 
-/// `gh pr merge`: an admin bypass, an unattended auto-merge, or arming or
-/// disarming one. No shorthand carries them in gh 2.46 (`-A` is
-/// `--author-email`).
-fn merge_forbidden(name: &str) -> bool {
-    matches!(name, "admin" | "auto" | "disable-auto")
-}
-
-/// A merge flag that carries its value in the next word (`-R`, `--repo`, …).
-fn merge_takes_value(name: &str) -> bool {
-    matches!(
-        name,
-        "R" | "A"
-            | "b"
-            | "F"
-            | "t"
-            | "repo"
-            | "author-email"
-            | "body"
-            | "body-file"
-            | "match-head-commit"
-            | "subject"
-    )
-}
-
-/// A boolean merge flag the reader knows. A name not listed here, and not a
-/// value flag, is unreadable and stays a hard block.
-fn merge_boolean(name: &str) -> bool {
-    matches!(
-        name,
-        "d" | "m" | "r" | "s" | "h" | "delete-branch" | "merge" | "rebase" | "squash" | "help"
-    )
-}
-
-/// The words before `pr` and between `pr` and `merge`: gh's global and
-/// inherited flags only, each with its value. A subcommand word, an unknown
-/// flag or a `$` expansion there means the scanner cannot read the merge.
-fn gh_globals_readable(a: &[String], from: usize, to: usize) -> bool {
-    let mut i = from;
-    while i < to {
-        let x = &a[i];
+/// The one merge line the CoS may turn into a prompt, matched on the raw
+/// command string before the tokenizer: `gh pr merge <number>` and, in this
+/// order, an optional `--repo`/`-R <owner>/<name>`, at most one of `--merge`,
+/// `--squash`, `--rebase`, an optional `--delete-branch` and an optional
+/// `--match-head-commit <7-40 hex>`. Single spaces, nothing before or after.
+/// Every other spelling is the hard block.
+fn canonical_merge(cmd: &str) -> bool {
+    let w: Vec<&str> = cmd.split(' ').collect();
+    if w.len() < 4 || w[..3] != ["gh", "pr", "merge"] {
+        return false;
+    }
+    if w[3].is_empty() || !w[3].chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut i = 4;
+    if i < w.len() && matches!(w[i], "--repo" | "-R") {
         i += 1;
-        if merge_word_unreadable(x) {
+        if i >= w.len() || !repo_word(w[i]) {
             return false;
         }
-        if matches!(x.as_str(), "-R" | "--repo" | "--hostname") {
-            if a.get(i).is_some_and(|v| merge_word_unreadable(v)) {
-                return false;
-            }
-            i += 1;
-            continue;
-        }
-        let ok = matches!(x.as_str(), "-h" | "--help" | "--version" | "--")
-            || x.starts_with("--repo=")
-            || x.starts_with("--hostname=")
-            || (x.starts_with("-R") && x.len() > 2 && !x.starts_with("--"));
-        if !ok {
-            return false;
-        }
-    }
-    true
-}
-
-/// The words after `merge`: the PR argument and the merge flags the reader
-/// knows. Anything else, a forbidden flag included, is not read. A separate
-/// value stays in the stream: a word the tokenizer dropped (`''`, `$(…)`) can
-/// shift the slot, so a flag-looking value is judged as the flag it spells.
-fn gh_merge_args_readable(a: &[String], m: usize) -> bool {
-    let mut i = m + 1;
-    while i < a.len() {
-        let x = &a[i];
         i += 1;
-        if merge_word_unreadable(x) {
+    }
+    if i < w.len() && matches!(w[i], "--merge" | "--squash" | "--rebase") {
+        i += 1;
+    }
+    if i < w.len() && w[i] == "--delete-branch" {
+        i += 1;
+    }
+    if i < w.len() && w[i] == "--match-head-commit" {
+        i += 1;
+        if i >= w.len() || !sha_word(w[i]) {
             return false;
         }
-        if x == "--" {
-            continue;
-        }
-        if let Some(rest) = x.strip_prefix("--") {
-            let name = rest.split('=').next().unwrap_or(rest);
-            if merge_forbidden(name) || !(merge_boolean(name) || merge_takes_value(name)) {
-                return false;
-            }
-            continue;
-        }
-        if x.len() > 1 && x.starts_with('-') {
-            let cluster = &x[1..];
-            let mut at = 0;
-            while at < cluster.len() {
-                let c = cluster[at..].chars().next().unwrap_or_default();
-                let name = c.to_string();
-                if !(merge_boolean(&name) || merge_takes_value(&name)) {
-                    return false;
-                }
-                at += c.len_utf8();
-                if merge_takes_value(&name) {
-                    // The rest of the cluster is its value; a separate word is
-                    // judged on its own (see above).
-                    break;
-                }
-            }
-            continue;
-        }
-        // The PR argument: a number, URL or branch, as written.
-        if x.contains('$') {
-            return false;
-        }
+        i += 1;
     }
-    true
+    i == w.len()
 }
 
-/// The positions of `pr` and `merge` when the words after `gh` name a merge.
-fn gh_merge_at(a: &[String]) -> Option<(usize, usize)> {
-    let p = a.iter().position(|x| x == "pr")?;
-    let m = p + 1 + a[p + 1..].iter().position(|x| x == "merge")?;
-    Some((p, m))
+/// `<owner>/<name>`: ascii letters, digits, dot, underscore and hyphen.
+fn repo_word(x: &str) -> bool {
+    x.split('/').count() == 2
+        && x.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+        && !x.starts_with('/')
+        && !x.ends_with('/')
 }
 
-/// A merge word that carries a mark from [`mark_drops`].
-const DROP: &str = "__qq_drop__";
-
-/// The index where a simple command's words become `gh … pr … merge`. A
-/// non-zero index means a word in front of gh (a wrapper, an assignment, a
-/// keyword): the fence does not read a merge reached through one.
-fn gh_merge_in(s: &[String]) -> Option<usize> {
-    (0..s.len()).find(|&j| {
-        let w = &s[j..];
-        w[0].rsplit('/').next().unwrap_or(&w[0]) == "gh" && gh_merge_at(&w[1..]).is_some()
-    })
-}
-
-/// A word bash would expand, glob or brace-expand into other words: a merge
-/// argument holding one is not the text gh receives. Quotes and spaces are
-/// already resolved in a token, so they are plain here.
-fn merge_word_unreadable(w: &str) -> bool {
-    w.contains(DROP)
-        || w.chars().any(|c| {
-            matches!(
-                c,
-                '$' | '`'
-                    | '{'
-                    | '}'
-                    | '*'
-                    | '?'
-                    | '['
-                    | ']'
-                    | '~'
-                    | '<'
-                    | '>'
-                    | '('
-                    | ')'
-                    | ';'
-                    | '&'
-                    | '|'
-                    | '!'
-                    | '\\'
-                    | '\n'
-            )
-        })
-}
-
-/// The end of the substitution that starts at `i`: a backtick, or `$(`/`<(`/`>(`
-/// with `i` on the `$`/`<`/`>` and `i + 1` the `(`. Quote-aware and
-/// parenthesis-nested, like the tokenizer's own `subst`.
-fn skip_subst(b: &[char], i: usize) -> usize {
-    if b[i] == '`' {
-        let mut j = i + 1;
-        while j < b.len() {
-            if b[j] == '\\' {
-                j += 2;
-                continue;
-            }
-            if b[j] == '`' {
-                return j + 1;
-            }
-            j += 1;
-        }
-        return b.len();
-    }
-    let mut j = i + 2;
-    let mut depth = 1usize;
-    let mut quote = '\0';
-    while j < b.len() {
-        let c = b[j];
-        match quote {
-            '\'' => {
-                if c == '\'' {
-                    quote = '\0';
-                }
-                j += 1;
-                continue;
-            }
-            '"' => {
-                if c == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if c == '"' {
-                    quote = '\0';
-                }
-                j += 1;
-                continue;
-            }
-            _ => {}
-        }
-        match c {
-            '\'' | '"' => quote = c,
-            '\\' => j += 1,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return j + 1;
-                }
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    b.len()
-}
-
-/// Copy `src` with every word the tokenizer would drop replaced by [`DROP`]:
-/// command and process substitutions, backticks, and empty quoted words. A
-/// second tokenize pass then says which simple command carried the drop.
-fn mark_drops(src: &str) -> String {
-    let b: Vec<char> = src.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            '\'' => {
-                if i + 1 < b.len() && b[i + 1] == '\'' {
-                    out.push_str(DROP);
-                    i += 2;
-                    continue;
-                }
-                // No substitution inside single quotes: copy it verbatim.
-                out.push(c);
-                i += 1;
-                while i < b.len() {
-                    out.push(b[i]);
-                    if b[i] == '\'' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            '"' => {
-                if i + 1 < b.len() && b[i + 1] == '"' {
-                    out.push_str(DROP);
-                    i += 2;
-                    continue;
-                }
-                out.push(c);
-                i += 1;
-                while i < b.len() {
-                    let d = b[i];
-                    if d == '\\' && i + 1 < b.len() {
-                        out.push(d);
-                        out.push(b[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    if d == '"' {
-                        out.push(d);
-                        i += 1;
-                        break;
-                    }
-                    if d == '`' || (d == '$' && i + 1 < b.len() && b[i + 1] == '(') {
-                        out.push_str(DROP);
-                        i = skip_subst(&b, i);
-                        continue;
-                    }
-                    out.push(d);
-                    i += 1;
-                }
-            }
-            '\\' => {
-                out.push(c);
-                if i + 1 < b.len() {
-                    out.push(b[i + 1]);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            '`' => {
-                out.push_str(DROP);
-                i = skip_subst(&b, i);
-            }
-            '$' if i + 1 < b.len() && b[i + 1] == '(' => {
-                out.push_str(DROP);
-                i = skip_subst(&b, i);
-            }
-            '<' | '>' if i + 1 < b.len() && b[i + 1] == '(' => {
-                out.push_str(DROP);
-                i = skip_subst(&b, i + 1);
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out
+/// A full or abbreviated commit sha: 7 to 40 hex characters.
+fn sha_word(x: &str) -> bool {
+    (7..=40).contains(&x.len()) && x.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn check_gh_cmd(a: &[String]) -> Found {
-    if let Some((p, m)) = gh_merge_at(a) {
-        let readable = gh_globals_readable(a, 0, p)
-            && gh_globals_readable(a, p + 1, m)
-            && gh_merge_args_readable(a, m);
-        return if readable {
-            Found::act(Action::MergeRequest, ASK_MERGE)
-        } else {
-            Found::block(MERGE_MESSAGE)
-        };
+    let pr = a.iter().position(|x| x == "pr");
+    if pr.is_some_and(|p| a[p + 1..].iter().any(|x| x == "merge")) {
+        return Found::block(MERGE_MESSAGE);
     }
     if a.windows(2).any(|w| w[0] == "release" && w[1] == "create") {
         return Found::act(Action::Release, ASK_RELEASE);
@@ -2787,14 +2517,6 @@ fn spaced_word(x: &str) -> Found {
 /// [`check_cmd`] (db writes, path writers, grants) still applies.
 fn check_flat(w: &[String]) -> Found {
     let base = w[0].rsplit('/').next().unwrap_or(&w[0]);
-    if matches!(base, "xargs" | "parallel") {
-        // Shallow: no wrapper deep scan here, only the merge shape.
-        return if gh_merge_in(w).is_some() {
-            Found::block(MERGE_MESSAGE)
-        } else {
-            Found::pass()
-        };
-    }
     if matches!(
         base,
         "sudo"
@@ -2806,6 +2528,7 @@ fn check_flat(w: &[String]) -> Found {
             | "nohup"
             | "setsid"
             | "stdbuf"
+            | "xargs"
             | "builtin"
             | "chrt"
             | "ionice"
@@ -2815,25 +2538,6 @@ fn check_flat(w: &[String]) -> Found {
         return Found::pass();
     }
     check_cmd(w, 0, false)
-}
-
-/// A merge reached through a door that adds or hides words (`xargs`, `find
-/// -exec`, `parallel`) is a hard block, never a prompt.
-fn merge_hit(f: Found) -> Found {
-    if f.listed
-        .iter()
-        .any(|h| matches!(h.p, Pending::Act(Action::MergeRequest)))
-    {
-        Found::block(MERGE_MESSAGE)
-    } else {
-        f
-    }
-}
-
-/// A wrapper that adds words the text does not show (`xargs`, `parallel`): a
-/// `gh pr merge` it runs is not readable, whatever its visible argv says.
-fn merge_behind(base: &str, a: &[String]) -> Found {
-    merge_hit(wrapper(base, a))
 }
 
 /// The rule-drift warning for an allowed `quaqua|quaqua worker|lead` dispatch from a
