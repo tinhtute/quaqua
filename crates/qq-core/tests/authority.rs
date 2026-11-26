@@ -1105,6 +1105,15 @@ mod caller_gate {
             ("ask-merge-r", "gh pr merge 5 -R o/r --squash"),
             ("ask-merge-rebase", "gh pr merge 5 --rebase --delete-branch"),
             ("ask-merge-sha", "gh pr merge 5 --match-head-commit abc1234"),
+            ("ask-merge-repo-merge", "gh pr merge 5 --repo o/r --merge"),
+            (
+                "ask-merge-repo-squash",
+                "gh pr merge 5 --repo o/r --squash --delete-branch",
+            ),
+            (
+                "ask-merge-squash-sha",
+                "gh pr merge 5 --squash --match-head-commit abc1234def",
+            ),
             (
                 "ask-merge-all",
                 "gh pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc1234def",
