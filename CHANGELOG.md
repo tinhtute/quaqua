@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **A blocked worker's approval prompt goes to anh iu**: the workspace template's `recovery.md` and `operations.md` no longer tell the orchestrator to answer a blocked agent's prompt with `herdr agent send-keys <name> <key>`; it reads the pane with `herdr agent read <name>`, hands the text to anh iu, and resumes with `quaqua worker prompt <name> --resume` once they answer. `babysit` and `shipping` name one background `gh pr checks <n> --watch --interval 60 >/dev/null; gh pr checks <n>` that reports once, instead of pstack's `watch-pr` script, which is not installed.
 - **`gh pr merge` asks the CoS only for one canonical line**: `gh pr merge <number>` with, in this order, an optional `--repo`/`-R <owner>/<name>`, at most one of `--merge`/`--squash`/`--rebase`, an optional `--delete-branch` and an optional `--match-head-commit <7-40 hex>`, single spaces and nothing before or after. That line reaches the native permission prompt at every tier, lane and full grant; every other merge spelling — a chained or quoted command, a wrapper, `xargs`/`find -exec`, a comment or heredoc, a `-c` script, a function or alias named gh, `--admin`/`--auto`/`--disable-auto`, `--body`/`--subject`, bare or reordered flags — stays hard-blocked, and every non-CoS caller blocks the canonical line too.
 
 ### Fixed
