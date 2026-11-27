@@ -14,7 +14,7 @@ herdr agent wait <name> --until idle --timeout 60000
 herdr agent list; herdr pane close <pane_id>
 ```
 
-`prompt --wait` can return idle before the reply renders: read again and verify the report, not the lifecycle state. Read `recovery.md` before sending input after a failure; a blocked agent takes only `herdr agent send-keys <name> enter`.
+`prompt --wait` can return idle before the reply renders: read again and verify the report, not the lifecycle state. Read `recovery.md` before sending input after a failure; `herdr agent send-keys <name> enter` only submits text left unsent; it never answers an approval prompt.
 
 Watchdog exit codes: `recovery.md`; resume a stalled worker with `quaqua worker prompt <name> --resume`. Accept a report only after rerunning its exact test, then clean up at once and close only panes you created. Never `herdr server stop`.
 
